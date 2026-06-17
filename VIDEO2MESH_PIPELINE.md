@@ -715,6 +715,46 @@ python -m video2mesh.cli import-object-labels \
 
 后续可以把 `track-masks` 内部替换为 SAM2/DEVA/XMem 的视频级 mask propagation，但保持上述输出协议不变。
 
+为了先把生产级 video segmentation 接口固定下来，而不在当前机器上硬跑重模型，可以先准备外部工具 job：
+
+```bash
+python -m video2mesh.cli prepare-video-segmentation-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --frames-dir /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/mast3r_keyframes \
+  --prompts /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/masks/auto_prompts.json \
+  --provider sam2 \
+  --command-template "python run_sam2.py --job {job_path} --output {mask_output_root}"
+```
+
+输出：
+
+```text
+simulator_assets/video_segmentation_jobs/video_segmentation_job.json
+simulator_assets/video_segmentation_jobs/jobs/<provider>.json
+simulator_assets/video_segmentation_jobs/run_video_segmentation.sh
+```
+
+`video_segmentation_job.json` 记录全部帧、object prompts、bbox、期望 mask 输出目录和外部 provider 名称。它是 SAM2 / DEVA / XMem / Grounded-SAM 的桥接协议：外部工具只需要按 `masks/<object_id>/<frame_id>.png` 或 manifest 写出 2D masks。
+
+外部工具跑完后，用导入器把结果规范化到 Video2Mesh 标准目录：
+
+```bash
+python -m video2mesh.cli import-video-segmentation-masks \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --source-root /path/to/external_masks \
+  --provider sam2 \
+  --mode copy
+```
+
+也可以用 `--source-manifest /path/to/external_masks.json`。支持的 manifest 可以是 `{"masks": [...]}`、`{"objects": [{"object_id": ..., "frames": [...]}]}`、`{object_id: {frame_id: mask_path}}` 或 list。导入后会写：
+
+```text
+masks/2d/<object_id>/<frame_id>.png
+masks/2d/tracking_manifest.json
+```
+
+随后直接继续 `fuse-masks`，不需要改 2D-to-3D fusion、semantic splats 或后续 mesh/仿真导出。当前这只是外部接口和数据协议，不代表已经在本仓库内实现了 SAM2/DEVA/XMem 本体。
+
 ### Phase C：2D mask 融合成 3D object mask
 
 ```bash

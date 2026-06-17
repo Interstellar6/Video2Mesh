@@ -153,6 +153,8 @@ def resolve_project_relative_path(path: Path, project_root: Path) -> Path:
 
 def copy_or_link(src: Path, dst: Path, mode: str = "copy") -> Path:
     ensure_dir(dst.parent)
+    if src.resolve() == dst.resolve():
+        return dst
     if dst.exists() or dst.is_symlink():
         dst.unlink()
     if mode == "symlink":
@@ -2202,6 +2204,295 @@ def scan_mask_records(mask_root: Path) -> list[MaskRecord]:
             f"No masks found in {mask_root}. Use <object_id>/<frame>.png or <frame>_<object_id>.png."
         )
     return records
+
+
+def read_optional_json(path: Path | None) -> Any:
+    if path and path.exists():
+        return read_json(path)
+    return None
+
+
+def external_segmentation_prompt_objects(prompts_path: Path | None, frames: list[Path]) -> list[dict[str, Any]]:
+    if not prompts_path:
+        return []
+    data = read_json(prompts_path.resolve())
+    raw_objects: list[Any]
+    if isinstance(data, dict) and isinstance(data.get("objects"), list):
+        raw_objects = data["objects"]
+    elif isinstance(data, dict):
+        raw_objects = []
+        for key, value in data.items():
+            if not isinstance(value, dict):
+                continue
+            item = dict(value)
+            item.setdefault("id", key)
+            raw_objects.append(item)
+    elif isinstance(data, list):
+        raw_objects = data
+    else:
+        raise ValueError("Prompt JSON must be a list, an object map, or contain an objects list.")
+
+    objects = []
+    fallback_frame = frame_stem(frames[0].stem) if frames else "000000"
+    for idx, raw in enumerate(raw_objects):
+        if not isinstance(raw, dict):
+            continue
+        object_id = slugify(raw.get("object_id") or raw.get("id") or raw.get("name") or f"object_{idx:02d}")
+        objects.append(
+            {
+                "object_id": object_id,
+                "name": raw.get("name", object_id.replace("_", " ")),
+                "category": raw.get("category", "unknown"),
+                "description": raw.get("description", ""),
+                "frame_id": frame_stem(raw.get("frame_id", raw.get("frame", fallback_frame))),
+                "bbox": raw.get("bbox") or raw.get("box"),
+                "prompt": raw,
+            }
+        )
+    return objects
+
+
+def cmd_prepare_video_segmentation_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    frames_dir = args.frames_dir or (project_root / manifest["scene"]["frames_dir"])
+    frames_dir = frames_dir.resolve()
+    frames = list_frame_images(frames_dir)
+    if args.max_frames and args.max_frames > 0:
+        frames = frames[: args.max_frames]
+    prompts_path = args.prompts or resolve_existing_path(manifest.get("artifacts", {}).get("tracking_prompts"), project_root)
+    prompts = external_segmentation_prompt_objects(prompts_path, frames)
+    output_dir = ensure_dir(args.output_dir or (project_root / manifest["simulator_assets_dir"] / "video_segmentation_jobs"))
+    job_root = ensure_dir(output_dir / "jobs")
+    mask_output_root = args.mask_output_root or (project_root / manifest["masks"]["mask_2d_dir"])
+
+    frame_records = [
+        {
+            "frame_id": frame_stem(frame.stem),
+            "image": str(frame),
+            "index": index,
+        }
+        for index, frame in enumerate(frames)
+    ]
+    objects = []
+    for prompt in prompts:
+        objects.append(
+            {
+                "object_id": prompt["object_id"],
+                "name": prompt.get("name"),
+                "category": prompt.get("category"),
+                "description": prompt.get("description", ""),
+                "prompt_frame": prompt.get("frame_id"),
+                "bbox": prompt.get("bbox"),
+                "bbox_format": (prompt.get("prompt") or {}).get("bbox_format") or (prompt.get("prompt") or {}).get("format") or "xyxy",
+            }
+        )
+
+    job = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "provider": args.provider,
+        "frames_dir": str(frames_dir),
+        "frame_count": len(frame_records),
+        "frames": frame_records,
+        "prompts": str(prompts_path) if prompts_path else None,
+        "objects": objects,
+        "expected_output": {
+            "mask_root": str(mask_output_root),
+            "layout": "masks/<object_id>/<frame_id>.png",
+            "manifest": str(output_dir / "external_masks_manifest.json"),
+        },
+        "notes": (
+            "Prepared for external video segmentation/tracking tools such as SAM2, DEVA, XMem, or Grounded-SAM. "
+            "Run the external tool, then use import-video-segmentation-masks to normalize outputs into masks/2d."
+        ),
+    }
+    job_path = output_dir / "video_segmentation_job.json"
+    write_json(job_path, job)
+    per_provider_job_path = job_root / f"{slugify(args.provider, 'external')}.json"
+    write_json(per_provider_job_path, job)
+
+    command = None
+    if args.command_template:
+        values = {
+            "job_path": str(job_path),
+            "project_root": str(project_root),
+            "frames_dir": str(frames_dir),
+            "prompts": str(prompts_path) if prompts_path else "",
+            "mask_output_root": str(mask_output_root),
+            "provider": args.provider,
+        }
+        command = args.command_template.format(**values)
+    script_path = output_dir / "run_video_segmentation.sh"
+    script_lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    if command:
+        script_lines.append(command)
+    else:
+        script_lines.append(f'echo "Fill in external {args.provider} segmentation command for job: {job_path}"')
+    script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+
+    manifest.setdefault("artifacts", {})["video_segmentation_job"] = str(job_path)
+    manifest.setdefault("external_stages", {})["segmentation_2d_tracking"] = {
+        "status": "external_video_segmentation_job_prepared",
+        "notes": "Prepared external video segmentation job; run/import external masks before fuse-masks.",
+        "provider": args.provider,
+        "job": str(job_path),
+        "script": str(script_path),
+        "object_count": len(objects),
+        "frame_count": len(frame_records),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared external video segmentation job: {job_path}")
+    print(f"Frames: {len(frame_records)}; objects/prompts: {len(objects)}")
+    print(f"Script: {script_path}")
+    return 0
+
+
+def external_manifest_entries(data: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(data, dict) and isinstance(data.get("masks"), list):
+        for item in data["masks"]:
+            if isinstance(item, dict):
+                entries.append(dict(item))
+    elif isinstance(data, dict) and isinstance(data.get("objects"), list):
+        for obj in data["objects"]:
+            if not isinstance(obj, dict):
+                continue
+            object_id = obj.get("object_id") or obj.get("id") or obj.get("name")
+            frames = obj.get("frames") or obj.get("masks") or []
+            if isinstance(frames, dict):
+                frames = [{"frame_id": key, "mask": value} for key, value in frames.items()]
+            for frame in frames:
+                if isinstance(frame, dict):
+                    item = dict(frame)
+                    item.setdefault("object_id", object_id)
+                    entries.append(item)
+    elif isinstance(data, dict):
+        for object_id, frames in data.items():
+            if object_id in {"schema_version", "project_root", "scene_id", "notes"}:
+                continue
+            if isinstance(frames, dict):
+                for frame_id, mask in frames.items():
+                    entries.append({"object_id": object_id, "frame_id": frame_id, "mask": mask})
+            elif isinstance(frames, list):
+                for frame in frames:
+                    if isinstance(frame, dict):
+                        item = dict(frame)
+                        item.setdefault("object_id", object_id)
+                        entries.append(item)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                entries.append(dict(item))
+    return entries
+
+
+def discover_external_mask_records(mask_root: Path) -> list[MaskRecord]:
+    return scan_mask_records(mask_root)
+
+
+def cmd_import_video_segmentation_masks(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    source_root = args.source_root.resolve() if args.source_root else None
+    source_manifest_path = args.source_manifest.resolve() if args.source_manifest else None
+    output_root = args.output_dir or (project_root / manifest["masks"]["mask_2d_dir"])
+    if args.clear_output and output_root.exists():
+        shutil.rmtree(output_root)
+    output_root = ensure_dir(output_root)
+
+    imported: dict[str, Any] = {}
+    missing: list[dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
+    source_manifest = read_optional_json(source_manifest_path)
+    if source_manifest is not None:
+        entries = external_manifest_entries(source_manifest)
+    elif source_root:
+        entries = [
+            {"object_id": record.object_id, "frame_id": record.frame_id, "mask": str(record.path)}
+            for record in discover_external_mask_records(source_root)
+        ]
+    else:
+        raise ValueError("Pass --source-root or --source-manifest.")
+
+    for index, entry in enumerate(entries):
+        object_id = slugify(entry.get("object_id") or entry.get("id") or entry.get("name") or f"object_{index:02d}")
+        frame_id = frame_stem(entry.get("frame_id") or entry.get("frame") or entry.get("image_id") or entry.get("index") or "000000")
+        mask_value = entry.get("mask") or entry.get("mask_path") or entry.get("path") or entry.get("file")
+        if not mask_value:
+            missing.append({"entry": entry, "reason": "missing_mask_path"})
+            continue
+        mask_path = Path(mask_value)
+        if not mask_path.is_absolute():
+            if source_root and (source_root / mask_path).exists():
+                mask_path = source_root / mask_path
+            elif source_manifest_path and (source_manifest_path.parent / mask_path).exists():
+                mask_path = source_manifest_path.parent / mask_path
+            else:
+                mask_path = (source_root or project_root) / mask_path
+        if not mask_path.exists():
+            missing.append({"object_id": object_id, "frame_id": frame_id, "mask": str(mask_path), "reason": "not_found"})
+            if not args.skip_missing:
+                raise FileNotFoundError(f"External mask not found: {mask_path}")
+            continue
+        if mask_path.suffix.lower() not in MASK_EXTENSIONS:
+            missing.append({"object_id": object_id, "frame_id": frame_id, "mask": str(mask_path), "reason": "unsupported_extension"})
+            if not args.skip_missing:
+                raise ValueError(f"Unsupported mask extension: {mask_path}")
+            continue
+        dst = output_root / object_id / f"{frame_id}{mask_path.suffix.lower()}"
+        copied = copy_or_link(mask_path, dst, args.mode)
+        imported.setdefault(object_id, {"frames": []})
+        imported[object_id]["frames"].append(
+            {
+                "frame_id": frame_id,
+                "source_mask": str(mask_path),
+                "mask": str(copied),
+                "score": entry.get("score") or entry.get("confidence"),
+                "bbox": entry.get("bbox"),
+            }
+        )
+
+    tracking_manifest = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": "external_video_segmentation_import",
+        "provider": args.provider,
+        "source_root": str(source_root) if source_root else None,
+        "source_manifest": str(source_manifest_path) if source_manifest_path else None,
+        "mask_root": str(output_root),
+        "objects": {
+            object_id: {
+                "frames_written": len(record["frames"]),
+                "frames": record["frames"],
+            }
+            for object_id, record in sorted(imported.items())
+        },
+        "missing": missing,
+        "notes": "External video segmentation masks normalized to Video2Mesh masks/2d layout.",
+    }
+    tracking_manifest_path = output_root / "tracking_manifest.json"
+    write_json(tracking_manifest_path, tracking_manifest)
+    manifest.setdefault("artifacts", {})["object_masks_2d"] = str(output_root)
+    manifest.setdefault("artifacts", {})["mask_tracking_manifest"] = str(tracking_manifest_path)
+    manifest.setdefault("external_stages", {})["segmentation_2d_tracking"] = {
+        "status": "external_video_segmentation_masks_imported",
+        "notes": "Imported external video segmentation masks into standard Video2Mesh masks/2d layout.",
+        "provider": args.provider,
+        "object_count": len(imported),
+        "mask_count": sum(len(record["frames"]) for record in imported.values()),
+        "missing_count": len(missing),
+    }
+    save_manifest(project_root, manifest)
+
+    total = sum(len(record["frames"]) for record in imported.values())
+    print(f"Imported {total} external 2D mask(s) for {len(imported)} object(s) into {output_root}")
+    if missing:
+        print(f"Missing/skipped entries: {len(missing)}")
+    print(f"Tracking manifest: {tracking_manifest_path}")
+    return 0
 
 
 def load_object_labels(project_root: Path, labels_path: Path | None = None) -> dict[str, dict[str, Any]]:
@@ -8735,6 +9026,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sam-multimask", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max-frames", type=int, default=0)
     p.set_defaults(func=cmd_track_masks)
+
+    p = sub.add_parser("prepare-video-segmentation-jobs", help="Prepare frame/prompt jobs for external video segmentation tools such as SAM2/DEVA/XMem.")
+    add_common_project_arg(p)
+    p.add_argument("--frames-dir", type=Path, help="Defaults to scene/frames.")
+    p.add_argument("--prompts", type=Path, help="Prompt JSON. Defaults to manifest artifacts.tracking_prompts when available.")
+    p.add_argument("--provider", default="external_video_segmentation", help="External provider/tool name, e.g. sam2, deva, xmem, grounded-sam.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/video_segmentation_jobs.")
+    p.add_argument("--mask-output-root", type=Path, help="Where the external tool should write masks. Defaults to masks/2d.")
+    p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument(
+        "--command-template",
+        help=(
+            "Optional shell command with {job_path}, {project_root}, {frames_dir}, {prompts}, "
+            "{mask_output_root}, {provider}."
+        ),
+    )
+    p.set_defaults(func=cmd_prepare_video_segmentation_jobs)
+
+    p = sub.add_parser("import-video-segmentation-masks", help="Import external video segmentation masks into the standard masks/2d layout.")
+    add_common_project_arg(p)
+    p.add_argument("--source-root", type=Path, help="Directory containing <object_id>/<frame>.png masks or <frame>_<object>.png masks.")
+    p.add_argument("--source-manifest", type=Path, help="JSON manifest listing external masks.")
+    p.add_argument("--provider", default="external_video_segmentation")
+    p.add_argument("--output-dir", type=Path, help="Defaults to masks/2d.")
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--clear-output", action="store_true", help="Remove output masks before importing.")
+    p.add_argument("--skip-missing", action="store_true")
+    p.set_defaults(func=cmd_import_video_segmentation_masks)
 
     p = sub.add_parser("auto-prompts", help="Generate bbox tracking prompts automatically from a representative frame.")
     add_common_project_arg(p)

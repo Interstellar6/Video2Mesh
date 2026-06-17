@@ -271,6 +271,24 @@ masks/3d/object_masks.json
 objects/<object_id>/object.json
 ```
 
+如果要把当前 demo 级 bbox/SAM tracking 替换成 SAM2 / DEVA / XMem / Grounded-SAM，可以先生成外部 video segmentation job，再把外部 masks 导回标准 `masks/2d`：
+
+```bash
+python -m video2mesh.cli prepare-video-segmentation-jobs \
+  --project-root exports/milscene2_real_demo \
+  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
+  --prompts exports/milscene2_real_demo/masks/auto_prompts.json \
+  --provider sam2 \
+  --command-template "python run_sam2.py --job {job_path} --output {mask_output_root}"
+
+python -m video2mesh.cli import-video-segmentation-masks \
+  --project-root exports/milscene2_real_demo \
+  --source-root /path/to/external_masks \
+  --provider sam2
+```
+
+导入后仍然走同一个 `fuse-masks -> semantic 3DGS -> object mesh -> simulator assets` 后半段。这一步是外部生产级视频分割的协议接口，不等于当前仓库已经内置 SAM2/DEVA/XMem。
+
 如果后续用 VLM / 开放词汇检测器给 object_id 生成了更可靠的类别、名称和描述，可以把 JSON 标签导入回 Video2Mesh：
 
 ```bash
