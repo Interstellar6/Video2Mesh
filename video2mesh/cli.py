@@ -1373,6 +1373,7 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
         mode=args.image_mode,
     )
     cmd_export_colmap(export_args)
+    manifest = load_manifest(project_root)
 
     command_values = {
         "source_path": str(source_path),
@@ -1469,6 +1470,107 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
     save_manifest(project_root, manifest)
     print(f"Prepared 3DGS COLMAP source: {source_path}")
     print(f"Run manifest: {stage_root / '3dgs_run_manifest.json'}")
+    return 0
+
+
+def default_3dgs_command_template(provider: str) -> str:
+    normalized = slugify(provider)
+    if normalized in {"graphdeco", "gaussian-splatting", "graphdeco-gaussian-splatting"}:
+        return "python train.py -s {source_path} -m {output_path}"
+    if normalized in {"nerfstudio", "splatfacto", "ns-splatfacto"}:
+        return "ns-train splatfacto --data {source_path} --output-dir {output_path}"
+    if normalized in {"gsplat", "full-gsplat"}:
+        return "python train_gsplat_full.py --data {source_path} --output {output_path}"
+    return "echo Fill in external 3DGS command for provider={provider} source={source_path} output={output_path}"
+
+
+def cmd_prepare_high_quality_3dgs_job(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    provider = args.provider
+    stage_root = ensure_dir(args.work_dir.resolve() if args.work_dir else project_root / "external" / "high_quality_3dgs")
+    source_path = args.source_path.resolve() if args.source_path else stage_root / "colmap_source"
+    output_path = args.output_path.resolve() if args.output_path else project_root / "scene" / "reconstruction" / f"3dgs_{slugify(provider)}"
+    log_path = project_root / "logs" / f"{slugify(provider)}_3dgs_train.log"
+    ensure_dir(log_path.parent)
+
+    export_args = argparse.Namespace(
+        project_root=project_root,
+        output_dir=source_path,
+        frames_dir=args.frames_dir,
+        camera_info=args.camera_info,
+        point_cloud=args.point_cloud,
+        camera_model=args.camera_model,
+        extrinsic_type=args.extrinsic_type,
+        mode=args.image_mode,
+    )
+    cmd_export_colmap(export_args)
+    manifest = load_manifest(project_root)
+
+    command_template = args.command_template or default_3dgs_command_template(provider)
+    values = {
+        "provider": provider,
+        "source_path": str(source_path),
+        "output_path": str(output_path),
+        "project_root": str(project_root),
+        "work_dir": str(stage_root),
+        "scene_id": str(manifest.get("scene_id", project_root.name)),
+        "log_path": str(log_path),
+    }
+    command = command_from_template(command_template, values)
+    job = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "high_quality_3dgs_training",
+        "provider": provider,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "source_path": str(source_path),
+        "output_path": str(output_path),
+        "work_dir": str(stage_root),
+        "log_path": str(log_path),
+        "camera_model": args.camera_model,
+        "command_template": command_template,
+        "command": command,
+        "expected_registration": {
+            "command": f"python -m video2mesh.cli register-3dgs --project-root {project_root} --path {output_path}",
+            "notes": "After external training finishes, register the output directory or final point_cloud.ply to replace the minimal baseline.",
+        },
+        "quality_targets": {
+            "notes": "Use a production trainer with densification/pruning/SH/exposure handling. This job only prepares data and commands.",
+            "replaces": "video2mesh_minimal_gsplat",
+        },
+    }
+    job_path = stage_root / "high_quality_3dgs_job.json"
+    write_json(job_path, job)
+    script_path = stage_root / "run_high_quality_3dgs.sh"
+    script = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"mkdir -p {output_path!s}",
+        f"mkdir -p {log_path.parent!s}",
+        f"{command} 2>&1 | tee {log_path}",
+        f"python -m video2mesh.cli register-3dgs --project-root {project_root} --path {output_path}",
+    ]
+    script_path.write_text("\n".join(script) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+
+    manifest.setdefault("artifacts", {})["high_quality_3dgs_job"] = str(job_path)
+    manifest.setdefault("external_stages", {})["video_to_3dgs"] = {
+        "status": "high_quality_3dgs_job_prepared",
+        "notes": "Prepared COLMAP-style source and external high-quality 3DGS trainer command; training not executed.",
+        "provider": provider,
+        "source_path": str(source_path),
+        "output_path": str(output_path),
+        "job": str(job_path),
+        "script": str(script_path),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared high-quality 3DGS job: {job_path}")
+    print(f"Provider: {provider}")
+    print(f"Source: {source_path}")
+    print(f"Output: {output_path}")
+    print(f"Script: {script_path}")
     return 0
 
 
@@ -8902,6 +9004,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--register-mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--no-register", action="store_true", help="Do not call register-3dgs after a successful command.")
     p.set_defaults(func=cmd_run_3dgs)
+
+    p = sub.add_parser("prepare-high-quality-3dgs-job", help="Prepare a provider-specific high-quality 3DGS training job without running it.")
+    add_common_project_arg(p)
+    p.add_argument("--provider", default="graphdeco", help="Provider/tool name: graphdeco, nerfstudio, gsplat, etc.")
+    p.add_argument("--source-path", type=Path, help="COLMAP-style source dir to create. Defaults to external/high_quality_3dgs/colmap_source.")
+    p.add_argument("--output-path", type=Path, help="Expected trainer output dir. Defaults to scene/reconstruction/3dgs_<provider>.")
+    p.add_argument("--work-dir", type=Path, help="Defaults to external/high_quality_3dgs.")
+    p.add_argument("--frames-dir", type=Path)
+    p.add_argument("--camera-info", type=Path)
+    p.add_argument("--point-cloud", type=Path)
+    p.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE"], default="PINHOLE")
+    p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
+    p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="symlink")
+    p.add_argument("--command-template", help="Optional command template with {provider}, {source_path}, {output_path}, {project_root}, {work_dir}, {scene_id}, {log_path}.")
+    p.set_defaults(func=cmd_prepare_high_quality_3dgs_job)
 
     p = sub.add_parser("render-reconstruction-preview", help="Project the point cloud into camera frames and write alignment overlay images/metrics.")
     add_common_project_arg(p)

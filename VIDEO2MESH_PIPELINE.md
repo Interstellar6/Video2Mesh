@@ -408,6 +408,33 @@ python -m video2mesh.cli run-3dgs \
   --prepare-only
 ```
 
+对于真正替换 baseline 的高质量 3DGS，推荐使用更显式的 job 入口。它仍然只做“准备和登记”，不会偷偷启动长时间训练：
+
+```bash
+python -m video2mesh.cli prepare-high-quality-3dgs-job \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --provider graphdeco \
+  --frames-dir /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/mast3r_keyframes \
+  --point-cloud /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/reconstruction/point_cloud_10k.ply \
+  --image-mode symlink \
+  --command-template "python /path/to/gaussian-splatting/train.py -s {source_path} -m {output_path}"
+```
+
+它会写出：
+
+```text
+external/high_quality_3dgs/colmap_source/             # COLMAP-style text source
+external/high_quality_3dgs/high_quality_3dgs_job.json # provider、命令、输入输出路径
+external/high_quality_3dgs/run_high_quality_3dgs.sh   # 可直接运行的训练和 register 脚本
+scene/reconstruction/3dgs_<provider>/                 # 预期外部 trainer 输出目录
+```
+
+内置 provider 默认模板包括 `graphdeco`、`nerfstudio/splatfacto` 和 `gsplat`，也可以用 `--command-template` 覆盖。模板额外支持 `{provider}` 和 `{log_path}`，训练完成后脚本会执行：
+
+```bash
+python -m video2mesh.cli register-3dgs --project-root <project> --path <output_path>
+```
+
 注意：`run-3dgs` 是外部 trainer 适配器，不内置完整 3DGS 训练算法。远端现在已经安装并验证 `gsplat==1.5.3` 的 CUDA rasterization/backward，说明底层 splat 渲染/梯度 runtime 可用；但真实训练仍需要基于 `gsplat` 写一个训练循环，或接入现成 gsplat/nerfstudio/gaussian-splatting trainer，然后通过 `--command-template` 调用。
 
 `gsplat` 远端 smoke 信息：

@@ -217,6 +217,29 @@ scene/reconstruction/3dgs/point_cloud/iteration_10/point_cloud_point_cloud.ply
 scene/reconstruction/3dgs/point_cloud/iteration_10/point_cloud_supersplat.ply
 ```
 
+如果要接生产级 3DGS trainer，不建议继续堆高这个最小 baseline 的迭代数，而是先准备外部训练 job。这个命令会导出 COLMAP-style source、写入 provider command 和可执行脚本，但不自动启动重训练：
+
+```bash
+python -m video2mesh.cli prepare-high-quality-3dgs-job \
+  --project-root exports/milscene2_real_demo \
+  --provider graphdeco \
+  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
+  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
+  --image-mode symlink \
+  --command-template "python train.py -s {source_path} -m {output_path}"
+```
+
+关键输出：
+
+```text
+external/high_quality_3dgs/colmap_source/
+external/high_quality_3dgs/high_quality_3dgs_job.json
+external/high_quality_3dgs/run_high_quality_3dgs.sh
+scene/reconstruction/3dgs_graphdeco/
+```
+
+训练脚本跑完后会调用 `register-3dgs`，把外部 trainer 的结果注册回 `manifest.json`。`graphdeco`、`nerfstudio/splatfacto`、`gsplat` 这几类 provider 都可以用这个接口统一描述；真正的高质量训练依然发生在外部项目里。
+
 ### 4.4 2D mask 与 3D mask
 
 自动生成物体候选：
