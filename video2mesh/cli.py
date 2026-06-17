@@ -5961,6 +5961,13 @@ def scaled_vector(values: Any, scale: float, fallback: list[float]) -> list[floa
     return [float(value) * scale for value in values]
 
 
+def multiply_vector(values: Any, factor: float, count: int = 3, fallback: float = 0.0) -> list[float]:
+    if not isinstance(values, (list, tuple)):
+        values = [fallback] * count
+    padded = list(values)[:count] + [fallback] * max(0, count - len(values))
+    return [float(value) * float(factor) for value in padded[:count]]
+
+
 def is_background_structure_record(obj: dict[str, Any]) -> bool:
     return obj.get("asset_role") == "background_structure"
 
@@ -6142,6 +6149,210 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
     return 0
 
 
+def object_longest_bbox_dimension(obj: dict[str, Any]) -> float | None:
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    bbox_size = pose.get("bbox_size")
+    if not isinstance(bbox_size, (list, tuple)) or len(bbox_size) < 3:
+        return None
+    try:
+        return max(abs(float(value)) for value in bbox_size[:3])
+    except Exception:
+        return None
+
+
+def resolve_reference_scene_length(bundle: dict[str, Any], object_id: str | None, reference_axis: str) -> float | None:
+    if not object_id:
+        return None
+    axis = str(reference_axis).lower()
+    axis_to_index = {"x": 0, "y": 1, "z": 2}
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict) or slugify(obj.get("object_id", "")) != slugify(object_id):
+            continue
+        pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+        bbox_size = pose.get("bbox_size")
+        if not isinstance(bbox_size, (list, tuple)) or len(bbox_size) < 3:
+            return None
+        try:
+            if axis == "longest":
+                return max(abs(float(value)) for value in bbox_size[:3])
+            if axis in axis_to_index:
+                return abs(float(bbox_size[axis_to_index[axis]]))
+        except Exception:
+            return None
+    return None
+
+
+def physics_defaults_for_asset(obj: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    asset_role = obj.get("asset_role", "object")
+    category = str(obj.get("category") or "").strip().lower()
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    bbox_size = pose.get("bbox_size") if isinstance(pose.get("bbox_size"), list) else [0.0, 0.0, 0.0]
+    dimensions = [max(float(value), 0.0) for value in (bbox_size[:3] if len(bbox_size) >= 3 else [0.0, 0.0, 0.0])]
+    volume = dimensions[0] * dimensions[1] * dimensions[2]
+    is_background_structure = asset_role == "background_structure"
+
+    if is_background_structure:
+        body_type = "static"
+        collider = "box"
+        mass = None
+    else:
+        body_type = args.body_type
+        collider = args.collider
+        estimated_mass = volume * float(args.default_density_kg_m3)
+        mass = min(max(estimated_mass, args.min_mass_kg), args.max_mass_kg)
+
+    material = args.default_material
+    if category in {"floor", "wall", "ceiling"}:
+        material = category
+    elif category in {"chair", "table", "desk", "cabinet", "bookshelf"}:
+        material = "rigid_furniture"
+
+    return {
+        "body_type": body_type,
+        "collider": collider,
+        "mass_kg": mass,
+        "material": {
+            "name": material,
+            "friction": [float(args.friction), float(args.torsional_friction), float(args.rolling_friction)],
+            "restitution": float(args.restitution),
+        },
+        "estimated": True,
+        "estimation": {
+            "method": "bbox_volume_density" if not is_background_structure else "static_background_structure",
+            "bbox_size_m": dimensions,
+            "bbox_volume_m3": volume,
+            "density_kg_m3": float(args.default_density_kg_m3) if not is_background_structure else None,
+            "mass_clamp_kg": [float(args.min_mass_kg), float(args.max_mass_kg)] if not is_background_structure else None,
+        },
+        "notes": "Estimated simulator physics defaults; replace with measured task-specific values before physics-critical use.",
+    }
+
+
+def cmd_calibrate_simulator_assets(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
+
+    old_scale = float(coordinate_system.get("scale_to_meters") or 1.0)
+    scale_to_meters = args.scale_to_meters
+    calibration_method = "manual_scale_to_meters" if scale_to_meters is not None else "assumption"
+    reference_scene_length = None
+    if scale_to_meters is None and args.reference_object and args.reference_length_m:
+        reference_scene_length = resolve_reference_scene_length(bundle, args.reference_object, args.reference_axis)
+        if not reference_scene_length or reference_scene_length <= 0:
+            raise ValueError(f"Could not derive reference scene length for object {args.reference_object!r} on axis {args.reference_axis!r}.")
+        scale_to_meters = float(args.reference_length_m) / float(reference_scene_length)
+        calibration_method = "reference_object_bbox"
+    if scale_to_meters is None:
+        scale_to_meters = old_scale
+
+    scale_ratio = float(scale_to_meters) / max(old_scale, 1e-12)
+    scale_calibrated = bool(args.scale_calibrated or calibration_method == "reference_object_bbox")
+    calibration = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": calibration_method,
+        "scale_to_meters": float(scale_to_meters),
+        "previous_scale_to_meters": old_scale,
+        "scale_ratio_applied_to_bundle": scale_ratio,
+        "scale_calibrated": scale_calibrated,
+        "up_axis": args.up_axis,
+        "reference_object": args.reference_object,
+        "reference_axis": args.reference_axis if args.reference_object else None,
+        "reference_scene_length": reference_scene_length,
+        "reference_length_m": args.reference_length_m,
+        "timestamp": int(time.time()),
+        "notes": args.notes or (
+            "Scale derived from a reference object bbox." if calibration_method == "reference_object_bbox" else
+            "Manual/assumed simulator calibration; verify with real measurements before physics-critical use."
+        ),
+    }
+
+    coordinate_system.update(
+        {
+            "frame": coordinate_system.get("frame", "video2mesh_scene"),
+            "scale_to_meters": float(scale_to_meters),
+            "scale_calibrated": scale_calibrated,
+            "calibrated": scale_calibrated,
+            "up_axis": args.up_axis,
+            "calibration": calibration,
+            "notes": "Scale/up-axis were updated by calibrate-simulator-assets; physics defaults may still be estimates.",
+        }
+    )
+    bundle["coordinate_system"] = coordinate_system
+
+    updated_objects = 0
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+        if args.rescale_existing_pose and abs(scale_ratio - 1.0) > 1e-12:
+            pose["position"] = multiply_vector(pose.get("position"), scale_ratio, 3, 0.0)
+            pose["bbox_size"] = multiply_vector(pose.get("bbox_size"), scale_ratio, 3, 0.0)
+            pose["scale"] = multiply_vector(pose.get("scale"), scale_ratio, 3, 1.0)
+        pose["units"] = "meters"
+        pose["scale_to_meters"] = float(scale_to_meters)
+        obj["pose"] = pose
+
+        if args.estimate_physics:
+            existing_physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+            defaults = physics_defaults_for_asset(obj, args)
+            if args.overwrite_physics:
+                obj["physics"] = defaults
+            else:
+                merged = dict(defaults)
+                merged.update({key: value for key, value in existing_physics.items() if value not in (None, "", [], {})})
+                if isinstance(existing_physics.get("material"), dict) and isinstance(defaults.get("material"), dict):
+                    material = dict(defaults["material"])
+                    material.update(existing_physics["material"])
+                    merged["material"] = material
+                obj["physics"] = merged
+
+        object_asset_path = resolve_existing_path(obj.get("object_asset_json"), project_root)
+        if object_asset_path and object_asset_path.exists():
+            object_asset = read_json(object_asset_path)
+            object_asset["coordinate_system"] = coordinate_system
+            object_asset["pose"] = obj.get("pose")
+            object_asset["physics"] = obj.get("physics")
+            write_json(object_asset_path, object_asset)
+        updated_objects += 1
+
+    bundle.setdefault("notes", [])
+    if isinstance(bundle["notes"], list):
+        bundle["notes"].append("Simulator scale/up-axis/physics defaults updated by calibrate-simulator-assets.")
+    bundle["simulator_calibration"] = calibration
+    write_json(bundle_path, bundle)
+
+    calibration_path = project_root / manifest["simulator_assets_dir"] / "simulator_calibration.json"
+    write_json(
+        calibration_path,
+        {
+            **calibration,
+            "project_root": str(project_root),
+            "bundle": str(bundle_path),
+            "updated_object_count": updated_objects,
+            "estimate_physics": bool(args.estimate_physics),
+        },
+    )
+    manifest.setdefault("artifacts", {})["simulator_calibration"] = str(calibration_path)
+    manifest.setdefault("external_stages", {})["simulator_calibration"] = {
+        "status": "simulator_assets_calibrated" if scale_calibrated else "simulator_assets_assumed",
+        "notes": calibration["notes"],
+        "scale_to_meters": float(scale_to_meters),
+        "up_axis": args.up_axis,
+        "estimate_physics": bool(args.estimate_physics),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Calibrated simulator bundle: {bundle_path}")
+    print(f"Scale to meters: {scale_to_meters:.8g}; up_axis={args.up_axis}; scale_calibrated={scale_calibrated}")
+    print(f"Updated objects: {updated_objects}; calibration: {calibration_path}")
+    return 0
+
+
 def simulator_bundle_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None = None) -> Path:
     if explicit is not None:
         return explicit.resolve()
@@ -6173,10 +6384,10 @@ def fmt_vec(values: Any, count: int = 3, fallback: float = 0.0) -> str:
     return " ".join(f"{float(value):.6g}" for value in padded[:count])
 
 
-def adapter_mesh_path(mesh_path: str | None, output_root: Path, object_id: str, args: argparse.Namespace) -> str | None:
+def adapter_mesh_path(mesh_path: str | None, output_root: Path, object_id: str, args: argparse.Namespace, project_root: Path) -> str | None:
     if not mesh_path:
         return None
-    src = Path(mesh_path)
+    src = resolve_existing_path(mesh_path, project_root) or Path(mesh_path)
     if not src.exists():
         return mesh_path
     if not args.copy_assets:
@@ -6202,25 +6413,29 @@ def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: 
         bbox_size = pose.get("bbox_size", [0.05, 0.05, 0.05])
         body_type = (obj.get("physics") or {}).get("body_type") or args.body_type
         mesh_path = mesh.get("path") if mesh else None
-        packaged_mesh_path = adapter_mesh_path(mesh_path, output_root, object_id, args)
+        packaged_mesh_path = adapter_mesh_path(mesh_path, output_root, object_id, args, project_root)
         mesh_rel = adapter_rel_path(packaged_mesh_path, output_dir) if packaged_mesh_path else None
         mesh_name = f"{object_id}_mesh"
         geom_attrs = ""
+        mesh_scale = pose.get("scale") if isinstance(pose.get("scale"), list) else None
+        mesh_scale_attr = f' scale="{fmt_vec(mesh_scale, 3, 1.0)}"' if mesh_scale else ""
         if mesh_rel:
-            assets.append(f'    <mesh name="{html.escape(mesh_name)}" file="{html.escape(mesh_rel)}"/>')
+            assets.append(f'    <mesh name="{html.escape(mesh_name)}" file="{html.escape(mesh_rel)}"{mesh_scale_attr}/>')
             geom_attrs = f'type="mesh" mesh="{html.escape(mesh_name)}"'
         else:
             half = []
             for value in (bbox_size if isinstance(bbox_size, list) else [0.05, 0.05, 0.05])[:3]:
                 half.append(max(float(value) * 0.5, 0.01))
             geom_attrs = f'type="box" size="{fmt_vec(half)}"'
+        friction = (((obj.get("physics") or {}).get("material") or {}).get("friction")) if isinstance((obj.get("physics") or {}).get("material"), dict) else None
+        friction_attr = f' friction="{fmt_vec(friction, 3, 1.0)}"' if isinstance(friction, list) else ""
         mass_attr = ""
         if body_type == "dynamic":
             mass = (obj.get("physics") or {}).get("mass_kg") or args.default_mass
             mass_attr = f' mass="{float(mass):.6g}"'
         bodies.append(
             f'    <body name="{html.escape(object_id)}" pos="{fmt_vec(position)}">\n'
-            f'      <geom name="{html.escape(object_id)}_geom" {geom_attrs}{mass_attr}/>\n'
+            f'      <geom name="{html.escape(object_id)}_geom" {geom_attrs}{mass_attr}{friction_attr}/>\n'
             f'    </body>'
         )
         objects.append(
@@ -6266,7 +6481,7 @@ def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: 
     return {"adapter_file": str(xml_path), "adapter_manifest": str(manifest_path), "object_count": len(objects)}
 
 
-def write_json_simulator_adapter(format_name: str, bundle: dict[str, Any], output_dir: Path, output_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def write_json_simulator_adapter(format_name: str, bundle: dict[str, Any], output_dir: Path, output_root: Path, project_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     ensure_dir(output_dir)
     out_path = output_dir / f"{format_name}_adapter.json"
     objects = []
@@ -6274,7 +6489,7 @@ def write_json_simulator_adapter(format_name: str, bundle: dict[str, Any], outpu
         object_id = slugify(obj.get("object_id", "object"))
         mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else None
         mesh_path = mesh.get("path") if mesh else None
-        packaged_mesh_path = adapter_mesh_path(mesh_path, output_root, object_id, args)
+        packaged_mesh_path = adapter_mesh_path(mesh_path, output_root, object_id, args, project_root)
         objects.append(
             {
                 "object_id": obj.get("object_id"),
@@ -6326,7 +6541,7 @@ def cmd_export_simulator_adapter(args: argparse.Namespace) -> int:
         if format_name == "mujoco":
             results[format_name] = write_mujoco_adapter(bundle, format_dir, output_root, project_root, args)
         else:
-            results[format_name] = write_json_simulator_adapter(format_name, bundle, format_dir, output_root, args)
+            results[format_name] = write_json_simulator_adapter(format_name, bundle, format_dir, output_root, project_root, args)
 
     adapter_manifest_path = output_root / "simulator_adapters.json"
     adapter_manifest = {
@@ -6939,6 +7154,9 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
     asset_qa_ok, asset_qa_detail = path_exists_for_manifest(project_root, artifacts.get("simulator_asset_qa"))
     items.append(validation_item("simulator_asset_qa", asset_qa_ok, asset_qa_detail or "missing simulator asset QA report", "recommended"))
 
+    calibration_ok, calibration_detail = path_exists_for_manifest(project_root, artifacts.get("simulator_calibration"))
+    items.append(validation_item("simulator_calibration", calibration_ok, calibration_detail or "missing simulator calibration report", "recommended"))
+
     required_failed = [item for item in items if item["severity"] == "required" and not item["ok"]]
     recommended_failed = [item for item in items if item["severity"] != "required" and not item["ok"]]
     return {
@@ -7095,6 +7313,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     multiview_mesh_jobs = safe_read_json(multiview_mesh_jobs_path) if multiview_mesh_jobs_path else None
     simulator_asset_qa_path = resolve_existing_path(artifacts.get("simulator_asset_qa"), project_root)
     simulator_asset_qa = safe_read_json(simulator_asset_qa_path) if simulator_asset_qa_path else None
+    simulator_calibration_path = resolve_existing_path(artifacts.get("simulator_calibration"), project_root)
+    simulator_calibration = safe_read_json(simulator_calibration_path) if simulator_calibration_path else None
     svpp_scene_path = resolve_existing_path(artifacts.get("svpp_scene"), project_root)
     svpp_metadata_path = resolve_existing_path(artifacts.get("svpp_metadata"), project_root)
     svpp_metadata = safe_read_json(svpp_metadata_path) if svpp_metadata_path else None
@@ -7247,6 +7467,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             "bundle_exists": bool(bundle_path and bundle_path.exists()),
             "object_count": len(bundle.get("objects", [])) if isinstance(bundle, dict) else 0,
             "missing_mesh_objects": bundle.get("missing_mesh_objects", []) if isinstance(bundle, dict) else [],
+            "coordinate_system": bundle.get("coordinate_system") if isinstance(bundle, dict) else None,
+            "calibration_report": str(simulator_calibration_path) if simulator_calibration_path else "",
+            "calibration_exists": bool(simulator_calibration_path and simulator_calibration_path.exists()),
+            "calibration": simulator_calibration,
             "qa_report": str(simulator_asset_qa_path) if simulator_asset_qa_path else "",
             "qa_exists": bool(simulator_asset_qa_path and simulator_asset_qa_path.exists()),
             "qa_ok": simulator_asset_qa.get("ok") if isinstance(simulator_asset_qa, dict) else None,
@@ -8726,6 +8950,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ascii-meshes", action=argparse.BooleanOptionalAction, default=False, help="Write localized simulator meshes as ASCII when supported.")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_export_simulator_assets)
+
+    p = sub.add_parser("calibrate-simulator-assets", help="Set simulator scale/up-axis and estimated physics defaults in the asset bundle.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--scale-to-meters", type=float, help="Manual scale multiplier from current bundle units to meters.")
+    p.add_argument("--scale-calibrated", action=argparse.BooleanOptionalAction, default=False, help="Mark the scale as calibrated rather than assumed.")
+    p.add_argument("--reference-object", help="Object id whose bbox length is known in meters.")
+    p.add_argument("--reference-axis", choices=["x", "y", "z", "longest"], default="longest")
+    p.add_argument("--reference-length-m", type=float, help="Known real-world length of the reference object/axis in meters.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], default="y")
+    p.add_argument("--rescale-existing-pose", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--estimate-physics", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--overwrite-physics", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--body-type", choices=["static", "kinematic", "dynamic"], default="dynamic")
+    p.add_argument("--collider", choices=["mesh", "convex_hull", "box", "none"], default="mesh")
+    p.add_argument("--default-density-kg-m3", type=float, default=120.0, help="Density used for bbox-volume mass estimates.")
+    p.add_argument("--min-mass-kg", type=float, default=0.05)
+    p.add_argument("--max-mass-kg", type=float, default=50.0)
+    p.add_argument("--default-material", default="estimated_rigid")
+    p.add_argument("--friction", type=float, default=0.8)
+    p.add_argument("--torsional-friction", type=float, default=0.02)
+    p.add_argument("--rolling-friction", type=float, default=0.001)
+    p.add_argument("--restitution", type=float, default=0.1)
+    p.add_argument("--notes", help="Optional calibration notes.")
+    p.set_defaults(func=cmd_calibrate_simulator_assets)
 
     p = sub.add_parser("export-simulator-adapter", help="Export MuJoCo/Isaac/Unity adapter manifests from simulator_asset_bundle.json.")
     add_common_project_arg(p)

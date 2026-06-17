@@ -1076,6 +1076,40 @@ simulator_assets/objects/<object_id>/<mesh_stem>_local.<ext>  # 对 scene-coordi
 
 注意：当前 pose/scale 来自重建坐标和 3D mask bbox，是工程初值；真实仿真还需要校准尺度、上方向、坐标系、碰撞体和物理参数。若 mesh 已在 `export-simulator-assets` 阶段被 localize，bundle 中该物体的 `pose.scale` 会写成 `[1, 1, 1]`，避免把 `scene_scale` 重复乘到已经 bake 过尺度的 mesh 上。
 
+导出 bundle 后，可以先写入尺度、上方向和估算物理字段：
+
+```bash
+python -m video2mesh.cli calibrate-simulator-assets \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --scale-to-meters 1.0 \
+  --no-scale-calibrated \
+  --up-axis y \
+  --estimate-physics \
+  --overwrite-physics
+```
+
+输出：
+
+```text
+simulator_assets/simulator_calibration.json
+simulator_assets/simulator_asset_bundle.json  # 更新 coordinate_system / pose / physics
+```
+
+如果没有真实标尺，`--scale-to-meters 1.0 --no-scale-calibrated` 只是协议层假设，QA 仍会提示 scale 未校准。若知道某个物体或背景结构的真实长度，可以用 reference object 自动反推真实比例：
+
+```bash
+python -m video2mesh.cli calibrate-simulator-assets \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --reference-object chair_01 \
+  --reference-axis longest \
+  --reference-length-m 0.82 \
+  --up-axis y \
+  --estimate-physics \
+  --overwrite-physics
+```
+
+这会把 `coordinate_system.scale_calibrated` 标为 true，并按 bbox 体积和默认密度估算前景物体 `mass_kg`、`material.friction`、`restitution` 等字段。背景结构会保持 static，通常只写 box collider 和 surface material。所有这些物理字段仍然是工程初值，不等于最终仿真任务的真实质量、摩擦和碰撞体。
+
 导出后建议跑一次 simulator-readiness QA：
 
 ```bash
@@ -1147,6 +1181,7 @@ python -m video2mesh.cli validate \
 - simulator asset bundle。
 - simulator adapters（recommended）。
 - simulator asset QA（recommended）。
+- simulator calibration（recommended）。
 
 `validate` 只证明工程产物是否齐全；真实质量还要继续评估重建清晰度、mask 一致性、mesh 几何质量、尺度/pose 和仿真器导入效果。
 
@@ -1174,7 +1209,7 @@ simulator_assets/evaluation_report.json
 - semantic labeling 的标签文件数量和非 `unknown` 类别数量。
 - mesh generation 的 object mesh index、缺失列表和 `prepare-multiview-mesh-jobs` 的 job 数量。
 - SceneVerse++ / SVPP 导出目录和 `metadata.json` instance 数量。
-- simulator asset bundle 是否存在、mesh 缺失列表、simulator QA summary、validation 缺口。
+- simulator asset bundle 是否存在、mesh 缺失列表、coordinate system、calibration report、simulator QA summary、validation 缺口。
 
 这个命令默认即使发现问题也返回成功，适合批量生成报告；如果要在 CI/脚本里把缺口当失败，可以加：
 
