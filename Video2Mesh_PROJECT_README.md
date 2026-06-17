@@ -537,6 +537,21 @@ python -m video2mesh.cli export-simulator-adapter \
   --format mujoco isaac unity
 ```
 
+如果本机安装了 Unity Editor，可以把 Unity adapter 直接导入一个轻量 Unity 工程并生成场景：
+
+```bash
+tools/import_video2mesh_to_unity.sh \
+  exports/milscene2_real_demo/simulator_assets/adapters/unity/unity_adapter.json
+```
+
+该脚本会打开 `UnityProject/`，执行 `Video2MeshUnityImporter.ImportFromCommandLine`，复制 adapter 打包的 mesh，并生成：
+
+```text
+UnityProject/Assets/Scenes/Video2MeshScene.unity
+UnityProject/Assets/Video2MeshImported/
+UnityProject/Logs/video2mesh-import.log
+```
+
 仿真资产 QA：
 
 ```bash

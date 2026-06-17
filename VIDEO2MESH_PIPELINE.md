@@ -1254,6 +1254,15 @@ simulator_assets/adapters/unity/unity_adapter.json
 
 `export-simulator-adapter` 会默认把 mesh 复制到 `simulator_assets/adapters/assets/`，并在 MuJoCo XML / Isaac JSON / Unity JSON 中使用相对路径。它只是仿真器导入 skeleton：真实使用时仍要校准 meters、up-axis、碰撞体、质量、摩擦和材质。
 
+仓库内还提供一个轻量 Unity Editor 导入模板：
+
+```bash
+tools/import_video2mesh_to_unity.sh \
+  /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/simulator_assets/adapters/unity/unity_adapter.json
+```
+
+它会在 `UnityProject/` 中运行 `Assets/Editor/Video2MeshUnityImporter.cs`，读取 `unity_adapter.json`，复制 adapter 打包的 meshes，创建 `Assets/Scenes/Video2MeshScene.unity`，并为每个 object 生成 GameObject、材质、collider / rigidbody。Unity 的 `Library/`、`Temp/`、`Logs/`、`Builds/` 等生成目录已加入 `.gitignore`。
+
 ### Phase G：验证工程产物完整性
 
 完整链路跑完后，用 `validate` 做项目审计：
