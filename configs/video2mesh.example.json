@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "scene_id": "demo_room_scan",
+  "project_root": "/root/autodl-tmp/workspace/Video2Mesh/exports/demo_room_scan",
+  "inputs": {
+    "video": "/root/autodl-tmp/data/demo_room_scan/video.mp4"
+  },
+  "external_stages": {
+    "video_to_3dgs": {
+      "engine": "COLMAP + Gaussian Splatting or MASt3R-SLAM + 3DGS",
+      "command_template": "TODO: write command that produces camera_info.json, point_cloud.ply, and scene_3dgs/"
+    },
+    "segmentation_2d_tracking": {
+      "engine": "Grounded-SAM/SAM2 + DEVA/XMem or another tracker",
+      "output_contract": "masks/2d/<object_id>/<frame_id>.png plus masks/object_labels.json"
+    },
+    "mesh_generation": {
+      "engine": "image-blaster Hunyuan/Meshy via FAL",
+      "dry_run_first": true
+    }
+  },
+  "contracts": {
+    "camera_info": {
+      "intrinsic": {
+        "w": 640,
+        "h": 480,
+        "fx": 500.0,
+        "fy": 500.0,
+        "cx": 320.0,
+        "cy": 240.0
+      },
+      "extrinsic": {
+        "0": "4x4 world_to_camera matrix"
+      }
+    },
+    "mask_naming": [
+      "masks/2d/<object_id>/<frame_id>.png",
+      "masks/2d/<frame_id>_<object_id>.png"
+    ]
+  }
+}

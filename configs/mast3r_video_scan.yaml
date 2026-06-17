@@ -1,0 +1,25 @@
+inherit: "config/base.yaml"
+
+use_calib: False
+single_thread: True
+
+dataset:
+  subsample: 1
+  img_downsample: 1
+  center_principle_point: True
+
+tracking:
+  min_match_frac: 0.03
+  match_frac_thresh: 0.75
+  Q_conf: 1.0
+
+local_opt:
+  min_match_frac: 0.05
+
+retrieval:
+  k: 5
+  min_thresh: 0.003
+
+reloc:
+  min_match_frac: 0.2
+  strict: False

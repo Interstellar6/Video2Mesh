@@ -1,0 +1,7 @@
+[submodule "SceneVersepp"]
+	path = SceneVersepp
+	url = https://github.com/sv-pp/SceneVersepp.git
+
+[submodule "image-blaster"]
+	path = image-blaster
+	url = https://github.com/neilsonnn/image-blaster.git
