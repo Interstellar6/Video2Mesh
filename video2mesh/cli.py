@@ -31,6 +31,8 @@ DEFAULT_SCHEMA_VERSION = 1
 MAST3R_KEYFRAMES_DIR = "scene/mast3r_keyframes"
 SH_C0 = 0.28209479177387814
 SCANNET20_LABEL_IDS = {
+    "wall": 1,
+    "floor": 2,
     "cabinet": 3,
     "bed": 4,
     "chair": 5,
@@ -41,6 +43,7 @@ SCANNET20_LABEL_IDS = {
     "counter": 12,
     "desk": 14,
     "curtain": 16,
+    "ceiling": 22,
     "refrigerator": 24,
     "shower curtain": 28,
     "toilet": 33,
@@ -307,6 +310,24 @@ def write_point_cloud_ascii_ply(path: Path, points, colors=None) -> None:
                 f"{float(point[0]):.8f} {float(point[1]):.8f} {float(point[2]):.8f} "
                 f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
             )
+
+
+def write_point_indices(project_root: Path, manifest: dict[str, Any], object_id: str, indices, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    np = import_numpy()
+    mask_3d_dir = ensure_dir(project_root / manifest["masks"]["mask_3d_dir"] / object_id)
+    indices_np = np.asarray(indices, dtype=np.int64)
+    npy_path = mask_3d_dir / "point_indices.npy"
+    json_path = mask_3d_dir / "point_indices.json"
+    np.save(npy_path, indices_np)
+    write_json(json_path, [int(value) for value in indices_np.tolist()])
+    mask_info = {
+        "point_indices_npy": str(npy_path),
+        "point_indices_json": str(json_path),
+        "point_count": int(indices_np.size),
+    }
+    if metadata:
+        mask_info.update(metadata)
+    return mask_info
 
 
 def rgb_to_sh_dc(colors):
@@ -2192,6 +2213,132 @@ def load_object_labels(project_root: Path, labels_path: Path | None = None) -> d
     return {}
 
 
+def normalize_object_label_record(raw: Any, object_id: str) -> dict[str, Any]:
+    if isinstance(raw, str):
+        return {"object_id": object_id, "name": raw, "category": raw, "description": ""}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Label for {object_id} must be a JSON object or string.")
+    label = dict(raw)
+    label["object_id"] = slugify(label.get("object_id") or label.get("id") or object_id)
+    if "name" not in label and label.get("label"):
+        label["name"] = label["label"]
+    if "category" not in label:
+        label["category"] = label.get("class") or label.get("class_name") or label.get("name") or "unknown"
+    if "description" not in label:
+        label["description"] = label.get("caption") or label.get("text") or ""
+    return label
+
+
+def load_object_label_updates(path: Path) -> dict[str, dict[str, Any]]:
+    data = read_json(path)
+    raw_items: list[tuple[str, Any]] = []
+    if isinstance(data, dict) and isinstance(data.get("objects"), list):
+        for index, raw in enumerate(data["objects"]):
+            if not isinstance(raw, dict):
+                raise ValueError(f"objects[{index}] in {path} is not a JSON object.")
+            object_id = slugify(raw.get("object_id") or raw.get("id") or raw.get("name") or f"object_{index:02d}")
+            raw_items.append((object_id, raw))
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            if key in {"schema_version", "project_root", "scene_id", "notes"}:
+                continue
+            raw_items.append((slugify(key), value))
+    elif isinstance(data, list):
+        for index, raw in enumerate(data):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Item #{index} in {path} is not a JSON object.")
+            object_id = slugify(raw.get("object_id") or raw.get("id") or raw.get("name") or f"object_{index:02d}")
+            raw_items.append((object_id, raw))
+    else:
+        raise ValueError(f"Label JSON must be a map, list, or object with an objects list: {path}")
+
+    labels: dict[str, dict[str, Any]] = {}
+    for object_id, raw in raw_items:
+        label = normalize_object_label_record(raw, object_id)
+        labels[label["object_id"]] = label
+    return labels
+
+
+def merge_object_label(target: dict[str, Any], label: dict[str, Any], overwrite: bool) -> dict[str, Any]:
+    fields = [
+        "name",
+        "category",
+        "description",
+        "aliases",
+        "open_vocab_labels",
+        "confidence",
+        "source",
+        "vlm",
+    ]
+    for field in fields:
+        if field not in label:
+            continue
+        current = target.get(field)
+        if overwrite or current in (None, "", [], {}, "unknown"):
+            target[field] = label[field]
+    target.setdefault("label_history", [])
+    if isinstance(target["label_history"], list):
+        target["label_history"].append(
+            {
+                "source": label.get("source", "external_label_import"),
+                "name": label.get("name"),
+                "category": label.get("category"),
+                "description": label.get("description"),
+                "confidence": label.get("confidence"),
+                "timestamp": int(time.time()),
+            }
+        )
+    return target
+
+
+def cmd_import_object_labels(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    updates = load_object_label_updates(args.labels.resolve())
+    labels_path = args.output.resolve() if args.output else project_root / "masks" / "object_labels.json"
+    existing_labels = load_object_labels(project_root, labels_path if labels_path.exists() else None)
+    objects_dir = project_root / manifest["objects_dir"]
+    updated_objects: dict[str, Any] = {}
+    missing_objects: list[str] = []
+
+    for object_id, label in updates.items():
+        previous = existing_labels.get(object_id, {})
+        merged_label = merge_object_label(dict(previous), label, args.overwrite)
+        existing_labels[object_id] = merged_label
+        object_json = objects_dir / object_id / "object.json"
+        if object_json.exists():
+            obj = read_json(object_json)
+            merge_object_label(obj, merged_label, args.overwrite)
+            write_json(object_json, obj)
+            updated_objects[object_id] = {
+                "object_json": str(object_json),
+                "name": obj.get("name"),
+                "category": obj.get("category"),
+                "description": obj.get("description"),
+            }
+        else:
+            missing_objects.append(object_id)
+
+    write_json(labels_path, existing_labels)
+    manifest.setdefault("artifacts", {})["object_labels"] = str(labels_path)
+    manifest.setdefault("external_stages", {}).setdefault("semantic_labeling", {})
+    manifest["external_stages"]["semantic_labeling"] = {
+        "status": "labels_imported",
+        "notes": "Object names/categories/descriptions imported from external labels or VLM output.",
+        "labels": str(args.labels.resolve()),
+        "object_labels": str(labels_path),
+        "updated_object_count": len(updated_objects),
+        "missing_objects": missing_objects,
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Imported labels for {len(updates)} object(s). Updated object records: {len(updated_objects)}")
+    print(f"Object labels: {labels_path}")
+    if missing_objects:
+        print(f"Labels without object records: {', '.join(missing_objects)}")
+    return 0
+
+
 def frame_sort_key(path: Path) -> tuple[int, Any]:
     stem = path.stem
     return (0, int(stem)) if stem.isdigit() else (1, stem)
@@ -3297,6 +3444,173 @@ def bbox_for_points(points):
     }
 
 
+def axis_index(axis: str) -> int:
+    normalized = str(axis).lower()
+    if normalized not in {"x", "y", "z"}:
+        raise ValueError("axis must be x, y, or z")
+    return {"x": 0, "y": 1, "z": 2}[normalized]
+
+
+def structure_indices_by_axis(points, axis: int, side: str, thickness: float | None, quantile: float, exclude_indices: set[int] | None = None):
+    np = import_numpy()
+    values = points[:, axis]
+    if side == "min":
+        boundary = float(np.quantile(values, float(quantile)))
+        limit = boundary + (float(thickness) if thickness is not None else 0.0)
+        mask = values <= limit
+    elif side == "max":
+        boundary = float(np.quantile(values, 1.0 - float(quantile)))
+        limit = boundary - (float(thickness) if thickness is not None else 0.0)
+        mask = values >= limit
+    else:
+        raise ValueError("side must be min or max")
+    if exclude_indices:
+        exclude = np.fromiter(exclude_indices, dtype=np.int64)
+        if exclude.size:
+            mask[exclude] = False
+    return np.flatnonzero(mask), boundary, limit
+
+
+def background_structure_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    up = axis_index(args.up_axis)
+    horizontal = [idx for idx in range(3) if idx != up]
+    specs: list[dict[str, Any]] = []
+    if args.include_floor:
+        specs.append({"object_id": args.floor_id, "name": "floor", "category": "floor", "axis": up, "side": "min"})
+    if args.include_ceiling:
+        specs.append({"object_id": args.ceiling_id, "name": "ceiling", "category": "ceiling", "axis": up, "side": "max"})
+    if args.include_walls:
+        axis_names = ["x", "y", "z"]
+        for axis in horizontal:
+            specs.append(
+                {
+                    "object_id": f"wall_{axis_names[axis]}_min",
+                    "name": f"{axis_names[axis]} min wall",
+                    "category": "wall",
+                    "axis": axis,
+                    "side": "min",
+                }
+            )
+            specs.append(
+                {
+                    "object_id": f"wall_{axis_names[axis]}_max",
+                    "name": f"{axis_names[axis]} max wall",
+                    "category": "wall",
+                    "axis": axis,
+                    "side": "max",
+                }
+            )
+    return specs
+
+
+def cmd_infer_background_structure_masks(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    point_cloud_path = args.point_cloud or (project_root / manifest["scene"]["point_cloud"])
+    point_cloud_path = resolve_project_cli_path(point_cloud_path, project_root)
+    points, _colors = read_point_cloud(point_cloud_path)
+    if points.shape[0] == 0:
+        raise RuntimeError(f"No points found in point cloud: {point_cloud_path}")
+    objects_dir = ensure_dir(project_root / manifest["objects_dir"])
+    structure_root = ensure_dir(project_root / manifest["simulator_assets_dir"] / "background_structures")
+    occupied: set[int] = set()
+    labels = load_object_labels(project_root)
+    structures: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    for spec in background_structure_specs(args):
+        object_id = slugify(spec["object_id"])
+        indices, boundary, limit = structure_indices_by_axis(
+            points,
+            int(spec["axis"]),
+            str(spec["side"]),
+            args.thickness,
+            args.quantile,
+            occupied if args.exclusive else None,
+        )
+        if indices.size < int(args.min_points):
+            skipped[object_id] = f"{indices.size} point(s), below --min-points {args.min_points}"
+            continue
+        if args.exclusive:
+            occupied.update(int(value) for value in indices.tolist())
+        bbox = bbox_for_points(points[indices])
+        mask_info = write_point_indices(
+            project_root,
+            manifest,
+            object_id,
+            indices,
+            {
+                "source": "background_structure_axis_boundary",
+                "axis": int(spec["axis"]),
+                "side": spec["side"],
+                "boundary": boundary,
+                "limit": limit,
+                "quantile": float(args.quantile),
+                "thickness": args.thickness,
+            },
+        )
+        label = labels.get(object_id, {})
+        object_info = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "asset_role": "background_structure",
+            "name": label.get("name", spec["name"]),
+            "category": label.get("category", spec["category"]),
+            "description": label.get("description", f"Inferred {spec['category']} background structure from point-cloud boundary."),
+            "point_count": int(indices.size),
+            "bbox_3d": bbox,
+            "mask_3d": mask_info,
+            "frame_scores": {},
+            "background_structure": {
+                "method": "axis_boundary",
+                "axis": int(spec["axis"]),
+                "side": spec["side"],
+                "boundary": boundary,
+                "limit": limit,
+                "quantile": float(args.quantile),
+                "thickness": args.thickness,
+                "exclusive": bool(args.exclusive),
+                "source_point_cloud": str(point_cloud_path),
+            },
+            "notes": "Background structures are semantic scene components; they are not expected to have object crops or per-object generated meshes.",
+        }
+        object_dir = ensure_dir(objects_dir / object_id)
+        write_json(object_dir / "object.json", object_info)
+        write_json(object_dir / "frame_scores.json", {})
+        structures[object_id] = object_info
+
+    structure_manifest_path = structure_root / "background_structures.json"
+    write_json(
+        structure_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "point_cloud": str(point_cloud_path),
+            "up_axis": args.up_axis,
+            "quantile": float(args.quantile),
+            "thickness": args.thickness,
+            "exclusive": bool(args.exclusive),
+            "structures": structures,
+            "skipped": skipped,
+            "notes": "Heuristic floor/ceiling/wall masks from point-cloud boundaries. Replace with layout/semantic segmentation for production.",
+        },
+    )
+    manifest.setdefault("artifacts", {})["background_structures"] = str(structure_manifest_path)
+    manifest.setdefault("external_stages", {})["background_structure_segmentation"] = {
+        "status": "heuristic_background_masks_inferred",
+        "notes": "Axis-boundary floor/ceiling/wall masks inferred from the scene point cloud; this is a protocol baseline, not production layout segmentation.",
+        "structure_count": len(structures),
+        "skipped": skipped,
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Inferred {len(structures)} background structure mask(s): {structure_manifest_path}")
+    if skipped:
+        print(f"Skipped: {', '.join(f'{key} ({value})' for key, value in skipped.items())}")
+    return 0
+
+
 def read_ascii_ply_table(path: Path) -> tuple[list[str], list[str], list[list[str]]]:
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         header = []
@@ -3422,7 +3736,10 @@ def source_labels_from_object_masks(
     for semantic_id, object_json in enumerate(sorted(objects_dir.glob("*/object.json")), start=1):
         obj = read_json(object_json)
         object_id = obj["object_id"]
-        index_path = mask_3d_dir / object_id / "point_indices.json"
+        mask_3d = obj.get("mask_3d") if isinstance(obj.get("mask_3d"), dict) else {}
+        index_path = resolve_existing_path(mask_3d.get("point_indices_json") or mask_3d.get("point_indices_npy"), objects_dir.parent)
+        if not index_path or not index_path.exists():
+            index_path = mask_3d_dir / object_id / "point_indices.json"
         if not index_path.exists():
             index_path = mask_3d_dir / object_id / "point_indices.npy"
         if not index_path.exists():
@@ -3440,6 +3757,7 @@ def source_labels_from_object_masks(
                 "semantic_id": semantic_id,
                 "name": obj.get("name", object_id),
                 "category": obj.get("category", "unknown"),
+                "asset_role": obj.get("asset_role", "object"),
                 "source_point_count": assigned,
                 "point_count": 0,
                 "bbox_3d": obj.get("bbox_3d"),
@@ -4018,6 +4336,106 @@ def mesh_asset_coordinate_frame(mesh_asset: dict[str, Any]) -> str:
     return "object_local"
 
 
+def bbox_for_vertex_list(vertices: list[list[float]]) -> dict[str, Any]:
+    mins = [min(vertex[axis] for vertex in vertices) for axis in range(3)]
+    maxs = [max(vertex[axis] for vertex in vertices) for axis in range(3)]
+    size = [maxs[axis] - mins[axis] for axis in range(3)]
+    return {
+        "min": mins,
+        "max": maxs,
+        "center": [(mins[axis] + maxs[axis]) * 0.5 for axis in range(3)],
+        "size": size,
+    }
+
+
+def summarize_obj_mesh_light(path: Path) -> dict[str, Any]:
+    vertices: list[list[float]] = []
+    triangle_count = 0
+    face_count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("v "):
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    try:
+                        vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                    except Exception:
+                        pass
+            elif line.startswith("f "):
+                face_count += 1
+                parts = line.strip().split()[1:]
+                if len(parts) >= 3:
+                    triangle_count += max(1, len(parts) - 2)
+    summary: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "readable": True,
+        "parser": "light_obj",
+        "vertex_count": len(vertices),
+        "triangle_count": triangle_count,
+        "face_count": face_count,
+    }
+    if vertices:
+        bbox = bbox_for_vertex_list(vertices)
+        summary["bbox"] = bbox
+        summary["bbox_diagonal"] = vector_diagonal(bbox.get("size"))
+    return summary
+
+
+def summarize_ascii_ply_mesh_light(path: Path) -> dict[str, Any]:
+    vertex_count = 0
+    face_count = 0
+    vertices: list[list[float]] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("element vertex"):
+                vertex_count = int(stripped.split()[-1])
+            elif stripped.startswith("element face"):
+                face_count = int(stripped.split()[-1])
+            elif stripped == "end_header":
+                break
+        for _ in range(vertex_count):
+            line = f.readline()
+            if not line:
+                break
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                try:
+                    vertices.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                except Exception:
+                    pass
+    summary: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "readable": True,
+        "parser": "light_ascii_ply",
+        "vertex_count": vertex_count,
+        "triangle_count": face_count,
+        "face_count": face_count,
+    }
+    if vertices:
+        bbox = bbox_for_vertex_list(vertices)
+        summary["bbox"] = bbox
+        summary["bbox_diagonal"] = vector_diagonal(bbox.get("size"))
+    return summary
+
+
+def summarize_triangle_mesh_light(path: Path) -> dict[str, Any]:
+    suffix = path.suffix.lower()
+    if suffix == ".obj":
+        return summarize_obj_mesh_light(path)
+    if suffix == ".ply":
+        return summarize_ascii_ply_mesh_light(path)
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "readable": False,
+        "parser": "light",
+        "error": f"No lightweight parser for {suffix or 'unknown'} mesh files.",
+    }
+
+
 def summarize_triangle_mesh(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {"exists": False, "readable": False, "error": "missing path"}
@@ -4030,8 +4448,8 @@ def summarize_triangle_mesh(path: Path | None) -> dict[str, Any]:
         summary["error"] = "file does not exist"
         return summary
     try:
-        np = import_numpy()
         o3d = import_open3d()
+        np = import_numpy()
         mesh = o3d.io.read_triangle_mesh(str(path))
         vertices = np.asarray(mesh.vertices, dtype=np.float64)
         triangles = np.asarray(mesh.triangles)
@@ -4063,7 +4481,12 @@ def summarize_triangle_mesh(path: Path | None) -> dict[str, Any]:
                     pass
         return summary
     except Exception as exc:
-        summary["error"] = str(exc)
+        try:
+            light_summary = summarize_triangle_mesh_light(path)
+            light_summary["fallback_reason"] = str(exc)
+            return light_summary
+        except Exception as fallback_exc:
+            summary["error"] = f"{exc}; lightweight fallback failed: {fallback_exc}"
         return summary
 
 
@@ -4127,6 +4550,208 @@ def transform_triangle_mesh_file(
     if not ok:
         raise RuntimeError(f"Failed to write transformed mesh: {output}")
     return summarize_triangle_mesh(output)
+
+
+def append_asset_issue(issues: list[dict[str, Any]], severity: str, name: str, detail: str, object_id: str | None = None, value: Any = None, threshold: Any = None) -> None:
+    issue = {"severity": severity, "name": name, "detail": detail}
+    if object_id:
+        issue["object_id"] = object_id
+    if value is not None:
+        issue["value"] = value
+    if threshold is not None:
+        issue["threshold"] = threshold
+    issues.append(issue)
+
+
+def simulator_asset_qa_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    bundle_path: Path,
+    min_mesh_vertices: int,
+    max_center_ratio: float,
+    max_size_ratio_delta: float,
+    require_physics: bool,
+    require_scale_calibration: bool,
+) -> dict[str, Any]:
+    bundle = read_json(bundle_path)
+    coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
+    issues: list[dict[str, Any]] = []
+    object_reports: list[dict[str, Any]] = []
+    scene_scale = float(coordinate_system.get("scale_to_meters") or 1.0)
+    up_axis = str(coordinate_system.get("up_axis") or "unknown").lower()
+    scale_calibrated = bool(coordinate_system.get("scale_calibrated") or coordinate_system.get("calibrated"))
+
+    if require_scale_calibration and not scale_calibrated:
+        append_asset_issue(
+            issues,
+            "required",
+            "scale_not_calibrated",
+            "coordinate_system.scale_calibrated is not true; reconstruction units should be calibrated before physics-critical simulation.",
+        )
+    elif not scale_calibrated:
+        append_asset_issue(
+            issues,
+            "warning",
+            "scale_not_calibrated",
+            "Scale is still an engineering estimate.",
+        )
+    if up_axis == "unknown":
+        append_asset_issue(issues, "warning", "up_axis_unknown", "coordinate_system.up_axis is unknown.")
+
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        object_id = slugify(obj.get("object_id") or "object")
+        is_background_structure = obj.get("asset_role") == "background_structure"
+        mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
+        pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+        physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        quality = obj.get("quality") if isinstance(obj.get("quality"), dict) else {}
+        mesh_quality = quality.get("mesh") if isinstance(quality.get("mesh"), dict) else {}
+        mesh_path = resolve_existing_path(mesh.get("path"), project_root) if mesh else None
+        mesh_summary = summarize_triangle_mesh(mesh_path) if mesh_path else {"exists": False, "readable": False, "error": "missing mesh path"}
+        object_issues: list[dict[str, Any]] = []
+
+        if (not mesh_path or not mesh_path.exists()) and not is_background_structure:
+            append_asset_issue(object_issues, "required", "missing_mesh", "Simulator object has no existing mesh path.", object_id)
+        elif not mesh_summary.get("readable"):
+            if mesh_path or not is_background_structure:
+                append_asset_issue(object_issues, "required", "unreadable_mesh", str(mesh_summary.get("error", "mesh is not readable")), object_id)
+        else:
+            vertices = int(mesh_summary.get("vertex_count") or 0)
+            triangles = int(mesh_summary.get("triangle_count") or 0)
+            if vertices < min_mesh_vertices:
+                append_asset_issue(object_issues, "warning", "low_mesh_vertex_count", f"{vertices} vertices.", object_id, vertices, min_mesh_vertices)
+            if triangles <= 0:
+                append_asset_issue(object_issues, "warning", "mesh_has_no_triangles", "Mesh has no triangles.", object_id, triangles, ">0")
+            if mesh_summary.get("is_watertight") is False:
+                append_asset_issue(object_issues, "warning", "mesh_not_watertight", "Mesh is not watertight.", object_id)
+            if mesh_summary.get("is_edge_manifold") is False or mesh_summary.get("is_vertex_manifold") is False:
+                append_asset_issue(object_issues, "warning", "mesh_not_manifold", "Mesh is not fully manifold.", object_id)
+
+        alignment = mesh_quality.get("source_to_mask_alignment") if isinstance(mesh_quality.get("source_to_mask_alignment"), dict) else {}
+        if alignment.get("status") == "ok":
+            center_ratio = alignment.get("center_distance_over_mask_diagonal")
+            diag_ratio = alignment.get("mesh_to_mask_diagonal_ratio")
+            if center_ratio is not None and float(center_ratio) > max_center_ratio:
+                append_asset_issue(
+                    object_issues,
+                    "warning",
+                    "mesh_center_far_from_mask_bbox",
+                    "Mesh bbox center is far from the fused 3D mask bbox center.",
+                    object_id,
+                    float(center_ratio),
+                    max_center_ratio,
+                )
+            if diag_ratio is not None:
+                ratio_delta = abs(float(diag_ratio) - 1.0)
+                if ratio_delta > max_size_ratio_delta:
+                    append_asset_issue(
+                        object_issues,
+                        "warning",
+                        "mesh_size_differs_from_mask_bbox",
+                        "Mesh diagonal differs substantially from the 3D mask bbox diagonal.",
+                        object_id,
+                        float(diag_ratio),
+                        f"1 +/- {max_size_ratio_delta}",
+                    )
+
+        body_type = physics.get("body_type")
+        mass = physics.get("mass_kg")
+        collider = physics.get("collider")
+        if require_physics and ((mass is None and not is_background_structure) or collider in (None, "none") or not body_type):
+            append_asset_issue(object_issues, "required", "physics_missing", "Mass/body_type/collider must be set for simulator-ready assets.", object_id)
+        else:
+            if mass is None and not is_background_structure:
+                append_asset_issue(object_issues, "warning", "mass_missing", "mass_kg is still unset.", object_id)
+            if collider in (None, "none"):
+                append_asset_issue(object_issues, "warning", "collider_missing", "No collider is configured.", object_id)
+        if pose.get("bbox_size") in (None, [], [0.0, 0.0, 0.0]):
+            append_asset_issue(object_issues, "warning", "bbox_size_missing", "Pose bbox_size is missing or zero.", object_id)
+
+        issues.extend(object_issues)
+        object_reports.append(
+            {
+                "object_id": object_id,
+                "name": obj.get("name"),
+                "category": obj.get("category"),
+                "mesh_path": str(mesh_path) if mesh_path else "",
+                "mesh_summary": mesh_summary,
+                "pose": pose,
+                "physics": physics,
+                "quality": quality,
+                "issues": object_issues,
+                "ok": not any(issue.get("severity") == "required" for issue in object_issues),
+            }
+        )
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "bundle": str(bundle_path),
+        "ok": not required,
+        "thresholds": {
+            "min_mesh_vertices": min_mesh_vertices,
+            "max_center_ratio": max_center_ratio,
+            "max_size_ratio_delta": max_size_ratio_delta,
+            "require_physics": require_physics,
+            "require_scale_calibration": require_scale_calibration,
+        },
+        "coordinate_system": {
+            **coordinate_system,
+            "scene_scale_to_meters": scene_scale,
+            "scale_calibrated": scale_calibrated,
+        },
+        "objects": object_reports,
+        "summary": {
+            "object_count": len(object_reports),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "issues": issues,
+    }
+
+
+def cmd_qa_simulator_assets(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    report = simulator_asset_qa_report(
+        project_root=project_root,
+        manifest=manifest,
+        bundle_path=bundle_path,
+        min_mesh_vertices=args.min_mesh_vertices,
+        max_center_ratio=args.max_center_ratio,
+        max_size_ratio_delta=args.max_size_ratio_delta,
+        require_physics=args.require_physics,
+        require_scale_calibration=args.require_scale_calibration,
+    )
+    output_path = args.output.resolve() if args.output else project_root / manifest["simulator_assets_dir"] / "simulator_asset_qa.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simulator_asset_qa"] = str(output_path)
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        status = "PASS" if report["ok"] else "ISSUES"
+        print(f"Simulator asset QA: {status} ({report['scene_id']})")
+        print(
+            f"Objects: {report['summary']['object_count']}; "
+            f"required={report['summary']['required_issue_count']}; warnings={report['summary']['warning_count']}"
+        )
+        for issue in report["issues"][: args.max_issues]:
+            object_prefix = f"{issue.get('object_id')}: " if issue.get("object_id") else ""
+            print(f"- [{issue.get('severity')}] {object_prefix}{issue.get('name')}: {issue.get('detail')}")
+        if len(report["issues"]) > args.max_issues:
+            print(f"- ... {len(report['issues']) - args.max_issues} more issue(s)")
+        print(f"Report: {output_path}")
+    return 1 if args.fail_on_required and not report["ok"] else 0
 
 
 def point_cloud_from_arrays(points, colors):
@@ -4354,6 +4979,8 @@ def cmd_reconstruct_object_meshes(args: argparse.Namespace) -> int:
 
     for object_json in sorted(objects_dir.glob("*/object.json")):
         obj = read_json(object_json)
+        if is_background_structure_record(obj):
+            continue
         object_id = slugify(obj.get("object_id") or object_json.parent.name)
         mask_cloud_path = resolve_object_mask_cloud_path(obj, object_id, project_root, manifest)
         if mask_cloud_path is None:
@@ -4685,6 +5312,8 @@ def cmd_select_frames(args: argparse.Namespace) -> int:
     selected_summary: dict[str, Any] = {}
     for object_json in sorted(objects_dir.glob("*/object.json")):
         obj = read_json(object_json)
+        if is_background_structure_record(obj):
+            continue
         object_id = obj["object_id"]
         frame_scores = obj.get("frame_scores", {})
         ranked = []
@@ -4739,6 +5368,8 @@ def cmd_prepare_object_images(args: argparse.Namespace) -> int:
     prepared_summary: dict[str, Any] = {}
     for object_json in sorted(objects_dir.glob("*/object.json")):
         obj = read_json(object_json)
+        if is_background_structure_record(obj):
+            continue
         object_id = slugify(obj["object_id"])
         selected = obj.get("selected_frames", [])
         if not selected:
@@ -4817,6 +5448,8 @@ def cmd_export_image_blaster(args: argparse.Namespace) -> int:
     exported_objects = []
     for object_json in sorted(objects_dir.glob("*/object.json")):
         obj = read_json(object_json)
+        if is_background_structure_record(obj):
+            continue
         object_id = slugify(obj["object_id"])
         primary = obj.get("primary_frame") or {}
         primary_object_image = obj.get("primary_object_image") or {}
@@ -4973,6 +5606,149 @@ def cmd_mesh_commands(args: argparse.Namespace) -> int:
     return 0
 
 
+def external_mesh_template_values(project_root: Path, object_id: str, object_json: Path, job_path: Path, output_dir: Path, mesh_output: Path, obj: dict[str, Any]) -> dict[str, str]:
+    selected_frames = obj.get("selected_frames") if isinstance(obj.get("selected_frames"), list) else []
+    image_paths = [
+        str(Path(item.get("selected_image") or item.get("image", "")).resolve())
+        for item in selected_frames
+        if item.get("selected_image") or item.get("image")
+    ]
+    object_images = obj.get("object_images") if isinstance(obj.get("object_images"), list) else []
+    crop_paths = [
+        str(Path(item.get("object_image", "")).resolve())
+        for item in object_images
+        if item.get("object_image")
+    ]
+    return {
+        "project_root": str(project_root),
+        "object_id": object_id,
+        "object_json": str(object_json),
+        "job_path": str(job_path),
+        "output_dir": str(output_dir),
+        "mesh_output": str(mesh_output),
+        "primary_frame": image_paths[0] if image_paths else "",
+        "primary_crop": crop_paths[0] if crop_paths else "",
+        "image_paths": " ".join(shell_quote(path) for path in image_paths),
+        "crop_paths": " ".join(shell_quote(path) for path in crop_paths),
+    }
+
+
+def cmd_prepare_multiview_mesh_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    objects_dir = project_root / manifest["objects_dir"]
+    if not objects_dir.exists():
+        raise FileNotFoundError("No objects directory. Run fuse-masks/select-frames first.")
+    output_root = ensure_dir(args.output_dir or (project_root / manifest["simulator_assets_dir"] / "multiview_mesh_jobs"))
+    jobs_dir = ensure_dir(output_root / "jobs")
+    mesh_root = ensure_dir(args.mesh_output_dir or (output_root / "meshes"))
+    commands: list[str] = []
+    jobs: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    for object_json in sorted(objects_dir.glob("*/object.json")):
+        obj = read_json(object_json)
+        if is_background_structure_record(obj):
+            continue
+        object_id = slugify(obj.get("object_id") or object_json.parent.name)
+        selected_frames = obj.get("selected_frames") if isinstance(obj.get("selected_frames"), list) else []
+        object_images = obj.get("object_images") if isinstance(obj.get("object_images"), list) else []
+        if not selected_frames and not object_images:
+            skipped[object_id] = "missing selected_frames/object_images"
+            if not args.skip_missing:
+                raise RuntimeError(f"{object_id} has no selected frames or object crops. Run select-frames/prepare-object-images first.")
+            continue
+
+        object_job_dir = ensure_dir(mesh_root / object_id)
+        mesh_output = object_job_dir / f"{object_id}.{args.mesh_format}"
+        job_path = jobs_dir / f"{object_id}.json"
+        mask_cloud_path = resolve_object_mask_cloud_path(obj, object_id, project_root, manifest)
+        job = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "name": obj.get("name", object_id),
+            "category": obj.get("category", "unknown"),
+            "description": obj.get("description", ""),
+            "object_json": str(object_json),
+            "selected_frames": selected_frames[: args.max_frames if args.max_frames > 0 else None],
+            "object_images": object_images[: args.max_frames if args.max_frames > 0 else None],
+            "mask_3d_cloud": str(mask_cloud_path) if mask_cloud_path else None,
+            "bbox_3d": obj.get("bbox_3d"),
+            "output_dir": str(object_job_dir),
+            "mesh_output": str(mesh_output),
+            "recommended_inputs": {
+                "single_image": "primary_crop or primary_frame",
+                "multi_view": "selected_frames/object_images",
+                "geometry_prior": "mask_3d_cloud and bbox_3d",
+            },
+            "notes": "Prepared job for an external single-image or multi-view object mesh reconstructor; no heavy model is run by this command.",
+        }
+        write_json(job_path, job)
+
+        command = ""
+        if args.command_template:
+            values = external_mesh_template_values(project_root, object_id, object_json, job_path, object_job_dir, mesh_output, obj)
+            command = command_from_template(args.command_template, values)
+            commands.append(command)
+        jobs[object_id] = {**job, "job_path": str(job_path), "command": command}
+
+    script_path = output_root / "run_mesh_jobs.sh"
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        *commands,
+        "",
+    ]
+    script_path.write_text("\n".join(lines), encoding="utf-8")
+    script_path.chmod(0o755)
+
+    manifest_path = output_root / "multiview_mesh_jobs.json"
+    job_manifest = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "output_root": str(output_root),
+        "mesh_root": str(mesh_root),
+        "mesh_format": args.mesh_format,
+        "jobs": jobs,
+        "commands": commands,
+        "script": str(script_path),
+        "skipped": skipped,
+        "template_variables": [
+            "project_root",
+            "object_id",
+            "object_json",
+            "job_path",
+            "output_dir",
+            "mesh_output",
+            "primary_frame",
+            "primary_crop",
+            "image_paths",
+            "crop_paths",
+        ],
+    }
+    write_json(manifest_path, job_manifest)
+    manifest.setdefault("artifacts", {})["multiview_mesh_jobs"] = str(manifest_path)
+    manifest.setdefault("external_stages", {}).setdefault("mesh_generation", {})
+    manifest["external_stages"]["mesh_generation"] = {
+        "status": "external_mesh_jobs_prepared",
+        "notes": "Prepared per-object mesh reconstruction jobs for external single-image or multi-view mesh tools.",
+        "job_count": len(jobs),
+        "skipped_objects": skipped,
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared {len(jobs)} external mesh job(s): {manifest_path}")
+    print(f"Command script: {script_path}")
+    if skipped:
+        print(f"Skipped: {', '.join(sorted(skipped))}")
+    if args.run and commands:
+        for command in commands:
+            print(command)
+            subprocess.run(command, cwd=output_root, shell=True, check=True)
+    return 0
+
+
 def indexed_file_index(path: Path) -> int:
     match = re.match(r"^\.?(\d+)-", path.name)
     return int(match.group(1)) if match else -1
@@ -5080,6 +5856,12 @@ def resolve_existing_path(path_value: str | None, project_root: Path) -> Path | 
             idx = len(parts) - 1 - list(reversed(parts)).index(project_name)
             suffix = Path(*parts[idx + 1 :])
             candidates.append(project_root / suffix)
+        repo_root = Path(__file__).resolve().parents[1]
+        repo_name = repo_root.name
+        if repo_name in parts:
+            idx = len(parts) - 1 - list(reversed(parts)).index(repo_name)
+            suffix = Path(*parts[idx + 1 :])
+            candidates.append(repo_root / suffix)
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
@@ -5101,6 +5883,8 @@ def cmd_import_object_meshes(args: argparse.Namespace) -> int:
 
     for object_json in sorted(objects_dir.glob("*/object.json")):
         obj = read_json(object_json)
+        if is_background_structure_record(obj):
+            continue
         object_id = slugify(obj.get("object_id") or object_json.parent.name)
         selected_mesh: Path | None = None
         selected_dir: Path | None = None
@@ -5177,6 +5961,10 @@ def scaled_vector(values: Any, scale: float, fallback: list[float]) -> list[floa
     return [float(value) * scale for value in values]
 
 
+def is_background_structure_record(obj: dict[str, Any]) -> bool:
+    return obj.get("asset_role") == "background_structure"
+
+
 def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -5196,6 +5984,8 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
     for index, object_json in enumerate(sorted(objects_dir.glob("*/object.json")), start=1):
         obj = read_json(object_json)
         object_id = slugify(obj.get("object_id") or object_json.parent.name)
+        asset_role = obj.get("asset_role", "object")
+        is_background_structure = asset_role == "background_structure"
         semantic_id = int(semantic_ids.get(object_id, index))
         bbox = obj.get("bbox_3d") or {}
         mesh_asset = obj.get("mesh_asset") or {}
@@ -5263,7 +6053,8 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                 "alignment_status": "localized_from_3d_mask_bbox" if mesh_qa.get("localization", {}).get("applied") else "estimated_from_3d_mask_bbox",
             }
         else:
-            missing_meshes.append(object_id)
+            if not is_background_structure:
+                missing_meshes.append(object_id)
 
         center = scaled_vector(bbox.get("center"), args.scene_scale, [0.0, 0.0, 0.0])
         size = scaled_vector(bbox.get("size"), args.scene_scale, [0.0, 0.0, 0.0])
@@ -5272,11 +6063,12 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
         asset = {
             "schema_version": DEFAULT_SCHEMA_VERSION,
             "object_id": object_id,
+            "asset_role": asset_role,
             "semantic_id": semantic_id,
             "name": obj.get("name", object_id),
             "category": obj.get("category", "unknown"),
             "description": obj.get("description", ""),
-            "status": "ready" if exported_mesh else "missing_mesh",
+            "status": "background_structure" if is_background_structure and not exported_mesh else "ready" if exported_mesh else "missing_mesh",
             "mesh": exported_mesh,
             "pose": {
                 "position": center,
@@ -5286,8 +6078,8 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                 "bbox_3d": bbox,
             },
             "physics": {
-                "body_type": args.body_type,
-                "collider": args.collider if exported_mesh else "none",
+                "body_type": "static" if is_background_structure else args.body_type,
+                "collider": "box" if is_background_structure else args.collider if exported_mesh else "none",
                 "mass_kg": None,
                 "material": None,
                 "notes": "Physics values are placeholders; validate mass, friction, and collider before simulation.",
@@ -5297,6 +6089,7 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                 "mask_3d_cloud": obj.get("mask_3d_cloud"),
                 "point_count": obj.get("point_count", 0),
             },
+            "background_structure": obj.get("background_structure") if is_background_structure else None,
             "quality": {
                 "mesh": mesh_qa,
             },
@@ -6056,6 +6849,8 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
             object_records.append(read_json(object_json))
         except Exception:
             pass
+    foreground_object_records = [obj for obj in object_records if obj.get("asset_role", "object") != "background_structure"]
+    background_structure_records = [obj for obj in object_records if obj.get("asset_role") == "background_structure"]
 
     masks3d_ok, masks3d_detail = path_exists_for_manifest(project_root, artifacts.get("object_masks_3d"))
     all_objects_have_3d_mask = bool(object_records) and all((obj.get("mask_3d") or {}).get("point_indices_json") or (obj.get("mask_3d") or {}).get("point_indices_npy") for obj in object_records)
@@ -6087,12 +6882,16 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
     semantic_preview_ok, semantic_preview_detail = path_exists_for_manifest(project_root, artifacts.get("semantic_preview"))
     items.append(validation_item("semantic_preview", semantic_preview_ok, semantic_preview_detail or "missing semantic mask projection preview", "recommended"))
 
+    labels_ok, labels_detail = path_exists_for_manifest(project_root, artifacts.get("object_labels"))
+    object_categories_named = bool(object_records) and all(str(obj.get("category", "unknown")).strip().lower() not in {"", "unknown"} for obj in object_records)
+    items.append(validation_item("object_semantic_labels", labels_ok or object_categories_named, labels_detail or "missing object_labels artifact or non-unknown object categories", "recommended"))
+
     selected_ok, selected_detail = path_exists_for_manifest(project_root, artifacts.get("selected_frames"))
-    all_objects_have_selected = bool(object_records) and all(obj.get("selected_frames") for obj in object_records)
+    all_objects_have_selected = bool(foreground_object_records) and all(obj.get("selected_frames") for obj in foreground_object_records)
     items.append(validation_item("selected_frames", selected_ok and all_objects_have_selected, selected_detail or "missing selected_frames artifact"))
 
     object_images_ok, object_images_detail = path_exists_for_manifest(project_root, artifacts.get("object_images"))
-    all_objects_have_crops = bool(object_records) and all(obj.get("primary_object_image") for obj in object_records)
+    all_objects_have_crops = bool(foreground_object_records) and all(obj.get("primary_object_image") for obj in foreground_object_records)
     items.append(validation_item("object_reference_images", object_images_ok and all_objects_have_crops, object_images_detail or "missing object_images artifact"))
 
     image_blaster_ok, image_blaster_detail = path_exists_for_manifest(project_root, artifacts.get("image_blaster_world"))
@@ -6110,9 +6909,9 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
     )
 
     object_meshes_ok, object_meshes_detail = path_exists_for_manifest(project_root, artifacts.get("object_meshes"))
-    all_objects_have_mesh = bool(object_records) and all((obj.get("mesh_asset") or {}).get("asset_path") or (obj.get("mesh_asset") or {}).get("source_mesh") for obj in object_records)
+    all_objects_have_mesh = bool(foreground_object_records) and all((obj.get("mesh_asset") or {}).get("asset_path") or (obj.get("mesh_asset") or {}).get("source_mesh") for obj in foreground_object_records)
     mesh_paths_exist = True
-    for obj in object_records:
+    for obj in foreground_object_records:
         mesh_asset = obj.get("mesh_asset") or {}
         mesh_path = resolve_existing_path(mesh_asset.get("asset_path") or mesh_asset.get("source_mesh"), project_root)
         if not mesh_path or not mesh_path.exists():
@@ -6120,12 +6919,15 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
             break
     items.append(validation_item("object_meshes", object_meshes_ok and all_objects_have_mesh and mesh_paths_exist, object_meshes_detail or "missing object_meshes artifact"))
 
+    background_ok, background_detail = path_exists_for_manifest(project_root, artifacts.get("background_structures"))
+    items.append(validation_item("background_structures", background_ok or bool(background_structure_records), background_detail or f"{len(background_structure_records)} background structure record(s)", "recommended"))
+
     bundle_ok, bundle_detail = path_exists_for_manifest(project_root, artifacts.get("simulator_asset_bundle"))
     bundle_objects_ok = False
     if bundle_ok:
         try:
             bundle = read_json(Path(bundle_detail))
-            bundle_objects_ok = len(bundle.get("objects", [])) == len(object_records) and not bundle.get("missing_mesh_objects")
+            bundle_objects_ok = len(bundle.get("objects", [])) >= len(foreground_object_records) and not bundle.get("missing_mesh_objects")
             bundle_detail = f"{bundle_detail}; objects={len(bundle.get('objects', []))}; missing_meshes={bundle.get('missing_mesh_objects')}"
         except Exception as exc:
             bundle_detail = f"{bundle_detail}; failed to read: {exc}"
@@ -6133,6 +6935,9 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
 
     adapters_ok, adapters_detail = path_exists_for_manifest(project_root, artifacts.get("simulator_adapters"))
     items.append(validation_item("simulator_adapters", adapters_ok, adapters_detail or "missing simulator_adapters artifact", "recommended"))
+
+    asset_qa_ok, asset_qa_detail = path_exists_for_manifest(project_root, artifacts.get("simulator_asset_qa"))
+    items.append(validation_item("simulator_asset_qa", asset_qa_ok, asset_qa_detail or "missing simulator asset QA report", "recommended"))
 
     required_failed = [item for item in items if item["severity"] == "required" and not item["ok"]]
     recommended_failed = [item for item in items if item["severity"] != "required" and not item["ok"]]
@@ -6155,6 +6960,8 @@ def evaluate_object_record(
     bundle_object: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     object_id = obj.get("object_id") or "unknown"
+    asset_role = obj.get("asset_role", "object")
+    is_background_structure = asset_role == "background_structure"
     issues: list[dict[str, Any]] = []
     point_count = int(obj.get("point_count") or 0)
     bbox = obj.get("bbox_3d") if isinstance(obj.get("bbox_3d"), dict) else {}
@@ -6190,11 +6997,11 @@ def evaluate_object_record(
                 "detail": f"{point_count} point(s), threshold={min_object_points}",
             }
         )
-    if not selected_frames:
+    if not selected_frames and not is_background_structure:
         issues.append({"severity": "required", "object_id": object_id, "name": "missing_selected_frames", "detail": "Run select-frames."})
-    if not primary_image_path or not primary_image_path.exists():
+    if (not primary_image_path or not primary_image_path.exists()) and not is_background_structure:
         issues.append({"severity": "required", "object_id": object_id, "name": "missing_object_reference_image", "detail": "Run prepare-object-images."})
-    if not mesh_path or not mesh_path.exists():
+    if (not mesh_path or not mesh_path.exists()) and not is_background_structure:
         issues.append({"severity": "required", "object_id": object_id, "name": "missing_object_mesh", "detail": "Import image-blaster/FAL mesh outputs."})
     if not mask_cloud_path or not mask_cloud_path.exists():
         issues.append({"severity": "required", "object_id": object_id, "name": "missing_object_mask_cloud", "detail": "Run export-object-mask-clouds."})
@@ -6208,6 +7015,7 @@ def evaluate_object_record(
 
     report = {
         "object_id": object_id,
+        "asset_role": asset_role,
         "name": obj.get("name", object_id),
         "category": obj.get("category", "unknown"),
         "point_count": point_count,
@@ -6281,6 +7089,12 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     bundle_path = resolve_existing_path(artifacts.get("simulator_asset_bundle"), project_root)
     bundle = safe_read_json(bundle_path) if bundle_path else None
     bundle_by_object = bundle_objects_by_id(bundle)
+    labels_path = resolve_existing_path(artifacts.get("object_labels"), project_root)
+    labels = safe_read_json(labels_path) if labels_path else None
+    multiview_mesh_jobs_path = resolve_existing_path(artifacts.get("multiview_mesh_jobs"), project_root)
+    multiview_mesh_jobs = safe_read_json(multiview_mesh_jobs_path) if multiview_mesh_jobs_path else None
+    simulator_asset_qa_path = resolve_existing_path(artifacts.get("simulator_asset_qa"), project_root)
+    simulator_asset_qa = safe_read_json(simulator_asset_qa_path) if simulator_asset_qa_path else None
     svpp_scene_path = resolve_existing_path(artifacts.get("svpp_scene"), project_root)
     svpp_metadata_path = resolve_existing_path(artifacts.get("svpp_metadata"), project_root)
     svpp_metadata = safe_read_json(svpp_metadata_path) if svpp_metadata_path else None
@@ -6395,11 +7209,26 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             },
         },
         "objects": object_reports,
+        "semantic_labeling": {
+            "labels": str(labels_path) if labels_path else "",
+            "labels_exists": bool(labels_path and labels_path.exists()),
+            "label_count": len(labels) if isinstance(labels, dict) else 0,
+            "objects_with_non_unknown_category": len(
+                [
+                    item
+                    for item in object_reports
+                    if str(item.get("category", "unknown")).strip().lower() not in {"", "unknown"}
+                ]
+            ),
+        },
         "mesh_generation": {
             "mesh_index": str(mesh_index_path) if mesh_index_path else "",
             "mesh_index_exists": bool(mesh_index_path and mesh_index_path.exists()),
             "imported_object_count": len(mesh_index.get("objects", {})) if isinstance(mesh_index, dict) else 0,
             "missing_objects": mesh_index.get("missing_objects", []) if isinstance(mesh_index, dict) else [],
+            "multiview_mesh_jobs": str(multiview_mesh_jobs_path) if multiview_mesh_jobs_path else "",
+            "multiview_mesh_jobs_exists": bool(multiview_mesh_jobs_path and multiview_mesh_jobs_path.exists()),
+            "multiview_mesh_job_count": len(multiview_mesh_jobs.get("jobs", {})) if isinstance(multiview_mesh_jobs, dict) else 0,
         },
         "sceneversepp": {
             "scene": str(svpp_scene_path) if svpp_scene_path else "",
@@ -6418,6 +7247,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             "bundle_exists": bool(bundle_path and bundle_path.exists()),
             "object_count": len(bundle.get("objects", [])) if isinstance(bundle, dict) else 0,
             "missing_mesh_objects": bundle.get("missing_mesh_objects", []) if isinstance(bundle, dict) else [],
+            "qa_report": str(simulator_asset_qa_path) if simulator_asset_qa_path else "",
+            "qa_exists": bool(simulator_asset_qa_path and simulator_asset_qa_path.exists()),
+            "qa_ok": simulator_asset_qa.get("ok") if isinstance(simulator_asset_qa, dict) else None,
+            "qa_summary": simulator_asset_qa.get("summary") if isinstance(simulator_asset_qa, dict) else None,
         },
         "summary": {
             "object_count": object_count,
@@ -7706,6 +8539,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--overwrite", action="store_true")
     p.set_defaults(func=cmd_auto_prompts)
 
+    p = sub.add_parser("import-object-labels", help="Import object names/categories/descriptions from JSON labels or VLM output.")
+    add_common_project_arg(p)
+    p.add_argument("--labels", type=Path, required=True, help="JSON map/list/object-with-objects labels keyed by object_id.")
+    p.add_argument("--output", type=Path, help="Defaults to masks/object_labels.json.")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True, help="Overwrite existing unknown/empty fields by default.")
+    p.set_defaults(func=cmd_import_object_labels)
+
     p = sub.add_parser("fuse-masks", help="Fuse frame-level 2D masks onto a point cloud.")
     add_common_project_arg(p)
     p.add_argument("--point-cloud", type=Path)
@@ -7719,6 +8559,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
     p.set_defaults(func=cmd_fuse_masks)
+
+    p = sub.add_parser("infer-background-structure-masks", help="Infer heuristic floor/ceiling/wall 3D masks from point-cloud boundaries.")
+    add_common_project_arg(p)
+    p.add_argument("--point-cloud", type=Path, help="Defaults to scene/reconstruction/point_cloud.ply.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], default="y", help="Axis treated as vertical for floor/ceiling inference.")
+    p.add_argument("--quantile", type=float, default=0.03, help="Boundary quantile used for each structure side.")
+    p.add_argument("--thickness", type=float, help="Optional absolute boundary thickness. If omitted, the boundary quantile itself is used.")
+    p.add_argument("--min-points", type=int, default=50)
+    p.add_argument("--exclusive", action=argparse.BooleanOptionalAction, default=True, help="Prevent earlier structures from reusing the same point indices.")
+    p.add_argument("--include-floor", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-ceiling", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-walls", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--floor-id", default="floor")
+    p.add_argument("--ceiling-id", default="ceiling")
+    p.set_defaults(func=cmd_infer_background_structure_masks)
 
     p = sub.add_parser("export-splat-masks", help="Write semantic object_id labels into an ASCII PLY splat/point cloud.")
     add_common_project_arg(p)
@@ -7834,6 +8689,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", action="store_true", help="Actually run image-blaster commands.")
     p.set_defaults(func=cmd_mesh_commands)
 
+    p = sub.add_parser("prepare-multiview-mesh-jobs", help="Prepare per-object external mesh reconstruction jobs from selected frames/crops.")
+    add_common_project_arg(p)
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/multiview_mesh_jobs.")
+    p.add_argument("--mesh-output-dir", type=Path, help="Defaults to <output-dir>/meshes.")
+    p.add_argument("--mesh-format", choices=["obj", "ply", "glb", "stl"], default="obj")
+    p.add_argument("--max-frames", type=int, default=0, help="Limit selected frames/object crops stored per job; 0 keeps all.")
+    p.add_argument(
+        "--command-template",
+        help=(
+            "Optional shell command with {job_path}, {object_id}, {output_dir}, {mesh_output}, "
+            "{primary_frame}, {primary_crop}, {image_paths}, {crop_paths}, {project_root}."
+        ),
+    )
+    p.add_argument("--skip-missing", action="store_true")
+    p.add_argument("--run", action="store_true", help="Run prepared external commands. Without this, only JSON/script artifacts are written.")
+    p.set_defaults(func=cmd_prepare_multiview_mesh_jobs)
+
     p = sub.add_parser("import-object-meshes", help="Import generated object meshes from image-blaster/external mesh dirs.")
     add_common_project_arg(p)
     p.add_argument("--image-blaster-root", type=Path, default=Path("image-blaster"))
@@ -7865,6 +8737,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--copy-assets", action=argparse.BooleanOptionalAction, default=True, help="Copy/symlink meshes into simulator_assets/adapters/assets.")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_export_simulator_adapter)
+
+    p = sub.add_parser("qa-simulator-assets", help="Run simulator-readiness QA on exported object meshes, scale, colliders, and physics fields.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/simulator_asset_qa.json.")
+    p.add_argument("--min-mesh-vertices", type=int, default=20)
+    p.add_argument("--max-center-ratio", type=float, default=0.5, help="Warn if mesh center is farther than this fraction of mask bbox diagonal.")
+    p.add_argument("--max-size-ratio-delta", type=float, default=1.5, help="Warn if mesh/mask bbox diagonal ratio differs from 1 by more than this.")
+    p.add_argument("--require-physics", action="store_true", help="Treat missing mass/collider/body_type as required failures.")
+    p.add_argument("--require-scale-calibration", action="store_true", help="Treat missing scale calibration as a required failure.")
+    p.add_argument("--max-issues", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.set_defaults(func=cmd_qa_simulator_assets)
 
     p = sub.add_parser("export-svpp-metadata", help="Export a SceneVerse++/PQ3D-style scene folder from fused 3D masks.")
     add_common_project_arg(p)

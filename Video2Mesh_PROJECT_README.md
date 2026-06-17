@@ -11,9 +11,11 @@ Video2Mesh 的目标是把一段真实空间扫描视频转换成可查看、可
   -> 最小 3D Gaussian Splatting baseline
   -> SAM 自动物体候选与 2D mask tracking
   -> 2D mask 投影融合为物体级 3D mask
+  -> floor / ceiling / wall 等背景结构 3D 语义 mask
   -> 语义 3DGS / SuperSplat 可视化文件
   -> 每物体相关帧选择
   -> 每物体粗 mesh 重建
+  -> 多视角 mesh job / image-blaster 资产入口
   -> image-blaster 物体资产目录
   -> MuJoCo / Isaac / Unity 仿真资产包
   -> SceneVerse++ / SVPP-style 数据导出
@@ -92,6 +94,8 @@ exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo/
   video2mesh_svpp_export.json
 ```
 
+SVPP 导出时要靠 `object_id` 对齐 Video2Mesh 的 object record、semantic PLY、simulator bundle 和 SceneVerse++ metadata。`semantic_id` 是实例标签，`pred_class_id` 是类别标签，二者不能混用；`floor`、`ceiling`、`wall_*` 这类背景结构也会作为带独立 semantic id 的结构实例进入 metadata。
+
 ### 3.2 image-blaster
 
 `image-blaster` 关注从单张图片生成资产。它的目录约定对 Video2Mesh 很有用：
@@ -117,6 +121,7 @@ image-blaster/worlds/milscene2-real-demo/
 
 ```text
 exports/milscene2_real_demo/simulator_assets/mesh_generation_commands.sh
+exports/milscene2_real_demo/simulator_assets/multiview_mesh_jobs/run_mesh_jobs.sh
 ```
 
 ## 4. 核心流水线
@@ -266,7 +271,57 @@ masks/3d/object_masks.json
 objects/<object_id>/object.json
 ```
 
-### 4.5 Semantic 3DGS 与 viewer PLY
+如果后续用 VLM / 开放词汇检测器给 object_id 生成了更可靠的类别、名称和描述，可以把 JSON 标签导入回 Video2Mesh：
+
+```bash
+python -m video2mesh.cli import-object-labels \
+  --project-root exports/milscene2_real_demo \
+  --labels /path/to/object_labels.json
+```
+
+支持的最小格式可以是 map 或 list，例如：
+
+```json
+{
+  "auto_object_blue_01": {
+    "name": "blue chair",
+    "category": "chair",
+    "description": "blue chair near the desk"
+  }
+}
+```
+
+导入后会更新 `masks/object_labels.json` 和对应的 `objects/<object_id>/object.json`。这是给 VLM/open-vocabulary 语义命名预留的接口；当前 demo 的自动名称仍然只是颜色和候选编号，不应当视为可靠类别。
+
+### 4.5 背景结构语义 mask
+
+前景物体来自 2D mask tracking 和 2D-to-3D fusion；地面、天花板、墙面这类背景结构通常没有单物体 crop，也不应该进入 image-blaster mesh 生成。当前工程提供一个可运行的 axis-boundary baseline：
+
+```bash
+python -m video2mesh.cli infer-background-structure-masks \
+  --project-root exports/milscene2_real_demo \
+  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
+  --up-axis y \
+  --quantile 0.03 \
+  --min-points 50
+```
+
+它会从点云边界启发式生成：
+
+```text
+objects/floor/object.json
+objects/ceiling/object.json
+objects/wall_x_min/object.json
+objects/wall_x_max/object.json
+objects/wall_z_min/object.json
+objects/wall_z_max/object.json
+masks/3d/<structure>/point_indices.json
+simulator_assets/background_structures/background_structures.json
+```
+
+这些记录的 `asset_role` 是 `background_structure`：它们参与 semantic 3DGS、object mask cloud、SVPP metadata 和 simulator bundle，但会跳过 selected frames、object crops、object mesh 这些前景物体步骤。这个 baseline 只是协议验证，后续应替换为更稳的 layout segmentation / SpatialLM / PQ3D / open-vocabulary 3D segmentation。
+
+### 4.6 Semantic 3DGS 与 viewer PLY
 
 把 3D object mask 转移到 3DGS：
 
@@ -325,7 +380,7 @@ python -m video2mesh.cli export-object-mask-clouds \
   --skip-missing
 ```
 
-选帧和裁剪参考图：
+选帧和裁剪参考图。注意：这些命令只处理 `asset_role=object` 的前景物体，会跳过 `asset_role=background_structure` 的 floor/wall/ceiling：
 
 ```bash
 python -m video2mesh.cli select-frames \
@@ -349,6 +404,26 @@ python -m video2mesh.cli reconstruct-object-meshes \
   --skip-missing \
   --skip-failed
 ```
+
+如果要把每个物体交给外部单图或多视角 mesh 方法，可以先生成统一的 job JSON 和 shell 脚本：
+
+```bash
+python -m video2mesh.cli prepare-multiview-mesh-jobs \
+  --project-root exports/milscene2_real_demo \
+  --max-frames 2 \
+  --command-template "python reconstruct_object.py --job {job_path} --output {mesh_output}" \
+  --skip-missing
+```
+
+输出：
+
+```text
+simulator_assets/multiview_mesh_jobs/multiview_mesh_jobs.json
+simulator_assets/multiview_mesh_jobs/jobs/<object_id>.json
+simulator_assets/multiview_mesh_jobs/run_mesh_jobs.sh
+```
+
+这个命令不会真正解决 mesh 质量问题，它只是把 “object_id -> selected frames / crops / expected mesh output” 标准化，方便后续接 Hunyuan3D、Meshy、多视角重建或自研 object reconstruction。
 
 导出 image-blaster world：
 
@@ -374,10 +449,21 @@ python -m video2mesh.cli export-simulator-adapter \
   --format mujoco isaac unity
 ```
 
+仿真资产 QA：
+
+```bash
+python -m video2mesh.cli qa-simulator-assets \
+  --project-root exports/milscene2_real_demo \
+  --max-issues 20
+```
+
+QA 会检查 mesh 是否可读、bbox/pose 是否大致对齐、是否缺少尺度标定、碰撞体和物理字段。背景结构允许没有 object mesh，并默认作为 static scene structure 进入 simulator bundle。
+
 关键输出：
 
 ```text
 simulator_assets/simulator_asset_bundle.json
+simulator_assets/simulator_asset_qa.json
 simulator_assets/adapters/mujoco/scene.xml
 simulator_assets/adapters/isaac/isaac_adapter.json
 simulator_assets/adapters/unity/unity_adapter.json
@@ -409,11 +495,16 @@ camera_poses=13
 point_cloud_vertices=1,869,714
 gsplat_vertices=8,000
 2D_masks=78
-semantic_ids=6
-objects=6
+semantic_records=12
+foreground_objects=6
+background_structures=6
+objects_total=12
 objects_with_reference_images=6
-objects_with_3d_mask_clouds=6
+objects_with_3d_mask_clouds=12
 objects_with_meshes=6
+svpp_instances=12
+simulator_bundle_objects=12
+simulator_missing_meshes=[]
 required_failed=[]
 recommended_failed=[]
 ```
@@ -426,6 +517,8 @@ exports/milscene2_real_demo/simulator_assets/evaluation_report.json
 exports/milscene2_real_demo/simulator_assets/viewer_plys/scene_3dgs_supersplat.ply
 exports/milscene2_real_demo/simulator_assets/viewer_plys/semantic_3dgs_supersplat.ply
 exports/milscene2_real_demo/simulator_assets/simulator_asset_bundle.json
+exports/milscene2_real_demo/simulator_assets/simulator_asset_qa.json
+exports/milscene2_real_demo/simulator_assets/background_structures/background_structures.json
 exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo/metadata.json
 image-blaster/worlds/milscene2-real-demo
 ```
@@ -505,6 +598,14 @@ python -m video2mesh.cli evaluate \
   --output exports/milscene2_real_demo/simulator_assets/evaluation_report.json
 ```
 
+仿真资产 QA：
+
+```bash
+python -m video2mesh.cli qa-simulator-assets \
+  --project-root exports/milscene2_real_demo \
+  --max-issues 20
+```
+
 Review HTML：
 
 ```bash
@@ -532,6 +633,7 @@ Review HTML 中会包含：
 - 3D mask fusion 依赖 MASt3R-SLAM 位姿和点云质量，遮挡、反光、透明物体会明显影响结果。
 - 当前 mesh 是从 3D mask cloud 粗重建，适合接口验证，不适合最终仿真质量。
 - 缺少真实尺度标定、物理属性估计、稳定碰撞体质量检查。
+- 背景结构目前只是点云边界启发式 floor/ceiling/wall mask，不会识别门、窗、柜体、桌面等语义结构，也不是可靠 layout reconstruction。
 
 建议下一步：
 
@@ -541,6 +643,7 @@ Review HTML 中会包含：
 4. 用多视角物体重建替换当前粗 mask-cloud mesh。
 5. 给仿真资产增加尺度标定、质量、摩擦、碰撞体简化和坐标系 QA。
 6. 将 SVPP-style export 接到 SceneVerse++ 的 SpatialLM / PQ3D 数据生成脚本中做进一步训练或评估。
+7. 用 layout / semantic scene parsing 替换当前背景结构启发式，覆盖地面、墙、天花板、门窗、固定柜体等不可移动或半固定结构。
 
 ## 10. 快速入口
 
@@ -570,4 +673,5 @@ exports/milscene2_real_demo/simulator_assets/viewer_plys/semantic_3dgs_point_clo
 exports/milscene2_real_demo/simulator_assets/adapters/mujoco/scene.xml
 exports/milscene2_real_demo/simulator_assets/adapters/isaac/isaac_adapter.json
 exports/milscene2_real_demo/simulator_assets/adapters/unity/unity_adapter.json
+exports/milscene2_real_demo/simulator_assets/simulator_asset_qa.json
 ```

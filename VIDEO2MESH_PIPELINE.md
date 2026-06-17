@@ -703,6 +703,16 @@ masks/2d/tracking_manifest.json
 masks/object_labels.json
 ```
 
+如果 object label 来自外部开放词汇检测器或 VLM，可以把结果导入到统一标签文件和 object record：
+
+```bash
+python -m video2mesh.cli import-object-labels \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --labels /path/to/object_labels.json
+```
+
+`object_labels.json` 可以是 `{object_id: label}` 的 map，也可以是 `{"objects": [...]}` 或 list。每条 label 支持 `name`、`category`、`description`、`aliases`、`open_vocab_labels`、`confidence`、`source`、`vlm` 等字段。这个接口的目标是把当前颜色/编号式自动命名替换成 VLM 可解释语义，同时保持后续 `fuse-masks`、SVPP export 和 simulator bundle 的文件协议不变。
+
 后续可以把 `track-masks` 内部替换为 SAM2/DEVA/XMem 的视频级 mask propagation，但保持上述输出协议不变。
 
 ### Phase C：2D mask 融合成 3D object mask
@@ -756,6 +766,35 @@ simulator_assets/object_masks_3d/<object_id>.ply
 simulator_assets/object_masks_3d/object_mask_clouds.json
 objects/<object_id>/object.json  # 写入 mask_3d_cloud
 ```
+
+背景结构可以作为另一类 semantic record 加入同一套 3D mask 协议。当前可运行 baseline 会从点云边界启发式推断 floor / ceiling / walls：
+
+```bash
+python -m video2mesh.cli infer-background-structure-masks \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --point-cloud /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/reconstruction/point_cloud_10k.ply \
+  --up-axis y \
+  --quantile 0.03 \
+  --min-points 50
+```
+
+输出：
+
+```text
+objects/floor/object.json
+objects/ceiling/object.json
+objects/wall_x_min/object.json
+objects/wall_x_max/object.json
+objects/wall_z_min/object.json
+objects/wall_z_max/object.json
+masks/3d/<structure_id>/point_indices.npy
+masks/3d/<structure_id>/point_indices.json
+simulator_assets/background_structures/background_structures.json
+```
+
+这些 object record 的 `asset_role` 是 `background_structure`。它们不是 PLY 里 `object_id=0` 的 unlabeled background，而是有正常 semantic id 的场景结构实例，会进入 semantic splats、object mask clouds、SVPP metadata 和 simulator bundle。与此同时，它们会跳过 `select-frames`、`prepare-object-images`、`reconstruct-object-meshes`、`export-image-blaster` 和 `prepare-multiview-mesh-jobs`，因为 floor/wall/ceiling 不是要送进单物体 mesh API 的可搬动物体。
+
+当前 `infer-background-structure-masks` 只是 axis-boundary heuristic，适合验证协议；真正系统应换成 layout segmentation、SpatialLM/PQ3D、open-vocabulary 3D segmentation 或从 3DGS/mesh 中提取稳定建筑结构。
 
 如果想把 object mask 写入 splat/点云 PLY，运行：
 
@@ -850,6 +889,8 @@ objects/<object_id>/object.json
 simulator_assets/selected_frames.json
 ```
 
+`select-frames` 只处理 `asset_role=object` 的前景物体。`asset_role=background_structure` 的 floor/wall/ceiling 会保留 3D mask 和 semantic id，但不会要求 selected frames。
+
 为了让单物体 mesh 生成更干净，建议再把 selected frames 按 2D mask 裁剪成单物体参考图：
 
 ```bash
@@ -915,6 +956,36 @@ image-blaster/worlds/<scene_id>/output/<object_id>/.<N>-<object_id>__model-reque
 ```
 
 其中隐藏的 `__model-request.json` 保存 provider、request id、输出文件等元数据。
+
+如果不想绑定 image-blaster/FAL，也可以只把每个前景物体的 selected frames、object crops、3D mask bbox 和预期输出位置整理成外部 mesh job：
+
+```bash
+python -m video2mesh.cli prepare-multiview-mesh-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --max-frames 3 \
+  --command-template "python reconstruct_object.py --job {job_path} --output {mesh_output}" \
+  --skip-missing
+```
+
+输出：
+
+```text
+simulator_assets/multiview_mesh_jobs/multiview_mesh_jobs.json
+simulator_assets/multiview_mesh_jobs/jobs/<object_id>.json
+simulator_assets/multiview_mesh_jobs/run_mesh_jobs.sh
+simulator_assets/multiview_mesh_jobs/meshes/<object_id>.<mesh_format>
+```
+
+`--command-template` 支持 `{job_path}`、`{object_id}`、`{output_dir}`、`{mesh_output}`、`{primary_frame}`、`{primary_crop}`、`{image_paths}`、`{crop_paths}`、`{project_root}`。默认只写 job 和脚本，不会执行外部模型；传 `--run` 才会真正调用命令。外部 mesh 生成结束后，可以用：
+
+```bash
+python -m video2mesh.cli import-object-meshes \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --mesh-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/simulator_assets/multiview_mesh_jobs/meshes \
+  --skip-missing
+```
+
+把 mesh 回流到 `simulator_assets/object_meshes.json`。该路线会跳过 `background_structure`，只为可作为独立资产的前景物体准备 mesh job。
 
 ### Phase F：导入 object mesh 并导出仿真器资产包
 
@@ -1005,6 +1076,32 @@ simulator_assets/objects/<object_id>/<mesh_stem>_local.<ext>  # 对 scene-coordi
 
 注意：当前 pose/scale 来自重建坐标和 3D mask bbox，是工程初值；真实仿真还需要校准尺度、上方向、坐标系、碰撞体和物理参数。若 mesh 已在 `export-simulator-assets` 阶段被 localize，bundle 中该物体的 `pose.scale` 会写成 `[1, 1, 1]`，避免把 `scene_scale` 重复乘到已经 bake 过尺度的 mesh 上。
 
+导出后建议跑一次 simulator-readiness QA：
+
+```bash
+python -m video2mesh.cli qa-simulator-assets \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --max-issues 20
+```
+
+输出：
+
+```text
+simulator_assets/simulator_asset_qa.json
+```
+
+QA 会检查 mesh 是否存在且可读、vertex/triangle 数是否太少、mesh 是否 watertight/manifold、mesh bbox 与 3D mask bbox 的 center/size 是否大致对齐、是否缺少 scale calibration、up axis、mass、collider、body_type。背景结构允许没有 object mesh，并以 static scene structure / box collider 的占位方式进入 simulator bundle。
+
+CI 或批处理可以把更严格的要求打开：
+
+```bash
+python -m video2mesh.cli qa-simulator-assets \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --require-physics \
+  --require-scale-calibration \
+  --fail-on-required
+```
+
 如果要生成目标仿真器的导入骨架，可以继续导出 adapter：
 
 ```bash
@@ -1042,10 +1139,14 @@ python -m video2mesh.cli validate \
 - objects 和 object-level 3D masks。
 - per-object 3D mask PLY clouds。
 - semantic splats PLY / manifest。
+- object semantic labels（recommended）。
+- background structures（recommended）。
 - selected frames 和 masked object reference images。
 - image-blaster world、object meshes。
+- SVPP-style scene export（recommended）。
 - simulator asset bundle。
 - simulator adapters（recommended）。
+- simulator asset QA（recommended）。
 
 `validate` 只证明工程产物是否齐全；真实质量还要继续评估重建清晰度、mask 一致性、mesh 几何质量、尺度/pose 和仿真器导入效果。
 
@@ -1070,7 +1171,10 @@ simulator_assets/evaluation_report.json
 - 2D mask 数量、3D mask fusion 配置和 skipped mask 数量。
 - semantic splats 的 label transfer 信息，以及 `render-semantic-preview` 生成的彩色语义 PLY、object-level 3D mask 投影 summary 和输出目录。
 - 每个物体的 point count、bbox、selected frame 数、object crop 数、mask cloud 是否存在、mesh 是否存在、simulator mesh 是否存在、simulator mesh coordinate frame 和 mesh QA/localization 摘要。
-- simulator asset bundle 是否存在、mesh 缺失列表、validation 缺口。
+- semantic labeling 的标签文件数量和非 `unknown` 类别数量。
+- mesh generation 的 object mesh index、缺失列表和 `prepare-multiview-mesh-jobs` 的 job 数量。
+- SceneVerse++ / SVPP 导出目录和 `metadata.json` instance 数量。
+- simulator asset bundle 是否存在、mesh 缺失列表、simulator QA summary、validation 缺口。
 
 这个命令默认即使发现问题也返回成功，适合批量生成报告；如果要在 CI/脚本里把缺口当失败，可以加：
 
@@ -1135,6 +1239,14 @@ simulator_assets/svpp/<scene_id>/
 ```
 
 其中 `metadata.json` 每个实例包含 `point_ids`、`pred_class_name`、`pred_class_id`、bbox、selected frames、mask cloud 和 mesh metadata。`SpatialLM/data_generation/svpp/generate_layout.py` 主要读取 `point_ids + pred_class_name` 来生成 3D boxes；`PQ3D/data_process/generate_dataset.py` 主要读取 `point_ids + pred_class_id` 来生成 point-level instance labels。
+
+SVPP 导出有几条一致性约束需要特别注意：
+
+- `mesh.ply` 当前通常复制的是 Video2Mesh 的 scene point cloud，而不是封闭三角 mesh；`metadata.json[*].point_ids` 必须索引到这个 `mesh.ply` 的 vertex 顺序。
+- `object_id` 是 Video2Mesh 内部跨文件 join key，会连接 `objects/<id>/object.json`、semantic PLY manifest、simulator bundle、SVPP metadata 和 image-blaster world。
+- semantic PLY / SuperSplat 中的 `semantic_id` 是实例标签，用于区分 object/structure；SVPP 里的 `pred_class_id` 是类别 id，例如 ScanNet20 的 wall/floor/chair，不是实例 id。
+- `object_id=0` 或 semantic label `0` 表示 unlabeled background；`floor`、`ceiling`、`wall_*` 这类 `background_structure` 是有独立 `object_id` 和 semantic id 的结构实例。
+- 如果要让 SVPP metadata 使用 VLM/open-vocabulary 的新类别，或包含 floor/wall/ceiling 背景结构，应先运行 `import-object-labels` / `infer-background-structure-masks`，再运行 `export-svpp-metadata`。
 
 如果 Video2Mesh 的类别不是 SceneVerse++/ScanNet20 类别，例如 `box`，可以显式映射：
 
