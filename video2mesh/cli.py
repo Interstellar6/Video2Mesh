@@ -8033,6 +8033,321 @@ def cmd_export_svpp_metadata(args: argparse.Namespace) -> int:
     return 0
 
 
+SPATIALLM_LAYOUT_CLASS_LABELS = {
+    "cabinet",
+    "bed",
+    "chair",
+    "sofa",
+    "table",
+    "bookshelf",
+    "picture",
+    "counter",
+    "desk",
+    "curtain",
+    "refrigerator",
+    "shower curtain",
+    "toilet",
+    "sink",
+    "bathtub",
+}
+
+
+def write_spatiallm_minimal_label_map(path: Path) -> None:
+    nyu40_ids = {
+        "cabinet": 3,
+        "bed": 4,
+        "chair": 5,
+        "sofa": 6,
+        "table": 7,
+        "bookshelf": 10,
+        "picture": 11,
+        "counter": 12,
+        "desk": 14,
+        "curtain": 16,
+        "refrigerator": 24,
+        "shower curtain": 28,
+        "toilet": 33,
+        "sink": 34,
+        "bathtub": 36,
+    }
+    lines = ["raw_category\tnyu40id"]
+    for label, nyu40id in sorted(nyu40_ids.items()):
+        lines.append(f"{label}\t{nyu40id}")
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_spatiallm_code_template(path: Path) -> None:
+    template = (
+        "Use one Bbox call per detected object. "
+        "Format: Bbox(class_name, center_x, center_y, center_z, angle_z, size_x, size_y, size_z)."
+    )
+    ensure_dir(path.parent)
+    path.write_text(template + "\n", encoding="utf-8")
+
+
+def write_pq3d_svpp_config(
+    path: Path,
+    svpp_data_root: Path,
+    save_root: Path,
+    segmentator_bin: Path,
+    workers: int,
+    process_number: int,
+    segmentator_s: float,
+    segmentator_k: int,
+    resplit_aug: bool,
+) -> None:
+    def ystr(value: Any) -> str:
+        return json.dumps(str(value))
+
+    lines = [
+        f"save_root: {ystr(save_root)}",
+        "aux_dir: aux",
+        "base_dir: base",
+        f"segmentator_bin: {ystr(segmentator_bin)}",
+        "process_dataset: [svpp]",
+        f"workers: {int(workers)}",
+        "datasets:",
+        "  svpp:",
+        f"    data_root: {ystr(svpp_data_root)}",
+        f"    process_number: {int(process_number)}",
+        f"    segmentator_s: {float(segmentator_s)}",
+        f"    segmentator_k: {int(segmentator_k)}",
+        f"    resplit_aug: {'true' if resplit_aug else 'false'}",
+    ]
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def sceneversepp_job_commands(
+    sceneversepp_root: Path,
+    svpp_data_root: Path,
+    spatiallm_save_path: Path,
+    spatiallm_dataset_name: str,
+    spatiallm_label_map: Path,
+    spatiallm_code_template: Path,
+    spatiallm_voxel_size: float,
+    spatiallm_workers: int,
+    spatiallm_process_number: int,
+    pq3d_config: Path,
+) -> dict[str, str]:
+    spatiallm_root = sceneversepp_root / "SpatialLM"
+    pq3d_root = sceneversepp_root / "PQ3D"
+    return {
+        "spatiallm_generate_layout": (
+            f"cd {shell_quote(str(spatiallm_root))} && "
+            f"python data_generation/svpp/generate_layout.py "
+            f"--data_root {shell_quote(str(svpp_data_root))} "
+            f"--save_path {shell_quote(str(spatiallm_save_path))} "
+            f"--voxel_size {float(spatiallm_voxel_size)} "
+            f"--workers {int(spatiallm_workers)} "
+            f"--process_number {int(spatiallm_process_number)} "
+            f"--label-map {shell_quote(str(spatiallm_label_map))}"
+        ),
+        "spatiallm_generate_dataset": (
+            f"cd {shell_quote(str(spatiallm_root))} && "
+            f"python data_generation/svpp/generate_dataset.py "
+            f"--dataset_dir {shell_quote(str(spatiallm_save_path))} "
+            f"--dataset_name {shell_quote(spatiallm_dataset_name)} "
+            f"--code_template_file {shell_quote(str(spatiallm_code_template))}"
+        ),
+        "pq3d_generate_dataset": (
+            f"cd {shell_quote(str(pq3d_root))} && "
+            f"python data_process/generate_dataset.py --config {shell_quote(str(pq3d_config))}"
+        ),
+    }
+
+
+def write_sceneversepp_scripts(
+    output_dir: Path,
+    sceneversepp_root: Path,
+    commands: dict[str, str],
+    spatiallm_label_map: Path,
+    spatiallm_code_template: Path,
+    pq3d_segmentator: Path,
+) -> dict[str, str]:
+    scripts = {
+        "run_spatiallm_data_generation": output_dir / "run_spatiallm_data_generation.sh",
+        "run_pq3d_data_generation": output_dir / "run_pq3d_data_generation.sh",
+        "run_sceneversepp_data_jobs": output_dir / "run_sceneversepp_data_jobs.sh",
+    }
+    spatiallm_lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"test -f {shell_quote(str(sceneversepp_root / 'SpatialLM' / 'data_generation' / 'svpp' / 'generate_layout.py'))}",
+        f"test -f {shell_quote(str(sceneversepp_root / 'SpatialLM' / 'data_generation' / 'svpp' / 'generate_dataset.py'))}",
+        f"test -f {shell_quote(str(spatiallm_label_map))}",
+        f"test -f {shell_quote(str(spatiallm_code_template))}",
+        commands["spatiallm_generate_layout"],
+        commands["spatiallm_generate_dataset"],
+        "",
+    ]
+    pq3d_lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"test -f {shell_quote(str(sceneversepp_root / 'PQ3D' / 'data_process' / 'generate_dataset.py'))}",
+        f"test -x {shell_quote(str(pq3d_segmentator))} || echo 'warning: PQ3D segmentator is missing or not executable; generate_dataset.py may fail if segments are not cached.'",
+        commands["pq3d_generate_dataset"],
+        "",
+    ]
+    combined_lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"{shell_quote(str(scripts['run_spatiallm_data_generation']))}",
+        f"{shell_quote(str(scripts['run_pq3d_data_generation']))}",
+        "",
+    ]
+    scripts["run_spatiallm_data_generation"].write_text("\n".join(spatiallm_lines), encoding="utf-8")
+    scripts["run_pq3d_data_generation"].write_text("\n".join(pq3d_lines), encoding="utf-8")
+    scripts["run_sceneversepp_data_jobs"].write_text("\n".join(combined_lines), encoding="utf-8")
+    for path in scripts.values():
+        path.chmod(0o755)
+    return {key: str(value) for key, value in scripts.items()}
+
+
+def cmd_prepare_sceneversepp_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    scene_id = slugify(args.scene_id or manifest.get("scene_id") or project_root.name, fallback="scene")
+    sceneversepp_root = (args.sceneversepp_root or Path("SceneVersepp")).resolve()
+    output_dir = ensure_dir(args.output_dir.resolve() if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "sceneversepp_jobs").resolve())
+    svpp_data_root = ensure_dir(args.svpp_data_root.resolve() if args.svpp_data_root else (output_dir / "svpp_data").resolve())
+    svpp_scene_dir = svpp_data_root / scene_id
+
+    export_args = argparse.Namespace(
+        project_root=project_root,
+        output_dir=svpp_scene_dir,
+        scene_id=scene_id,
+        mode=args.mode,
+        min_points=args.min_points,
+        skip_small=args.skip_small,
+        skip_missing=args.skip_missing,
+        category_map=args.category_map,
+        default_category=args.default_category,
+    )
+    cmd_export_svpp_metadata(export_args)
+    manifest = load_manifest(project_root)
+
+    spatiallm_save_path = args.spatiallm_save_path.resolve() if args.spatiallm_save_path else (output_dir / "spatiallm_data").resolve()
+    spatiallm_label_map = args.spatiallm_label_map.resolve() if args.spatiallm_label_map else (output_dir / "spatiallm_scannetv2_labels_minimal.tsv").resolve()
+    spatiallm_code_template = args.spatiallm_code_template.resolve() if args.spatiallm_code_template else (output_dir / "spatiallm_code_template.txt").resolve()
+    if args.write_minimal_spatiallm_files:
+        if not spatiallm_label_map.exists():
+            write_spatiallm_minimal_label_map(spatiallm_label_map)
+        if not spatiallm_code_template.exists():
+            write_spatiallm_code_template(spatiallm_code_template)
+
+    pq3d_save_root = args.pq3d_save_root.resolve() if args.pq3d_save_root else (output_dir / "pq3d_training_datas").resolve()
+    pq3d_config = output_dir / "pq3d_svpp_config.yaml"
+    pq3d_segmentator = args.pq3d_segmentator.resolve() if args.pq3d_segmentator else sceneversepp_root / "PQ3D" / "data_process" / "segmentator"
+    write_pq3d_svpp_config(
+        pq3d_config,
+        svpp_data_root,
+        pq3d_save_root,
+        pq3d_segmentator,
+        args.pq3d_workers,
+        args.pq3d_process_number,
+        args.pq3d_segmentator_s,
+        args.pq3d_segmentator_k,
+        args.pq3d_resplit_aug,
+    )
+
+    commands = sceneversepp_job_commands(
+        sceneversepp_root,
+        svpp_data_root,
+        spatiallm_save_path,
+        args.spatiallm_dataset_name,
+        spatiallm_label_map,
+        spatiallm_code_template,
+        args.spatiallm_voxel_size,
+        args.spatiallm_workers,
+        args.spatiallm_process_number,
+        pq3d_config,
+    )
+    scripts = write_sceneversepp_scripts(
+        output_dir,
+        sceneversepp_root,
+        commands,
+        spatiallm_label_map,
+        spatiallm_code_template,
+        pq3d_segmentator,
+    )
+
+    svpp_export = read_json(svpp_scene_dir / "video2mesh_svpp_export.json")
+    instances = svpp_export.get("instances", []) if isinstance(svpp_export, dict) else []
+    spatiallm_supported = []
+    spatiallm_skipped = []
+    for item in instances:
+        category = str(item.get("category", "")).strip().lower()
+        target = spatiallm_supported if category in SPATIALLM_LAYOUT_CLASS_LABELS else spatiallm_skipped
+        target.append(
+            {
+                "object_id": item.get("object_id"),
+                "category": category,
+                "point_count": item.get("point_count"),
+                "reason": None if target is spatiallm_supported else "SpatialLM SVPP generate_layout.py filters to object classes and skips this category.",
+            }
+        )
+
+    dependency_status = {
+        "sceneversepp_root_exists": sceneversepp_root.exists(),
+        "spatiallm_generate_layout_exists": (sceneversepp_root / "SpatialLM" / "data_generation" / "svpp" / "generate_layout.py").exists(),
+        "spatiallm_generate_dataset_exists": (sceneversepp_root / "SpatialLM" / "data_generation" / "svpp" / "generate_dataset.py").exists(),
+        "spatiallm_label_map_exists": spatiallm_label_map.exists(),
+        "spatiallm_code_template_exists": spatiallm_code_template.exists(),
+        "pq3d_generate_dataset_exists": (sceneversepp_root / "PQ3D" / "data_process" / "generate_dataset.py").exists(),
+        "pq3d_segmentator_exists": pq3d_segmentator.exists(),
+        "pq3d_segmentator_executable": os.access(pq3d_segmentator, os.X_OK),
+    }
+    job = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "sceneversepp_data_generation",
+        "project_root": str(project_root),
+        "scene_id": scene_id,
+        "sceneversepp_root": str(sceneversepp_root),
+        "svpp_data_root": str(svpp_data_root),
+        "svpp_scene_dir": str(svpp_scene_dir),
+        "svpp_export": str(svpp_scene_dir / "video2mesh_svpp_export.json"),
+        "spatiallm": {
+            "save_path": str(spatiallm_save_path),
+            "dataset_name": args.spatiallm_dataset_name,
+            "label_map": str(spatiallm_label_map),
+            "code_template": str(spatiallm_code_template),
+            "supported_instances": spatiallm_supported,
+            "skipped_instances": spatiallm_skipped,
+            "notes": "SceneVerse++ SpatialLM SVPP layout generation only keeps its object-class allowlist; wall/floor/ceiling structures may be skipped by that upstream script.",
+        },
+        "pq3d": {
+            "config": str(pq3d_config),
+            "save_root": str(pq3d_save_root),
+            "segmentator": str(pq3d_segmentator),
+            "notes": "PQ3D data generation may run the segmentator binary and can be CPU/memory intensive on large scenes; this command prepares the config and script only.",
+        },
+        "commands": commands,
+        "scripts": scripts,
+        "dependency_status": dependency_status,
+        "notes": "Prepared SceneVerse++/SpatialLM/PQ3D data-generation jobs from Video2Mesh SVPP-style export. No training or heavy processing is executed by this command.",
+    }
+    job_path = output_dir / "sceneversepp_jobs.json"
+    write_json(job_path, job)
+
+    manifest.setdefault("artifacts", {})["sceneversepp_jobs"] = str(job_path)
+    manifest.setdefault("external_stages", {})["sceneversepp_data_generation"] = {
+        "status": "sceneversepp_jobs_prepared",
+        "notes": "Prepared SVPP export plus SpatialLM/PQ3D data-generation scripts; not executed.",
+        "job": str(job_path),
+        "svpp_data_root": str(svpp_data_root),
+        "sceneversepp_root": str(sceneversepp_root),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared SceneVerse++ jobs: {job_path}")
+    print(f"SVPP scene: {svpp_scene_dir}")
+    print(f"SpatialLM script: {scripts['run_spatiallm_data_generation']}")
+    print(f"PQ3D script: {scripts['run_pq3d_data_generation']}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -10413,6 +10728,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--category-map", type=Path, help="Optional JSON map from Video2Mesh categories to SceneVerse++/ScanNet20 labels.")
     p.add_argument("--default-category", help="Optional fallback category for labels outside SceneVerse++/ScanNet20.")
     p.set_defaults(func=cmd_export_svpp_metadata)
+
+    p = sub.add_parser("prepare-sceneversepp-jobs", help="Prepare SceneVerse++ SpatialLM/PQ3D data-generation jobs from SVPP metadata.")
+    add_common_project_arg(p)
+    p.add_argument("--sceneversepp-root", type=Path, default=Path("SceneVersepp"), help="Path to the cloned SceneVersepp repository.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/sceneversepp_jobs.")
+    p.add_argument("--svpp-data-root", type=Path, help="Root containing SVPP scene folders. Defaults to <output-dir>/svpp_data.")
+    p.add_argument("--scene-id", help="SVPP scene folder name. Defaults to manifest scene_id.")
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy", help="How to place mesh.ply/camera_info.json in the SVPP export folder.")
+    p.add_argument("--min-points", type=int, default=1, help="Minimum point_ids count to include an instance in SVPP metadata.")
+    p.add_argument("--skip-small", action="store_true", help="Skip instances smaller than --min-points instead of exporting them.")
+    p.add_argument("--skip-missing", action="store_true", help="Skip objects without 3D point index masks.")
+    p.add_argument("--category-map", type=Path, help="Optional JSON map from Video2Mesh categories to SceneVerse++/ScanNet20 labels.")
+    p.add_argument("--default-category", help="Optional fallback category for labels outside SceneVerse++/ScanNet20.")
+    p.add_argument("--spatiallm-save-path", type=Path, help="Defaults to <output-dir>/spatiallm_data.")
+    p.add_argument("--spatiallm-dataset-name", default="video2mesh_svpp")
+    p.add_argument("--spatiallm-label-map", type=Path, help="TSV label map for SpatialLM generate_layout.py.")
+    p.add_argument("--spatiallm-code-template", type=Path, help="Code template for SpatialLM generate_dataset.py.")
+    p.add_argument("--write-minimal-spatiallm-files", action=argparse.BooleanOptionalAction, default=True, help="Write minimal label-map/template files when missing.")
+    p.add_argument("--spatiallm-voxel-size", type=float, default=0.02)
+    p.add_argument("--spatiallm-workers", type=int, default=1)
+    p.add_argument("--spatiallm-process-number", type=int, default=-1)
+    p.add_argument("--pq3d-save-root", type=Path, help="Defaults to <output-dir>/pq3d_training_datas.")
+    p.add_argument("--pq3d-segmentator", type=Path, help="Defaults to SceneVersepp/PQ3D/data_process/segmentator.")
+    p.add_argument("--pq3d-workers", type=int, default=1)
+    p.add_argument("--pq3d-process-number", type=int, default=-1)
+    p.add_argument("--pq3d-segmentator-s", type=float, default=0.1)
+    p.add_argument("--pq3d-segmentator-k", type=int, default=100)
+    p.add_argument("--pq3d-resplit-aug", action=argparse.BooleanOptionalAction, default=True)
+    p.set_defaults(func=cmd_prepare_sceneversepp_jobs)
 
     p = sub.add_parser("run-local", help="Run fuse-masks, select-frames, and export-image-blaster.")
     add_common_project_arg(p)

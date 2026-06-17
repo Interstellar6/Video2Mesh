@@ -96,6 +96,34 @@ exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo/
 
 SVPP 导出时要靠 `object_id` 对齐 Video2Mesh 的 object record、semantic PLY、simulator bundle 和 SceneVerse++ metadata。`semantic_id` 是实例标签，`pred_class_id` 是类别标签，二者不能混用；`floor`、`ceiling`、`wall_*` 这类背景结构也会作为带独立 semantic id 的结构实例进入 metadata。
 
+如果要继续接 SceneVerse++ 的 SpatialLM / PQ3D 数据生成脚本，不需要手工拼路径；可以直接生成 job、脚本和 PQ3D config：
+
+```bash
+python -m video2mesh.cli prepare-sceneversepp-jobs \
+  --project-root exports/milscene2_real_demo \
+  --sceneversepp-root SceneVersepp \
+  --scene-id milscene2-sceneversepp \
+  --default-category chair \
+  --skip-missing \
+  --min-points 1
+```
+
+输出：
+
+```text
+simulator_assets/sceneversepp_jobs/
+  sceneversepp_jobs.json
+  run_spatiallm_data_generation.sh
+  run_pq3d_data_generation.sh
+  run_sceneversepp_data_jobs.sh
+  pq3d_svpp_config.yaml
+  spatiallm_scannetv2_labels_minimal.tsv
+  spatiallm_code_template.txt
+  svpp_data/<scene_id>/{mesh.ply,metadata.json,camera_info.json,data_info.json}
+```
+
+这个命令只准备数据和脚本，不跑 SpatialLM/PQ3D 训练，也不强行执行可能吃内存的 segmentator。`sceneversepp_jobs.json` 会记录 SpatialLM/PQ3D 命令、依赖检查和哪些实例会被 SpatialLM 的 SVPP allowlist 过滤。
+
 反向对接也已经有工程接口：可以把当前点云、相机、帧、semantic splats、SVPP export 打包成外部 scene structure job，交给 SpatialLM / PQ3D / open-vocabulary 3D segmentation 一类工具产生地面、墙面、门窗、固定柜体等结构 mask，然后再导回 Video2Mesh：
 
 ```bash
@@ -803,7 +831,7 @@ Review HTML 中会包含：
 3. 引入开放词汇检测或 VLM，为每个 object_id 自动生成类别和描述。
 4. 用多视角物体重建替换当前粗 mask-cloud mesh。
 5. 给仿真资产增加尺度标定、质量、摩擦、碰撞体简化和坐标系 QA。
-6. 将 SVPP-style export 接到 SceneVerse++ 的 SpatialLM / PQ3D 数据生成脚本中做进一步训练或评估。
+6. 执行并评估 `prepare-sceneversepp-jobs` 生成的 SpatialLM / PQ3D 数据生成脚本，确认哪些类别、背景结构和点云规模适合进一步训练或评估。
 7. 用 layout / semantic scene parsing 替换当前背景结构启发式，覆盖地面、墙、天花板、门窗、固定柜体等不可移动或半固定结构。
 
 ## 10. 快速入口

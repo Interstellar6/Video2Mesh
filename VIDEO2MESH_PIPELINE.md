@@ -1346,6 +1346,7 @@ python -m video2mesh.cli validate \
 - selected frames 和 masked object reference images。
 - image-blaster world、object meshes。
 - SVPP-style scene export（recommended）。
+- SceneVerse++ data-generation jobs（recommended）。
 - simulator asset bundle。
 - simulator adapters（recommended）。
 - simulator asset QA（recommended）。
@@ -1359,6 +1360,7 @@ python -m video2mesh.cli validate \
 - 每个结构 object 是否有 `mask_3d.point_indices_json/npy` 和可预览的 `mask_3d_cloud`。
 - SVPP export 的 `metadata.json[*].point_ids` 是否索引同一份 `mesh.ply` vertex 顺序。
 - `pred_class_name/id` 是否是 wall/floor/ceiling/cabinet 等类别 id，而不是 semantic PLY 中的实例 id。
+- `sceneversepp_jobs.json` 是否存在，并且 SpatialLM / PQ3D 脚本中的路径都指向当前 SVPP export。
 
 如果希望看到更细的阶段 readiness 和物体级质量摘要，运行：
 
@@ -1449,6 +1451,46 @@ simulator_assets/svpp/<scene_id>/
 ```
 
 其中 `metadata.json` 每个实例包含 `point_ids`、`pred_class_name`、`pred_class_id`、bbox、selected frames、mask cloud 和 mesh metadata。`SpatialLM/data_generation/svpp/generate_layout.py` 主要读取 `point_ids + pred_class_name` 来生成 3D boxes；`PQ3D/data_process/generate_dataset.py` 主要读取 `point_ids + pred_class_id` 来生成 point-level instance labels。
+
+如果要把当前项目继续接到 SceneVerse++ 的数据生成入口，使用：
+
+```bash
+python -m video2mesh.cli prepare-sceneversepp-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --sceneversepp-root /root/autodl-tmp/workspace/Video2Mesh/SceneVersepp \
+  --scene-id <scene_id>-sceneversepp \
+  --default-category chair \
+  --skip-missing \
+  --min-points 1
+```
+
+输出：
+
+```text
+simulator_assets/sceneversepp_jobs/
+  sceneversepp_jobs.json
+  run_spatiallm_data_generation.sh
+  run_pq3d_data_generation.sh
+  run_sceneversepp_data_jobs.sh
+  pq3d_svpp_config.yaml
+  spatiallm_scannetv2_labels_minimal.tsv
+  spatiallm_code_template.txt
+  svpp_data/<scene_id>/
+    mesh.ply
+    camera_info.json
+    data_info.json
+    metadata.json
+    video2mesh_svpp_export.json
+```
+
+`prepare-sceneversepp-jobs` 会先调用 `export-svpp-metadata`，再生成：
+
+- SpatialLM `data_generation/svpp/generate_layout.py` 命令。
+- SpatialLM `data_generation/svpp/generate_dataset.py` 命令。
+- PQ3D `data_process/generate_dataset.py --config <pq3d_svpp_config.yaml>` 命令。
+- 一个最小 SpatialLM label-map/template，便于在没有官方 `scannetv2-labels.combined.tsv` 和 `code_template.txt` 时先验证数据协议。
+
+这个命令不会跑训练，也不会自动执行 PQ3D segmentator；它只是把“Video2Mesh 结果 -> SceneVerse++/SpatialLM/PQ3D 数据生成入口”的工程路径固化下来。执行脚本前要确认 SceneVersepp 环境、Open3D、PyTorch、PQ3D segmentator、SpatialLM 依赖已经安装。SpatialLM 当前 SVPP layout 生成脚本有 object-class allowlist，wall/floor/ceiling 等背景结构可能被上游脚本过滤；PQ3D metadata 则会保留 `pred_class_id != -1` 的 point-level instance labels。
 
 SVPP 导出有几条一致性约束需要特别注意：
 
