@@ -2597,6 +2597,428 @@ def cmd_import_video_segmentation_masks(args: argparse.Namespace) -> int:
     return 0
 
 
+def open_vocab_default_queries() -> list[str]:
+    return [
+        "chair",
+        "table",
+        "sofa",
+        "cabinet",
+        "shelf",
+        "box",
+        "monitor",
+        "keyboard",
+        "book",
+        "cup",
+        "bottle",
+        "plant",
+        "door",
+        "window",
+        "wall",
+        "floor",
+        "ceiling",
+        "counter",
+    ]
+
+
+def parse_query_list(value: str | None) -> list[str]:
+    if not value:
+        return open_vocab_default_queries()
+    path = Path(value)
+    if path.exists():
+        data = read_json(path) if path.suffix.lower() == ".json" else path.read_text(encoding="utf-8").splitlines()
+        if isinstance(data, dict):
+            raw = data.get("queries") or data.get("labels") or data.get("categories") or []
+        else:
+            raw = data
+    else:
+        raw = value.split(",")
+    queries = []
+    for item in raw:
+        text = str(item).strip()
+        if text:
+            queries.append(text)
+    return queries or open_vocab_default_queries()
+
+
+def cmd_prepare_open_vocab_detection_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    frames_dir = args.frames_dir or (project_root / manifest["scene"]["frames_dir"])
+    frames_dir = frames_dir.resolve()
+    frames = list_frame_images(frames_dir)
+    if args.max_frames and args.max_frames > 0:
+        frames = frames[: args.max_frames]
+    queries = parse_query_list(args.queries)
+    output_dir = ensure_dir(args.output_dir or (project_root / manifest["simulator_assets_dir"] / "open_vocab_detection_jobs"))
+    detections_template = output_dir / "detections_template.json"
+    frame_records = [
+        {
+            "frame_id": frame_stem(frame.stem),
+            "image": str(frame),
+            "index": index,
+        }
+        for index, frame in enumerate(frames)
+    ]
+    job = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "provider": args.provider,
+        "frames_dir": str(frames_dir),
+        "frame_count": len(frame_records),
+        "frames": frame_records,
+        "queries": queries,
+        "expected_output": {
+            "manifest": str(detections_template),
+            "detections_schema": {
+                "frame_id": frame_records[0]["frame_id"] if frame_records else "000000",
+                "label": "chair",
+                "bbox": [0, 0, 100, 100],
+                "bbox_format": "xyxy",
+                "score": 0.0,
+                "description": "optional natural-language object description",
+            },
+        },
+        "notes": (
+            "Prepared for open-vocabulary object discovery tools such as GroundingDINO, OWL-ViT, YOLO-World, "
+            "or Grounded-SAM. Run the external detector, then import detections with import-open-vocab-detections "
+            "to create tracking prompts and object labels."
+        ),
+    }
+    job_path = output_dir / "open_vocab_detection_job.json"
+    write_json(job_path, job)
+    write_json(
+        detections_template,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider": args.provider,
+            "frames_dir": str(frames_dir),
+            "detections": [],
+            "notes": "Fill detections with frame_id/image, label/category, bbox, bbox_format, and score.",
+        },
+    )
+
+    command = None
+    if args.command_template:
+        values = {
+            "job_path": str(job_path),
+            "project_root": str(project_root),
+            "frames_dir": str(frames_dir),
+            "queries": ",".join(queries),
+            "output_manifest": str(detections_template),
+            "provider": args.provider,
+        }
+        command = args.command_template.format(**values)
+    script_path = output_dir / "run_open_vocab_detection.sh"
+    script_lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    if command:
+        script_lines.append(command)
+    else:
+        script_lines.append(f'echo "Fill in external {args.provider} open-vocabulary detector command for job: {job_path}"')
+    script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+
+    manifest.setdefault("artifacts", {})["open_vocab_detection_job"] = str(job_path)
+    manifest.setdefault("artifacts", {})["open_vocab_detection_template"] = str(detections_template)
+    manifest.setdefault("external_stages", {})["open_vocab_object_discovery"] = {
+        "status": "open_vocab_detection_job_prepared",
+        "notes": "Prepared external open-vocabulary object discovery job; import detections before tracking/video segmentation.",
+        "provider": args.provider,
+        "job": str(job_path),
+        "script": str(script_path),
+        "frame_count": len(frame_records),
+        "query_count": len(queries),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared open-vocabulary detection job: {job_path}")
+    print(f"Frames: {len(frame_records)}; queries: {len(queries)}")
+    print(f"Template: {detections_template}")
+    return 0
+
+
+def detection_entries(data: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(data, dict) and isinstance(data.get("detections"), list):
+        for item in data["detections"]:
+            if isinstance(item, dict):
+                entries.append(dict(item))
+    elif isinstance(data, dict) and isinstance(data.get("frames"), list):
+        for frame in data["frames"]:
+            if not isinstance(frame, dict):
+                continue
+            frame_id = frame.get("frame_id") or frame.get("id") or frame.get("frame")
+            image = frame.get("image")
+            for item in frame.get("detections", []) if isinstance(frame.get("detections"), list) else []:
+                if isinstance(item, dict):
+                    det = dict(item)
+                    det.setdefault("frame_id", frame_id)
+                    det.setdefault("image", image)
+                    entries.append(det)
+    elif isinstance(data, list):
+        entries = [dict(item) for item in data if isinstance(item, dict)]
+    elif isinstance(data, dict):
+        for frame_id, value in data.items():
+            if frame_id in {"schema_version", "provider", "frames_dir", "queries", "notes"}:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        det = dict(item)
+                        det.setdefault("frame_id", frame_id)
+                        entries.append(det)
+            elif isinstance(value, dict):
+                detections = value.get("detections") if isinstance(value.get("detections"), list) else []
+                for item in detections:
+                    if isinstance(item, dict):
+                        det = dict(item)
+                        det.setdefault("frame_id", value.get("frame_id") or frame_id)
+                        det.setdefault("image", value.get("image"))
+                        entries.append(det)
+    else:
+        raise ValueError("Detection manifest must be a list, map, or object with detections/frames.")
+    return entries
+
+
+def bbox_from_detection(raw: dict[str, Any]) -> Any:
+    if raw.get("bbox") is not None:
+        return raw.get("bbox")
+    if raw.get("box") is not None:
+        return raw.get("box")
+    if all(key in raw for key in ("x0", "y0", "x1", "y1")):
+        return [raw["x0"], raw["y0"], raw["x1"], raw["y1"]]
+    if all(key in raw for key in ("x", "y", "w", "h")):
+        return [raw["x"], raw["y"], raw["w"], raw["h"]]
+    return None
+
+
+def frame_id_from_detection(raw: dict[str, Any], image_to_frame: dict[str, str], fallback: str) -> str:
+    value = raw.get("frame_id") or raw.get("frame") or raw.get("frame_index")
+    if value is not None:
+        if isinstance(value, int) or str(value).isdigit():
+            return frame_stem(value)
+        return frame_stem(str(value))
+    image_value = raw.get("image") or raw.get("image_path")
+    if image_value:
+        key = Path(str(image_value)).name
+        if key in image_to_frame:
+            return image_to_frame[key]
+        return frame_stem(Path(str(image_value)).stem)
+    return fallback
+
+
+def score_from_detection(raw: dict[str, Any]) -> float:
+    for key in ("score", "confidence", "prob", "logit"):
+        if raw.get(key) is not None:
+            return float(raw[key])
+    return 1.0
+
+
+def label_from_detection(raw: dict[str, Any], index: int) -> tuple[str, str]:
+    label = raw.get("label") or raw.get("category") or raw.get("class_name") or raw.get("name") or f"object_{index:02d}"
+    label_text = str(label).strip() or f"object_{index:02d}"
+    category = str(raw.get("category") or raw.get("class_name") or label_text).strip() or "unknown"
+    return label_text, category
+
+
+def unique_detection_object_id(label: str, frame_id: str, used_ids: set[str], prefix: str, index: int) -> str:
+    base = slugify(f"{prefix}_{label}_{frame_id}", fallback=f"{prefix}_{index:02d}")
+    object_id = base
+    suffix = 2
+    while object_id in used_ids:
+        object_id = f"{base}_{suffix}"
+        suffix += 1
+    used_ids.add(object_id)
+    return object_id
+
+
+def cmd_import_open_vocab_detections(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    frames_dir = args.frames_dir or (project_root / manifest["scene"]["frames_dir"])
+    frames_dir = frames_dir.resolve()
+    frames = list_frame_images(frames_dir)
+    frame_ids = [frame_stem(path.stem) for path in frames]
+    frame_paths_by_id = {frame_id: path for frame_id, path in zip(frame_ids, frames)}
+    image_to_frame = {path.name: frame_id for path, frame_id in zip(frames, frame_ids)}
+    fallback_frame = frame_ids[0] if frame_ids else "000000"
+    fallback_width, fallback_height = image_shape(frames[0])
+    frame_shapes: dict[str, tuple[int, int]] = {fallback_frame: (fallback_width, fallback_height)}
+    data = read_json(resolve_project_cli_path(args.source_manifest, project_root))
+    raw_entries = detection_entries(data)
+
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_entries, start=1):
+        try:
+            score = score_from_detection(raw)
+            if score < args.min_score:
+                skipped.append({"index": index, "reason": "score_below_threshold", "score": score})
+                continue
+            bbox_value = bbox_from_detection(raw)
+            if bbox_value is None:
+                skipped.append({"index": index, "reason": "missing_bbox"})
+                continue
+            bbox_format = str(raw.get("bbox_format") or raw.get("format") or args.bbox_format)
+            frame_id = frame_id_from_detection(raw, image_to_frame, fallback_frame)
+            if frame_id not in frame_shapes:
+                frame_path = frame_paths_by_id.get(frame_id)
+                frame_shapes[frame_id] = image_shape(frame_path) if frame_path else (fallback_width, fallback_height)
+            width, height = frame_shapes[frame_id]
+            bbox = normalize_bbox(bbox_value, width, height, bbox_format)
+            if bbox_area(bbox) <= 0:
+                skipped.append({"index": index, "reason": "empty_bbox"})
+                continue
+            label, category = label_from_detection(raw, index)
+            candidates.append(
+                {
+                    "raw_index": index,
+                    "label": label,
+                    "category": category,
+                    "frame_id": frame_id,
+                    "bbox": list(bbox),
+                    "score": score,
+                    "description": raw.get("description") or raw.get("caption") or f"Open-vocabulary detection: {label}.",
+                    "source": raw.get("source") or args.provider,
+                    "raw": raw if args.keep_raw else None,
+                }
+            )
+        except Exception as exc:
+            skipped.append({"index": index, "reason": "parse_error", "error": str(exc)})
+
+    kept: list[dict[str, Any]] = []
+    candidates_by_frame: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        candidates_by_frame.setdefault(str(candidate["frame_id"]), []).append(candidate)
+    for frame_id, frame_candidates in sorted(candidates_by_frame.items()):
+        width, height = frame_shapes.get(frame_id, (fallback_width, fallback_height))
+        kept.extend(
+            filter_prompt_candidates(
+                frame_candidates,
+                width,
+                height,
+                args.min_area_ratio,
+                args.max_area_ratio,
+                args.min_width,
+                args.min_height,
+                0,
+                args.nms_iou,
+                args.containment_overlap,
+                args.containment_area_ratio,
+            )
+        )
+    kept = sorted(kept, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    if args.max_objects > 0:
+        kept = kept[: args.max_objects]
+
+    output_path = args.output or (project_root / "masks" / "open_vocab_prompts.json")
+    output_path = output_path if output_path.is_absolute() else project_root / output_path
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Prompt file already exists: {output_path}. Pass --overwrite to replace it.")
+    labels_path = args.object_labels or (project_root / "masks" / "object_labels.json")
+    labels_path = labels_path if labels_path.is_absolute() else project_root / labels_path
+    labels = load_object_labels(project_root, labels_path if labels_path.exists() else None)
+
+    used_ids: set[str] = set()
+    objects: list[dict[str, Any]] = []
+    for idx, det in enumerate(kept, start=1):
+        object_id = unique_detection_object_id(det["label"], det["frame_id"], used_ids, args.object_prefix, idx)
+        prompt = {
+            "id": object_id,
+            "object_id": object_id,
+            "name": det["label"],
+            "category": det["category"],
+            "description": det["description"],
+            "frame_id": det["frame_id"],
+            "bbox": det["bbox"],
+            "bbox_format": "xyxy",
+            "score": det["score"],
+            "source": det["source"],
+            "open_vocab": {
+                "provider": args.provider,
+                "label": det["label"],
+                "category": det["category"],
+                "raw_index": det["raw_index"],
+            },
+        }
+        if det.get("raw") is not None:
+            prompt["raw_detection"] = det["raw"]
+        objects.append(prompt)
+        labels[object_id] = merge_object_label(
+            labels.get(object_id, {}),
+            {
+                "object_id": object_id,
+                "name": det["label"],
+                "category": det["category"],
+                "description": det["description"],
+                "confidence": det["score"],
+                "source": args.provider,
+                "open_vocab_labels": [det["label"]],
+            },
+            True,
+        )
+
+    preview_frame_id = objects[0]["frame_id"] if objects else fallback_frame
+    preview_frame = find_frame_image(frames_dir, preview_frame_id) or frames[0]
+    cv2 = import_cv2()
+    preview_image = cv2.imread(str(preview_frame))
+    if preview_image is None:
+        raise RuntimeError(f"Failed to read preview frame: {preview_frame}")
+    preview_objects = [obj for obj in objects if obj["frame_id"] == preview_frame_id] or objects
+    preview_path = args.preview_output or output_path.with_name(f"{output_path.stem}_preview.png")
+    preview_path = preview_path if preview_path.is_absolute() else project_root / preview_path
+    write_prompt_preview(preview_image, preview_objects, preview_path)
+
+    prompt_manifest = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": "external_open_vocab_detection_import",
+        "provider": args.provider,
+        "frames_dir": str(frames_dir),
+        "source_manifest": str(resolve_project_cli_path(args.source_manifest, project_root)),
+        "image_size": {"w": fallback_width, "h": fallback_height},
+        "candidate_count": len(candidates),
+        "object_count": len(objects),
+        "skipped": skipped,
+        "filters": {
+            "min_score": args.min_score,
+            "max_objects": args.max_objects,
+            "min_area_ratio": args.min_area_ratio,
+            "max_area_ratio": args.max_area_ratio,
+            "min_width": args.min_width,
+            "min_height": args.min_height,
+            "nms_iou": args.nms_iou,
+            "containment_overlap": args.containment_overlap,
+            "containment_area_ratio": args.containment_area_ratio,
+        },
+        "preview_image": str(preview_path),
+        "objects": objects,
+        "notes": "Imported external open-vocabulary detections as bbox prompts for track-masks or external video segmentation jobs.",
+    }
+    write_json(output_path, prompt_manifest)
+    write_json(labels_path, labels)
+    manifest.setdefault("artifacts", {})["open_vocab_tracking_prompts"] = str(output_path)
+    manifest.setdefault("artifacts", {})["tracking_prompts"] = str(output_path)
+    manifest.setdefault("artifacts", {})["open_vocab_tracking_prompts_preview"] = str(preview_path)
+    manifest.setdefault("artifacts", {})["object_labels"] = str(labels_path)
+    manifest.setdefault("external_stages", {})["open_vocab_object_discovery"] = {
+        "status": "open_vocab_detections_imported",
+        "notes": "Imported external open-vocabulary detections into tracking prompts and object_labels.",
+        "provider": args.provider,
+        "source_manifest": str(resolve_project_cli_path(args.source_manifest, project_root)),
+        "prompt_file": str(output_path),
+        "object_count": len(objects),
+        "skipped_count": len(skipped),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Imported {len(objects)} open-vocabulary detection prompt(s): {output_path}")
+    print(f"Object labels: {labels_path}")
+    print(f"Preview: {preview_path}")
+    if skipped:
+        print(f"Skipped detections: {len(skipped)}")
+    return 0
+
+
 def load_object_labels(project_root: Path, labels_path: Path | None = None) -> dict[str, dict[str, Any]]:
     path = labels_path or (project_root / "masks" / "object_labels.json")
     if path.exists():
@@ -10385,6 +10807,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sam-multimask", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max-frames", type=int, default=0)
     p.set_defaults(func=cmd_track_masks)
+
+    p = sub.add_parser("prepare-open-vocab-detection-jobs", help="Prepare frame/query jobs for external open-vocabulary object detectors.")
+    add_common_project_arg(p)
+    p.add_argument("--frames-dir", type=Path, help="Defaults to scene/frames.")
+    p.add_argument("--provider", default="external_open_vocab_detector", help="External provider/tool name, e.g. groundingdino, owlvit, yolo-world, grounded-sam.")
+    p.add_argument("--queries", help="Comma-separated queries, a .txt file, or a JSON file with queries/labels/categories.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/open_vocab_detection_jobs.")
+    p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument(
+        "--command-template",
+        help=(
+            "Optional shell command with {job_path}, {project_root}, {frames_dir}, "
+            "{queries}, {output_manifest}, {provider}."
+        ),
+    )
+    p.set_defaults(func=cmd_prepare_open_vocab_detection_jobs)
+
+    p = sub.add_parser("import-open-vocab-detections", help="Import external open-vocabulary detections as tracking prompts and object labels.")
+    add_common_project_arg(p)
+    p.add_argument("--source-manifest", type=Path, required=True, help="JSON list/map or object with detections/frames entries.")
+    p.add_argument("--frames-dir", type=Path, help="Defaults to scene/frames.")
+    p.add_argument("--provider", default="external_open_vocab_detector")
+    p.add_argument("--output", type=Path, help="Defaults to masks/open_vocab_prompts.json.")
+    p.add_argument("--preview-output", type=Path, help="Defaults to masks/open_vocab_prompts_preview.png.")
+    p.add_argument("--object-labels", type=Path, help="Defaults to masks/object_labels.json.")
+    p.add_argument("--bbox-format", choices=["xyxy", "xywh"], default="xyxy")
+    p.add_argument("--min-score", type=float, default=0.0)
+    p.add_argument("--max-objects", type=int, default=16)
+    p.add_argument("--min-area-ratio", type=float, default=0.0005)
+    p.add_argument("--max-area-ratio", type=float, default=0.65)
+    p.add_argument("--min-width", type=int, default=4)
+    p.add_argument("--min-height", type=int, default=4)
+    p.add_argument("--nms-iou", type=float, default=0.65)
+    p.add_argument("--containment-overlap", type=float, default=0.9)
+    p.add_argument("--containment-area-ratio", type=float, default=1.8)
+    p.add_argument("--object-prefix", default="ov_object")
+    p.add_argument("--keep-raw", action="store_true", help="Store raw detection records inside the prompt manifest.")
+    p.add_argument("--overwrite", action="store_true")
+    p.set_defaults(func=cmd_import_open_vocab_detections)
 
     p = sub.add_parser("prepare-video-segmentation-jobs", help="Prepare frame/prompt jobs for external video segmentation tools such as SAM2/DEVA/XMem.")
     add_common_project_arg(p)

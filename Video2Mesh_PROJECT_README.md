@@ -304,6 +304,30 @@ python -m video2mesh.cli auto-prompts \
   --overwrite
 ```
 
+更接近生产的物体发现入口是外部开放词汇检测器，例如 GroundingDINO、OWL-ViT、YOLO-World 或 Grounded-SAM。先准备检测 job：
+
+```bash
+python -m video2mesh.cli prepare-open-vocab-detection-jobs \
+  --project-root exports/milscene2_real_demo \
+  --frames-dir exports/milscene2_real_demo/scene/frames \
+  --provider groundingdino \
+  --queries "chair,table,cabinet,door,window,box"
+```
+
+外部检测器跑完后，把 `frame_id/image + label/category + bbox + score` 导回标准 prompts 和 object labels：
+
+```bash
+python -m video2mesh.cli import-open-vocab-detections \
+  --project-root exports/milscene2_real_demo \
+  --source-manifest /path/to/open_vocab_detections.json \
+  --provider groundingdino \
+  --min-score 0.25 \
+  --max-objects 20 \
+  --overwrite
+```
+
+这会写 `masks/open_vocab_prompts.json`、`masks/open_vocab_prompts_preview.png` 和 `masks/object_labels.json`，后续可直接交给 `track-masks` 或 `prepare-video-segmentation-jobs --provider sam2/deva/xmem`。
+
 跨帧生成 2D masks：
 
 ```bash

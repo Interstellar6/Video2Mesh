@@ -642,6 +642,54 @@ masks/object_labels.json
 
 `--max-area-ratio`、`--min-area-ratio`、`--nms-iou` 和 `--containment-*` 用于过滤背景大块区域、重复框和包住多个小物体的大合并框。`auto_prompts.json` 里的 `objects` 字段兼容 `track-masks --prompts`。
 
+生产路线里，物体候选和类别更适合来自开放词汇检测器，例如 GroundingDINO、OWL-ViT、YOLO-World 或 Grounded-SAM。Video2Mesh 提供 job/import 桥，不直接运行这些重模型：
+
+```bash
+python -m video2mesh.cli prepare-open-vocab-detection-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --frames-dir /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/frames \
+  --provider groundingdino \
+  --queries "chair,table,cabinet,door,window,box" \
+  --command-template "python run_groundingdino.py --job {job_path} --queries {queries} --output {output_manifest}"
+```
+
+输出：
+
+```text
+simulator_assets/open_vocab_detection_jobs/open_vocab_detection_job.json
+simulator_assets/open_vocab_detection_jobs/detections_template.json
+simulator_assets/open_vocab_detection_jobs/run_open_vocab_detection.sh
+```
+
+外部检测器写出 `detections` 列表即可，每条包含 `frame_id` 或 `image`、`label/category`、`bbox`、`bbox_format`、`score`。导入后会生成可直接给 `track-masks` 或 `prepare-video-segmentation-jobs` 使用的 prompts，并同步 `object_labels.json`：
+
+```bash
+python -m video2mesh.cli import-open-vocab-detections \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --source-manifest /path/to/open_vocab_detections.json \
+  --provider groundingdino \
+  --min-score 0.25 \
+  --max-objects 20 \
+  --overwrite
+```
+
+输出：
+
+```text
+masks/open_vocab_prompts.json
+masks/open_vocab_prompts_preview.png
+masks/object_labels.json
+```
+
+`masks/open_vocab_prompts.json` 会成为新的 `tracking_prompts` artifact。下一步可以直接：
+
+```bash
+python -m video2mesh.cli prepare-video-segmentation-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --prompts /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/masks/open_vocab_prompts.json \
+  --provider sam2
+```
+
 在一键 pipeline 中可以让它自动接到 `track-masks`：
 
 ```bash
