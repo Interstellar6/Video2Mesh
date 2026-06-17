@@ -6251,13 +6251,19 @@ def simulator_asset_qa_report(
         body_type = physics.get("body_type")
         mass = physics.get("mass_kg")
         collider = physics.get("collider")
-        if require_physics and ((mass is None and not is_background_structure) or collider in (None, "none") or not body_type):
-            append_asset_issue(object_issues, "required", "physics_missing", "Mass/body_type/collider must be set for simulator-ready assets.", object_id)
+        material = physics.get("material") if isinstance(physics.get("material"), dict) else {}
+        friction = material.get("friction") if isinstance(material, dict) else None
+        restitution = material.get("restitution") if isinstance(material, dict) else None
+        material_ready = isinstance(material, dict) and bool(material.get("name")) and isinstance(friction, list) and len(friction) >= 3 and restitution is not None
+        if require_physics and ((mass is None and not is_background_structure) or collider in (None, "none") or not body_type or not material_ready):
+            append_asset_issue(object_issues, "required", "physics_missing", "Mass/body_type/collider/material/friction/restitution must be set for simulator-ready assets.", object_id)
         else:
             if mass is None and not is_background_structure:
                 append_asset_issue(object_issues, "warning", "mass_missing", "mass_kg is still unset.", object_id)
             if collider in (None, "none"):
                 append_asset_issue(object_issues, "warning", "collider_missing", "No collider is configured.", object_id)
+            if not material_ready:
+                append_asset_issue(object_issues, "warning", "material_physics_incomplete", "Material name/friction/restitution are incomplete.", object_id)
         if pose.get("bbox_size") in (None, [], [0.0, 0.0, 0.0]):
             append_asset_issue(object_issues, "warning", "bbox_size_missing", "Pose bbox_size is missing or zero.", object_id)
 
@@ -7659,6 +7665,90 @@ def multiply_vector(values: Any, factor: float, count: int = 3, fallback: float 
     return [float(value) * float(factor) for value in padded[:count]]
 
 
+def merge_physics_dict(base: dict[str, Any], update: dict[str, Any], overwrite: bool = True) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in update.items():
+        if value in (None, "", [], {}):
+            continue
+        if key == "material" and isinstance(value, dict):
+            material = dict(merged.get("material") if isinstance(merged.get("material"), dict) else {})
+            material.update(value)
+            merged["material"] = material
+        elif overwrite or merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def normalize_friction(value: Any, fallback: list[float] | None = None) -> list[float] | None:
+    if value in (None, "", []):
+        return fallback
+    defaults = fallback if fallback and len(fallback) >= 3 else [0.8, 0.02, 0.001]
+    if isinstance(value, dict):
+        values = [
+            value.get("sliding", value.get("lateral", value.get("friction"))),
+            value.get("torsional", value.get("spin", value.get("torsional_friction"))),
+            value.get("rolling", value.get("rolling_friction")),
+        ]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        values = [value]
+    if len(values) == 1:
+        values = [values[0], defaults[1], defaults[2]]
+    values = values[:3] + [defaults[idx] for idx in range(len(values), 3)]
+    values = [defaults[idx] if item in (None, "") else item for idx, item in enumerate(values[:3])]
+    try:
+        return [float(item) for item in values[:3]]
+    except Exception:
+        return fallback
+
+
+def normalize_physics_record(raw: dict[str, Any], current: dict[str, Any] | None = None, source: str = "external_physics") -> dict[str, Any]:
+    current = current or {}
+    physics = {}
+    for key in ("body_type", "collider", "collision_shape", "contact_group", "collision_group"):
+        if raw.get(key) not in (None, ""):
+            physics[key] = raw[key]
+    for key in ("mass_kg", "density_kg_m3"):
+        raw_value = raw.get(key)
+        if raw_value is None and key == "mass_kg":
+            raw_value = raw.get("mass")
+        if raw_value not in (None, ""):
+            physics[key] = float(raw_value)
+    for key in ("center_of_mass", "inertia"):
+        if raw.get(key) not in (None, "", []):
+            physics[key] = raw[key]
+
+    current_material = current.get("material") if isinstance(current.get("material"), dict) else {}
+    raw_material = raw.get("material")
+    material = dict(current_material)
+    if isinstance(raw_material, dict):
+        material.update({key: value for key, value in raw_material.items() if value not in (None, "", [], {})})
+    elif raw_material not in (None, ""):
+        material["name"] = str(raw_material)
+    if raw.get("material_name") not in (None, ""):
+        material["name"] = str(raw["material_name"])
+    friction = normalize_friction(raw.get("friction") or raw.get("friction_coefficients") or material.get("friction"), material.get("friction") if isinstance(material.get("friction"), list) else None)
+    if friction is not None:
+        material["friction"] = friction
+    if raw.get("restitution") not in (None, ""):
+        material["restitution"] = float(raw["restitution"])
+    if raw.get("roughness") not in (None, ""):
+        material["roughness"] = float(raw["roughness"])
+    if material:
+        physics["material"] = material
+
+    physics["estimated"] = bool(raw.get("estimated", False))
+    physics["source"] = raw.get("source") or source
+    if raw.get("confidence") is not None:
+        physics["confidence"] = raw.get("confidence")
+    if raw.get("notes") not in (None, ""):
+        physics["notes"] = raw["notes"]
+    else:
+        physics.setdefault("notes", "Imported simulator physics properties; verify before physics-critical use.")
+    return physics
+
+
 def is_background_structure_record(obj: dict[str, Any]) -> bool:
     return obj.get("asset_role") == "background_structure"
 
@@ -7804,6 +7894,14 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
         if exported_mesh and mesh_coordinate_frame == "video2mesh_scene" and not mesh_normalized:
             pose_position = [0.0, 0.0, 0.0]
         pose_scale = [1.0, 1.0, 1.0] if mesh_normalized else [args.scene_scale, args.scene_scale, args.scene_scale]
+        default_physics = {
+            "body_type": "static" if is_background_structure else args.body_type,
+            "collider": "box" if is_background_structure else args.collider if exported_mesh else "none",
+            "mass_kg": None,
+            "material": None,
+            "notes": "Physics values are placeholders; validate mass, friction, and collider before simulation.",
+        }
+        object_physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
         asset = {
             "schema_version": DEFAULT_SCHEMA_VERSION,
             "object_id": object_id,
@@ -7821,13 +7919,7 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                 "bbox_size": size,
                 "bbox_3d": bbox,
             },
-            "physics": {
-                "body_type": "static" if is_background_structure else args.body_type,
-                "collider": "box" if is_background_structure else args.collider if exported_mesh else "none",
-                "mass_kg": None,
-                "material": None,
-                "notes": "Physics values are placeholders; validate mass, friction, and collider before simulation.",
-            },
+            "physics": merge_physics_dict(default_physics, object_physics, overwrite=True),
             "masks": {
                 "mask_3d": obj.get("mask_3d"),
                 "mask_3d_cloud": obj.get("mask_3d_cloud"),
@@ -8087,6 +8179,223 @@ def cmd_calibrate_simulator_assets(args: argparse.Namespace) -> int:
     print(f"Calibrated simulator bundle: {bundle_path}")
     print(f"Scale to meters: {scale_to_meters:.8g}; up_axis={args.up_axis}; scale_calibrated={scale_calibrated}")
     print(f"Updated objects: {updated_objects}; calibration: {calibration_path}")
+    return 0
+
+
+def simulator_physics_template_entry(obj: dict[str, Any], default_source: str) -> dict[str, Any]:
+    physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+    material = physics.get("material") if isinstance(physics.get("material"), dict) else {}
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    category = str(obj.get("category") or "").lower()
+    is_background_structure = obj.get("asset_role") == "background_structure"
+    default_body_type = "static" if is_background_structure else physics.get("body_type", "dynamic")
+    default_collider = "box" if is_background_structure else physics.get("collider", "mesh")
+    default_mass = None if is_background_structure else physics.get("mass_kg")
+    return {
+        "object_id": obj.get("object_id"),
+        "name": obj.get("name"),
+        "category": obj.get("category"),
+        "asset_role": obj.get("asset_role", "object"),
+        "bbox_size_m": pose.get("bbox_size"),
+        "current_physics": physics,
+        "body_type": default_body_type,
+        "collider": default_collider,
+        "mass_kg": default_mass,
+        "density_kg_m3": physics.get("density_kg_m3"),
+        "material": {
+            "name": material.get("name") or ("structure_surface" if is_background_structure else category or "rigid"),
+            "friction": material.get("friction", [0.8, 0.02, 0.001]),
+            "restitution": material.get("restitution", 0.1),
+        },
+        "source": default_source,
+        "confidence": None,
+        "notes": "Fill measured or task-specific simulator physics values here.",
+    }
+
+
+def cmd_prepare_simulator_physics_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    output_dir = ensure_dir(args.output_dir or (project_root / manifest["simulator_assets_dir"] / "physics_properties_jobs"))
+    objects = []
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("asset_role") == "background_structure" and not args.include_background:
+            continue
+        objects.append(simulator_physics_template_entry(obj, args.provider))
+    template_path = output_dir / "physics_properties_template.json"
+    job_path = output_dir / "physics_properties_job.json"
+    template = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": bundle.get("scene_id"),
+        "provider": args.provider,
+        "source_bundle": str(bundle_path),
+        "objects": objects,
+        "notes": "Fill body_type/collider/mass_kg/material friction/restitution, then import with import-simulator-physics.",
+    }
+    write_json(template_path, template)
+    write_json(
+        job_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "scene_id": bundle.get("scene_id"),
+            "provider": args.provider,
+            "source_bundle": str(bundle_path),
+            "template": str(template_path),
+            "object_count": len(objects),
+            "expected_output_schema": {
+                "objects": [
+                    {
+                        "object_id": "object id from bundle",
+                        "body_type": "dynamic|kinematic|static",
+                        "collider": "mesh|convex_hull|box|none",
+                        "mass_kg": 1.0,
+                        "material": {"name": "wood", "friction": [0.8, 0.02, 0.001], "restitution": 0.1},
+                    }
+                ]
+            },
+            "notes": "Prepared physics annotation/import job. This command does not estimate or run simulation.",
+        },
+    )
+    manifest.setdefault("artifacts", {})["simulator_physics_job"] = str(job_path)
+    manifest.setdefault("artifacts", {})["simulator_physics_template"] = str(template_path)
+    manifest.setdefault("external_stages", {})["simulator_physics_properties"] = {
+        "status": "physics_properties_job_prepared",
+        "notes": "Prepared per-object simulator physics property template for external/manual annotation.",
+        "provider": args.provider,
+        "job": str(job_path),
+        "template": str(template_path),
+        "object_count": len(objects),
+    }
+    save_manifest(project_root, manifest)
+    print(f"Prepared simulator physics job: {job_path}")
+    print(f"Template: {template_path}")
+    print(f"Objects: {len(objects)}")
+    return 0
+
+
+def physics_entries(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict) and isinstance(data.get("objects"), list):
+        return [dict(item) for item in data["objects"] if isinstance(item, dict)]
+    if isinstance(data, list):
+        return [dict(item) for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        physics_keys = {
+            "object_id",
+            "id",
+            "body_type",
+            "collider",
+            "mass_kg",
+            "mass",
+            "density_kg_m3",
+            "material",
+            "material_name",
+            "friction",
+            "restitution",
+        }
+        if any(key in data for key in physics_keys) and (data.get("object_id") or data.get("id") or data.get("name")):
+            return [dict(data)]
+        entries = []
+        for key, value in data.items():
+            if key in {"schema_version", "project_root", "scene_id", "provider", "source_bundle", "notes"}:
+                continue
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("object_id", key)
+                entries.append(item)
+        return entries
+    raise ValueError("Physics properties JSON must be a list, map, or object with an objects list.")
+
+
+def cmd_import_simulator_physics(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    source_path = resolve_project_cli_path(args.physics, project_root)
+    data = read_json(source_path)
+    entries = physics_entries(data)
+    updates_by_id: dict[str, dict[str, Any]] = {}
+    for raw in entries:
+        object_id = slugify(raw.get("object_id") or raw.get("id") or raw.get("name") or "")
+        if not object_id:
+            continue
+        updates_by_id[object_id] = raw
+
+    objects_dir = project_root / manifest["objects_dir"]
+    updated: dict[str, Any] = {}
+    missing: list[str] = []
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        object_id = slugify(obj.get("object_id") or "")
+        raw = updates_by_id.get(object_id)
+        if raw is None:
+            continue
+        current_physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        normalized = normalize_physics_record(raw, current_physics, args.provider)
+        obj["physics"] = merge_physics_dict(current_physics, normalized, overwrite=args.overwrite)
+        object_asset_path = resolve_existing_path(obj.get("object_asset_json"), project_root)
+        if object_asset_path and object_asset_path.exists():
+            object_asset = read_json(object_asset_path)
+            object_asset["physics"] = obj["physics"]
+            write_json(object_asset_path, object_asset)
+        object_json = objects_dir / object_id / "object.json"
+        if object_json.exists():
+            record = read_json(object_json)
+            record["physics"] = merge_physics_dict(record.get("physics") if isinstance(record.get("physics"), dict) else {}, obj["physics"], overwrite=True)
+            write_json(object_json, record)
+        updated[object_id] = obj["physics"]
+
+    for object_id in sorted(set(updates_by_id) - set(updated)):
+        missing.append(object_id)
+        if not args.skip_missing:
+            raise KeyError(f"Physics properties reference object not present in simulator bundle: {object_id}")
+
+    bundle.setdefault("notes", [])
+    if isinstance(bundle["notes"], list):
+        bundle["notes"].append(f"Simulator physics properties imported from {source_path}.")
+    bundle["simulator_physics_properties"] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source": str(source_path),
+        "provider": args.provider,
+        "updated_object_count": len(updated),
+        "missing_objects": missing,
+        "timestamp": int(time.time()),
+    }
+    write_json(bundle_path, bundle)
+
+    report_path = project_root / manifest["simulator_assets_dir"] / "simulator_physics_properties.json"
+    write_json(
+        report_path,
+        {
+            **bundle["simulator_physics_properties"],
+            "bundle": str(bundle_path),
+            "updated_objects": updated,
+        },
+    )
+    manifest.setdefault("artifacts", {})["simulator_physics_properties"] = str(report_path)
+    manifest.setdefault("external_stages", {})["simulator_physics_properties"] = {
+        "status": "physics_properties_imported",
+        "notes": "Imported external/manual simulator physics properties into bundle and object records.",
+        "provider": args.provider,
+        "source": str(source_path),
+        "updated_object_count": len(updated),
+        "missing_objects": missing,
+    }
+    save_manifest(project_root, manifest)
+    print(f"Imported simulator physics properties for {len(updated)} object(s): {report_path}")
+    if missing:
+        print(f"Missing objects: {', '.join(missing)}")
     return 0
 
 
@@ -11152,6 +11461,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restitution", type=float, default=0.1)
     p.add_argument("--notes", help="Optional calibration notes.")
     p.set_defaults(func=cmd_calibrate_simulator_assets)
+
+    p = sub.add_parser("prepare-simulator-physics-jobs", help="Prepare per-object simulator physics property templates for external/manual annotation.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/physics_properties_jobs.")
+    p.add_argument("--provider", default="external_physics")
+    p.add_argument("--include-background", action="store_true", help="Also include background_structure records.")
+    p.set_defaults(func=cmd_prepare_simulator_physics_jobs)
+
+    p = sub.add_parser("import-simulator-physics", help="Import measured/manual simulator physics properties into the bundle and object records.")
+    add_common_project_arg(p)
+    p.add_argument("--physics", type=Path, required=True, help="JSON map/list/object-with-objects containing per-object physics properties.")
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--provider", default="external_physics")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--skip-missing", action="store_true")
+    p.set_defaults(func=cmd_import_simulator_physics)
 
     p = sub.add_parser("export-simulator-adapter", help="Export MuJoCo/Isaac/Unity adapter manifests from simulator_asset_bundle.json.")
     add_common_project_arg(p)

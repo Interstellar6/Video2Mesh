@@ -1317,6 +1317,43 @@ python -m video2mesh.cli calibrate-simulator-assets \
 
 这会把 `coordinate_system.scale_calibrated` 标为 true，并按 bbox 体积和默认密度估算前景物体 `mass_kg`、`material.friction`、`restitution` 等字段。背景结构会保持 static，通常只写 box collider 和 surface material。所有这些物理字段仍然是工程初值，不等于最终仿真任务的真实质量、摩擦和碰撞体。
 
+如果有人工测量、规则库、VLM/LLM 估计或目标仿真器给出的物理属性，可以生成 per-object 模板并导回 bundle。这个步骤不会跑仿真，只把真实或任务相关的 `mass_kg`、`body_type`、`collider`、`material.friction`、`restitution` 等属性稳定写回 Video2Mesh：
+
+```bash
+python -m video2mesh.cli prepare-simulator-physics-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --provider manual_physics \
+  --include-background
+```
+
+输出：
+
+```text
+simulator_assets/physics_properties_jobs/physics_properties_job.json
+simulator_assets/physics_properties_jobs/physics_properties_template.json
+```
+
+填好模板后导入：
+
+```bash
+python -m video2mesh.cli import-simulator-physics \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --physics /path/to/physics_properties.json \
+  --provider manual_physics \
+  --skip-missing
+```
+
+导入会同步更新：
+
+```text
+simulator_assets/simulator_asset_bundle.json
+simulator_assets/objects/<object_id>/object_asset.json
+objects/<object_id>/object.json
+simulator_assets/simulator_physics_properties.json
+```
+
+之后即使重新 `export-simulator-assets`，object record 中已有的 `physics` 也会被继承到新 bundle，避免人工物理属性被 placeholder 覆盖。
+
 导出后建议跑一次 simulator-readiness QA：
 
 ```bash
@@ -1331,7 +1368,7 @@ python -m video2mesh.cli qa-simulator-assets \
 simulator_assets/simulator_asset_qa.json
 ```
 
-QA 会检查 mesh 是否存在且可读、vertex/triangle 数是否太少、mesh 是否 watertight/manifold、mesh bbox 与 3D mask bbox 的 center/size 是否大致对齐、是否缺少 scale calibration、up axis、mass、collider、body_type。背景结构允许没有 object mesh，并以 static scene structure / box collider 的占位方式进入 simulator bundle。
+QA 会检查 mesh 是否存在且可读、vertex/triangle 数是否太少、mesh 是否 watertight/manifold、mesh bbox 与 3D mask bbox 的 center/size 是否大致对齐、是否缺少 scale calibration、up axis、mass、collider、body_type、material/friction/restitution。背景结构允许没有 object mesh，并以 static scene structure / box collider 的占位方式进入 simulator bundle。
 
 CI 或批处理可以把更严格的要求打开：
 

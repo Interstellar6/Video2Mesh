@@ -635,6 +635,27 @@ python -m video2mesh.cli calibrate-simulator-assets \
 
 没有真实标尺时，`--scale-to-meters 1.0 --no-scale-calibrated` 只代表工程假设，不能当作真实物理尺度。后续如果知道某个物体的真实长度，可以用 `--reference-object <object_id> --reference-axis longest --reference-length-m <meters>` 自动反推 scale。
 
+如果要把人工测量、规则库或目标仿真器里的真实物理属性写回资产包，可以先生成模板：
+
+```bash
+python -m video2mesh.cli prepare-simulator-physics-jobs \
+  --project-root exports/milscene2_real_demo \
+  --provider manual_physics \
+  --include-background
+```
+
+填好 `physics_properties_template.json` 里的 `body_type`、`collider`、`mass_kg`、`material.friction` 和 `restitution` 后导入：
+
+```bash
+python -m video2mesh.cli import-simulator-physics \
+  --project-root exports/milscene2_real_demo \
+  --physics /path/to/physics_properties.json \
+  --provider manual_physics \
+  --skip-missing
+```
+
+导入会同步更新 `simulator_asset_bundle.json`、每个 `object_asset.json` 和 `objects/<object_id>/object.json`，后续重新导出 bundle 时也会继承 object record 中已有的 `physics`。
+
 导出仿真器 adapter：
 
 ```bash
@@ -666,7 +687,7 @@ python -m video2mesh.cli qa-simulator-assets \
   --max-issues 20
 ```
 
-QA 会检查 mesh 是否可读、bbox/pose 是否大致对齐、是否缺少尺度标定、碰撞体和物理字段。背景结构允许没有 object mesh，并默认作为 static scene structure 进入 simulator bundle。
+QA 会检查 mesh 是否可读、bbox/pose 是否大致对齐、是否缺少尺度标定、碰撞体、质量、body type、material/friction/restitution。背景结构允许没有 object mesh，并默认作为 static scene structure 进入 simulator bundle。
 
 关键输出：
 
