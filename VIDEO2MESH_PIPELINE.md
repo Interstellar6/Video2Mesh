@@ -1082,6 +1082,8 @@ python -m video2mesh.cli import-object-meshes \
   --mesh-root /path/to/object_meshes
 ```
 
+`import-object-meshes` 会优先查找 `/path/to/object_meshes/<object_id>/`，也兼容模型文件放在 object 目录的子目录里，或由 `.*__model-request.json` 的 `output_files` / `downloaded_files` 指向。也就是说外部 Hunyuan、Meshy、多视角重建脚本不一定要手动把文件搬成完全相同的扁平结构，只要能按 object_id 分目录并保留 metadata，就能被回流到 `mesh_asset`。
+
 第二条是几何 baseline 路线：如果已经有 `export-object-mask-clouds` 生成的物体级 3D mask point cloud，可以直接从点云重建每个物体的 mesh：
 
 ```bash
@@ -1114,6 +1116,18 @@ simulator_assets/object_meshes.json
 - `reconstruct-object-meshes` 从 3D mask cloud 直接生成的 mesh 默认视为 `video2mesh_scene`，顶点本身已经在场景坐标中。
 
 因此，后续 `export-simulator-assets` 会对 `object_mask_cloud_reconstruction` 来源的 mesh 自动生成一个 `*_local.obj`/`*_local.<ext>` 副本：用 3D mask bbox center 把顶点平移到物体局部坐标，再把 `pose.position` 设置为该 bbox center。这样可避免仿真器 adapter 里出现“mesh 顶点已经在世界坐标，同时 body 又放到 bbox center”的双重位移问题。
+
+对于 image-blaster/FAL/Hunyuan/Meshy 这类 `object_local` mesh，如果生成模型的局部尺度不可信，可以在导出仿真资产时显式启用 bbox fitting：
+
+```bash
+python -m video2mesh.cli export-simulator-assets \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --fit-object-local-meshes-to-bbox \
+  --fit-axis diagonal \
+  --ascii-meshes
+```
+
+这个开关会把 object-local mesh 以自身 bbox center 归零，并按 3D mask bbox 的 diagonal 或 longest axis 做等比缩放，输出 `<mesh_stem>_bboxfit.<ext>`。bundle 中对应物体会写入 `alignment_status=normalized_to_3d_mask_bbox`、`pose.scale=[1,1,1]` 和 `quality.mesh.fit_to_mask_bbox`，方便 QA 检查 mesh 尺寸是否贴近 fused 3D mask。
 
 最后导出仿真器资产包：
 

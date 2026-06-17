@@ -25,8 +25,8 @@ from typing import Any
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MASK_EXTENSIONS = {".png", ".jpg", ".jpeg"}
-MODEL_EXTENSIONS = {".blend", ".fbx", ".glb", ".obj", ".stl", ".usdz"}
-MODEL_EXTENSION_PRIORITY = {".glb": 0, ".obj": 1, ".fbx": 2, ".stl": 3, ".usdz": 4, ".blend": 5}
+MODEL_EXTENSIONS = {".blend", ".fbx", ".glb", ".obj", ".ply", ".stl", ".usdz"}
+MODEL_EXTENSION_PRIORITY = {".glb": 0, ".obj": 1, ".ply": 2, ".fbx": 3, ".stl": 4, ".usdz": 5, ".blend": 6}
 DEFAULT_SCHEMA_VERSION = 1
 MAST3R_KEYFRAMES_DIR = "scene/mast3r_keyframes"
 SH_C0 = 0.28209479177387814
@@ -4945,6 +4945,100 @@ def transform_triangle_mesh_file(
     return summarize_triangle_mesh(output)
 
 
+def bbox_fit_length(size: Any, mode: str) -> float | None:
+    if not isinstance(size, (list, tuple)) or len(size) < 3:
+        return None
+    try:
+        values = [abs(float(value)) for value in size[:3]]
+    except Exception:
+        return None
+    if mode == "diagonal":
+        return vector_diagonal(values)
+    return max(values)
+
+
+def fit_to_mask_bbox_summary(exported_summary: dict[str, Any], target_bbox: dict[str, Any], target_size_scaled: list[float]) -> dict[str, Any]:
+    np = import_numpy()
+    exported_bbox = exported_summary.get("bbox") if isinstance(exported_summary.get("bbox"), dict) else {}
+    exported_size = exported_bbox.get("size") if isinstance(exported_bbox, dict) else None
+    result: dict[str, Any] = {
+        "has_exported_bbox": isinstance(exported_size, list),
+        "target_bbox": target_bbox,
+        "target_bbox_size_scaled": target_size_scaled,
+    }
+    if not isinstance(exported_size, list):
+        result["status"] = "missing_exported_bbox"
+        return result
+    exported_size_np = np.asarray(exported_size, dtype=np.float64)
+    target_size_np = np.asarray(target_size_scaled, dtype=np.float64)
+    result.update(
+        {
+            "status": "ok",
+            "exported_bbox": exported_bbox,
+            "size_ratio": (exported_size_np / np.maximum(target_size_np, 1e-9)).tolist(),
+            "mesh_diagonal": float(np.linalg.norm(exported_size_np)),
+            "mask_diagonal": float(np.linalg.norm(target_size_np)),
+            "mesh_to_mask_diagonal_ratio": float(np.linalg.norm(exported_size_np) / max(float(np.linalg.norm(target_size_np)), 1e-9)),
+            "mesh_longest_axis": float(exported_size_np.max()) if exported_size_np.size else 0.0,
+            "mask_longest_axis": float(target_size_np.max()) if target_size_np.size else 0.0,
+            "mesh_to_mask_longest_axis_ratio": float(exported_size_np.max() / max(float(target_size_np.max()), 1e-9)) if exported_size_np.size and target_size_np.size else None,
+            "center_offset_from_local_origin": exported_bbox.get("center"),
+        }
+    )
+    return result
+
+
+def fit_object_local_mesh_to_bbox(
+    source: Path,
+    output: Path,
+    source_summary: dict[str, Any],
+    target_bbox: dict[str, Any],
+    scene_scale: float,
+    fit_axis: str,
+    write_ascii: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source_bbox = source_summary.get("bbox") if isinstance(source_summary.get("bbox"), dict) else {}
+    source_center = source_bbox.get("center") if isinstance(source_bbox, dict) else None
+    source_size = source_bbox.get("size") if isinstance(source_bbox, dict) else None
+    target_size = target_bbox.get("size") if isinstance(target_bbox, dict) else None
+    if not isinstance(source_center, list) or not isinstance(source_size, list):
+        raise RuntimeError("Source mesh has no readable bbox for bbox-fit.")
+    if not isinstance(target_size, list):
+        raise RuntimeError("Object record has no bbox_3d.size for bbox-fit.")
+
+    source_length = bbox_fit_length(source_size, fit_axis)
+    target_length = bbox_fit_length(target_size, fit_axis)
+    if not source_length or source_length <= 1e-12:
+        raise RuntimeError("Source mesh bbox is too small for bbox-fit.")
+    if not target_length or target_length <= 1e-12:
+        raise RuntimeError("Target 3D mask bbox is too small for bbox-fit.")
+
+    fit_scale = float(scene_scale) * float(target_length) / float(source_length)
+    exported_summary = transform_triangle_mesh_file(
+        source,
+        output,
+        translation=[-float(value) for value in source_center[:3]],
+        scale=fit_scale,
+        write_ascii=write_ascii,
+    )
+    target_size_scaled = scaled_vector(target_size, float(scene_scale), [0.0, 0.0, 0.0])
+    fit_summary = fit_to_mask_bbox_summary(exported_summary, target_bbox, target_size_scaled)
+    fit_summary.update(
+        {
+            "applied": True,
+            "fit_axis": fit_axis,
+            "uniform_scale": fit_scale,
+            "scene_scale": float(scene_scale),
+            "source_bbox": source_bbox,
+            "source_fit_length": float(source_length),
+            "target_fit_length": float(target_length),
+            "target_fit_length_scaled": float(target_length) * float(scene_scale),
+            "notes": "Object-local mesh centered at its own bbox origin and uniformly scaled to the fused 3D mask bbox.",
+        }
+    )
+    return exported_summary, fit_summary
+
+
 def append_asset_issue(issues: list[dict[str, Any]], severity: str, name: str, detail: str, object_id: str | None = None, value: Any = None, threshold: Any = None) -> None:
     issue = {"severity": severity, "name": name, "detail": detail}
     if object_id:
@@ -5022,10 +5116,13 @@ def simulator_asset_qa_report(
             if mesh_summary.get("is_edge_manifold") is False or mesh_summary.get("is_vertex_manifold") is False:
                 append_asset_issue(object_issues, "warning", "mesh_not_manifold", "Mesh is not fully manifold.", object_id)
 
-        alignment = mesh_quality.get("source_to_mask_alignment") if isinstance(mesh_quality.get("source_to_mask_alignment"), dict) else {}
+        fit_alignment = mesh_quality.get("fit_to_mask_bbox") if isinstance(mesh_quality.get("fit_to_mask_bbox"), dict) else {}
+        alignment = fit_alignment if fit_alignment.get("status") == "ok" else mesh_quality.get("source_to_mask_alignment") if isinstance(mesh_quality.get("source_to_mask_alignment"), dict) else {}
         if alignment.get("status") == "ok":
-            center_ratio = alignment.get("center_distance_over_mask_diagonal")
-            diag_ratio = alignment.get("mesh_to_mask_diagonal_ratio")
+            center_ratio = None if fit_alignment.get("status") == "ok" else alignment.get("center_distance_over_mask_diagonal")
+            fit_axis = fit_alignment.get("fit_axis") if fit_alignment.get("status") == "ok" else None
+            size_ratio_value = alignment.get("mesh_to_mask_longest_axis_ratio") if fit_axis == "longest" else alignment.get("mesh_to_mask_diagonal_ratio")
+            size_ratio_label = "longest-axis" if fit_axis == "longest" else "diagonal"
             if center_ratio is not None and float(center_ratio) > max_center_ratio:
                 append_asset_issue(
                     object_issues,
@@ -5036,16 +5133,16 @@ def simulator_asset_qa_report(
                     float(center_ratio),
                     max_center_ratio,
                 )
-            if diag_ratio is not None:
-                ratio_delta = abs(float(diag_ratio) - 1.0)
+            if size_ratio_value is not None:
+                ratio_delta = abs(float(size_ratio_value) - 1.0)
                 if ratio_delta > max_size_ratio_delta:
                     append_asset_issue(
                         object_issues,
                         "warning",
                         "mesh_size_differs_from_mask_bbox",
-                        "Mesh diagonal differs substantially from the 3D mask bbox diagonal.",
+                        f"Mesh {size_ratio_label} differs substantially from the 3D mask bbox {size_ratio_label}.",
                         object_id,
-                        float(diag_ratio),
+                        float(size_ratio_value),
                         f"1 +/- {max_size_ratio_delta}",
                     )
 
@@ -6147,10 +6244,81 @@ def indexed_file_index(path: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
-def find_latest_model_file(object_dir: Path) -> Path | None:
-    if not object_dir.exists():
+def is_model_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in MODEL_EXTENSIONS
+
+
+def path_matches_object_id(path: Path, object_id: str | None) -> bool:
+    if not object_id:
+        return True
+    object_slug = slugify(object_id)
+    if not object_slug:
+        return True
+    return object_slug == slugify(path.parent.name) or object_slug in slugify(path.stem)
+
+
+def metadata_path_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        values: list[str] = []
+        for key in ("path", "local_path", "asset_path", "file", "filename"):
+            if isinstance(value.get(key), str):
+                values.append(value[key])
+        return values
+    if isinstance(value, list):
+        values = []
+        for item in value:
+            values.extend(metadata_path_values(item))
+        return values
+    return []
+
+
+def candidate_roots_for_metadata_path(object_dir: Path, max_depth: int = 8) -> list[Path]:
+    roots = [object_dir]
+    current = object_dir
+    for _ in range(max_depth):
+        parent = current.parent
+        if parent == current:
+            break
+        roots.append(parent)
+        current = parent
+    return roots
+
+
+def resolve_metadata_model_path(raw_value: str, object_dir: Path) -> Path | None:
+    value = str(raw_value).strip()
+    if not value or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
         return None
-    candidates = [p for p in object_dir.iterdir() if p.is_file() and p.suffix.lower() in MODEL_EXTENSIONS]
+    path = Path(value)
+    candidates = [path] if path.is_absolute() else [root / path for root in candidate_roots_for_metadata_path(object_dir)]
+    for candidate in candidates:
+        if candidate.exists() and is_model_file(candidate):
+            return candidate.resolve()
+    return None
+
+
+def metadata_model_file_candidates(object_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for request_path in sorted(object_dir.glob(".*__model-request.json")):
+        try:
+            data = read_json(request_path)
+        except Exception:
+            continue
+        for key in ("model_files", "output_files", "downloaded_files"):
+            for raw_value in metadata_path_values(data.get(key)):
+                resolved = resolve_metadata_model_path(raw_value, object_dir)
+                if not resolved:
+                    continue
+                key_path = str(resolved)
+                if key_path not in seen:
+                    candidates.append(resolved)
+                    seen.add(key_path)
+    return candidates
+
+
+def rank_model_candidates(candidates: list[Path]) -> Path | None:
     if not candidates:
         return None
 
@@ -6163,6 +6331,34 @@ def find_latest_model_file(object_dir: Path) -> Path | None:
         return (indexed_file_index(path), -priority, mtime, path.name)
 
     return max(candidates, key=sort_key)
+
+
+def find_latest_model_file(object_dir: Path, object_id: str | None = None) -> Path | None:
+    if not object_dir.exists():
+        return None
+
+    object_dir_matches = bool(object_id) and slugify(object_dir.name) == slugify(object_id)
+    groups = [
+        [p.resolve() for p in object_dir.iterdir() if is_model_file(p)],
+        metadata_model_file_candidates(object_dir),
+        [path.resolve() for path in object_dir.rglob("*") if is_model_file(path)],
+    ]
+    seen: set[str] = set()
+    for group in groups:
+        candidates: list[Path] = []
+        for candidate in group:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+        if object_id and not object_dir_matches:
+            candidates = [path for path in candidates if path_matches_object_id(path, object_id)]
+        selected = rank_model_candidates(candidates)
+        if selected:
+            return selected
+
+    return None
 
 
 def find_model_request_metadata(object_dir: Path, object_id: str, model_path: Path | None) -> dict[str, Any] | None:
@@ -6289,7 +6485,7 @@ def cmd_import_object_meshes(args: argparse.Namespace) -> int:
             args.world,
             mesh_root,
         ):
-            model = find_latest_model_file(candidate_dir)
+            model = find_latest_model_file(candidate_dir, object_id)
             if model:
                 selected_mesh = model.resolve()
                 selected_dir = candidate_dir
@@ -6400,6 +6596,7 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                 "source_to_mask_alignment": mesh_alignment_summary(bbox, source_mesh_summary),
                 "source_coordinate_frame": mesh_asset_coordinate_frame(mesh_asset),
             }
+            mesh_export_normalized = False
             if args.copy_meshes:
                 dst = sim_objects_dir / object_id / source_mesh.name
                 if mesh_qa["source_coordinate_frame"] == "video2mesh_scene" and bbox.get("center"):
@@ -6421,6 +6618,47 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                         "scale": args.scene_scale,
                         "reason": "source mesh was in video2mesh_scene coordinates; exported mesh is object-local around bbox center",
                     }
+                    mesh_export_normalized = True
+                elif args.fit_object_local_meshes_to_bbox and mesh_qa["source_coordinate_frame"] == "object_local" and bbox.get("center") and bbox.get("size"):
+                    local_suffix = source_mesh.suffix.lower() or f".{mesh_asset.get('format', 'obj')}"
+                    dst = sim_objects_dir / object_id / f"{source_mesh.stem}_bboxfit{local_suffix}"
+                    try:
+                        fit_summary, fit_detail = fit_object_local_mesh_to_bbox(
+                            source_mesh,
+                            dst,
+                            source_mesh_summary,
+                            bbox,
+                            args.scene_scale,
+                            args.fit_axis,
+                            write_ascii=args.ascii_meshes,
+                        )
+                        mesh_path = dst
+                        mesh_qa["exported_mesh"] = fit_summary
+                        mesh_qa["fit_to_mask_bbox"] = fit_detail
+                        mesh_qa["localization"] = {
+                            "applied": True,
+                            "translation": [-float(value) for value in fit_detail["source_bbox"].get("center", [0.0, 0.0, 0.0])[:3]],
+                            "scale": fit_detail["uniform_scale"],
+                            "reason": "object-local mesh was centered and uniformly scaled to the fused 3D mask bbox",
+                        }
+                        mesh_export_normalized = True
+                    except Exception as exc:
+                        fallback_dst = sim_objects_dir / object_id / source_mesh.name
+                        mesh_qa["fit_to_mask_bbox"] = {
+                            "applied": False,
+                            "error": str(exc),
+                            "reason": "bbox-fit failed; falling back to object-local mesh copy",
+                        }
+                        if source_mesh.resolve() != fallback_dst.resolve():
+                            mesh_path = copy_or_link(source_mesh, fallback_dst, args.mode)
+                        else:
+                            mesh_path = fallback_dst
+                        mesh_qa["exported_mesh"] = summarize_triangle_mesh(mesh_path)
+                        mesh_qa["localization"] = {
+                            "applied": False,
+                            "scale": args.scene_scale,
+                            "reason": "source mesh treated as object-local after bbox-fit fallback",
+                        }
                 elif source_mesh.resolve() != dst.resolve():
                     mesh_path = copy_or_link(source_mesh, dst, args.mode)
                     mesh_qa["exported_mesh"] = summarize_triangle_mesh(mesh_path)
@@ -6449,8 +6687,8 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                 "source_path": str(source_mesh),
                 "format": mesh_path.suffix.lower().lstrip("."),
                 "source_coordinate_frame": mesh_qa["source_coordinate_frame"],
-                "coordinate_frame": "object_local" if mesh_qa.get("localization", {}).get("applied") else mesh_qa["source_coordinate_frame"],
-                "alignment_status": "localized_from_3d_mask_bbox" if mesh_qa.get("localization", {}).get("applied") else "estimated_from_3d_mask_bbox",
+                "coordinate_frame": "object_local" if mesh_export_normalized else mesh_qa["source_coordinate_frame"],
+                "alignment_status": "normalized_to_3d_mask_bbox" if mesh_qa.get("fit_to_mask_bbox", {}).get("applied") else "localized_from_3d_mask_bbox" if mesh_export_normalized else "estimated_from_3d_mask_bbox",
             }
         else:
             if not is_background_structure:
@@ -6458,8 +6696,12 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
 
         center = scaled_vector(bbox.get("center"), args.scene_scale, [0.0, 0.0, 0.0])
         size = scaled_vector(bbox.get("size"), args.scene_scale, [0.0, 0.0, 0.0])
-        mesh_localized = bool(mesh_qa and mesh_qa.get("localization", {}).get("applied"))
-        pose_scale = [1.0, 1.0, 1.0] if mesh_localized else [args.scene_scale, args.scene_scale, args.scene_scale]
+        mesh_normalized = bool(exported_mesh and exported_mesh.get("alignment_status") in {"localized_from_3d_mask_bbox", "normalized_to_3d_mask_bbox"})
+        mesh_coordinate_frame = exported_mesh.get("coordinate_frame") if isinstance(exported_mesh, dict) else ""
+        pose_position = center
+        if exported_mesh and mesh_coordinate_frame == "video2mesh_scene" and not mesh_normalized:
+            pose_position = [0.0, 0.0, 0.0]
+        pose_scale = [1.0, 1.0, 1.0] if mesh_normalized else [args.scene_scale, args.scene_scale, args.scene_scale]
         asset = {
             "schema_version": DEFAULT_SCHEMA_VERSION,
             "object_id": object_id,
@@ -6471,7 +6713,7 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
             "status": "background_structure" if is_background_structure and not exported_mesh else "ready" if exported_mesh else "missing_mesh",
             "mesh": exported_mesh,
             "pose": {
-                "position": center,
+                "position": pose_position,
                 "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
                 "scale": pose_scale,
                 "bbox_size": size,
@@ -8787,6 +9029,8 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                         collider=args.collider,
                         copy_meshes=True,
                         ascii_meshes=args.simulator_ascii_meshes,
+                        fit_object_local_meshes_to_bbox=args.fit_object_local_meshes_to_bbox,
+                        fit_axis=args.fit_axis,
                         mode=args.mode,
                     )
                 )
@@ -9384,6 +9628,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collider", choices=["mesh", "convex_hull", "box", "none"], default="mesh")
     p.add_argument("--copy-meshes", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--ascii-meshes", action=argparse.BooleanOptionalAction, default=False, help="Write localized simulator meshes as ASCII when supported.")
+    p.add_argument("--fit-object-local-meshes-to-bbox", action=argparse.BooleanOptionalAction, default=False, help="Center object-local imported meshes and uniformly scale them to the fused 3D mask bbox.")
+    p.add_argument("--fit-axis", choices=["diagonal", "longest"], default="diagonal", help="Object-local bbox fitting length metric.")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_export_simulator_assets)
 
@@ -9640,6 +9886,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--body-type", choices=["static", "kinematic", "dynamic"], default="dynamic")
     p.add_argument("--collider", choices=["mesh", "convex_hull", "box", "none"], default="mesh")
     p.add_argument("--simulator-ascii-meshes", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--fit-object-local-meshes-to-bbox", action=argparse.BooleanOptionalAction, default=False, help="When exporting simulator assets, bbox-fit imported object-local meshes to fused 3D masks.")
+    p.add_argument("--fit-axis", choices=["diagonal", "longest"], default="diagonal")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--skip-validate", action="store_true")
     p.add_argument("--allow-incomplete", action="store_true")

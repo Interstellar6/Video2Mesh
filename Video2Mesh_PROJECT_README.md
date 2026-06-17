@@ -486,6 +486,18 @@ python -m video2mesh.cli export-simulator-assets \
   --ascii-meshes
 ```
 
+如果导入的是 image-blaster / Hunyuan / Meshy 这类 object-local mesh，且需要先按 3D mask bbox 统一尺度，可显式启用 bbox-fit：
+
+```bash
+python -m video2mesh.cli export-simulator-assets \
+  --project-root exports/milscene2_real_demo \
+  --fit-object-local-meshes-to-bbox \
+  --fit-axis diagonal \
+  --ascii-meshes
+```
+
+这会额外生成 `<mesh_stem>_bboxfit.<ext>`，并在 bundle 的 `quality.mesh.fit_to_mask_bbox` 中记录等比缩放和 bbox 对齐信息。`import-object-meshes` 也会兼容外部 mesh root 中按 object_id 分目录的嵌套模型，以及 image-blaster/FAL request metadata 里的 `output_files` / `downloaded_files` 路径。
+
 写入尺度、上方向和估算物理字段：
 
 ```bash
