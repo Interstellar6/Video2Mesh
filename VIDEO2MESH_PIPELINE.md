@@ -733,9 +733,26 @@ masks/object_labels.json
 如果 object label 来自外部开放词汇检测器或 VLM，可以把结果导入到统一标签文件和 object record：
 
 ```bash
+python -m video2mesh.cli prepare-object-labeling-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --provider external_vlm \
+  --max-images 4
+```
+
+这个命令会把每个前景物体的 `reference.png`、object crops、selected frames、3D bbox、point count 和 mask cloud 路径整理到：
+
+```text
+simulator_assets/object_labeling_jobs/object_labeling_jobs.json
+simulator_assets/object_labeling_jobs/jobs/<object_id>.json
+simulator_assets/object_labeling_jobs/labels_template.json
+```
+
+外部 VLM/open-vocabulary detector 或人工标注只需要填 `labels_template.json` 中每个 object 的 `name`、`category`、`description`、`aliases`、`open_vocab_labels`、`confidence`。该命令不会运行模型；它只是把“颜色编号 object_id -> 可解释语义标签”的生产级接口固定下来。
+
+```bash
 python -m video2mesh.cli import-object-labels \
   --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
-  --labels /path/to/object_labels.json
+  --labels /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/simulator_assets/object_labeling_jobs/labels_template.json
 ```
 
 `object_labels.json` 可以是 `{object_id: label}` 的 map，也可以是 `{"objects": [...]}` 或 list。每条 label 支持 `name`、`category`、`description`、`aliases`、`open_vocab_labels`、`confidence`、`source`、`vlm` 等字段。这个接口的目标是把当前颜色/编号式自动命名替换成 VLM 可解释语义，同时保持后续 `fuse-masks`、SVPP export 和 simulator bundle 的文件协议不变。

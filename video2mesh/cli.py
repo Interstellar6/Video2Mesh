@@ -2684,6 +2684,221 @@ def merge_object_label(target: dict[str, Any], label: dict[str, Any], overwrite:
     return target
 
 
+def object_labeling_image_records(obj: dict[str, Any], object_dir: Path, project_root: Path, max_images: int) -> list[dict[str, Any]]:
+    images: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_image(path_value: Any, role: str, extra: dict[str, Any] | None = None) -> None:
+        if not path_value:
+            return
+        raw_path_text = str(path_value)
+        resolved_path = resolve_existing_path(raw_path_text, project_root)
+        path_text = str(resolved_path) if resolved_path else raw_path_text
+        if path_text in seen:
+            return
+        seen.add(path_text)
+        record = {"path": path_text, "role": role}
+        if path_text != raw_path_text:
+            record["source_path"] = raw_path_text
+        if extra:
+            for key, value in extra.items():
+                if value in (None, "", []):
+                    continue
+                if key in {"mask", "image", "object_image", "reference_image", "selected_image"}:
+                    resolved_extra = resolve_existing_path(str(value), project_root)
+                    resolved_text = str(resolved_extra) if resolved_extra else str(value)
+                    record[key] = resolved_text
+                    if resolved_text != str(value):
+                        record[f"source_{key}"] = str(value)
+                else:
+                    record[key] = value
+        images.append(record)
+
+    primary_object_image = obj.get("primary_object_image") if isinstance(obj.get("primary_object_image"), dict) else {}
+    add_image(
+        primary_object_image.get("reference_image") or primary_object_image.get("object_image"),
+        "primary_object_crop",
+        {
+            "frame_id": primary_object_image.get("frame_id"),
+            "mask": primary_object_image.get("mask"),
+            "crop_xyxy": primary_object_image.get("crop_xyxy"),
+        },
+    )
+    primary_frame = obj.get("primary_frame") if isinstance(obj.get("primary_frame"), dict) else {}
+    add_image(
+        primary_frame.get("selected_image") or primary_frame.get("image"),
+        "primary_selected_frame",
+        {
+            "frame_id": primary_frame.get("frame_id"),
+            "score": primary_frame.get("score"),
+        },
+    )
+    for item in obj.get("object_images", []) if isinstance(obj.get("object_images"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        add_image(
+            item.get("object_image"),
+            "object_crop",
+            {
+                "frame_id": item.get("frame_id"),
+                "rank": item.get("rank"),
+                "mask": item.get("mask"),
+                "crop_xyxy": item.get("crop_xyxy"),
+            },
+        )
+        if max_images > 0 and len(images) >= max_images:
+            return images[:max_images]
+    for item in obj.get("selected_frames", []) if isinstance(obj.get("selected_frames"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        add_image(
+            item.get("selected_image") or item.get("image"),
+            "selected_frame",
+            {
+                "frame_id": item.get("frame_id"),
+                "rank": item.get("rank"),
+                "score": item.get("score"),
+            },
+        )
+        if max_images > 0 and len(images) >= max_images:
+            break
+    if max_images <= 0 or len(images) < max_images:
+        reference = object_dir / "reference.png"
+        if reference.exists():
+            add_image(reference, "reference_file")
+    for directory_name, role in (("object_images", "object_crop_file"), ("selected_frames", "selected_frame_file")):
+        if max_images > 0 and len(images) >= max_images:
+            break
+        image_dir = object_dir / directory_name
+        if not image_dir.exists():
+            continue
+        for image_path in sorted(p for p in image_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS):
+            frame_id = image_path.stem.split("_")[-1]
+            extra = {"frame_id": frame_id}
+            mask_path = project_root / "masks" / "2d" / slugify(obj.get("object_id") or object_dir.name) / f"{frame_id}.png"
+            if mask_path.exists():
+                extra["mask"] = str(mask_path)
+            add_image(image_path, role, extra)
+            if max_images > 0 and len(images) >= max_images:
+                break
+    return images[:max_images] if max_images > 0 else images
+
+
+def cmd_prepare_object_labeling_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    objects_dir = project_root / manifest["objects_dir"]
+    if not objects_dir.exists():
+        raise FileNotFoundError("No objects directory. Run fuse-masks/select-frames first.")
+
+    output_dir = ensure_dir(args.output_dir or (project_root / manifest["simulator_assets_dir"] / "object_labeling_jobs"))
+    jobs_dir = ensure_dir(output_dir / "jobs")
+    labels_template: dict[str, Any] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "provider": args.provider,
+        "instructions": (
+            "Fill name/category/description/open_vocab_labels/confidence for each object_id, "
+            "then import this file with `python -m video2mesh.cli import-object-labels --labels <file>`."
+        ),
+        "objects": [],
+    }
+    jobs: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    for object_json in sorted(objects_dir.glob("*/object.json")):
+        obj = read_json(object_json)
+        object_id = slugify(obj.get("object_id") or object_json.parent.name)
+        if is_background_structure_record(obj) and not args.include_background:
+            skipped[object_id] = "background_structure"
+            continue
+        images = object_labeling_image_records(obj, object_json.parent, project_root, args.max_images)
+        if not images and not args.allow_missing_images:
+            skipped[object_id] = "missing reference images"
+            continue
+        job = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "name": obj.get("name", object_id),
+            "current_category": obj.get("category", "unknown"),
+            "current_description": obj.get("description", ""),
+            "asset_role": obj.get("asset_role", "object"),
+            "object_json": str(object_json),
+            "bbox_3d": obj.get("bbox_3d"),
+            "point_count": obj.get("point_count", 0),
+            "mask_3d_cloud": str(resolve_existing_path((obj.get("mask_3d_cloud") or {}).get("path"), project_root)) if isinstance(obj.get("mask_3d_cloud"), dict) and (obj.get("mask_3d_cloud") or {}).get("path") else None,
+            "images": images,
+            "recommended_prompt": (
+                "Identify the main physical object shown by the masked crop/selected frames. "
+                "Return JSON with object_id, name, category, description, aliases, open_vocab_labels, confidence, and source."
+            ),
+            "expected_output_schema": {
+                "object_id": object_id,
+                "name": "",
+                "category": "",
+                "description": "",
+                "aliases": [],
+                "open_vocab_labels": [],
+                "confidence": None,
+                "source": args.provider,
+                "vlm": {"model": "", "notes": ""},
+            },
+        }
+        job_path = jobs_dir / f"{object_id}.json"
+        write_json(job_path, job)
+        jobs[object_id] = {**job, "job_path": str(job_path)}
+        labels_template["objects"].append(
+            {
+                "object_id": object_id,
+                "name": obj.get("name", object_id),
+                "category": obj.get("category", "unknown"),
+                "description": obj.get("description", ""),
+                "aliases": [],
+                "open_vocab_labels": [],
+                "confidence": None,
+                "source": args.provider,
+                "vlm": {"model": "", "notes": ""},
+                "job_path": str(job_path),
+            }
+        )
+
+    manifest_path = output_dir / "object_labeling_jobs.json"
+    template_path = output_dir / "labels_template.json"
+    write_json(
+        manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "provider": args.provider,
+            "output_dir": str(output_dir),
+            "jobs": jobs,
+            "labels_template": str(template_path),
+            "skipped": skipped,
+            "notes": "Prepared external VLM/open-vocabulary object labeling jobs; no model is executed by this command.",
+        },
+    )
+    write_json(template_path, labels_template)
+    manifest.setdefault("artifacts", {})["object_labeling_jobs"] = str(manifest_path)
+    manifest.setdefault("artifacts", {})["object_labeling_template"] = str(template_path)
+    manifest.setdefault("external_stages", {})["semantic_labeling"] = {
+        "status": "object_labeling_jobs_prepared",
+        "notes": "Prepared per-object reference images and metadata for external VLM/open-vocabulary semantic labeling.",
+        "provider": args.provider,
+        "job_count": len(jobs),
+        "skipped_objects": skipped,
+        "labels_template": str(template_path),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared {len(jobs)} object labeling job(s): {manifest_path}")
+    print(f"Labels template: {template_path}")
+    if skipped:
+        print(f"Skipped: {', '.join(sorted(skipped))}")
+    return 0
+
+
 def cmd_import_object_labels(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -7736,6 +7951,9 @@ def validate_project(project_root: Path, strict: bool = False) -> dict[str, Any]
     object_categories_named = bool(object_records) and all(str(obj.get("category", "unknown")).strip().lower() not in {"", "unknown"} for obj in object_records)
     items.append(validation_item("object_semantic_labels", labels_ok or object_categories_named, labels_detail or "missing object_labels artifact or non-unknown object categories", "recommended"))
 
+    labeling_jobs_ok, labeling_jobs_detail = path_exists_for_manifest(project_root, artifacts.get("object_labeling_jobs"))
+    items.append(validation_item("object_labeling_jobs", labeling_jobs_ok, labeling_jobs_detail or "missing external VLM/open-vocabulary labeling jobs", "recommended"))
+
     selected_ok, selected_detail = path_exists_for_manifest(project_root, artifacts.get("selected_frames"))
     all_objects_have_selected = bool(foreground_object_records) and all(obj.get("selected_frames") for obj in foreground_object_records)
     items.append(validation_item("selected_frames", selected_ok and all_objects_have_selected, selected_detail or "missing selected_frames artifact"))
@@ -9442,6 +9660,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sam-device", default="auto")
     p.add_argument("--overwrite", action="store_true")
     p.set_defaults(func=cmd_auto_prompts)
+
+    p = sub.add_parser("prepare-object-labeling-jobs", help="Prepare per-object VLM/open-vocabulary semantic labeling jobs from crops and selected frames.")
+    add_common_project_arg(p)
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/object_labeling_jobs.")
+    p.add_argument("--provider", default="external_vlm")
+    p.add_argument("--max-images", type=int, default=4, help="Maximum evidence images stored per object; 0 keeps all.")
+    p.add_argument("--include-background", action="store_true", help="Also prepare jobs for background_structure records.")
+    p.add_argument("--allow-missing-images", action="store_true", help="Write jobs even when no crop/selected frame is available.")
+    p.set_defaults(func=cmd_prepare_object_labeling_jobs)
 
     p = sub.add_parser("import-object-labels", help="Import object names/categories/descriptions from JSON labels or VLM output.")
     add_common_project_arg(p)

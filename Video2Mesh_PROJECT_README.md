@@ -315,9 +315,26 @@ python -m video2mesh.cli import-video-segmentation-masks \
 如果后续用 VLM / 开放词汇检测器给 object_id 生成了更可靠的类别、名称和描述，可以把 JSON 标签导入回 Video2Mesh：
 
 ```bash
+python -m video2mesh.cli prepare-object-labeling-jobs \
+  --project-root exports/milscene2_real_demo \
+  --provider external_vlm \
+  --max-images 4
+```
+
+输出：
+
+```text
+simulator_assets/object_labeling_jobs/object_labeling_jobs.json
+simulator_assets/object_labeling_jobs/jobs/<object_id>.json
+simulator_assets/object_labeling_jobs/labels_template.json
+```
+
+把 `labels_template.json` 交给 VLM/open-vocabulary detector 或人工标注，填好每个 object 的 `name`、`category`、`description`、`open_vocab_labels` 和 `confidence` 后导入：
+
+```bash
 python -m video2mesh.cli import-object-labels \
   --project-root exports/milscene2_real_demo \
-  --labels /path/to/object_labels.json
+  --labels exports/milscene2_real_demo/simulator_assets/object_labeling_jobs/labels_template.json
 ```
 
 支持的最小格式可以是 map 或 list，例如：
