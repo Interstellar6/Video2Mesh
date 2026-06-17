@@ -4219,6 +4219,471 @@ def cmd_infer_background_structure_masks(args: argparse.Namespace) -> int:
     return 0
 
 
+SCENE_STRUCTURE_LABELS = [
+    {
+        "category": "floor",
+        "asset_role": "background_structure",
+        "description": "Walkable or support floor plane.",
+    },
+    {
+        "category": "ceiling",
+        "asset_role": "background_structure",
+        "description": "Ceiling or upper room boundary.",
+    },
+    {
+        "category": "wall",
+        "asset_role": "background_structure",
+        "description": "Wall or vertical room boundary.",
+    },
+    {
+        "category": "door",
+        "asset_role": "background_structure",
+        "description": "Door, doorway, or fixed opening.",
+    },
+    {
+        "category": "window",
+        "asset_role": "background_structure",
+        "description": "Window or fixed transparent opening.",
+    },
+    {
+        "category": "cabinet",
+        "asset_role": "background_structure",
+        "description": "Built-in cabinet or fixed storage.",
+    },
+    {
+        "category": "counter",
+        "asset_role": "background_structure",
+        "description": "Countertop or fixed work surface.",
+    },
+    {
+        "category": "shelf",
+        "asset_role": "background_structure",
+        "description": "Fixed shelf or wall-mounted storage.",
+    },
+    {
+        "category": "fixed_furniture",
+        "asset_role": "background_structure",
+        "description": "Large fixed or semi-fixed scene furniture.",
+    },
+    {
+        "category": "other_structure",
+        "asset_role": "background_structure",
+        "description": "Other non-movable scene structure.",
+    },
+]
+
+
+def cmd_prepare_scene_structure_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    point_cloud_path = args.point_cloud or (project_root / manifest["scene"]["point_cloud"])
+    point_cloud_path = resolve_project_cli_path(point_cloud_path, project_root)
+    if not point_cloud_path.exists():
+        raise FileNotFoundError(f"Point cloud not found: {point_cloud_path}")
+    camera_info_path = resolve_project_path(manifest["scene"]["camera_info"], project_root)
+    frames_dir = resolve_project_path(manifest["scene"]["frames_dir"], project_root)
+    frames = sorted((p for p in frames_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS), key=frame_sort_key) if frames_dir.exists() else []
+    if args.max_frames and args.max_frames > 0:
+        frames = frames[: args.max_frames]
+
+    output_dir = ensure_dir(args.output_dir or (project_root / manifest["simulator_assets_dir"] / "scene_structure_jobs"))
+    jobs_dir = ensure_dir(output_dir / "jobs")
+    expected_mask_manifest = output_dir / "scene_structure_masks_template.json"
+    frame_records = [
+        {
+            "frame_id": frame_stem(frame.stem),
+            "image": str(frame),
+            "index": index,
+        }
+        for index, frame in enumerate(frames)
+    ]
+    artifact_candidates = {
+        "semantic_splats_ply": manifest.get("artifacts", {}).get("semantic_splats_ply"),
+        "semantic_splats_manifest": manifest.get("artifacts", {}).get("semantic_splats_manifest"),
+        "object_mask_clouds": manifest.get("artifacts", {}).get("object_mask_clouds"),
+        "svpp_scene": manifest.get("artifacts", {}).get("svpp_scene"),
+        "svpp_metadata": manifest.get("artifacts", {}).get("svpp_metadata"),
+        "background_structures": manifest.get("artifacts", {}).get("background_structures"),
+    }
+    resolved_artifacts = {
+        key: str(resolve_existing_path(str(value), project_root)) if value and resolve_existing_path(str(value), project_root) else value
+        for key, value in artifact_candidates.items()
+    }
+    job = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "provider": args.provider,
+        "point_cloud": str(point_cloud_path),
+        "camera_info": str(camera_info_path) if camera_info_path.exists() else None,
+        "frames_dir": str(frames_dir) if frames_dir.exists() else None,
+        "frame_count": len(frame_records),
+        "frames": frame_records,
+        "artifacts": resolved_artifacts,
+        "recommended_labels": SCENE_STRUCTURE_LABELS,
+        "expected_output": {
+            "manifest": str(expected_mask_manifest),
+            "structures_schema": {
+                "object_id": "wall_0",
+                "name": "left wall",
+                "category": "wall",
+                "asset_role": "background_structure",
+                "point_indices": [0, 1, 2],
+                "point_indices_json": "optional/path/to/indices.json",
+                "point_indices_npy": "optional/path/to/indices.npy",
+                "confidence": 0.0,
+                "source": args.provider,
+                "notes": "point_indices must index the job point_cloud vertex order.",
+            },
+        },
+        "notes": (
+            "Prepared for external scene structure/layout segmentation such as SpatialLM/PQ3D adapters, "
+            "open-vocabulary 3D segmentation, or room-layout parsers. Run the external tool, then import "
+            "its point-index masks with import-scene-structure-masks. Frames may be empty for point-cloud-only tools."
+        ),
+    }
+    job_path = output_dir / "scene_structure_job.json"
+    write_json(job_path, job)
+    per_provider_job_path = jobs_dir / f"{slugify(args.provider, 'external')}.json"
+    write_json(per_provider_job_path, job)
+
+    template = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "provider": args.provider,
+        "point_cloud": str(point_cloud_path),
+        "structures": [
+            {
+                "object_id": "floor",
+                "name": "floor",
+                "category": "floor",
+                "asset_role": "background_structure",
+                "point_indices": [],
+                "confidence": None,
+                "source": args.provider,
+            }
+        ],
+        "notes": "Fill structures with point-index masks, then run import-scene-structure-masks --source-manifest <this file>.",
+    }
+    write_json(expected_mask_manifest, template)
+
+    command = None
+    if args.command_template:
+        values = {
+            "job_path": str(job_path),
+            "project_root": str(project_root),
+            "point_cloud": str(point_cloud_path),
+            "camera_info": str(camera_info_path) if camera_info_path.exists() else "",
+            "frames_dir": str(frames_dir) if frames_dir.exists() else "",
+            "provider": args.provider,
+            "output_manifest": str(expected_mask_manifest),
+        }
+        command = args.command_template.format(**values)
+    script_path = output_dir / "run_scene_structure_segmentation.sh"
+    script_lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    if command:
+        script_lines.append(command)
+    else:
+        script_lines.append(f'echo "Fill in external {args.provider} scene-structure command for job: {job_path}"')
+    script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+
+    manifest.setdefault("artifacts", {})["scene_structure_job"] = str(job_path)
+    manifest.setdefault("artifacts", {})["scene_structure_template"] = str(expected_mask_manifest)
+    manifest.setdefault("external_stages", {})["background_structure_segmentation"] = {
+        "status": "external_scene_structure_job_prepared",
+        "notes": "Prepared external scene structure/layout segmentation job; import point-index masks before semantic export/simulator packaging.",
+        "provider": args.provider,
+        "job": str(job_path),
+        "script": str(script_path),
+        "point_cloud": str(point_cloud_path),
+        "frame_count": len(frame_records),
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Prepared scene structure segmentation job: {job_path}")
+    print(f"Template: {expected_mask_manifest}")
+    print(f"Script: {script_path}")
+    return 0
+
+
+def scene_structure_entries(data: Any) -> list[dict[str, Any]]:
+    raw_entries: list[Any]
+    if isinstance(data, dict) and isinstance(data.get("structures"), list):
+        raw_entries = data["structures"]
+    elif isinstance(data, dict) and isinstance(data.get("objects"), list):
+        raw_entries = data["objects"]
+    elif isinstance(data, dict):
+        raw_entries = []
+        for key, value in data.items():
+            if key in {"schema_version", "project_root", "scene_id", "provider", "point_cloud", "notes"}:
+                continue
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("object_id", key)
+                raw_entries.append(item)
+    elif isinstance(data, list):
+        raw_entries = data
+    else:
+        raise ValueError("Scene structure manifest must be a list, map, or object with structures/objects.")
+
+    entries: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_entries):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Scene structure entry #{index} is not a JSON object.")
+        object_id = slugify(raw.get("object_id") or raw.get("id") or raw.get("name") or f"structure_{index:02d}")
+        item = dict(raw)
+        item["object_id"] = object_id
+        entries.append(item)
+    return entries
+
+
+def resolve_scene_structure_sidecar_path(path_value: Any, project_root: Path, source_root: Path) -> Path | None:
+    if not path_value:
+        return None
+    path = Path(str(path_value))
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.extend([project_root / path, source_root / path])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    if path.is_absolute():
+        return path.resolve()
+    return (source_root / path).resolve()
+
+
+def load_scene_structure_indices(entry: dict[str, Any], project_root: Path, source_root: Path) -> list[int]:
+    inline = entry.get("point_indices")
+    if inline is None:
+        inline = entry.get("indices")
+    if inline is not None:
+        if not isinstance(inline, list):
+            raise ValueError(f"point_indices for {entry.get('object_id')} must be a list.")
+        return [int(value) for value in inline]
+    for key in ("point_indices_json", "indices_json", "point_indices_npy", "indices_npy"):
+        path = resolve_scene_structure_sidecar_path(entry.get(key), project_root, source_root)
+        if path and path.exists():
+            return load_point_index_mask(path)
+    raise ValueError(f"Scene structure {entry.get('object_id')} has no point_indices or point_indices_json/npy.")
+
+
+def write_mask_cloud_for_indices(
+    output_dir: Path,
+    object_id: str,
+    point_cloud_path: Path,
+    points,
+    colors,
+    indices: list[int],
+    source_indices: str,
+) -> dict[str, Any]:
+    np = import_numpy()
+    if colors is None:
+        colors_u8 = np.full((points.shape[0], 3), 180, dtype=np.uint8)
+    else:
+        colors_u8 = np.clip(np.rint(colors * 255.0), 0, 255).astype(np.uint8)
+    object_points = []
+    for index in indices:
+        if not (0 <= index < points.shape[0]):
+            continue
+        point = points[index]
+        color = colors_u8[index]
+        object_points.append(
+            (
+                float(point[0]),
+                float(point[1]),
+                float(point[2]),
+                int(color[0]),
+                int(color[1]),
+                int(color[2]),
+            )
+        )
+    out_ply = output_dir / f"{object_id}.ply"
+    write_ascii_ply(out_ply, object_points)
+    return {
+        "path": str(out_ply),
+        "point_count": len(object_points),
+        "source_point_cloud": str(point_cloud_path),
+        "source_indices": source_indices,
+    }
+
+
+def cmd_import_scene_structure_masks(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    source_manifest_path = resolve_project_cli_path(args.source_manifest, project_root)
+    data = read_json(source_manifest_path)
+    entries = scene_structure_entries(data)
+    source_root = source_manifest_path.parent
+    if args.point_cloud:
+        point_cloud_path = resolve_project_cli_path(args.point_cloud, project_root)
+    elif isinstance(data, dict) and data.get("point_cloud"):
+        point_cloud_path = resolve_scene_structure_sidecar_path(data.get("point_cloud"), project_root, source_root)
+    else:
+        point_cloud_path = resolve_project_path(manifest["scene"]["point_cloud"], project_root)
+    points, colors = read_point_cloud(point_cloud_path)
+    if points.shape[0] == 0:
+        raise RuntimeError(f"No points found in point cloud: {point_cloud_path}")
+
+    objects_dir = ensure_dir(project_root / manifest["objects_dir"])
+    structure_root = ensure_dir(project_root / manifest["simulator_assets_dir"] / "background_structures")
+    cloud_dir = ensure_dir(args.cloud_output_dir or (project_root / manifest["simulator_assets_dir"] / "object_masks_3d"))
+    labels_path = resolve_project_cli_path(args.object_labels, project_root) if args.object_labels else (project_root / "masks" / "object_labels.json")
+    labels = load_object_labels(project_root, labels_path)
+    imported: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    for entry in entries:
+        object_id = slugify(entry.get("object_id"), fallback="structure")
+        indices = [int(index) for index in load_scene_structure_indices(entry, project_root, source_root)]
+        invalid_count = sum(1 for index in indices if not (0 <= index < points.shape[0]))
+        valid_indices = sorted({index for index in indices if 0 <= index < points.shape[0]})
+        duplicate_count = max(0, len(indices) - invalid_count - len(valid_indices))
+        if len(valid_indices) < int(args.min_points):
+            if args.skip_small:
+                skipped[object_id] = f"{len(valid_indices)} valid point(s), below --min-points {args.min_points}"
+                continue
+            raise ValueError(f"Scene structure {object_id} has only {len(valid_indices)} valid point(s).")
+
+        bbox = entry.get("bbox_3d") if isinstance(entry.get("bbox_3d"), dict) else bbox_for_points(points[np.asarray(valid_indices, dtype=np.int64)])
+        mask_info = write_point_indices(
+            project_root,
+            manifest,
+            object_id,
+            valid_indices,
+            {
+                "source": entry.get("source", args.provider),
+                "source_manifest": str(source_manifest_path),
+                "source_point_cloud": str(point_cloud_path),
+                "invalid_index_count": invalid_count,
+                "duplicate_index_count": duplicate_count,
+            },
+        )
+        mask_cloud = write_mask_cloud_for_indices(
+            cloud_dir,
+            object_id,
+            point_cloud_path,
+            points,
+            colors,
+            valid_indices,
+            mask_info["point_indices_json"],
+        )
+        label = labels.get(object_id, {})
+        category = entry.get("category") or entry.get("class") or entry.get("class_name") or label.get("category") or "other_structure"
+        name = entry.get("name") or label.get("name") or object_id.replace("-", " ")
+        description = entry.get("description") or label.get("description") or f"Imported {category} scene structure."
+        asset_role = "background_structure"
+        object_info = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "asset_role": asset_role,
+            "name": name,
+            "category": category,
+            "description": description,
+            "point_count": int(len(valid_indices)),
+            "bbox_3d": bbox,
+            "mask_3d": mask_info,
+            "mask_3d_cloud": mask_cloud,
+            "frame_scores": {},
+            "background_structure": {
+                "method": "external_scene_structure_mask",
+                "provider": args.provider,
+                "source": entry.get("source", args.provider),
+                "source_manifest": str(source_manifest_path),
+                "source_point_cloud": str(point_cloud_path),
+                "confidence": entry.get("confidence"),
+                "invalid_index_count": invalid_count,
+                "duplicate_index_count": duplicate_count,
+                "notes": entry.get("notes"),
+            },
+            "notes": "Imported scene structure mask. It participates in semantic splats, SVPP metadata, and simulator export; it is skipped by object mesh generation.",
+        }
+        object_dir = ensure_dir(objects_dir / object_id)
+        write_json(object_dir / "object.json", object_info)
+        write_json(object_dir / "frame_scores.json", {})
+        labels[object_id] = merge_object_label(
+            labels.get(object_id, {}),
+            {
+                "object_id": object_id,
+                "name": name,
+                "category": category,
+                "description": description,
+                "confidence": entry.get("confidence"),
+                "source": entry.get("source", args.provider),
+            },
+            True,
+        )
+        imported[object_id] = object_info
+
+    write_json(labels_path, labels)
+    structure_manifest_path = structure_root / "background_structures.json"
+    existing_structures: dict[str, Any] = {}
+    if structure_manifest_path.exists() and not args.replace_manifest:
+        existing = read_json(structure_manifest_path)
+        if isinstance(existing, dict) and isinstance(existing.get("structures"), dict):
+            existing_structures = dict(existing["structures"])
+    existing_structures.update(imported)
+    write_json(
+        structure_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "point_cloud": str(point_cloud_path),
+            "provider": args.provider,
+            "source_manifest": str(source_manifest_path),
+            "structures": existing_structures,
+            "imported": sorted(imported),
+            "skipped": skipped,
+            "notes": "Scene structures imported from external point-index masks.",
+        },
+    )
+    object_cloud_manifest_path = cloud_dir / "object_mask_clouds.json"
+    if object_cloud_manifest_path.exists():
+        cloud_manifest = read_json(object_cloud_manifest_path)
+        if not isinstance(cloud_manifest, dict):
+            cloud_manifest = {}
+    else:
+        cloud_manifest = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "point_cloud": str(point_cloud_path),
+            "output_dir": str(cloud_dir),
+            "objects": {},
+        }
+    cloud_manifest.setdefault("schema_version", DEFAULT_SCHEMA_VERSION)
+    cloud_manifest.setdefault("point_cloud", str(point_cloud_path))
+    cloud_manifest.setdefault("output_dir", str(cloud_dir))
+    cloud_manifest.setdefault("objects", {})
+    for object_id, obj in imported.items():
+        cloud_manifest["objects"][object_id] = {
+            "object_id": object_id,
+            "name": obj.get("name", object_id),
+            "category": obj.get("category", "unknown"),
+            **(obj.get("mask_3d_cloud") or {}),
+        }
+    write_json(object_cloud_manifest_path, cloud_manifest)
+
+    manifest.setdefault("artifacts", {})["object_labels"] = str(labels_path)
+    manifest.setdefault("artifacts", {})["background_structures"] = str(structure_manifest_path)
+    manifest.setdefault("artifacts", {})["object_mask_clouds"] = str(object_cloud_manifest_path)
+    manifest.setdefault("external_stages", {})["background_structure_segmentation"] = {
+        "status": "external_scene_structure_masks_imported",
+        "notes": "Imported external scene structure/layout point-index masks into Video2Mesh object records.",
+        "provider": args.provider,
+        "source_manifest": str(source_manifest_path),
+        "structure_count": len(imported),
+        "skipped": skipped,
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Imported {len(imported)} scene structure mask(s): {structure_manifest_path}")
+    print(f"Object mask clouds: {object_cloud_manifest_path}")
+    if skipped:
+        print(f"Skipped: {', '.join(f'{key} ({value})' for key, value in skipped.items())}")
+    return 0
+
+
 def read_ascii_ply_table(path: Path) -> tuple[list[str], list[str], list[list[str]]]:
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         header = []
@@ -9676,6 +10141,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, help="Defaults to masks/object_labels.json.")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True, help="Overwrite existing unknown/empty fields by default.")
     p.set_defaults(func=cmd_import_object_labels)
+
+    p = sub.add_parser("prepare-scene-structure-jobs", help="Prepare point-cloud/layout jobs for external scene structure segmentation.")
+    add_common_project_arg(p)
+    p.add_argument("--point-cloud", type=Path, help="Defaults to scene/reconstruction/point_cloud.ply.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/scene_structure_jobs.")
+    p.add_argument("--provider", default="external_scene_structure", help="External provider/tool name, e.g. spatiallm, pq3d, ov3dseg.")
+    p.add_argument("--max-frames", type=int, default=0, help="Maximum source frames to list in the job; 0 keeps all.")
+    p.add_argument(
+        "--command-template",
+        help=(
+            "Optional shell command with {job_path}, {project_root}, {point_cloud}, "
+            "{camera_info}, {frames_dir}, {provider}, {output_manifest}."
+        ),
+    )
+    p.set_defaults(func=cmd_prepare_scene_structure_jobs)
+
+    p = sub.add_parser("import-scene-structure-masks", help="Import external scene structure/layout point-index masks as background_structure records.")
+    add_common_project_arg(p)
+    p.add_argument("--source-manifest", type=Path, required=True, help="JSON list/map or object with structures/objects entries.")
+    p.add_argument("--point-cloud", type=Path, help="Point cloud whose vertex order the imported indices reference. Defaults to manifest or source-manifest point_cloud.")
+    p.add_argument("--provider", default="external_scene_structure")
+    p.add_argument("--object-labels", type=Path, help="Defaults to masks/object_labels.json.")
+    p.add_argument("--cloud-output-dir", type=Path, help="Defaults to simulator_assets/object_masks_3d.")
+    p.add_argument("--min-points", type=int, default=1)
+    p.add_argument("--skip-small", action="store_true", help="Skip structures below --min-points instead of failing.")
+    p.add_argument("--replace-manifest", action="store_true", help="Replace existing background_structures.json instead of merging.")
+    p.set_defaults(func=cmd_import_scene_structure_masks)
 
     p = sub.add_parser("fuse-masks", help="Fuse frame-level 2D masks onto a point cloud.")
     add_common_project_arg(p)

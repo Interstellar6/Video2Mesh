@@ -851,7 +851,68 @@ simulator_assets/object_masks_3d/object_mask_clouds.json
 objects/<object_id>/object.json  # 写入 mask_3d_cloud
 ```
 
-背景结构可以作为另一类 semantic record 加入同一套 3D mask 协议。当前可运行 baseline 会从点云边界启发式推断 floor / ceiling / walls：
+背景结构可以作为另一类 semantic record 加入同一套 3D mask 协议。生产路线是把点云、相机、帧和已有 semantic artifacts 打包给外部 scene structure / layout segmentation 工具，例如 SpatialLM、PQ3D adapter、open-vocabulary 3D segmentation 或房间 layout parser：
+
+```bash
+python -m video2mesh.cli prepare-scene-structure-jobs \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --point-cloud /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/reconstruction/point_cloud_10k.ply \
+  --provider spatiallm \
+  --command-template "python run_scene_structure.py --job {job_path} --output {output_manifest}"
+```
+
+输出：
+
+```text
+simulator_assets/scene_structure_jobs/scene_structure_job.json
+simulator_assets/scene_structure_jobs/jobs/<provider>.json
+simulator_assets/scene_structure_jobs/scene_structure_masks_template.json
+simulator_assets/scene_structure_jobs/run_scene_structure_segmentation.sh
+```
+
+`scene_structure_job.json` 会列出 point cloud、camera_info、源帧、semantic splats、object mask clouds、SVPP export 等可用上下文。外部工具跑完后，只需要写回如下核心结构：
+
+```json
+{
+  "point_cloud": "/path/to/the/same/point_cloud.ply",
+  "structures": [
+    {
+      "object_id": "wall_0",
+      "name": "left wall",
+      "category": "wall",
+      "point_indices": [0, 1, 2],
+      "confidence": 0.92,
+      "source": "spatiallm"
+    }
+  ]
+}
+```
+
+也可以把点索引放在 `point_indices_json` 或 `point_indices_npy`。关键约束是：这些点索引必须引用同一个 point cloud 的 vertex 顺序。导入命令会把外部结果规范化为 Video2Mesh 的 background structure records：
+
+```bash
+python -m video2mesh.cli import-scene-structure-masks \
+  --project-root /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id> \
+  --source-manifest /path/to/external_scene_structures.json \
+  --point-cloud /root/autodl-tmp/workspace/Video2Mesh/exports/<scene_id>/scene/reconstruction/point_cloud_10k.ply \
+  --provider spatiallm \
+  --min-points 50
+```
+
+输出：
+
+```text
+objects/<structure_id>/object.json
+masks/3d/<structure_id>/point_indices.npy
+masks/3d/<structure_id>/point_indices.json
+simulator_assets/object_masks_3d/<structure_id>.ply
+simulator_assets/object_masks_3d/object_mask_clouds.json
+simulator_assets/background_structures/background_structures.json
+```
+
+这些导入的 records 会被强制标记为 `asset_role=background_structure`，因此会进入 semantic splats、SVPP metadata、review/evaluate 和 simulator bundle，但不会被送入单物体 image-blaster mesh 生成。
+
+如果还没有外部 layout 模型，当前可运行 baseline 会从点云边界启发式推断 floor / ceiling / walls：
 
 ```bash
 python -m video2mesh.cli infer-background-structure-masks \
@@ -878,7 +939,7 @@ simulator_assets/background_structures/background_structures.json
 
 这些 object record 的 `asset_role` 是 `background_structure`。它们不是 PLY 里 `object_id=0` 的 unlabeled background，而是有正常 semantic id 的场景结构实例，会进入 semantic splats、object mask clouds、SVPP metadata 和 simulator bundle。与此同时，它们会跳过 `select-frames`、`prepare-object-images`、`reconstruct-object-meshes`、`export-image-blaster` 和 `prepare-multiview-mesh-jobs`，因为 floor/wall/ceiling 不是要送进单物体 mesh API 的可搬动物体。
 
-当前 `infer-background-structure-masks` 只是 axis-boundary heuristic，适合验证协议；真正系统应换成 layout segmentation、SpatialLM/PQ3D、open-vocabulary 3D segmentation 或从 3DGS/mesh 中提取稳定建筑结构。
+当前 `infer-background-structure-masks` 只是 axis-boundary heuristic，适合验证协议；真正系统应优先走 `prepare-scene-structure-jobs` + `import-scene-structure-masks`，接 layout segmentation、SpatialLM/PQ3D、open-vocabulary 3D segmentation 或从 3DGS/mesh 中提取稳定建筑结构。
 
 如果想把 object mask 写入 splat/点云 PLY，运行：
 
@@ -1292,6 +1353,13 @@ python -m video2mesh.cli validate \
 
 `validate` 只证明工程产物是否齐全；真实质量还要继续评估重建清晰度、mask 一致性、mesh 几何质量、尺度/pose 和仿真器导入效果。
 
+对于外部 scene structure / layout mask，还要额外检查：
+
+- `background_structures` artifact 是否存在，并且结构 object 有 `asset_role=background_structure`。
+- 每个结构 object 是否有 `mask_3d.point_indices_json/npy` 和可预览的 `mask_3d_cloud`。
+- SVPP export 的 `metadata.json[*].point_ids` 是否索引同一份 `mesh.ply` vertex 顺序。
+- `pred_class_name/id` 是否是 wall/floor/ceiling/cabinet 等类别 id，而不是 semantic PLY 中的实例 id。
+
 如果希望看到更细的阶段 readiness 和物体级质量摘要，运行：
 
 ```bash
@@ -1388,7 +1456,8 @@ SVPP 导出有几条一致性约束需要特别注意：
 - `object_id` 是 Video2Mesh 内部跨文件 join key，会连接 `objects/<id>/object.json`、semantic PLY manifest、simulator bundle、SVPP metadata 和 image-blaster world。
 - semantic PLY / SuperSplat 中的 `semantic_id` 是实例标签，用于区分 object/structure；SVPP 里的 `pred_class_id` 是类别 id，例如 ScanNet20 的 wall/floor/chair，不是实例 id。
 - `object_id=0` 或 semantic label `0` 表示 unlabeled background；`floor`、`ceiling`、`wall_*` 这类 `background_structure` 是有独立 `object_id` 和 semantic id 的结构实例。
-- 如果要让 SVPP metadata 使用 VLM/open-vocabulary 的新类别，或包含 floor/wall/ceiling 背景结构，应先运行 `import-object-labels` / `infer-background-structure-masks`，再运行 `export-svpp-metadata`。
+- 如果要让 SVPP metadata 使用 VLM/open-vocabulary 的新类别，或包含 floor/wall/ceiling/door/window/cabinet 等背景结构，应先运行 `import-object-labels` / `import-scene-structure-masks` / `infer-background-structure-masks`，再运行 `export-svpp-metadata`。
+- `export-svpp-metadata` 是把 Video2Mesh 的 masks 导出给 SceneVerse++/PQ3D 的方向；`prepare-scene-structure-jobs` + `import-scene-structure-masks` 是把 SpatialLM/PQ3D/open-vocabulary 3D segmentation 等外部结构理解结果导回 Video2Mesh 的方向。
 
 如果 Video2Mesh 的类别不是 SceneVerse++/ScanNet20 类别，例如 `box`，可以显式映射：
 

@@ -96,6 +96,23 @@ exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo/
 
 SVPP 导出时要靠 `object_id` 对齐 Video2Mesh 的 object record、semantic PLY、simulator bundle 和 SceneVerse++ metadata。`semantic_id` 是实例标签，`pred_class_id` 是类别标签，二者不能混用；`floor`、`ceiling`、`wall_*` 这类背景结构也会作为带独立 semantic id 的结构实例进入 metadata。
 
+反向对接也已经有工程接口：可以把当前点云、相机、帧、semantic splats、SVPP export 打包成外部 scene structure job，交给 SpatialLM / PQ3D / open-vocabulary 3D segmentation 一类工具产生地面、墙面、门窗、固定柜体等结构 mask，然后再导回 Video2Mesh：
+
+```bash
+python -m video2mesh.cli prepare-scene-structure-jobs \
+  --project-root exports/milscene2_real_demo \
+  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
+  --provider spatiallm
+
+python -m video2mesh.cli import-scene-structure-masks \
+  --project-root exports/milscene2_real_demo \
+  --source-manifest exports/milscene2_real_demo/simulator_assets/scene_structure_jobs/scene_structure_masks_template.json \
+  --provider spatiallm \
+  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply
+```
+
+导入格式的核心是 `structures[*].point_indices` 或 `point_indices_json/npy`。这些点索引必须对应同一个 point cloud 的 vertex 顺序；导入后会写 `asset_role=background_structure` 的 object record，并进入 semantic 3DGS、SVPP metadata 和 simulator bundle。
+
 ### 3.2 image-blaster
 
 `image-blaster` 关注从单张图片生成资产。它的目录约定对 Video2Mesh 很有用：
@@ -353,7 +370,44 @@ python -m video2mesh.cli import-object-labels \
 
 ### 4.5 背景结构语义 mask
 
-前景物体来自 2D mask tracking 和 2D-to-3D fusion；地面、天花板、墙面这类背景结构通常没有单物体 crop，也不应该进入 image-blaster mesh 生成。当前工程提供一个可运行的 axis-boundary baseline：
+前景物体来自 2D mask tracking 和 2D-to-3D fusion；地面、天花板、墙面、门窗、固定柜体这类背景结构通常没有单物体 crop，也不应该进入 image-blaster mesh 生成。生产路线是先把场景点云/相机/帧打包给外部 layout 或 3D scene parsing 工具：
+
+```bash
+python -m video2mesh.cli prepare-scene-structure-jobs \
+  --project-root exports/milscene2_real_demo \
+  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
+  --provider spatiallm
+```
+
+输出：
+
+```text
+simulator_assets/scene_structure_jobs/scene_structure_job.json
+simulator_assets/scene_structure_jobs/jobs/<provider>.json
+simulator_assets/scene_structure_jobs/scene_structure_masks_template.json
+simulator_assets/scene_structure_jobs/run_scene_structure_segmentation.sh
+```
+
+外部工具只需要填回 `structures` 列表，每个结构包含 `object_id`、`category` 和 `point_indices` 或 `point_indices_json/npy`。导入后会生成标准 3D mask、结构点云和 object record：
+
+```bash
+python -m video2mesh.cli import-scene-structure-masks \
+  --project-root exports/milscene2_real_demo \
+  --source-manifest /path/to/external_scene_structures.json \
+  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
+  --provider spatiallm
+```
+
+它会写：
+
+```text
+objects/<structure>/object.json
+masks/3d/<structure>/point_indices.json
+simulator_assets/object_masks_3d/<structure>.ply
+simulator_assets/background_structures/background_structures.json
+```
+
+当前工程还提供一个可运行的 axis-boundary baseline，用来在没有外部 layout 模型时验证协议：
 
 ```bash
 python -m video2mesh.cli infer-background-structure-masks \
@@ -377,7 +431,7 @@ masks/3d/<structure>/point_indices.json
 simulator_assets/background_structures/background_structures.json
 ```
 
-这些记录的 `asset_role` 是 `background_structure`：它们参与 semantic 3DGS、object mask cloud、SVPP metadata 和 simulator bundle，但会跳过 selected frames、object crops、object mesh 这些前景物体步骤。这个 baseline 只是协议验证，后续应替换为更稳的 layout segmentation / SpatialLM / PQ3D / open-vocabulary 3D segmentation。
+这些记录的 `asset_role` 是 `background_structure`：它们参与 semantic 3DGS、object mask cloud、SVPP metadata 和 simulator bundle，但会跳过 selected frames、object crops、object mesh 这些前景物体步骤。`infer-background-structure-masks` 只是协议验证；`prepare-scene-structure-jobs` + `import-scene-structure-masks` 才是后续接 SpatialLM / PQ3D / open-vocabulary 3D segmentation 的桥。
 
 ### 4.6 Semantic 3DGS 与 viewer PLY
 
@@ -728,6 +782,8 @@ Review HTML 中会包含：
 - 3DGS render / target / error。
 - 每个物体的 reference image、selected frames、mesh 路径、simulator mesh 状态。
 
+结构 mask 的额外检查点是：`background_structures` artifact 是否存在；结构 object 是否都有 `mask_3d.point_indices_json/npy`；SVPP export 的 `metadata.json[*].point_ids` 是否仍能索引到同一份 `mesh.ply` vertex 顺序；`pred_class_name/id` 是否按 wall/floor/ceiling/cabinet 等类别映射，而不是混成实例语义 id。
+
 ## 9. 局限和下一步
 
 当前系统已经完成工程闭环，但还有明显局限：
@@ -738,7 +794,7 @@ Review HTML 中会包含：
 - 3D mask fusion 依赖 MASt3R-SLAM 位姿和点云质量，遮挡、反光、透明物体会明显影响结果。
 - 当前 mesh 是从 3D mask cloud 粗重建，适合接口验证，不适合最终仿真质量。
 - 目前只有工程假设/参考物体式尺度接口和 bbox 体积物理估计，仍缺少真实测量尺度、可靠质量/摩擦和稳定碰撞体。
-- 背景结构目前只是点云边界启发式 floor/ceiling/wall mask，不会识别门、窗、柜体、桌面等语义结构，也不是可靠 layout reconstruction。
+- 背景结构已经有外部 layout/3D segmentation 导入协议，但当前内置可运行 baseline 仍只是点云边界启发式 floor/ceiling/wall mask；门、窗、柜体、桌面等语义结构需要接入 SpatialLM / PQ3D / open-vocabulary 3D segmentation 等外部模型。
 
 建议下一步：
 
