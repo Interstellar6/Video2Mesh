@@ -184,7 +184,8 @@ exports/bedroom_100_first60_quick_first60_graphdeco_20260620_052824
 - `tools/run_video2mesh_quick.sh` 已确认使用 `GS_BACKEND=graphdeco`，命令中包含 `3dgs_graphdeco` 和 GraphDECO `train.py --disable_viewer`。
 - first60 在 30 分钟阈值内结束 MASt3R，但只导入 `1` 个 pose。
 - `scene/reconstruction/point_cloud.ply` 是空 PLY，Open3D 报 `Read PLY failed: number of vertex <= 0`。
-- pipeline 随后在 GraphDECO source/point-cloud 准备阶段失败：`No points found in point cloud`。
+- `reconstruction-readiness` 已能提前诊断该状态：`frames=1 poses=1 points=0`，`ok=False colmap=False 3dgs=False mask_fusion=False`。
+- pipeline 现在会在 GraphDECO source/point-cloud 准备前写 `simulator_assets/reconstruction_readiness_report.json` 并停止，避免空点云继续进入训练。
 - 因该实验没有跑通完整链路，本轮不拆分 `video2mesh/cli.py`。
 
 下一步建议：

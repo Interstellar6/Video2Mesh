@@ -25991,6 +25991,7 @@ def cmd_verify_svpp_import_pack(args: argparse.Namespace) -> int:
 def reconstruction_readiness_report(
     project_root: Path,
     manifest: dict[str, Any],
+    frames_dir: Path | None = None,
     min_frames: int = 3,
     min_camera_poses: int = 2,
     min_point_count: int = 100,
@@ -25999,7 +26000,7 @@ def reconstruction_readiness_report(
     require_preview: bool = False,
 ) -> dict[str, Any]:
     artifacts = manifest.get("artifacts", {})
-    frames_dir = resolve_project_frames_dir(project_root, manifest)
+    frames_dir = frames_dir if frames_dir is not None else resolve_project_frames_dir(project_root, manifest)
     frames = list_frame_images(frames_dir) if frames_dir.exists() else []
     frames_manifest = read_frames_manifest(project_root, manifest)
     camera_path = project_root / manifest["scene"]["camera_info"]
@@ -26121,6 +26122,99 @@ def reconstruction_readiness_report(
             "Train/register a real 3DGS before semantic splat transfer." if not (scene_3dgs_path and scene_3dgs_path.exists()) else "",
         ],
     }
+
+
+def write_reconstruction_readiness_artifact(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    output: Path | None = None,
+    frames_dir: Path | None = None,
+    min_frames: int = 3,
+    min_camera_poses: int = 2,
+    min_point_count: int = 100,
+    min_camera_coverage: float = 0.8,
+    min_visible_point_ratio: float = 0.05,
+    require_preview: bool = False,
+    update_manifest: bool = True,
+) -> tuple[Path, dict[str, Any]]:
+    report = reconstruction_readiness_report(
+        project_root,
+        manifest,
+        frames_dir=frames_dir,
+        min_frames=min_frames,
+        min_camera_poses=min_camera_poses,
+        min_point_count=min_point_count,
+        min_camera_coverage=min_camera_coverage,
+        min_visible_point_ratio=min_visible_point_ratio,
+        require_preview=require_preview,
+    )
+    output_path = resolve_project_relative_path(output, project_root) if output else project_root / "simulator_assets" / "reconstruction_readiness_report.json"
+    write_json(output_path, report)
+    if update_manifest:
+        manifest.setdefault("artifacts", {})["reconstruction_readiness_report"] = str(output_path)
+        save_manifest(project_root, manifest)
+    return output_path, report
+
+
+def reconstruction_readiness_failure_detail(report: dict[str, Any]) -> str:
+    failures = report.get("blocking_failures") if isinstance(report.get("blocking_failures"), list) else []
+    warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
+    items = failures or warnings
+    details = []
+    for item in items[:4]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or "check"
+        detail = item.get("detail") or ""
+        value = item.get("value")
+        threshold = item.get("threshold")
+        suffix = ""
+        if value is not None and threshold is not None:
+            suffix = f" (value={value}, threshold={threshold})"
+        details.append(f"{name}: {detail}{suffix}")
+    return "; ".join(details) if details else "see reconstruction readiness report"
+
+
+def cmd_reconstruction_readiness(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    frames_dir = resolve_project_cli_path(args.frames_dir, project_root) if args.frames_dir else None
+    output_path, report = write_reconstruction_readiness_artifact(
+        project_root,
+        manifest,
+        output=args.output,
+        frames_dir=frames_dir,
+        min_frames=args.min_frames,
+        min_camera_poses=args.min_camera_poses,
+        min_point_count=args.min_point_count,
+        min_camera_coverage=args.min_camera_coverage,
+        min_visible_point_ratio=args.min_visible_point_ratio,
+        require_preview=args.require_preview,
+        update_manifest=not args.no_update_manifest,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(
+            "Reconstruction readiness: "
+            f"ok={report.get('ok')} "
+            f"colmap={report.get('ready_for_colmap_export')} "
+            f"3dgs={report.get('ready_for_gsplat_training')} "
+            f"mask_fusion={report.get('ready_for_mask_fusion')}"
+        )
+        print(
+            f"frames={report.get('frames', {}).get('frame_count')} "
+            f"poses={report.get('camera', {}).get('extrinsic_count')} "
+            f"points={report.get('point_cloud', {}).get('vertex_count')}"
+        )
+        for item in report.get("checks", []):
+            if isinstance(item, dict) and not item.get("ok"):
+                print(f"- {item.get('severity')}: {item.get('name')} - {item.get('detail')}")
+        print(f"Report: {output_path}")
+    if args.fail_on_not_ready and not report.get("ok"):
+        return 1
+    return 0
 
 
 def vector_diagonal(values: Any) -> float | None:
@@ -29807,6 +29901,44 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
         mask_source_point_cloud = default_3dgs_point_cloud
         append_pipeline_step(steps, "mask_source_point_cloud", "selected", str(mask_source_point_cloud))
 
+        if has_full_point_cloud_sensitive_stage or args.reconstruction_readiness_fail_on_not_ready:
+            readiness_path, readiness = write_reconstruction_readiness_artifact(
+                project_root,
+                manifest,
+                frames_dir=working_frames_dir,
+                min_frames=args.reconstruction_readiness_min_frames,
+                min_camera_poses=args.reconstruction_readiness_min_camera_poses,
+                min_point_count=args.reconstruction_readiness_min_point_count,
+                min_camera_coverage=args.reconstruction_readiness_min_camera_coverage,
+                min_visible_point_ratio=args.reconstruction_readiness_min_visible_point_ratio,
+                require_preview=False,
+                update_manifest=True,
+            )
+            manifest = load_manifest(project_root)
+            append_pipeline_step(
+                steps,
+                "reconstruction_readiness",
+                "passed" if readiness.get("ok") else "failed",
+                str(readiness_path),
+            )
+            if has_video_to_3dgs_stage and not readiness.get("ready_for_gsplat_training"):
+                raise RuntimeError(
+                    "Reconstruction is not ready for 3DGS training: "
+                    f"{reconstruction_readiness_failure_detail(readiness)}. Report: {readiness_path}"
+                )
+            if has_full_point_cloud_sensitive_stage and not readiness.get("ready_for_mask_fusion"):
+                raise RuntimeError(
+                    "Reconstruction is not ready for semantic mask fusion: "
+                    f"{reconstruction_readiness_failure_detail(readiness)}. Report: {readiness_path}"
+                )
+            if args.reconstruction_readiness_fail_on_not_ready and not readiness.get("ok"):
+                raise RuntimeError(
+                    "Reconstruction readiness checks failed: "
+                    f"{reconstruction_readiness_failure_detail(readiness)}. Report: {readiness_path}"
+                )
+        else:
+            append_pipeline_step(steps, "reconstruction_readiness", "skipped", "no downstream reconstruction-dependent stage")
+
         if args.downsample_point_cloud:
             downsample_output = args.downsample_output
             if downsample_output is None:
@@ -30885,6 +31017,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_run_mast3r_slam)
 
+    p = sub.add_parser("reconstruction-readiness", help="Check whether cameras and point cloud are usable before 3DGS training or mask fusion.")
+    add_common_project_arg(p)
+    p.add_argument("--frames-dir", type=Path, help="Defaults to the active scene frames directory.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/reconstruction_readiness_report.json.")
+    p.add_argument("--min-frames", type=int, default=3)
+    p.add_argument("--min-camera-poses", type=int, default=2)
+    p.add_argument("--min-point-count", type=int, default=100)
+    p.add_argument("--min-camera-coverage", type=float, default=0.8)
+    p.add_argument("--min-visible-point-ratio", type=float, default=0.05)
+    p.add_argument("--require-preview", action="store_true")
+    p.add_argument("--no-update-manifest", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-not-ready", action="store_true")
+    p.set_defaults(func=cmd_reconstruction_readiness)
+
     p = sub.add_parser("track-masks", help="Generate frame-level 2D object masks from bbox prompts.")
     add_common_project_arg(p)
     p.add_argument("--prompts", type=Path, required=True, help="JSON prompts with object ids and bbox prompts.")
@@ -31917,6 +32064,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reconstruction-preview-point-radius", type=int, default=2)
     p.add_argument("--reconstruction-preview-alpha", type=float, default=0.85)
     p.add_argument("--reconstruction-preview-seed", type=int, default=7)
+    p.add_argument("--reconstruction-readiness-min-frames", type=int, default=3)
+    p.add_argument("--reconstruction-readiness-min-camera-poses", type=int, default=2)
+    p.add_argument("--reconstruction-readiness-min-point-count", type=int, default=100)
+    p.add_argument("--reconstruction-readiness-min-camera-coverage", type=float, default=0.8)
+    p.add_argument("--reconstruction-readiness-min-visible-point-ratio", type=float, default=0.05)
+    p.add_argument("--reconstruction-readiness-fail-on-not-ready", action="store_true", help="Fail run-pipeline if required reconstruction readiness checks are not satisfied, even when no downstream stage needs them.")
     p.add_argument("--prepare-3dgs-source", action="store_true")
     p.add_argument("--g3dgs-command-template")
     p.add_argument("--g3dgs-point-cloud", type=Path, help="Point cloud exported into the external 3DGS COLMAP source. Defaults to the original scene/reconstruction/point_cloud.ply, not any downsampled working cloud.")

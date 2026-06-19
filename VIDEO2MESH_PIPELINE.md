@@ -118,6 +118,14 @@ GraphDECO 输出默认在：
 scene/reconstruction/3dgs_graphdeco/
 ```
 
+进入 GraphDECO 或语义 mask fusion 前，`run-pipeline` 会写入：
+
+```text
+simulator_assets/reconstruction_readiness_report.json
+```
+
+这个报告检查帧数、相机 pose、帧-相机覆盖率和 `scene/reconstruction/point_cloud.ply` 点数。默认门槛是至少 3 帧、2 个 pose、100 个点、80% camera coverage。若 MASt3R 只得到单 pose 或空点云，pipeline 会在 3DGS 训练前失败，避免继续消耗训练时间。
+
 ## 5. 点云和 PLY 约定
 
 | 文件 | 含义 |
@@ -286,3 +294,10 @@ dataset/bedroom_100.mp4
 ```
 
 该失败说明：裁剪前 60 秒并不保证可重建；如果视频开头缺乏足够视差、纹理或稳定运动，MASt3R 仍可能只输出单 pose/空点云。后续应选择更合适的 10 秒片段，或先在已验证可重建的数据上继续 GraphDECO/SAM2 后半段。
+
+该 run 已可用 `reconstruction-readiness` 明确诊断：
+
+```text
+frames=1 poses=1 points=0
+ok=False colmap=False 3dgs=False mask_fusion=False
+```
