@@ -8,7 +8,7 @@
 
 给定一个已经有 2D masks 和 3D mask 的物体，自动找出若干相关帧，用于后续物体裁图、单物体 mesh 或多视角 mesh 重建。
 
-它不是传统图像检索，也不是完整复现 SVLGaussian 论文。当前实现借用了 SVLGaussian 数据构造里的 view-selection protocol：anchor 视角、5/10 frame offset、±30 random window，并结合 mask 可见性和 crop 多样性。
+它不是传统图像检索，也不是完整复现 SVLGaussian 论文。当前实现采用的是论文里的 view-selection protocol 工程化适配：RE10K 的 5/10 frame offset、30-frame random interval，以及 lerf_ovs 的 ±3 frame visibility window，并结合 Video2Mesh 已有的 object mask 可见性和 crop 多样性。
 
 ## 2. 输入
 
@@ -38,7 +38,7 @@ camera_info.json
 reason = svlgaussian_anchor_best_visible
 ```
 
-或在新版策略中优先选择能覆盖更多 offset 的 anchor：
+当前策略优先选择能覆盖更多 offset 的 anchor，再按 object 可见性分数排序：
 
 ```text
 reason = svlgaussian_anchor_offset_coverage
@@ -82,7 +82,13 @@ svlgaussian_random_window_30
 
 ### Step 4：masked crop diversity fallback
 
-如果还没达到 `top_k`，对候选 crop 计算简化视觉特征：
+默认 `top_k=4`，对应：
+
+```text
+anchor + offset_5 + offset_10 + random_window
+```
+
+如果候选帧不足或无法满足 offset/random slot，才对候选 crop 计算简化视觉特征：
 
 ```text
 mask bbox crop -> grayscale -> resize 32x32 -> normalize -> dot-product similarity
@@ -101,6 +107,7 @@ quality_score - similarity_penalty * max_similarity + temporal_bonus
 ```text
 objects/<object_id>/selected_frames/
 simulator_assets/selected_frames.json
+simulator_assets/frame_selection_matching/frame_selection_matching_report.json
 simulator_assets/frame_selection_quality_report.json
 ```
 
@@ -111,6 +118,16 @@ simulator_assets/frame_selection_quality_report.json
 - selection reason
 - mask/crop path
 - offset coverage
+- protocol_slots.expected_top_k
+- per-object offset match details
+
+其中 `frame_selection_matching_report.json` 会记录官方 DOI：
+
+```text
+10.1049/cit2.70148
+```
+
+并显式说明采用的是 SVLGaussian 的 view-selection protocol，而不是完整单图 SVLGaussian pipeline。
 
 ## 5. 当前局限
 

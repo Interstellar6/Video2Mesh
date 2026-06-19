@@ -27,7 +27,7 @@ Video2Mesh 的目标是把一段真实空间扫描视频转换为可展示、可
 - SAM v1 ViT-B：生成初始 object prompts。
 - SAM2.1 Hiera Tiny：做 video mask propagation。
 - Video2Mesh fusion：把 2D masks 通过相机投影融合成 3D masks，并回写到 Gaussian / viewer PLY。
-- SVLGaussian-style frame selection：为每个物体选择 anchor、5/10 frame offset、随机窗口补充帧。
+- SVLGaussian-style frame selection：采用 SVLGaussian 论文的 view-selection protocol（DOI `10.1049/cit2.70148`），为每个物体选择 anchor、5/10 frame offset、30-frame random-window 补充帧；这不是完整复现其 Flash3D/Qwen/SAM 单图 pipeline。
 - baseline mesh exporter：先从 3D mask cloud 得到粗 mesh；后续可替换为 Hunyuan/Meshy/多视角 mesh。
 - simulator exporter：导出 object pose、mesh、collider、physics stub、语义 ID 和仿真器 adapter。
 

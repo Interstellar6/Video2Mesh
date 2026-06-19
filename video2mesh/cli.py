@@ -42,6 +42,10 @@ SVLGAUSSIAN_OFFICIAL_DOI = "10.1049/cit2.70148"
 SVLGAUSSIAN_OFFICIAL_URL = "https://ietresearch.onlinelibrary.wiley.com/doi/10.1049/cit2.70148"
 SVLGAUSSIAN_SOURCE_PDF = "SVLGaussian_TRIT.pdf"
 SVLGAUSSIAN_PROVIDED_PDF_DOI = "xxx/xxxx"
+SVLGAUSSIAN_DEFAULT_OFFSETS = [5, 10]
+SVLGAUSSIAN_DEFAULT_RANDOM_WINDOW = 30
+SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW = 3
+SVLGAUSSIAN_DEFAULT_TOP_K = 1 + len(SVLGAUSSIAN_DEFAULT_OFFSETS) + 1
 PLACEHOLDER_OBJECT_NAME_RE = re.compile(
     r"^(?:auto|blue|cyan|green|light|dark|neutral|orange|purple|red|yellow|gray|grey|white|black|brown)\s+object$"
 )
@@ -14168,7 +14172,14 @@ def frame_selection_matching_summary_from_report(project_root: Path, path: Path 
     }
 
 
+def svlgaussian_expected_frame_count(offsets: list[int], random_window: int) -> int:
+    return 1 + len([value for value in offsets if int(value) != 0]) + (1 if int(random_window) > 0 else 0)
+
+
 def svlgaussian_protocol_metadata(offsets: list[int], random_window: int, visibility_window: int, seed: int) -> dict[str, Any]:
+    offsets = [int(value) for value in offsets]
+    random_window = int(random_window)
+    visibility_window = int(visibility_window)
     return {
         "source": SVLGAUSSIAN_SOURCE_PDF,
         "paper_title": SVLGAUSSIAN_TITLE,
@@ -14184,17 +14195,24 @@ def svlgaussian_protocol_metadata(offsets: list[int], random_window: int, visibi
         ),
         "adapted_component": "view-selection protocol for reference frame selection",
         "original_protocol": {
-            "re10k_novel_view_offsets": [5, 10],
-            "re10k_random_interval": 30,
-            "lerf_ovs_input_visibility_window": 3,
+            "re10k_novel_view_offsets": SVLGAUSSIAN_DEFAULT_OFFSETS,
+            "re10k_random_interval": SVLGAUSSIAN_DEFAULT_RANDOM_WINDOW,
+            "lerf_ovs_input_visibility_window": SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW,
+            "paper_location": "SVLGaussian_TRIT.pdf Appendix A / dataset statistics and view selection protocol",
         },
         "video2mesh_adaptation": (
             "Select the best-visible object frame as anchor, satisfy requested frame offsets within a visibility window, "
             "sample one deterministic random-window candidate, then fill remaining slots with masked-crop diversity matching."
         ),
-        "offsets": [int(value) for value in offsets],
-        "random_window": int(random_window),
-        "visibility_window": int(visibility_window),
+        "protocol_slots": {
+            "anchor": 1,
+            "offset_views": len([value for value in offsets if int(value) != 0]),
+            "random_window_views": 1 if random_window > 0 else 0,
+            "expected_top_k": svlgaussian_expected_frame_count(offsets, random_window),
+        },
+        "offsets": offsets,
+        "random_window": random_window,
+        "visibility_window": visibility_window,
         "seed": int(seed),
         "notes": (
             "SVLGaussian uses curated input views for single-view querying: RE10K evaluates 5/10-frame offsets and "
@@ -14589,9 +14607,9 @@ def cmd_select_frames(args: argparse.Namespace) -> int:
     matching_similarity_penalty = float(getattr(args, "matching_similarity_penalty", 250.0))
     matching_temporal_bonus = float(getattr(args, "matching_temporal_bonus", 2.0))
     matching_min_frame_gap = int(getattr(args, "matching_min_frame_gap", 3))
-    svlgaussian_offsets = [int(value) for value in getattr(args, "svlgaussian_offsets", [5, 10])]
-    svlgaussian_random_window = int(getattr(args, "svlgaussian_random_window", 30))
-    svlgaussian_visibility_window = int(getattr(args, "svlgaussian_visibility_window", 3))
+    svlgaussian_offsets = [int(value) for value in getattr(args, "svlgaussian_offsets", SVLGAUSSIAN_DEFAULT_OFFSETS)]
+    svlgaussian_random_window = int(getattr(args, "svlgaussian_random_window", SVLGAUSSIAN_DEFAULT_RANDOM_WINDOW))
+    svlgaussian_visibility_window = int(getattr(args, "svlgaussian_visibility_window", SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW))
     svlgaussian_seed = int(getattr(args, "svlgaussian_seed", 7))
     matching_report_max_candidates = int(getattr(args, "matching_report_max_candidates", 25))
     matching_report_dir = ensure_dir(project_root / manifest["simulator_assets_dir"] / "frame_selection_matching")
@@ -23269,11 +23287,11 @@ def generate_frame_selection_quality_report(
     project_root: Path,
     manifest: dict[str, Any],
     *,
-    min_frames: int = 3,
+    min_frames: int = SVLGAUSSIAN_DEFAULT_TOP_K,
     expected_offsets: list[int] | None = None,
-    visibility_window: int = 3,
+    visibility_window: int = SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW,
 ) -> dict[str, Any]:
-    expected_offsets = [int(value) for value in (expected_offsets or [5, 10])]
+    expected_offsets = [int(value) for value in (expected_offsets or SVLGAUSSIAN_DEFAULT_OFFSETS)]
     records = [obj for obj in load_object_records(project_root, manifest) if not is_background_structure_record(obj)]
     items = [frame_selection_quality_item(obj, project_root, min_frames, expected_offsets, visibility_window) for obj in records]
     missing_items = [item for item in items if item["selected_frame_count"] <= 0]
@@ -30382,7 +30400,10 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
             cmd_frame_selection_quality_report(
                 argparse.Namespace(
                     project_root=project_root,
-                    min_frames=min(args.top_k, 3),
+                    min_frames=min(
+                        args.top_k,
+                        svlgaussian_expected_frame_count(args.frame_svlgaussian_offsets, args.frame_svlgaussian_random_window),
+                    ),
                     expected_offsets=args.frame_svlgaussian_offsets,
                     visibility_window=args.frame_svlgaussian_visibility_window,
                     json=False,
@@ -30677,9 +30698,9 @@ def cmd_run_local(args: argparse.Namespace) -> int:
     cmd_frame_selection_quality_report(
         argparse.Namespace(
             project_root=args.project_root,
-            min_frames=min(args.top_k, 3),
-            expected_offsets=[5, 10],
-            visibility_window=3,
+            min_frames=min(args.top_k, svlgaussian_expected_frame_count(SVLGAUSSIAN_DEFAULT_OFFSETS, SVLGAUSSIAN_DEFAULT_RANDOM_WINDOW)),
+            expected_offsets=SVLGAUSSIAN_DEFAULT_OFFSETS,
+            visibility_window=SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW,
             json=False,
             output=None,
             max_objects=20,
@@ -31449,7 +31470,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("select-frames", help="Select best source frames for each fused object.")
     add_common_project_arg(p)
     p.add_argument("--frames-dir", type=Path)
-    p.add_argument("--top-k", type=int, default=3)
+    p.add_argument("--top-k", type=int, default=SVLGAUSSIAN_DEFAULT_TOP_K)
     p.add_argument("--use-sharpness", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--hit-weight", type=float, default=1.0)
     p.add_argument("--area-weight", type=float, default=0.001)
@@ -31461,16 +31482,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--matching-min-frame-gap", type=int, default=3)
     p.add_argument("--matching-feature-size", type=int, default=32)
     p.add_argument("--matching-crop-to-mask", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--svlgaussian-offsets", type=int, nargs="+", default=[5, 10], help="Frame offsets used by the SVLGaussian-style selector.")
-    p.add_argument("--svlgaussian-random-window", type=int, default=30, help="Random candidate interval around the anchor frame.")
-    p.add_argument("--svlgaussian-visibility-window", type=int, default=3, help="Maximum nearest-frame distance allowed when satisfying target offsets.")
+    p.add_argument("--svlgaussian-offsets", type=int, nargs="+", default=SVLGAUSSIAN_DEFAULT_OFFSETS, help="Frame offsets used by the SVLGaussian-style selector.")
+    p.add_argument("--svlgaussian-random-window", type=int, default=SVLGAUSSIAN_DEFAULT_RANDOM_WINDOW, help="Random candidate interval around the anchor frame.")
+    p.add_argument("--svlgaussian-visibility-window", type=int, default=SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW, help="Maximum nearest-frame distance allowed when satisfying target offsets.")
     p.add_argument("--svlgaussian-seed", type=int, default=7)
     p.add_argument("--matching-report-max-candidates", type=int, default=25, help="Maximum ranked candidate frames to keep per object in the frame-selection matching report.")
     p.set_defaults(func=cmd_select_frames)
 
     p = sub.add_parser("prepare-object-images", help="Create masked object crop/reference images from selected frames.")
     add_common_project_arg(p)
-    p.add_argument("--top-k", type=int, default=3)
+    p.add_argument("--top-k", type=int, default=SVLGAUSSIAN_DEFAULT_TOP_K)
     p.add_argument("--padding-ratio", type=float, default=0.18)
     p.add_argument("--min-padding", type=int, default=24)
     p.add_argument("--square", action=argparse.BooleanOptionalAction, default=True)
@@ -31489,7 +31510,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-missing", action="store_true")
     p.add_argument("--use-object-crop", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--auto-prepare-crops", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--crop-top-k", type=int, default=3)
+    p.add_argument("--crop-top-k", type=int, default=SVLGAUSSIAN_DEFAULT_TOP_K)
     p.add_argument("--crop-padding-ratio", type=float, default=0.18)
     p.add_argument("--crop-min-padding", type=int, default=24)
     p.add_argument("--transparent-crops", action=argparse.BooleanOptionalAction, default=True)
@@ -32013,7 +32034,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
-    p.add_argument("--top-k", type=int, default=3)
+    p.add_argument("--top-k", type=int, default=SVLGAUSSIAN_DEFAULT_TOP_K)
     p.add_argument("--world")
     p.add_argument("--image-blaster-root", type=Path, default=Path("image-blaster"))
     p.add_argument("--provider", choices=["hunyuan", "meshy"], default="hunyuan")
@@ -32207,16 +32228,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--transfer-mode", choices=["auto", "index", "nearest"], default="auto")
     p.add_argument("--max-transfer-distance", type=float)
     p.add_argument("--skip-select-frames", action="store_true")
-    p.add_argument("--top-k", type=int, default=3)
+    p.add_argument("--top-k", type=int, default=SVLGAUSSIAN_DEFAULT_TOP_K)
     p.add_argument("--frame-selection-method", choices=["score", "matching", "svlgaussian"], default="svlgaussian", help="Object reference frame selector used before crops/mesh jobs.")
     p.add_argument("--frame-matching-similarity-penalty", type=float, default=250.0)
     p.add_argument("--frame-matching-temporal-bonus", type=float, default=2.0)
     p.add_argument("--frame-matching-min-gap", type=int, default=3)
     p.add_argument("--frame-matching-feature-size", type=int, default=32)
     p.add_argument("--frame-matching-crop-to-mask", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--frame-svlgaussian-offsets", type=int, nargs="+", default=[5, 10])
-    p.add_argument("--frame-svlgaussian-random-window", type=int, default=30)
-    p.add_argument("--frame-svlgaussian-visibility-window", type=int, default=3)
+    p.add_argument("--frame-svlgaussian-offsets", type=int, nargs="+", default=SVLGAUSSIAN_DEFAULT_OFFSETS)
+    p.add_argument("--frame-svlgaussian-random-window", type=int, default=SVLGAUSSIAN_DEFAULT_RANDOM_WINDOW)
+    p.add_argument("--frame-svlgaussian-visibility-window", type=int, default=SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW)
     p.add_argument("--frame-svlgaussian-seed", type=int, default=7)
     p.add_argument("--skip-object-images", action="store_true")
     p.add_argument("--crop-padding-ratio", type=float, default=0.18)
@@ -32344,9 +32365,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("frame-selection-quality-report", help="Audit selected object frames for mesh reconstruction readiness.")
     add_common_project_arg(p)
-    p.add_argument("--min-frames", type=int, default=3, help="Required selected frame count per foreground object.")
-    p.add_argument("--expected-offsets", type=int, nargs="+", default=[5, 10], help="SVLGaussian-style target frame offsets to check.")
-    p.add_argument("--visibility-window", type=int, default=3, help="Allowed frame distance around each expected offset.")
+    p.add_argument("--min-frames", type=int, default=SVLGAUSSIAN_DEFAULT_TOP_K, help="Required selected frame count per foreground object.")
+    p.add_argument("--expected-offsets", type=int, nargs="+", default=SVLGAUSSIAN_DEFAULT_OFFSETS, help="SVLGaussian-style target frame offsets to check.")
+    p.add_argument("--visibility-window", type=int, default=SVLGAUSSIAN_DEFAULT_VISIBILITY_WINDOW, help="Allowed frame distance around each expected offset.")
     p.add_argument("--json", action="store_true", help="Print JSON frame-selection-quality report.")
     p.add_argument("--output", type=Path, help="Optional JSON report path. Defaults to simulator_assets/frame_selection_quality_report.json.")
     p.add_argument("--max-objects", type=int, default=20, help="Maximum object ids with warnings to print in text mode.")
