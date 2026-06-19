@@ -271,3 +271,18 @@ python -m video2mesh.cli verify-showcase-pack \
 5. 背景结构语义：floor、wall、ceiling、door、window、cabinet。
 6. 真实尺度标定、碰撞体简化、质量/摩擦/恢复系数估计。
 7. SceneVerse++ / PQ3D 数据桥接和评估。
+
+## 11. 实验检查点记录
+
+`bedroom_100` 当前结果：
+
+```text
+dataset/bedroom_100.mp4
+  -> MASt3R > 1.5h 无有效相机/点云
+  -> 中断
+  -> dataset/bedroom_100_first60.mp4
+  -> MASt3R 只得到 1 pose 和空 point_cloud.ply
+  -> GraphDECO 未开始训练
+```
+
+该失败说明：裁剪前 60 秒并不保证可重建；如果视频开头缺乏足够视差、纹理或稳定运动，MASt3R 仍可能只输出单 pose/空点云。后续应选择更合适的 10 秒片段，或先在已验证可重建的数据上继续 GraphDECO/SAM2 后半段。

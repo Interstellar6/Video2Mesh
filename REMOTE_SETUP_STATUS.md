@@ -145,3 +145,50 @@ source /etc/network_turbo
 - GraphDECO 训练真实质量依赖位姿质量、训练帧和分辨率；OOM 时优先降分辨率，不降 full cloud。
 - SAM2 tiny 对复杂家具和植物仍可能过分割。
 - 当前 mesh 是 baseline，生产质量需要外部物体重建。
+
+## 9. 2026-06-20 bedroom_100 检查点
+
+输入数据：
+
+```text
+dataset/bedroom_100.mp4
+```
+
+执行结果：
+
+- 原始 604.5 秒视频运行 MASt3R-SLAM 超过 1.5 小时仍未产出 `camera_info.json` 和有效 `point_cloud.ply`，已按规则中断。
+- 已用 OpenCV 裁剪前 60 秒为新数据集：
+
+```text
+dataset/bedroom_100_first60.mp4
+```
+
+裁剪文件信息：
+
+```text
+duration: 59.993s
+fps: 29.97
+frames: 1798
+resolution: 640x360
+size: 42 MB
+```
+
+first60 GraphDECO quick run：
+
+```text
+exports/bedroom_100_first60_quick_first60_graphdeco_20260620_052824
+```
+
+状态：
+
+- `tools/run_video2mesh_quick.sh` 已确认使用 `GS_BACKEND=graphdeco`，命令中包含 `3dgs_graphdeco` 和 GraphDECO `train.py --disable_viewer`。
+- first60 在 30 分钟阈值内结束 MASt3R，但只导入 `1` 个 pose。
+- `scene/reconstruction/point_cloud.ply` 是空 PLY，Open3D 报 `Read PLY failed: number of vertex <= 0`。
+- pipeline 随后在 GraphDECO source/point-cloud 准备阶段失败：`No points found in point cloud`。
+- 因该实验没有跑通完整链路，本轮不拆分 `video2mesh/cli.py`。
+
+下一步建议：
+
+1. 对 `bedroom_100` 另取更有视差和稳定运动的 10 秒片段，而不是默认视频开头。
+2. 或先用官方 SceneVerse++ / milscene3 这类已能重建的数据继续验证 GraphDECO 与 SAM2 后半段。
+3. 如果必须使用 `bedroom_100`，先人工抽查前 60 秒内容是否静止、黑屏、快速运动或缺纹理；MASt3R 只得到 1 pose 说明输入片段不适合当前配置。

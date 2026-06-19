@@ -174,3 +174,14 @@ python -m video2mesh.cli verify-showcase-pack \
 ```
 
 如果 `production_ready=false` 但 `demo_ready=true`，当前阶段可以接受。主要原因通常是：语义标签仍弱、mesh 仍粗、scale/physics 未真实标定。
+
+## 8. bedroom_100 当前检查点
+
+2026-06-20 的 `bedroom_100` 实验状态：
+
+- 原始 `dataset/bedroom_100.mp4` 时长约 604.5 秒，MASt3R 超过 1.5 小时仍未产出相机/有效点云，已中断。
+- 已生成新数据集 `dataset/bedroom_100_first60.mp4`，时长约 59.99 秒。
+- first60 run 路径为 `exports/bedroom_100_first60_quick_first60_graphdeco_20260620_052824`。
+- first60 使用 GraphDECO quick 入口，但 MASt3R 只产生 1 pose 和空点云，GraphDECO 未能开始训练。
+- 失败信息：`No points found in point cloud`。
+- 因未跑通，不执行 `video2mesh/cli.py` 拆分。
