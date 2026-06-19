@@ -48,6 +48,7 @@ data/
 checkpoints/
 weights/
 models/
+UnityProject/
 *.mp4
 *.mov
 *.avi

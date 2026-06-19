@@ -163,8 +163,18 @@ public static class Video2MeshUnityImporter
                     continue;
                 }
 
-                var collider = meshFilter.gameObject.GetComponent<MeshCollider>()
-                    ?? meshFilter.gameObject.AddComponent<MeshCollider>();
+                var collider = meshFilter.gameObject.GetComponent<MeshCollider>();
+                if (collider == null)
+                {
+                    collider = meshFilter.gameObject.AddComponent<MeshCollider>();
+                }
+
+                if (collider == null)
+                {
+                    Debug.LogWarning($"Could not add MeshCollider to {meshFilter.gameObject.name}");
+                    continue;
+                }
+
                 collider.sharedMesh = meshFilter.sharedMesh;
                 collider.convex = string.Equals(bodyType, "dynamic", StringComparison.OrdinalIgnoreCase);
             }

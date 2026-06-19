@@ -1,911 +1,154 @@
 # Video2Mesh 项目说明
 
+更新时间：2026-06-20
+
 ## 1. 项目目标
 
-Video2Mesh 的目标是把一段真实空间扫描视频转换成可查看、可分解、可导入仿真器的 3D 场景资产。当前工程已经跑通一条 demo 级闭环：
+Video2Mesh 的目标是把一段真实空间扫描视频转换为可展示、可分解、可进入仿真器的 3D 场景资产。
+
+当前工程目标不是“单图生成一个好看的 mesh”，而是：
 
 ```text
 扫描视频
-  -> 抽帧
-  -> MASt3R-SLAM 相机位姿与点云
-  -> 最小 3D Gaussian Splatting baseline
-  -> SAM 自动物体候选与 2D mask tracking
-  -> 2D mask 投影融合为物体级 3D mask
-  -> floor / ceiling / wall 等背景结构 3D 语义 mask
-  -> 语义 3DGS / SuperSplat 可视化文件
-  -> 每物体相关帧选择
-  -> 每物体粗 mesh 重建
-  -> 多视角 mesh job / image-blaster 资产入口
-  -> image-blaster 物体资产目录
-  -> MuJoCo / Isaac / Unity 仿真资产包
-  -> SceneVerse++ / SVPP-style 数据导出
+  -> 相机位姿与场景点云
+  -> 场景级 3D Gaussian Splatting
+  -> 物体/背景结构级 3D semantic masks
+  -> 每个物体的相关帧与裁图
+  -> 每个物体 mesh
+  -> MuJoCo / Unity / Isaac 可消费的资产包
 ```
 
-这个仓库当前不是最终论文级系统，而是一个工程协议和可运行 baseline。它的价值在于把视频重建、3DGS、物体语义 mask、单物体 mesh、仿真导出这些模块用统一文件格式串起来。
+## 2. 当前默认路线
 
-## 2. 仓库结构
+真实视频实验默认使用：
 
-```text
-Video2Mesh/
-  video2mesh/
-    cli.py                         # 主 CLI，所有流水线命令都在这里
-  configs/
-    mast3r_video_scan.yaml         # MASt3R-SLAM 视频扫描配置
-  dataset/
-    milscene.mp4                   # 示例扫描视频
-    milscene2.mp4                  # 示例扫描视频
-  exports/
-    milscene_real_demo/            # 已跑通的真实视频 demo
-    milscene2_real_demo/           # 已跑通的真实视频 demo，含最新 viewer PLY
-  SceneVersepp/                    # 参考项目：3D 场景理解 / SVPP / SpatialLM / PQ3D
-  image-blaster/                   # 参考项目：单图生成环境 / 物体 mesh / Three.js viewer
-  Video2Mesh_technical_survey_draft.md
-  Video2Mesh_real_demo_runbook.md
-  VIDEO2MESH_PIPELINE.md
-  REMOTE_SETUP_STATUS.md
-```
+- MASt3R-SLAM：从视频估计相机位姿、keyframes 和原始场景点云。
+- GraphDECO Gaussian Splatting：默认 3DGS trainer。
+- SAM v1 ViT-B：生成初始 object prompts。
+- SAM2.1 Hiera Tiny：做 video mask propagation。
+- Video2Mesh fusion：把 2D masks 通过相机投影融合成 3D masks，并回写到 Gaussian / viewer PLY。
+- SVLGaussian-style frame selection：为每个物体选择 anchor、5/10 frame offset、随机窗口补充帧。
+- baseline mesh exporter：先从 3D mask cloud 得到粗 mesh；后续可替换为 Hunyuan/Meshy/多视角 mesh。
+- simulator exporter：导出 object pose、mesh、collider、physics stub、语义 ID 和仿真器 adapter。
 
-几个文档的分工：
+内置 minimal `train-gsplat` 只作为 smoke/debug fallback；真实实验默认使用 GraphDECO。
 
-- `Video2Mesh_PROJECT_README.md`：当前这份总览文档。
-- `Video2Mesh_technical_survey_draft.md`：偏论文调研，解释 SceneVerse++ 和 image-blaster 如何映射到目标系统。
-- `VIDEO2MESH_PIPELINE.md`：偏 CLI / 数据协议 / 阶段说明。
-- `Video2Mesh_real_demo_runbook.md`：真实 demo 的运行记录和命令。
-- `REMOTE_SETUP_STATUS.md`：远端环境、依赖、smoke test 记录。
+## 3. 一键入口
 
-## 3. 参考项目的角色
-
-### 3.1 SceneVersepp
-
-`SceneVersepp` 不是直接的端到端视频转 3DGS 工具。它更像一个研究型 3D 场景理解数据引擎，重点在：
-
-- `data_processing/`：视频下载、抽帧、相机位姿可视化。
-- `SpatialLM/`：3D object/layout detection，输出 3D boxes / layout code。
-- `PQ3D/`：3D instance segmentation，训练点云或 segment 级实例 mask。
-
-对 Video2Mesh 来说，SceneVerse++ 最有用的是 SVPP-style 数据组织方式：
-
-```text
-mesh.ply
-camera_info.json
-metadata.json
-data_info.json
-```
-
-Video2Mesh 已提供：
+远端运行：
 
 ```bash
-python -m video2mesh.cli export-svpp-metadata \
-  --project-root exports/milscene2_real_demo \
-  --scene-id milscene2-real-demo \
-  --output-dir exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo \
-  --default-category object \
-  --min-points 1
+cd /root/autodl-tmp/workspace/Video2Mesh
+source /etc/network_turbo >/dev/null 2>&1 || true
+
+bash tools/run_video2mesh_quick.sh /root/autodl-tmp/workspace/Video2Mesh/dataset/<video>.mp4
 ```
 
-输出示例：
+默认参数：
 
 ```text
-exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo/
-  mesh.ply
-  camera_info.json
-  metadata.json
-  data_info.json
-  video2mesh_svpp_export.json
+GS_BACKEND=graphdeco
+GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
+GRAPHDECO_ITERATIONS=7000
+GRAPHDECO_RESOLUTION=1
+MASK_BACKEND=sam2
+MAX_FRAMES=72
+EXTRACT_EVERY=2
 ```
 
-SVPP 导出时要靠 `object_id` 对齐 Video2Mesh 的 object record、semantic PLY、simulator bundle 和 SceneVerse++ metadata。`semantic_id` 是实例标签，`pred_class_id` 是类别标签，二者不能混用；`floor`、`ceiling`、`wall_*` 这类背景结构也会作为带独立 semantic id 的结构实例进入 metadata。
+如果 MASt3R-SLAM 对长视频运行超过 1.5 小时仍未产出 `camera_info.json` 和 `point_cloud.ply`，当前实验策略是中断该次 MASt3R，把视频前 60 秒裁剪成新的 dataset 文件，例如：
 
-如果要继续接 SceneVerse++ 的 SpatialLM / PQ3D 数据生成脚本，不需要手工拼路径；可以直接生成 job、脚本和 PQ3D config：
+```text
+dataset/bedroom_100_first60.mp4
+```
+
+然后对该新数据集重新运行一键流程。
+
+## 4. 不降采样约定
+
+高质量实验默认使用 MASt3R-SLAM 原始点云：
+
+```text
+scene/reconstruction/point_cloud.ply
+```
+
+它同时作为：
+
+- GraphDECO COLMAP `points3D.txt` 的来源。
+- 2D-to-3D mask fusion 的点索引源。
+- semantic splat transfer 的点索引源。
+- object mask cloud 和背景结构 mask 的点索引源。
+
+`point_cloud_10k.ply`、`point_cloud_30000.ply` 只用于轻量预览、人工检查或低资源 debug，不作为默认训练/分割输入。
+
+检查命令：
 
 ```bash
-python -m video2mesh.cli prepare-sceneversepp-jobs \
-  --project-root exports/milscene2_real_demo \
-  --sceneversepp-root SceneVersepp \
-  --scene-id milscene2-sceneversepp \
-  --default-category chair \
-  --skip-missing \
-  --min-points 1
+python -m video2mesh.cli audit-3dgs-init-point-cloud \
+  --project-root exports/<run>
 ```
 
-输出：
+## 5. 关键输出
+
+每个 run 默认在：
 
 ```text
-simulator_assets/sceneversepp_jobs/
-  sceneversepp_jobs.json
-  run_spatiallm_data_generation.sh
-  run_pq3d_data_generation.sh
-  run_sceneversepp_data_jobs.sh
-  pq3d_svpp_config.yaml
-  spatiallm_scannetv2_labels_minimal.tsv
-  spatiallm_code_template.txt
-  svpp_data/<scene_id>/{mesh.ply,metadata.json,camera_info.json,data_info.json}
+exports/<scene>_quick_<timestamp>/
 ```
 
-这个命令只准备数据和脚本，不跑 SpatialLM/PQ3D 训练，也不强行执行可能吃内存的 segmentator。`sceneversepp_jobs.json` 会记录 SpatialLM/PQ3D 命令、依赖检查和哪些实例会被 SpatialLM 的 SVPP allowlist 过滤。
-
-反向对接也已经有工程接口：可以把当前点云、相机、帧、semantic splats、SVPP export 打包成外部 scene structure job，交给 SpatialLM / PQ3D / open-vocabulary 3D segmentation 一类工具产生地面、墙面、门窗、固定柜体等结构 mask，然后再导回 Video2Mesh：
-
-```bash
-python -m video2mesh.cli prepare-scene-structure-jobs \
-  --project-root exports/milscene2_real_demo \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --provider spatiallm
-
-python -m video2mesh.cli import-scene-structure-masks \
-  --project-root exports/milscene2_real_demo \
-  --source-manifest exports/milscene2_real_demo/simulator_assets/scene_structure_jobs/scene_structure_masks_template.json \
-  --provider spatiallm \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply
-```
-
-导入格式的核心是 `structures[*].point_indices` 或 `point_indices_json/npy`。这些点索引必须对应同一个 point cloud 的 vertex 顺序；导入后会写 `asset_role=background_structure` 的 object record，并进入 semantic 3DGS、SVPP metadata 和 simulator bundle。
-
-### 3.2 image-blaster
-
-`image-blaster` 关注从单张图片生成资产。它的目录约定对 Video2Mesh 很有用：
-
-```text
-image-blaster/worlds/<world>/
-  source/
-  output/<object_id>/
-    object.json
-    source.png
-    video2mesh_object_images/
-```
-
-Video2Mesh 会把每个物体选出的参考帧和裁剪图导出到 image-blaster world。后续可以用 image-blaster / FAL / Hunyuan / Meshy 生成更好的单物体 mesh。
-
-当前 demo 中已经生成：
-
-```text
-image-blaster/worlds/milscene2-real-demo/
-```
-
-对应命令脚本：
-
-```text
-exports/milscene2_real_demo/simulator_assets/mesh_generation_commands.sh
-exports/milscene2_real_demo/simulator_assets/multiview_mesh_jobs/run_mesh_jobs.sh
-```
-
-## 4. 核心流水线
-
-### 4.1 视频与重建
-
-输入视频放在：
-
-```text
-dataset/<video>.mp4
-```
-
-初始化项目并抽帧：
-
-```bash
-python -m video2mesh.cli init \
-  --project-root exports/milscene2_real_demo \
-  --scene-id milscene2_real_demo \
-  --video dataset/milscene2.mp4
-
-python -m video2mesh.cli extract-frames \
-  --project-root exports/milscene2_real_demo \
-  --every 4 \
-  --overwrite \
-  --renumber
-```
-
-运行 MASt3R-SLAM：
-
-```bash
-python -m video2mesh.cli run-mast3r-slam \
-  --project-root exports/milscene2_real_demo \
-  --dataset exports/milscene2_real_demo/scene/frames \
-  --config config/video_scan.yaml \
-  --save-as milscene2_real_demo_dense \
-  --focal-scale 1.2
-```
-
-关键输出：
+核心产物：
 
 ```text
 scene/cameras/camera_info.json
 scene/reconstruction/point_cloud.ply
-scene/mast3r_keyframes/
-```
-
-### 4.2 原始点云与 10k 点云
-
-`point_cloud.ply` 是 MASt3R-SLAM 原始点云，点数更多，几何更完整。
-
-`point_cloud_10k.ply` 是从原始点云下采样得到的轻量工作点云，用于 3DGS baseline、mask fusion 和物体 mask cloud 导出。
-
-```text
-scene/reconstruction/point_cloud.ply      # 原始大点云
-scene/reconstruction/point_cloud_10k.ply  # 10k 下采样点云
-```
-
-下采样命令：
-
-```bash
-python -m video2mesh.cli downsample-point-cloud \
-  --project-root exports/milscene2_real_demo \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud.ply \
-  --output scene/reconstruction/point_cloud_10k.ply \
-  --max-points 10000 \
-  --seed 7
-```
-
-### 4.3 3DGS baseline
-
-当前 `train-gsplat` 是最小 baseline：从点云初始化 Gaussians，用 `gsplat.rasterization` 做少量 L1 reconstruction 优化。它用于验证工程接口，不代表最终高质量 3DGS。
-
-```bash
-MAX_JOBS=1 TORCH_CUDA_ARCH_LIST=8.9 python -m video2mesh.cli train-gsplat \
-  --project-root exports/milscene2_real_demo \
-  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --output-dir exports/milscene2_real_demo/scene/reconstruction/3dgs_trained \
-  --iterations 10 \
-  --max-frames 6 \
-  --max-points 8000 \
-  --device cuda \
-  --width 288 \
-  --height 512 \
-  --log-every 2
-```
-
-关键输出：
-
-```text
-scene/reconstruction/3dgs/point_cloud/iteration_10/point_cloud.ply
-scene/reconstruction/3dgs/point_cloud/iteration_10/point_cloud_point_cloud.ply
-scene/reconstruction/3dgs/point_cloud/iteration_10/point_cloud_supersplat.ply
-```
-
-如果要接生产级 3DGS trainer，不建议继续堆高这个最小 baseline 的迭代数，而是先准备外部训练 job。这个命令会导出 COLMAP-style source、写入 provider command 和可执行脚本，但不自动启动重训练：
-
-```bash
-python -m video2mesh.cli prepare-high-quality-3dgs-job \
-  --project-root exports/milscene2_real_demo \
-  --provider graphdeco \
-  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --image-mode symlink \
-  --command-template "python train.py -s {source_path} -m {output_path}"
-```
-
-关键输出：
-
-```text
-external/high_quality_3dgs/colmap_source/
-external/high_quality_3dgs/high_quality_3dgs_job.json
-external/high_quality_3dgs/run_high_quality_3dgs.sh
 scene/reconstruction/3dgs_graphdeco/
-```
-
-训练脚本跑完后会调用 `register-3dgs`，把外部 trainer 的结果注册回 `manifest.json`。`graphdeco`、`nerfstudio/splatfacto`、`gsplat` 这几类 provider 都可以用这个接口统一描述；真正的高质量训练依然发生在外部项目里。
-
-### 4.4 2D mask 与 3D mask
-
-自动生成物体候选：
-
-```bash
-python -m video2mesh.cli auto-prompts \
-  --project-root exports/milscene2_real_demo \
-  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
-  --method sam \
-  --sam-checkpoint /root/autodl-tmp/checkpoints/sam/sam_vit_b_01ec64.pth \
-  --sam-model-type vit_b \
-  --sam-device cuda \
-  --frame-index 6 \
-  --max-objects 6 \
-  --min-area-ratio 0.003 \
-  --max-area-ratio 0.35 \
-  --overwrite
-```
-
-更接近生产的物体发现入口是外部开放词汇检测器，例如 GroundingDINO、OWL-ViT、YOLO-World 或 Grounded-SAM。先准备检测 job：
-
-```bash
-python -m video2mesh.cli prepare-open-vocab-detection-jobs \
-  --project-root exports/milscene2_real_demo \
-  --frames-dir exports/milscene2_real_demo/scene/frames \
-  --provider groundingdino \
-  --queries "chair,table,cabinet,door,window,box"
-```
-
-外部检测器跑完后，把 `frame_id/image + label/category + bbox + score` 导回标准 prompts 和 object labels：
-
-```bash
-python -m video2mesh.cli import-open-vocab-detections \
-  --project-root exports/milscene2_real_demo \
-  --source-manifest /path/to/open_vocab_detections.json \
-  --provider groundingdino \
-  --min-score 0.25 \
-  --max-objects 20 \
-  --overwrite
-```
-
-这会写 `masks/open_vocab_prompts.json`、`masks/open_vocab_prompts_preview.png` 和 `masks/object_labels.json`，后续可直接交给 `track-masks` 或 `prepare-video-segmentation-jobs --provider sam2/deva/xmem`。
-
-跨帧生成 2D masks：
-
-```bash
-python -m video2mesh.cli track-masks \
-  --project-root exports/milscene2_real_demo \
-  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
-  --prompts exports/milscene2_real_demo/masks/auto_prompts.json \
-  --mask-backend sam \
-  --sam-checkpoint /root/autodl-tmp/checkpoints/sam/sam_vit_b_01ec64.pth \
-  --sam-model-type vit_b \
-  --sam-device cuda \
-  --max-frames 13 \
-  --clear-output
-```
-
-融合到 3D 点云：
-
-```bash
-python -m video2mesh.cli fuse-masks \
-  --project-root exports/milscene2_real_demo \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --min-votes 1 \
-  --occlusion-filter \
-  --depth-tolerance 0.05 \
-  --relative-depth-tolerance 0.03
-```
-
-关键输出：
-
-```text
-masks/2d/
+masks/2d*/
 masks/3d/object_masks.json
-objects/<object_id>/object.json
-```
-
-如果要把当前 demo 级 bbox/SAM tracking 替换成 SAM2 / DEVA / XMem / Grounded-SAM，可以先生成外部 video segmentation job，再把外部 masks 导回标准 `masks/2d`：
-
-```bash
-python -m video2mesh.cli prepare-video-segmentation-jobs \
-  --project-root exports/milscene2_real_demo \
-  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
-  --prompts exports/milscene2_real_demo/masks/auto_prompts.json \
-  --provider sam2 \
-  --command-template "python run_sam2.py --job {job_path} --output {mask_output_root}"
-
-python -m video2mesh.cli import-video-segmentation-masks \
-  --project-root exports/milscene2_real_demo \
-  --source-root /path/to/external_masks \
-  --provider sam2
-```
-
-导入后仍然走同一个 `fuse-masks -> semantic 3DGS -> object mesh -> simulator assets` 后半段。这一步是外部生产级视频分割的协议接口，不等于当前仓库已经内置 SAM2/DEVA/XMem。
-
-如果后续用 VLM / 开放词汇检测器给 object_id 生成了更可靠的类别、名称和描述，可以把 JSON 标签导入回 Video2Mesh：
-
-```bash
-python -m video2mesh.cli prepare-object-labeling-jobs \
-  --project-root exports/milscene2_real_demo \
-  --provider external_vlm \
-  --max-images 4
-```
-
-输出：
-
-```text
-simulator_assets/object_labeling_jobs/object_labeling_jobs.json
-simulator_assets/object_labeling_jobs/jobs/<object_id>.json
-simulator_assets/object_labeling_jobs/labels_template.json
-```
-
-把 `labels_template.json` 交给 VLM/open-vocabulary detector 或人工标注，填好每个 object 的 `name`、`category`、`description`、`open_vocab_labels` 和 `confidence` 后导入：
-
-```bash
-python -m video2mesh.cli import-object-labels \
-  --project-root exports/milscene2_real_demo \
-  --labels exports/milscene2_real_demo/simulator_assets/object_labeling_jobs/labels_template.json
-```
-
-支持的最小格式可以是 map 或 list，例如：
-
-```json
-{
-  "auto_object_blue_01": {
-    "name": "blue chair",
-    "category": "chair",
-    "description": "blue chair near the desk"
-  }
-}
-```
-
-导入后会更新 `masks/object_labels.json` 和对应的 `objects/<object_id>/object.json`。这是给 VLM/open-vocabulary 语义命名预留的接口；当前 demo 的自动名称仍然只是颜色和候选编号，不应当视为可靠类别。
-
-### 4.5 背景结构语义 mask
-
-前景物体来自 2D mask tracking 和 2D-to-3D fusion；地面、天花板、墙面、门窗、固定柜体这类背景结构通常没有单物体 crop，也不应该进入 image-blaster mesh 生成。生产路线是先把场景点云/相机/帧打包给外部 layout 或 3D scene parsing 工具：
-
-```bash
-python -m video2mesh.cli prepare-scene-structure-jobs \
-  --project-root exports/milscene2_real_demo \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --provider spatiallm
-```
-
-输出：
-
-```text
-simulator_assets/scene_structure_jobs/scene_structure_job.json
-simulator_assets/scene_structure_jobs/jobs/<provider>.json
-simulator_assets/scene_structure_jobs/scene_structure_masks_template.json
-simulator_assets/scene_structure_jobs/run_scene_structure_segmentation.sh
-```
-
-外部工具只需要填回 `structures` 列表，每个结构包含 `object_id`、`category` 和 `point_indices` 或 `point_indices_json/npy`。导入后会生成标准 3D mask、结构点云和 object record：
-
-```bash
-python -m video2mesh.cli import-scene-structure-masks \
-  --project-root exports/milscene2_real_demo \
-  --source-manifest /path/to/external_scene_structures.json \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --provider spatiallm
-```
-
-它会写：
-
-```text
-objects/<structure>/object.json
-masks/3d/<structure>/point_indices.json
-simulator_assets/object_masks_3d/<structure>.ply
-simulator_assets/background_structures/background_structures.json
-```
-
-当前工程还提供一个可运行的 axis-boundary baseline，用来在没有外部 layout 模型时验证协议：
-
-```bash
-python -m video2mesh.cli infer-background-structure-masks \
-  --project-root exports/milscene2_real_demo \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --up-axis y \
-  --quantile 0.03 \
-  --min-points 50
-```
-
-它会从点云边界启发式生成：
-
-```text
-objects/floor/object.json
-objects/ceiling/object.json
-objects/wall_x_min/object.json
-objects/wall_x_max/object.json
-objects/wall_z_min/object.json
-objects/wall_z_max/object.json
-masks/3d/<structure>/point_indices.json
-simulator_assets/background_structures/background_structures.json
-```
-
-这些记录的 `asset_role` 是 `background_structure`：它们参与 semantic 3DGS、object mask cloud、SVPP metadata 和 simulator bundle，但会跳过 selected frames、object crops、object mesh 这些前景物体步骤。`infer-background-structure-masks` 只是协议验证；`prepare-scene-structure-jobs` + `import-scene-structure-masks` 才是后续接 SpatialLM / PQ3D / open-vocabulary 3D segmentation 的桥。
-
-### 4.6 Semantic 3DGS 与 viewer PLY
-
-把 3D object mask 转移到 3DGS：
-
-```bash
-python -m video2mesh.cli export-splat-masks \
-  --project-root exports/milscene2_real_demo \
-  --mask-source-ply exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --transfer-mode nearest \
-  --max-transfer-distance 0.08
-```
-
-该命令会输出：
-
-```text
-simulator_assets/semantic_splats.ply
-simulator_assets/semantic_splats_manifest.json
-simulator_assets/semantic_point_cloud.ply
-simulator_assets/semantic_supersplat.ply
-```
-
-也可以手动导出 viewer PLY：
-
-```bash
-python -m video2mesh.cli export-viewer-plys \
-  --project-root exports/milscene2_real_demo \
-  --kind all
-```
-
-输出：
-
-```text
+objects/<object_id>/selected_frames/
+objects/<object_id>/object_images/
 simulator_assets/viewer_plys/
-  scene_3dgs_point_cloud.ply
-  scene_3dgs_supersplat.ply
-  semantic_3dgs_point_cloud.ply
-  semantic_3dgs_supersplat.ply
-  viewer_plys_manifest.json
+simulator_assets/semantic_splats.ply
+simulator_assets/simulator_asset_bundle.json
+simulator_assets/adapters/
+simulator_assets/review/index.html
 ```
 
-PLY 查看约定：
+Viewer PLY 约定：
 
 | 文件 | 用途 |
-| --- | --- |
-| `*_point_cloud.ply` | 普通点云，字段是 `x/y/z/red/green/blue`，适合 Mac Preview、CloudCompare、MeshLab。 |
-| `*_supersplat.ply` | SuperSplat / GraphDECO 兼容 PLY，字段包含 `f_dc_0/1/2`、`opacity`、`scale_0/1/2`、`rot_0/1/2/3`。 |
-| `semantic_splats.ply` | Video2Mesh 内部语义 splat，包含 `object_id`，用于评估和投影。 |
+|---|---|
+| `*_point_cloud.ply` | 普通 XYZ/RGB 点云，Mac Preview、MeshLab、CloudCompare 可看。 |
+| `*_supersplat.ply` | GraphDECO/SuperSplat 字段 PLY，可上传到 SuperSplat。 |
+| `semantic_*` | 语义颜色或 `object_id/object_probability` 已写入的版本。 |
 
-## 5. 物体资产与仿真导出
+## 6. 两个参考项目的角色
 
-导出每个物体的 3D mask cloud：
+`SceneVersepp`：
 
-```bash
-python -m video2mesh.cli export-object-mask-clouds \
-  --project-root exports/milscene2_real_demo \
-  --point-cloud exports/milscene2_real_demo/scene/reconstruction/point_cloud_10k.ply \
-  --skip-missing
-```
+- 不是任意扫描视频到 3DGS 的完整推理系统。
+- 主要提供 SVPP-style 数据格式、SpatialLM/PQ3D 的场景理解训练/评估接口。
+- Video2Mesh 复用它的数据组织方式：`mesh.ply`、`camera_info.json`、`metadata.json`、`data_info.json`。
 
-选帧和裁剪参考图。注意：这些命令只处理 `asset_role=object` 的前景物体，会跳过 `asset_role=background_structure` 的 floor/wall/ceiling：
+`image-blaster`：
 
-```bash
-python -m video2mesh.cli select-frames \
-  --project-root exports/milscene2_real_demo \
-  --frames-dir exports/milscene2_real_demo/scene/mast3r_keyframes \
-  --top-k 3
+- 不是视频重建系统。
+- 主要提供单图/物体图到 mesh、world 目录和 Three.js viewer 的资产生成思路。
+- Video2Mesh 复用其 `worlds/<world>/output/<object>/` 资产约定，后续可接 Hunyuan/Meshy/FAL。
 
-python -m video2mesh.cli prepare-object-images \
-  --project-root exports/milscene2_real_demo \
-  --top-k 3 \
-  --skip-missing
-```
+## 7. 当前局限
 
-从 3D mask cloud 生成粗 mesh：
+- GraphDECO 已接入为默认 trainer，但长视频重建质量仍受 MASt3R 位姿、帧选择、显存和训练时间影响。
+- SAM2.1 tiny 比 SAM v1 bbox tracking 更稳定，但对折叠椅、植物、透明/反光/细结构仍会过分割或漂移。
+- 物体语义名还需要开放词汇检测或 VLM 回流。
+- 当前物体 mesh 多为 object mask cloud baseline，适合验证尺度和接口，不是最终仿真质量。
+- 背景结构仍以 floor/wall/ceiling 等 baseline 为主，door/window/cabinet 等需要更强 scene structure segmentation。
+- 仿真器资产仍需要真实尺度标定、碰撞体质量检查和物理属性测量。
 
-```bash
-python -m video2mesh.cli reconstruct-object-meshes \
-  --project-root exports/milscene2_real_demo \
-  --method auto \
-  --format obj \
-  --skip-missing \
-  --skip-failed
-```
+## 8. 文档入口
 
-如果要把每个物体交给外部单图或多视角 mesh 方法，可以先生成统一的 job JSON 和 shell 脚本：
-
-```bash
-python -m video2mesh.cli prepare-multiview-mesh-jobs \
-  --project-root exports/milscene2_real_demo \
-  --max-frames 2 \
-  --command-template "python reconstruct_object.py --job {job_path} --output {mesh_output}" \
-  --skip-missing
-```
-
-输出：
-
-```text
-simulator_assets/multiview_mesh_jobs/multiview_mesh_jobs.json
-simulator_assets/multiview_mesh_jobs/jobs/<object_id>.json
-simulator_assets/multiview_mesh_jobs/run_mesh_jobs.sh
-```
-
-这个命令不会真正解决 mesh 质量问题，它只是把 “object_id -> selected frames / crops / expected mesh output” 标准化，方便后续接 Hunyuan3D、Meshy、多视角重建或自研 object reconstruction。
-
-导出 image-blaster world：
-
-```bash
-python -m video2mesh.cli export-image-blaster \
-  --project-root exports/milscene2_real_demo \
-  --world milscene2-real-demo \
-  --image-blaster-root image-blaster \
-  --provider hunyuan \
-  --use-object-crop \
-  --skip-missing
-```
-
-导出仿真器资产：
-
-```bash
-python -m video2mesh.cli export-simulator-assets \
-  --project-root exports/milscene2_real_demo \
-  --ascii-meshes
-```
-
-如果导入的是 image-blaster / Hunyuan / Meshy 这类 object-local mesh，且需要先按 3D mask bbox 统一尺度，可显式启用 bbox-fit：
-
-```bash
-python -m video2mesh.cli export-simulator-assets \
-  --project-root exports/milscene2_real_demo \
-  --fit-object-local-meshes-to-bbox \
-  --fit-axis diagonal \
-  --ascii-meshes
-```
-
-这会额外生成 `<mesh_stem>_bboxfit.<ext>`，并在 bundle 的 `quality.mesh.fit_to_mask_bbox` 中记录等比缩放和 bbox 对齐信息。`import-object-meshes` 也会兼容外部 mesh root 中按 object_id 分目录的嵌套模型，以及 image-blaster/FAL request metadata 里的 `output_files` / `downloaded_files` 路径。
-
-写入尺度、上方向和估算物理字段：
-
-```bash
-python -m video2mesh.cli calibrate-simulator-assets \
-  --project-root exports/milscene2_real_demo \
-  --scale-to-meters 1.0 \
-  --no-scale-calibrated \
-  --up-axis y \
-  --estimate-physics \
-  --overwrite-physics
-```
-
-没有真实标尺时，`--scale-to-meters 1.0 --no-scale-calibrated` 只代表工程假设，不能当作真实物理尺度。后续如果知道某个物体的真实长度，可以用 `--reference-object <object_id> --reference-axis longest --reference-length-m <meters>` 自动反推 scale。
-
-如果要把人工测量、规则库或目标仿真器里的真实物理属性写回资产包，可以先生成模板：
-
-```bash
-python -m video2mesh.cli prepare-simulator-physics-jobs \
-  --project-root exports/milscene2_real_demo \
-  --provider manual_physics \
-  --include-background
-```
-
-填好 `physics_properties_template.json` 里的 `body_type`、`collider`、`mass_kg`、`material.friction` 和 `restitution` 后导入：
-
-```bash
-python -m video2mesh.cli import-simulator-physics \
-  --project-root exports/milscene2_real_demo \
-  --physics /path/to/physics_properties.json \
-  --provider manual_physics \
-  --skip-missing
-```
-
-导入会同步更新 `simulator_asset_bundle.json`、每个 `object_asset.json` 和 `objects/<object_id>/object.json`，后续重新导出 bundle 时也会继承 object record 中已有的 `physics`。
-
-导出仿真器 adapter：
-
-```bash
-python -m video2mesh.cli export-simulator-adapter \
-  --project-root exports/milscene2_real_demo \
-  --format mujoco isaac unity
-```
-
-如果本机安装了 Unity Editor，可以把 Unity adapter 直接导入一个轻量 Unity 工程并生成场景：
-
-```bash
-tools/import_video2mesh_to_unity.sh \
-  exports/milscene2_real_demo/simulator_assets/adapters/unity/unity_adapter.json
-```
-
-该脚本会打开 `UnityProject/`，执行 `Video2MeshUnityImporter.ImportFromCommandLine`，复制 adapter 打包的 mesh，并生成：
-
-```text
-UnityProject/Assets/Scenes/Video2MeshScene.unity
-UnityProject/Assets/Video2MeshImported/
-UnityProject/Logs/video2mesh-import.log
-```
-
-仿真资产 QA：
-
-```bash
-python -m video2mesh.cli qa-simulator-assets \
-  --project-root exports/milscene2_real_demo \
-  --max-issues 20
-```
-
-QA 会检查 mesh 是否可读、bbox/pose 是否大致对齐、是否缺少尺度标定、碰撞体、质量、body type、material/friction/restitution。背景结构允许没有 object mesh，并默认作为 static scene structure 进入 simulator bundle。
-
-关键输出：
-
-```text
-simulator_assets/simulator_asset_bundle.json
-simulator_assets/simulator_calibration.json
-simulator_assets/simulator_asset_qa.json
-simulator_assets/adapters/mujoco/scene.xml
-simulator_assets/adapters/isaac/isaac_adapter.json
-simulator_assets/adapters/unity/unity_adapter.json
-simulator_assets/objects/<object_id>/
-```
-
-## 6. 当前已跑通的真实 demo
-
-### 6.1 milscene2_real_demo
-
-路径：
-
-```text
-exports/milscene2_real_demo
-```
-
-输入：
-
-```text
-dataset/milscene2.mp4
-```
-
-当前评估：
-
-```text
-ok=true
-frames=36
-camera_poses=13
-point_cloud_vertices=1,869,714
-gsplat_vertices=8,000
-2D_masks=78
-semantic_records=12
-foreground_objects=6
-background_structures=6
-objects_total=12
-objects_with_reference_images=6
-objects_with_3d_mask_clouds=12
-objects_with_meshes=6
-svpp_instances=12
-simulator_bundle_objects=12
-simulator_missing_meshes=[]
-required_failed=[]
-recommended_failed=[]
-```
-
-关键文件：
-
-```text
-exports/milscene2_real_demo/simulator_assets/review/index.html
-exports/milscene2_real_demo/simulator_assets/evaluation_report.json
-exports/milscene2_real_demo/simulator_assets/viewer_plys/scene_3dgs_supersplat.ply
-exports/milscene2_real_demo/simulator_assets/viewer_plys/semantic_3dgs_supersplat.ply
-exports/milscene2_real_demo/simulator_assets/simulator_asset_bundle.json
-exports/milscene2_real_demo/simulator_assets/simulator_calibration.json
-exports/milscene2_real_demo/simulator_assets/simulator_asset_qa.json
-exports/milscene2_real_demo/simulator_assets/background_structures/background_structures.json
-exports/milscene2_real_demo/simulator_assets/svpp/milscene2-real-demo/metadata.json
-image-blaster/worlds/milscene2-real-demo
-```
-
-### 6.2 milscene_real_demo
-
-路径：
-
-```text
-exports/milscene_real_demo
-```
-
-输入：
-
-```text
-dataset/milscene.mp4
-```
-
-当前评估：
-
-```text
-ok=true
-frames=46
-camera_poses=45
-point_cloud_vertices=5,083,870
-gsplat_vertices=8,000
-2D_masks=108
-semantic_ids=6
-objects=6
-objects_with_reference_images=6
-objects_with_3d_mask_clouds=6
-objects_with_meshes=6
-required_failed=[]
-recommended_failed=[]
-```
-
-## 7. 远端环境
-
-主要运行环境在远端：
-
-```bash
-ssh -p 14225 root@connect.westd.seetacloud.com
-cd /root/autodl-tmp/workspace/Video2Mesh
-source /etc/network_turbo || true
-source remote_env.sh
-```
-
-关键路径：
-
-```text
-/root/autodl-tmp/workspace/Video2Mesh
-/root/autodl-tmp/workspace/MASt3R-SLAM
-/root/autodl-tmp/checkpoints/sam/sam_vit_b_01ec64.pth
-```
-
-当前远端环境已验证：
-
-- Python / PyTorch / CUDA 可用。
-- MASt3R-SLAM 可以从 frame sequence 输出 trajectory、point cloud、keyframes。
-- `gsplat` CUDA extension 已编译缓存，后续 3DGS baseline 训练会比第一次快。
-- SAM vit_b checkpoint 可用于 auto prompts 和 bbox mask backend。
-
-## 8. 验证和 Review
-
-项目级验证：
-
-```bash
-python -m video2mesh.cli validate \
-  --project-root exports/milscene2_real_demo
-```
-
-评估报告：
-
-```bash
-python -m video2mesh.cli evaluate \
-  --project-root exports/milscene2_real_demo \
-  --output exports/milscene2_real_demo/simulator_assets/evaluation_report.json
-```
-
-仿真资产 QA：
-
-```bash
-python -m video2mesh.cli qa-simulator-assets \
-  --project-root exports/milscene2_real_demo \
-  --max-issues 20
-```
-
-Review HTML：
-
-```bash
-python -m video2mesh.cli export-review-pack \
-  --project-root exports/milscene2_real_demo \
-  --max-scene-frames 4 \
-  --max-frames 3
-```
-
-Review HTML 中会包含：
-
-- 自动 prompt 预览。
-- 点云投影 QA。
-- semantic mask 投影 QA。
-- 3DGS render / target / error。
-- 每个物体的 reference image、selected frames、mesh 路径、simulator mesh 状态。
-
-结构 mask 的额外检查点是：`background_structures` artifact 是否存在；结构 object 是否都有 `mask_3d.point_indices_json/npy`；SVPP export 的 `metadata.json[*].point_ids` 是否仍能索引到同一份 `mesh.ply` vertex 顺序；`pred_class_name/id` 是否按 wall/floor/ceiling/cabinet 等类别映射，而不是混成实例语义 id。
-
-## 9. 局限和下一步
-
-当前系统已经完成工程闭环，但还有明显局限：
-
-- 3DGS 是最小 baseline，只有少量迭代，没有 densification、pruning、SH appearance、曝光处理。
-- 物体语义名仍来自自动候选颜色名，不是可靠开放词汇类别。
-- 2D tracking 是 bbox/SAM demo 级别，后续应换 SAM2 / DEVA / XMem 一类跨帧一致性更强的 video segmentation。
-- 3D mask fusion 依赖 MASt3R-SLAM 位姿和点云质量，遮挡、反光、透明物体会明显影响结果。
-- 当前 mesh 是从 3D mask cloud 粗重建，适合接口验证，不适合最终仿真质量。
-- 目前只有工程假设/参考物体式尺度接口和 bbox 体积物理估计，仍缺少真实测量尺度、可靠质量/摩擦和稳定碰撞体。
-- 背景结构已经有外部 layout/3D segmentation 导入协议，但当前内置可运行 baseline 仍只是点云边界启发式 floor/ceiling/wall mask；门、窗、柜体、桌面等语义结构需要接入 SpatialLM / PQ3D / open-vocabulary 3D segmentation 等外部模型。
-
-建议下一步：
-
-1. 接入更高质量 3DGS trainer，例如完整 gsplat / nerfstudio / gaussian-splatting 流水线。
-2. 用 SAM2 或 DEVA 替换当前 bbox/SAM tracking。
-3. 引入开放词汇检测或 VLM，为每个 object_id 自动生成类别和描述。
-4. 用多视角物体重建替换当前粗 mask-cloud mesh。
-5. 给仿真资产增加尺度标定、质量、摩擦、碰撞体简化和坐标系 QA。
-6. 执行并评估 `prepare-sceneversepp-jobs` 生成的 SpatialLM / PQ3D 数据生成脚本，确认哪些类别、背景结构和点云规模适合进一步训练或评估。
-7. 用 layout / semantic scene parsing 替换当前背景结构启发式，覆盖地面、墙、天花板、门窗、固定柜体等不可移动或半固定结构。
-
-## 10. 快速入口
-
-查看已跑通 demo：
-
-```text
-exports/milscene2_real_demo/simulator_assets/review/index.html
-```
-
-上传到 SuperSplat：
-
-```text
-exports/milscene2_real_demo/simulator_assets/viewer_plys/scene_3dgs_supersplat.ply
-exports/milscene2_real_demo/simulator_assets/viewer_plys/semantic_3dgs_supersplat.ply
-```
-
-用 Mac Preview 看普通点云：
-
-```text
-exports/milscene2_real_demo/simulator_assets/viewer_plys/scene_3dgs_point_cloud.ply
-exports/milscene2_real_demo/simulator_assets/viewer_plys/semantic_3dgs_point_cloud.ply
-```
-
-查看仿真器导出：
-
-```text
-exports/milscene2_real_demo/simulator_assets/adapters/mujoco/scene.xml
-exports/milscene2_real_demo/simulator_assets/adapters/isaac/isaac_adapter.json
-exports/milscene2_real_demo/simulator_assets/adapters/unity/unity_adapter.json
-exports/milscene2_real_demo/simulator_assets/simulator_asset_qa.json
-```
+- `README.md`：GitHub 首页。
+- `VIDEO2MESH_PIPELINE.md`：完整流程、命令和数据协议。
+- `Video2Mesh_real_demo_runbook.md`：远端实验运行手册。
+- `REMOTE_SETUP_STATUS.md`：远端环境、依赖、权重和 GraphDECO 状态。
+- `Video2Mesh_milscene3_showcase.md`：当前可展示产物清单。
+- `SVLGaussian_frame_matching_notes.md`：帧匹配/选帧算法说明。
