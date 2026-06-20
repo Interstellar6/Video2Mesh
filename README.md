@@ -65,6 +65,10 @@ downstream pass with:
 bash tools/run_video2mesh_downstream_light.sh exports/<run> dataset/<video>_best10.mp4
 ```
 
+This resume script still fuses object masks against the full MASt3R point cloud,
+but caps background-plane RANSAC sampling by default so recovery runs remain
+interactive on 16M+ point clouds.
+
 ## Key Docs
 
 - `Video2Mesh_PROJECT_README.md`: project overview.

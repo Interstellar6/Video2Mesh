@@ -23,6 +23,8 @@ Optional environment overrides:
   GAUSSIAN_BACKPROJECT=0|1
   RENDER_SEMANTIC_PREVIEW=0|1
   RECONSTRUCT_MASK_MESHES=1|0
+  BACKGROUND_RANSAC_MAX_POINTS=200000
+  BACKGROUND_FIT_MAX_POINTS=80000
 USAGE
 }
 
@@ -91,6 +93,8 @@ RECONSTRUCT_MASK_MESHES="${RECONSTRUCT_MASK_MESHES:-1}"
 PIXEL_STRIDE="${PIXEL_STRIDE:-6}"
 MAX_PIXELS_PER_MASK="${MAX_PIXELS_PER_MASK:-1500}"
 SEMANTIC_PREVIEW_MAX_POINTS="${SEMANTIC_PREVIEW_MAX_POINTS:-8000}"
+BACKGROUND_RANSAC_MAX_POINTS="${BACKGROUND_RANSAC_MAX_POINTS:-200000}"
+BACKGROUND_FIT_MAX_POINTS="${BACKGROUND_FIT_MAX_POINTS:-80000}"
 
 if [[ "$AUTO_PROMPT_METHOD" == "sam" && ! -f "$SAM_CHECKPOINT" ]]; then
   echo "[Video2Mesh downstream] SAM checkpoint not found, falling back to OpenCV auto prompts: $SAM_CHECKPOINT" >&2
@@ -114,6 +118,7 @@ echo "[Video2Mesh downstream] scene_id: $SCENE_ID" | tee -a "$LOG"
 echo "[Video2Mesh downstream] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh downstream] semantic_splats: $SEMANTIC_SPLATS" | tee -a "$LOG"
 echo "[Video2Mesh downstream] gaussian_backproject: $GAUSSIAN_BACKPROJECT" | tee -a "$LOG"
+echo "[Video2Mesh downstream] background_ransac_max_points: $BACKGROUND_RANSAC_MAX_POINTS" | tee -a "$LOG"
 
 semantic_args=()
 if [[ "$SEMANTIC_SPLATS" == "1" || "$SEMANTIC_SPLATS" == "true" ]]; then
@@ -174,6 +179,8 @@ fi
   --infer-background-plane-masks \
   --background-plane-max-planes 6 \
   --background-plane-min-points 300 \
+  --background-plane-max-ransac-points "$BACKGROUND_RANSAC_MAX_POINTS" \
+  --background-plane-max-fit-points "$BACKGROUND_FIT_MAX_POINTS" \
   "${semantic_args[@]}" \
   --top-k "$TOP_K" \
   --frame-selection-method svlgaussian \

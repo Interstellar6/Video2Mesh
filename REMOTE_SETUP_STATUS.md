@@ -147,6 +147,8 @@ bash tools/run_video2mesh_downstream_light.sh \
 
 该入口默认使用 SAM2，但限制 prompt/object 数和 tracking 帧数，并跳过最重的 Gaussian semantic backprojection。若只需要补语义 splat，可设置 `SEMANTIC_SPLATS=1`；若机器负载正常再设置 `GAUSSIAN_BACKPROJECT=1`。
 
+注意：该入口不降采样 object mask fusion 使用的 full cloud，但默认限制背景平面 RANSAC/Fit 采样点数，避免背景结构推断在 16M+ 点云上把机器压到无法 SSH。
+
 ## 7. 网络和磁盘
 
 GitHub/HuggingFace 下载前：

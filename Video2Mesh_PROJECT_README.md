@@ -86,6 +86,8 @@ bash tools/run_video2mesh_downstream_light.sh \
   dataset/bedroom_100_first60_best10.mp4
 ```
 
+该入口默认跳过 Gaussian semantic backprojection，并只限制背景平面 RANSAC 采样；object 级 3D mask fusion 仍使用 full MASt3R point cloud。
+
 ## 4. 不降采样约定
 
 高质量实验默认使用 MASt3R-SLAM 原始点云：

@@ -124,6 +124,13 @@ SEMANTIC_SPLATS=1 GAUSSIAN_BACKPROJECT=0 \
 bash tools/run_video2mesh_downstream_light.sh exports/<run> dataset/<video>_best10.mp4
 ```
 
+该脚本仍用 full MASt3R point cloud 做 object mask fusion；为了避免背景结构 RANSAC 在千万级点云上压满机器，默认只对背景平面拟合采样：
+
+```text
+BACKGROUND_RANSAC_MAX_POINTS=200000
+BACKGROUND_FIT_MAX_POINTS=80000
+```
+
 ## 4. GraphDECO 3DGS
 
 远端 GraphDECO 路径：
