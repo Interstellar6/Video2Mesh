@@ -51,6 +51,13 @@ bash tools/run_video2mesh_quick.sh dataset/bedroom_100_first60.mp4
 
 For a `*_first60.mp4` retry, use a 30 minute MASt3R budget. If it exceeds that budget, or if readiness reports a single pose / empty point cloud even though it finished, crop a better-scored 10 second segment into `dataset/<name>_best10.mp4` and continue from that dataset.
 
+```bash
+python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
+  --duration 10 \
+  --output dataset/bedroom_100_first60_best10.mp4 \
+  --force
+```
+
 ## Key Docs
 
 - `Video2Mesh_PROJECT_README.md`: project overview.

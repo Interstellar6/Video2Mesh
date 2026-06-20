@@ -90,6 +90,25 @@ bash tools/run_video2mesh_quick.sh dataset/bedroom_100_first60.mp4
 
 对 `*_first60.mp4` 二次实验使用 30 分钟 MASt3R 预算。如果 30 分钟内仍没有有效 `camera_info.json` / `point_cloud.ply`，或者虽然结束但 `reconstruction-readiness` 显示单 pose、空点云、`ready_for_gsplat_training=false`，则不再继续用该片段训练，改裁一个运动和视差更稳定的 10 秒片段，保存为 `dataset/<name>_best10.mp4` 后继续。
 
+无 `ffmpeg` 的远端环境使用 OpenCV 裁剪工具：
+
+```bash
+python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
+  --duration 10 \
+  --output dataset/bedroom_100_first60_best10.mp4 \
+  --force
+```
+
+如果只需要固定裁剪前 60 秒，也可以显式指定起点：
+
+```bash
+python tools/crop_best_video_window.py dataset/bedroom_100.mp4 \
+  --start 0 \
+  --duration 60 \
+  --output dataset/bedroom_100_first60.mp4 \
+  --force
+```
+
 ## 4. GraphDECO 3DGS
 
 远端 GraphDECO 路径：

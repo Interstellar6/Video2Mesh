@@ -69,6 +69,15 @@ dataset/bedroom_100_first60.mp4
 
 如果 `*_first60.mp4` 的 MASt3R 仍超过 30 分钟，或 30 分钟内结束但 readiness 显示单 pose / 空点云，则继续裁剪更稳定的 10 秒片段作为新 dataset，例如 `dataset/bedroom_100_first60_best10.mp4`。这条规则用于避免把不可重建片段送入 GraphDECO 或语义融合。
 
+推荐使用仓库内的 OpenCV 裁剪工具生成该 fallback 数据集：
+
+```bash
+python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
+  --duration 10 \
+  --output dataset/bedroom_100_first60_best10.mp4 \
+  --force
+```
+
 ## 4. 不降采样约定
 
 高质量实验默认使用 MASt3R-SLAM 原始点云：

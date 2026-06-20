@@ -112,6 +112,7 @@ bash tools/run_graphdeco_3dgs.sh exports/<run>
 - 裁剪前 60 秒到 `dataset/<name>_first60.mp4`。
 - 对裁剪视频重新跑 quick script。
 - 对 `*_first60.mp4` 使用 30 分钟 MASt3R 预算；如果超时，或虽然结束但 readiness 显示单 pose / 空点云，则裁剪更稳定的 10 秒片段到 `dataset/<name>_best10.mp4` 继续。
+- 远端没有 `ffmpeg` 时，用 `python tools/crop_best_video_window.py ...`，该脚本基于 OpenCV 写出新 dataset 视频。
 
 裁剪命令：
 
@@ -125,6 +126,15 @@ ffmpeg -y -i dataset/<name>.mp4 -t 60 -c copy dataset/<name>_first60.mp4
 ffmpeg -y -i dataset/<name>.mp4 -t 60 \
   -c:v libx264 -crf 18 -preset veryfast \
   -c:a copy dataset/<name>_first60.mp4
+```
+
+OpenCV fallback：
+
+```bash
+python tools/crop_best_video_window.py dataset/<name>_first60.mp4 \
+  --duration 10 \
+  --output dataset/<name>_first60_best10.mp4 \
+  --force
 ```
 
 ## 7. 网络和磁盘
