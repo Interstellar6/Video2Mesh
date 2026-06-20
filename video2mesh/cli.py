@@ -31,6 +31,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from video2mesh.gsplat_utils import (
+    default_3dgs_command_template,
+    find_latest_splat_ply,
+    gsplat_result_has_ply,
+    gsplat_train_manifest_for_output,
+    gsplat_viewer_companion_paths,
+    local_registered_path,
+)
+
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MASK_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -1200,49 +1209,6 @@ def estimate_or_read_intrinsic(args: argparse.Namespace, frames_dir: Path | None
     }
 
 
-def find_latest_splat_ply(path: Path) -> Path:
-    if path.is_file():
-        return path
-    candidates = sorted(path.rglob("point_cloud.ply"), key=lambda item: (len(str(item)), str(item)))
-    if not candidates:
-        candidates = sorted(path.rglob("*.ply"), key=lambda item: (len(str(item)), str(item)))
-    if not candidates:
-        raise FileNotFoundError(f"No PLY file found under {path}")
-
-    def iteration_key(item: Path) -> tuple[int, str]:
-        match = re.search(r"iteration[_-]?(\d+)", str(item))
-        return (int(match.group(1)) if match else -1, str(item))
-
-    return sorted(candidates, key=iteration_key)[-1]
-
-
-def local_registered_path(src: Path, dst: Path, path: Path) -> Path:
-    if src.is_dir():
-        try:
-            return dst / path.resolve().relative_to(src.resolve())
-        except Exception:
-            return path
-    if path.resolve() == src.resolve():
-        return dst / src.name
-    return path
-
-
-def gsplat_viewer_companion_paths(splat_ply: Path) -> dict[str, Path]:
-    stem = splat_ply.with_suffix("")
-    return {
-        "point_cloud_ply": stem.parent / f"{stem.name}_point_cloud.ply",
-        "supersplat_ply": stem.parent / f"{stem.name}_supersplat.ply",
-    }
-
-
-def gsplat_train_manifest_for_output(output_dir: Path) -> dict[str, Any]:
-    manifest_path = output_dir / "video2mesh_gsplat_train.json"
-    if not manifest_path.exists():
-        return {}
-    data = safe_read_json(manifest_path)
-    return data if isinstance(data, dict) else {}
-
-
 def cmd_make_sample(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = init_project(project_root, args.scene_id)
@@ -2049,17 +2015,6 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
     print(f"Prepared 3DGS COLMAP source: {source_path}")
     print(f"Run manifest: {stage_root / '3dgs_run_manifest.json'}")
     return 0
-
-
-def default_3dgs_command_template(provider: str) -> str:
-    normalized = slugify(provider)
-    if normalized in {"graphdeco", "gaussian-splatting", "graphdeco-gaussian-splatting"}:
-        return "python train.py -s {source_path} -m {output_path}"
-    if normalized in {"nerfstudio", "splatfacto", "ns-splatfacto"}:
-        return "ns-train splatfacto --data {source_path} --output-dir {output_path}"
-    if normalized in {"gsplat", "full-gsplat"}:
-        return "python train_gsplat_full.py --data {source_path} --output {output_path}"
-    return "echo Fill in external 3DGS command for provider={provider} source={source_path} output={output_path}"
 
 
 def high_quality_3dgs_backend_commands(source_path: Path, output_path: Path, project_root: Path) -> dict[str, dict[str, Any]]:
@@ -21340,14 +21295,6 @@ def cmd_export_production_upgrade_execution_plan(args: argparse.Namespace) -> in
         if not args.no_script:
             print(f"Script: {script_path}")
     return 0
-
-
-def gsplat_result_has_ply(path: Path) -> bool:
-    try:
-        find_latest_splat_ply(path)
-        return True
-    except Exception:
-        return False
 
 
 def run_production_import_stage(

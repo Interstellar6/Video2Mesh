@@ -35,6 +35,7 @@ MAX_FRAMES=72 \
 EXTRACT_EVERY=2 \
 GRAPHDECO_ITERATIONS=7000 \
 GRAPHDECO_RESOLUTION=1 \
+GRAPHDECO_DENSIFY_UNTIL_ITER=0 \
 bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 ```
 
@@ -43,7 +44,7 @@ bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 - 输出到 `exports/<scene>_quick_<timestamp>`。
 - 使用 `/root/autodl-tmp/venvs/v2m-svpp/bin/python`。
 - 用 MASt3R-SLAM 生成 camera poses、keyframes、full point cloud。
-- 用 GraphDECO `train.py` 训练 3DGS。
+- 用 GraphDECO `train.py` 训练 3DGS，默认保留 full cloud 初始化并关闭 densification。
 - 用 SAM v1 自动生成 prompts。
 - 用 SAM2.1 Hiera Tiny 传播视频 masks。
 - 使用 full `point_cloud.ply` 做 mask fusion、semantic transfer 和 object mask clouds。
@@ -87,6 +88,8 @@ bash tools/run_video2mesh_quick.sh dataset/bedroom_100_first60.mp4
 
 这个裁剪文件要保存在 `dataset/` 中，作为独立数据集记录，而不是临时文件。
 
+对 `*_first60.mp4` 二次实验使用 30 分钟 MASt3R 预算。如果 30 分钟内仍没有有效 `camera_info.json` / `point_cloud.ply`，或者虽然结束但 `reconstruction-readiness` 显示单 pose、空点云、`ready_for_gsplat_training=false`，则不再继续用该片段训练，改裁一个运动和视差更稳定的 10 秒片段，保存为 `dataset/<name>_best10.mp4` 后继续。
+
 ## 4. GraphDECO 3DGS
 
 远端 GraphDECO 路径：
@@ -111,6 +114,15 @@ bash tools/run_graphdeco_3dgs.sh /root/autodl-tmp/workspace/Video2Mesh/exports/<
 3. 生成 COLMAP-style source。
 4. 调用 GraphDECO `train.py --disable_viewer`。
 5. 用 `import-3dgs-result` 注册结果并导出 viewer PLY / semantic preview。
+
+默认 GraphDECO 参数：
+
+```text
+--densify_until_iter 0
+--densify_from_iter 100000000
+```
+
+原因是 MASt3R-SLAM 对短扫描片段可能给出千万级初始化点云。默认 GraphDECO densification 会继续扩点，在 32GB 显存上容易 OOM。当前约定是不降采样初始化点云，而是关闭 densification；如果后续使用更小点云或更大显存，可以通过 `GRAPHDECO_DENSIFY_UNTIL_ITER`、`GRAPHDECO_DENSIFY_FROM_ITER` 和 `GRAPHDECO_EXTRA_ARGS` 覆盖。
 
 GraphDECO 输出默认在：
 
@@ -291,9 +303,12 @@ dataset/bedroom_100.mp4
   -> dataset/bedroom_100_first60.mp4
   -> MASt3R 只得到 1 pose 和空 point_cloud.ply
   -> GraphDECO 未开始训练
+  -> 裁剪最佳 10 秒片段 dataset/bedroom_100_first60_best10.mp4
+  -> MASt3R 恢复 161 poses 和 full point_cloud.ply
+  -> GraphDECO 真实训练 7000 iter 完成，默认关闭 densification
 ```
 
-该失败说明：裁剪前 60 秒并不保证可重建；如果视频开头缺乏足够视差、纹理或稳定运动，MASt3R 仍可能只输出单 pose/空点云。后续应选择更合适的 10 秒片段，或先在已验证可重建的数据上继续 GraphDECO/SAM2 后半段。
+该失败说明：裁剪前 60 秒并不保证可重建；如果视频开头缺乏足够视差、纹理或稳定运动，MASt3R 仍可能只输出单 pose/空点云。本次已按该诊断改用更合适的 10 秒片段继续 GraphDECO/SAM2 后半段。
 
 该 run 已可用 `reconstruction-readiness` 明确诊断：
 

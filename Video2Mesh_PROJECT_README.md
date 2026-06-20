@@ -51,10 +51,13 @@ GS_BACKEND=graphdeco
 GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
 GRAPHDECO_ITERATIONS=7000
 GRAPHDECO_RESOLUTION=1
+GRAPHDECO_DENSIFY_UNTIL_ITER=0
 MASK_BACKEND=sam2
 MAX_FRAMES=72
 EXTRACT_EVERY=2
 ```
+
+GraphDECO 默认使用 MASt3R full point cloud 初始化，但关闭 densification。这个设置是为了避免千万级初始化点云在 32GB 显存上继续扩点导致 OOM；它不是降采样策略。
 
 如果 MASt3R-SLAM 对长视频运行超过 1.5 小时仍未产出 `camera_info.json` 和 `point_cloud.ply`，当前实验策略是中断该次 MASt3R，把视频前 60 秒裁剪成新的 dataset 文件，例如：
 
@@ -63,6 +66,8 @@ dataset/bedroom_100_first60.mp4
 ```
 
 然后对该新数据集重新运行一键流程。
+
+如果 `*_first60.mp4` 的 MASt3R 仍超过 30 分钟，或 30 分钟内结束但 readiness 显示单 pose / 空点云，则继续裁剪更稳定的 10 秒片段作为新 dataset，例如 `dataset/bedroom_100_first60_best10.mp4`。这条规则用于避免把不可重建片段送入 GraphDECO 或语义融合。
 
 ## 4. 不降采样约定
 

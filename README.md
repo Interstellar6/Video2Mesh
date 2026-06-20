@@ -31,9 +31,14 @@ The quick entrypoint defaults to:
 
 - `GS_BACKEND=graphdeco`
 - `GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting`
+- `GRAPHDECO_DENSIFY_UNTIL_ITER=0`
 - `MASK_BACKEND=sam2`
 - full MASt3R point cloud for 3DGS and semantic fusion
 - simulator/export QA reports at the end
+
+The GraphDECO default keeps the full MASt3R initialization cloud, but disables
+densification by default. This avoids out-of-memory failures on 16M+ point
+initializations while preserving the original scan geometry as the 3DGS seed.
 
 ## Long Video Rule
 
@@ -43,6 +48,8 @@ If MASt3R-SLAM runs longer than 1.5 hours without producing `camera_info.json` a
 ffmpeg -y -i dataset/bedroom_100.mp4 -t 60 -c copy dataset/bedroom_100_first60.mp4
 bash tools/run_video2mesh_quick.sh dataset/bedroom_100_first60.mp4
 ```
+
+For a `*_first60.mp4` retry, use a 30 minute MASt3R budget. If it exceeds that budget, or if readiness reports a single pose / empty point cloud even though it finished, crop a better-scored 10 second segment into `dataset/<name>_best10.mp4` and continue from that dataset.
 
 ## Key Docs
 

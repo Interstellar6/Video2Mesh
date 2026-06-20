@@ -94,6 +94,7 @@ bash tools/run_video2mesh_quick.sh dataset/<video>.mp4
 - `GRAPHDECO_ITERATIONS=7000`
 - `GRAPHDECO_RESOLUTION=1`
 - 不降采样 MASt3R full cloud
+- GraphDECO 默认 `DENSIFY_UNTIL_ITER=0` / `GRAPHDECO_DENSIFY_UNTIL_ITER=0`，即保留 full cloud 初始化但关闭 densification，避免 16M+ 初始化点在 32GB 显存上 OOM。
 
 单独补跑 GraphDECO：
 
@@ -110,6 +111,7 @@ bash tools/run_graphdeco_3dgs.sh exports/<run>
 - 超过 1.5 小时仍未产出 `camera_info.json` 和 `point_cloud.ply`，中断当前 run。
 - 裁剪前 60 秒到 `dataset/<name>_first60.mp4`。
 - 对裁剪视频重新跑 quick script。
+- 对 `*_first60.mp4` 使用 30 分钟 MASt3R 预算；如果超时，或虽然结束但 readiness 显示单 pose / 空点云，则裁剪更稳定的 10 秒片段到 `dataset/<name>_best10.mp4` 继续。
 
 裁剪命令：
 
@@ -186,10 +188,10 @@ exports/bedroom_100_first60_quick_first60_graphdeco_20260620_052824
 - `scene/reconstruction/point_cloud.ply` 是空 PLY，Open3D 报 `Read PLY failed: number of vertex <= 0`。
 - `reconstruction-readiness` 已能提前诊断该状态：`frames=1 poses=1 points=0`，`ok=False colmap=False 3dgs=False mask_fusion=False`。
 - pipeline 现在会在 GraphDECO source/point-cloud 准备前写 `simulator_assets/reconstruction_readiness_report.json` 并停止，避免空点云继续进入训练。
-- 因该实验没有跑通完整链路，本轮不拆分 `video2mesh/cli.py`。
+- 该 first60 片段未进入 GraphDECO 训练；后续已裁剪更稳定的 10 秒片段继续。
 
-下一步建议：
+后续执行：
 
-1. 对 `bedroom_100` 另取更有视差和稳定运动的 10 秒片段，而不是默认视频开头。
-2. 或先用官方 SceneVerse++ / milscene3 这类已能重建的数据继续验证 GraphDECO 与 SAM2 后半段。
-3. 如果必须使用 `bedroom_100`，先人工抽查前 60 秒内容是否静止、黑屏、快速运动或缺纹理；MASt3R 只得到 1 pose 说明输入片段不适合当前配置。
+1. 已对 `bedroom_100_first60.mp4` 选择更有视差和稳定运动的 10 秒片段，保存为 `dataset/bedroom_100_first60_best10.mp4`。
+2. 该 best10 片段已跑通 MASt3R full cloud，并进入 GraphDECO/SAM2 后半段验证。
+3. `video2mesh/cli.py` 在 GraphDECO 训练跑通后做了第一批低风险拆分，把 3DGS path/helper 逻辑移到 `video2mesh/gsplat_utils.py`。

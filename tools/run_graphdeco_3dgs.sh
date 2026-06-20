@@ -16,6 +16,9 @@ Optional environment overrides:
   GRAPHDECO_PYTHON=/root/autodl-tmp/venvs/v2m-svpp/bin/python
   ITERATIONS=7000
   RESOLUTION=1
+  DENSIFY_UNTIL_ITER=0
+  DENSIFY_FROM_ITER=100000000
+  GRAPHDECO_EXTRA_ARGS="--densification_interval 100"
   TRAIN_IMAGES=images
 USAGE
 }
@@ -38,6 +41,9 @@ GRAPHDECO_ROOT="${GRAPHDECO_ROOT:-/root/autodl-tmp/workspace/gaussian-splatting}
 GRAPHDECO_PYTHON="${GRAPHDECO_PYTHON:-$V2M_PYTHON}"
 ITERATIONS="${ITERATIONS:-7000}"
 RESOLUTION="${RESOLUTION:-1}"
+DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER:-0}"
+DENSIFY_FROM_ITER="${DENSIFY_FROM_ITER:-100000000}"
+GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 TRAIN_IMAGES="${TRAIN_IMAGES:-images}"
 SOURCE_PATH="${SOURCE_PATH:-$PROJECT_ROOT/external/graphdeco_3dgs/colmap_source}"
 OUTPUT_PATH="${OUTPUT_PATH:-$PROJECT_ROOT/scene/reconstruction/3dgs_graphdeco}"
@@ -98,6 +104,7 @@ echo "[Video2Mesh GraphDECO] source:  $SOURCE_PATH"
 echo "[Video2Mesh GraphDECO] output:  $OUTPUT_PATH"
 echo "[Video2Mesh GraphDECO] graphdeco: $GRAPHDECO_ROOT"
 echo "[Video2Mesh GraphDECO] iterations=$ITERATIONS resolution=$RESOLUTION"
+echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from_iter=$DENSIFY_FROM_ITER"
 
 "$V2M_PYTHON" -B -m video2mesh.cli run-3dgs \
   --project-root "$PROJECT_ROOT" \
@@ -110,7 +117,7 @@ echo "[Video2Mesh GraphDECO] iterations=$ITERATIONS resolution=$RESOLUTION"
   --camera-model PINHOLE \
   --image-mode copy \
   --prepare-only \
-  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $ITERATIONS --test_iterations $ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --disable_viewer"
+  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $ITERATIONS --test_iterations $ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER $GRAPHDECO_EXTRA_ARGS --disable_viewer"
 
 (
   cd "$GRAPHDECO_ROOT"
@@ -122,6 +129,9 @@ echo "[Video2Mesh GraphDECO] iterations=$ITERATIONS resolution=$RESOLUTION"
     --test_iterations "$ITERATIONS" \
     --resolution "$RESOLUTION" \
     --images "$TRAIN_IMAGES" \
+    --densify_until_iter "$DENSIFY_UNTIL_ITER" \
+    --densify_from_iter "$DENSIFY_FROM_ITER" \
+    $GRAPHDECO_EXTRA_ARGS \
     --disable_viewer
 ) 2>&1 | tee "$LOG"
 

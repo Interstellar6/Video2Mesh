@@ -20,6 +20,9 @@ Optional environment overrides:
   GS_BACKEND=graphdeco|minimal|none
   GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
   GRAPHDECO_ITERATIONS=7000
+  GRAPHDECO_DENSIFY_UNTIL_ITER=0
+  GRAPHDECO_DENSIFY_FROM_ITER=100000000
+  GRAPHDECO_EXTRA_ARGS="--densification_interval 100"
   MAX_FRAMES=72
   SAM_CHECKPOINT=/root/autodl-tmp/checkpoints/sam/sam_vit_b_01ec64.pth
 USAGE
@@ -84,6 +87,9 @@ MAX_FRAMES="${MAX_FRAMES:-72}"
 EXTRACT_EVERY="${EXTRACT_EVERY:-2}"
 GRAPHDECO_ITERATIONS="${GRAPHDECO_ITERATIONS:-7000}"
 GRAPHDECO_RESOLUTION="${GRAPHDECO_RESOLUTION:-1}"
+GRAPHDECO_DENSIFY_UNTIL_ITER="${GRAPHDECO_DENSIFY_UNTIL_ITER:-0}"
+GRAPHDECO_DENSIFY_FROM_ITER="${GRAPHDECO_DENSIFY_FROM_ITER:-100000000}"
+GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 GSPLAT_ITERATIONS="${GSPLAT_ITERATIONS:-500}"
 GSPLAT_MAX_FRAMES="${GSPLAT_MAX_FRAMES:-6}"
 GSPLAT_MAX_POINTS="${GSPLAT_MAX_POINTS:-24000}"
@@ -143,7 +149,7 @@ if [[ "$GS_BACKEND" == "graphdeco" ]]; then
     --prepare-3dgs-source
     --g3dgs-output-path scene/reconstruction/3dgs_graphdeco
     --g3dgs-work-dir external/graphdeco_3dgs
-    --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_ITERATIONS} --test_iterations ${GRAPHDECO_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --disable_viewer"
+    --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_ITERATIONS} --test_iterations ${GRAPHDECO_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --densify_until_iter ${GRAPHDECO_DENSIFY_UNTIL_ITER} --densify_from_iter ${GRAPHDECO_DENSIFY_FROM_ITER} ${GRAPHDECO_EXTRA_ARGS} --disable_viewer"
   )
 elif [[ "$GS_BACKEND" == "minimal" ]]; then
   g3dgs_args=(
