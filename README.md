@@ -69,6 +69,12 @@ This resume script still fuses object masks against the full MASt3R point cloud,
 but caps background-plane RANSAC sampling by default so recovery runs remain
 interactive on 16M+ point clouds.
 
+Refresh demo/advisor reports and list showable files with:
+
+```bash
+bash tools/audit_showcase_artifacts.sh exports/<run>
+```
+
 ## Key Docs
 
 - `Video2Mesh_PROJECT_README.md`: project overview.

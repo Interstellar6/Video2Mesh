@@ -149,6 +149,12 @@ bash tools/run_video2mesh_downstream_light.sh \
 
 注意：该入口不降采样 object mask fusion 使用的 full cloud，但默认限制背景平面 RANSAC/Fit 采样点数，避免背景结构推断在 16M+ 点云上把机器压到无法 SSH。
 
+导师展示产物审计：
+
+```bash
+bash tools/audit_showcase_artifacts.sh exports/<run>
+```
+
 ## 7. 网络和磁盘
 
 GitHub/HuggingFace 下载前：

@@ -131,6 +131,23 @@ BACKGROUND_RANSAC_MAX_POINTS=200000
 BACKGROUND_FIT_MAX_POINTS=80000
 ```
 
+导师展示前刷新并检查可展示产物：
+
+```bash
+bash tools/audit_showcase_artifacts.sh exports/<run>
+```
+
+重点看这些文件是否存在：
+
+```text
+simulator_assets/review/index.html
+simulator_assets/advisor_demo_summary.md
+simulator_assets/showcase_pack_verification.json
+simulator_assets/viewer_plys/scene_3dgs_supersplat.ply
+simulator_assets/simulator_asset_bundle.json
+simulator_assets/adapters/unity/unity_adapter.json
+```
+
 ## 4. GraphDECO 3DGS
 
 远端 GraphDECO 路径：

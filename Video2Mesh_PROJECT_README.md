@@ -88,6 +88,12 @@ bash tools/run_video2mesh_downstream_light.sh \
 
 该入口默认跳过 Gaussian semantic backprojection，并只限制背景平面 RANSAC 采样；object 级 3D mask fusion 仍使用 full MASt3R point cloud。
 
+展示前可运行：
+
+```bash
+bash tools/audit_showcase_artifacts.sh exports/<run>
+```
+
 ## 4. 不降采样约定
 
 高质量实验默认使用 MASt3R-SLAM 原始点云：
