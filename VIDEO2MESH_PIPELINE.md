@@ -207,6 +207,25 @@ simulator_assets/reconstruction_readiness_report.json
 
 SuperSplat 需要 `f_dc_*`、`opacity`、`scale_*`、`rot_*` 等 Gaussian 字段。只有普通 XYZ/RGB 的 PLY 能被 Mac Preview 打开，但不能被 SuperSplat 当作 3DGS 加载。
 
+大场景语义导出默认拆成两步，避免 `export-splat-masks` 在写语义源 PLY 的同时再生成一个巨大 SuperSplat 副本导致远端磁盘满：
+
+```bash
+python -m video2mesh.cli export-splat-masks \
+  --project-root exports/<run> \
+  --splat-ply exports/<run>/scene/reconstruction/point_cloud.ply \
+  --mask-source-ply exports/<run>/scene/reconstruction/point_cloud.ply \
+  --transfer-mode index \
+  --no-export-viewer-plys \
+  --output exports/<run>/simulator_assets/semantic_point_cloud_full.ply
+
+python -m video2mesh.cli export-viewer-plys \
+  --project-root exports/<run> \
+  --splat-ply exports/<run>/simulator_assets/semantic_point_cloud_full.ply \
+  --output-dir exports/<run>/simulator_assets/viewer_plys \
+  --prefix semantic_3dgs \
+  --include-labels
+```
+
 ## 6. 2D 到 3D 语义 mask
 
 输入：
