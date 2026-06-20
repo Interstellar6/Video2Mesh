@@ -78,6 +78,14 @@ python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
   --force
 ```
 
+当 MASt3R/GraphDECO 已经完成、只需要恢复下游资产阶段时，使用：
+
+```bash
+bash tools/run_video2mesh_downstream_light.sh \
+  exports/<run> \
+  dataset/bedroom_100_first60_best10.mp4
+```
+
 ## 4. 不降采样约定
 
 高质量实验默认使用 MASt3R-SLAM 原始点云：

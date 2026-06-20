@@ -58,6 +58,13 @@ python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
   --force
 ```
 
+After a project already has valid MASt3R/GraphDECO outputs, resume a lighter
+downstream pass with:
+
+```bash
+bash tools/run_video2mesh_downstream_light.sh exports/<run> dataset/<video>_best10.mp4
+```
+
 ## Key Docs
 
 - `Video2Mesh_PROJECT_README.md`: project overview.

@@ -137,6 +137,16 @@ python tools/crop_best_video_window.py dataset/<name>_first60.mp4 \
   --force
 ```
 
+远端恢复下游阶段：
+
+```bash
+bash tools/run_video2mesh_downstream_light.sh \
+  exports/<run> \
+  dataset/<name>_first60_best10.mp4
+```
+
+该入口默认使用 SAM2，但限制 prompt/object 数和 tracking 帧数，并跳过最重的 Gaussian semantic backprojection。若只需要补语义 splat，可设置 `SEMANTIC_SPLATS=1`；若机器负载正常再设置 `GAUSSIAN_BACKPROJECT=1`。
+
 ## 7. 网络和磁盘
 
 GitHub/HuggingFace 下载前：

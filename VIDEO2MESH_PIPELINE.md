@@ -109,6 +109,21 @@ python tools/crop_best_video_window.py dataset/bedroom_100.mp4 \
   --force
 ```
 
+如果已有 project 已经完成 MASt3R/GraphDECO，只需要恢复下游 SAM2、3D mask、选帧、mesh 和 simulator 资产，使用轻量恢复入口：
+
+```bash
+bash tools/run_video2mesh_downstream_light.sh \
+  exports/<run> \
+  dataset/bedroom_100_first60_best10.mp4
+```
+
+默认 `SEMANTIC_SPLATS=0`，即先产出 3D object masks、object meshes 和 simulator bundle，跳过最重的 Gaussian semantic backprojection。需要语义 splat 时再显式打开：
+
+```bash
+SEMANTIC_SPLATS=1 GAUSSIAN_BACKPROJECT=0 \
+bash tools/run_video2mesh_downstream_light.sh exports/<run> dataset/<video>_best10.mp4
+```
+
 ## 4. GraphDECO 3DGS
 
 远端 GraphDECO 路径：
