@@ -39,6 +39,11 @@ from video2mesh.gsplat_utils import (
     gsplat_viewer_companion_paths,
     local_registered_path,
 )
+from video2mesh.viewer_ply_exports import (
+    alias_custom_viewer_export,
+    current_requested_exports,
+    update_manifest_viewer_artifacts,
+)
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -11255,10 +11260,17 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
         probabilities if include_probabilities else None,
     )
     viewer_exports = None
-    try:
-        viewer_exports = export_viewer_plys(output_ply, output_ply.parent, "semantic", include_labels=True)
-    except Exception as exc:
-        viewer_exports = {"error": str(exc)}
+    if bool(getattr(args, "export_viewer_plys", True)):
+        try:
+            viewer_exports = export_viewer_plys(output_ply, output_ply.parent, "semantic", include_labels=True)
+        except Exception as exc:
+            viewer_exports = {"error": str(exc)}
+    else:
+        viewer_exports = {
+            "ok": False,
+            "skipped": True,
+            "reason": "--no-export-viewer-plys",
+        }
     semantic_manifest = {
         "schema_version": DEFAULT_SCHEMA_VERSION,
         "source_ply": str(source_ply),
@@ -11341,23 +11353,18 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
         if kind in {"semantic", "all"}:
             export_one("semantic", artifacts.get("semantic_splats_ply"), args.prefix or "semantic_3dgs", include_labels=True)
 
+    alias_custom_viewer_export(
+        results["exports"],
+        prefix=args.prefix,
+        source_ply=args.splat_ply,
+        include_labels=bool(args.include_labels),
+    )
+
     write_json(manifest_path, results)
-    manifest["artifacts"]["viewer_plys_manifest"] = str(manifest_path)
-    scene_export = results["exports"].get("scene")
-    if isinstance(scene_export, dict) and scene_export.get("ok"):
-        manifest["artifacts"]["scene_3dgs_point_cloud_ply"] = scene_export.get("point_cloud_ply")
-        manifest["artifacts"]["scene_3dgs_supersplat_ply"] = scene_export.get("supersplat_ply")
-    semantic_export = results["exports"].get("semantic")
-    if isinstance(semantic_export, dict) and semantic_export.get("ok"):
-        manifest["artifacts"]["semantic_point_cloud_ply"] = semantic_export.get("point_cloud_ply")
-        manifest["artifacts"]["semantic_supersplat_ply"] = semantic_export.get("supersplat_ply")
+    update_manifest_viewer_artifacts(manifest, manifest_path, results["exports"])
     save_manifest(project_root, manifest)
 
-    current_items = {
-        name: item
-        for name, item in results["exports"].items()
-        if name in requested_exports and isinstance(item, dict)
-    }
+    current_items = current_requested_exports(results["exports"], requested_exports)
     ok_count = len([item for item in current_items.values() if item.get("ok")])
     print(f"Viewer PLY exports: {ok_count}/{len(current_items)} succeeded")
     for name, item in current_items.items():
@@ -31299,6 +31306,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--transfer-mode", choices=["auto", "index", "nearest"], default="auto")
     p.add_argument("--max-transfer-distance", type=float, help="Optional nearest-neighbor distance cutoff; farther target vertices become background.")
     p.add_argument("--include-probabilities", action=argparse.BooleanOptionalAction, default=True, help="Append object_probability from fused point_probabilities.npz when available.")
+    p.add_argument("--export-viewer-plys", action=argparse.BooleanOptionalAction, default=True, help="Also export semantic point-cloud and SuperSplat viewer PLYs.")
     p.add_argument("--output", type=Path, help="Output semantic PLY path.")
     p.set_defaults(func=cmd_export_splat_masks)
 

@@ -112,14 +112,14 @@ show_file "target_capability_matrix" "$PROJECT_ROOT/simulator_assets/target_capa
 show_file "evaluation_report" "$PROJECT_ROOT/simulator_assets/evaluation_report.json"
 show_file "simulator_bundle" "$PROJECT_ROOT/simulator_assets/simulator_asset_bundle.json"
 show_file "unity_adapter" "$PROJECT_ROOT/simulator_assets/adapters/unity/unity_adapter.json"
-show_file "mujoco_adapter" "$PROJECT_ROOT/simulator_assets/adapters/mujoco/mujoco_adapter.xml"
+show_file "mujoco_adapter" "$PROJECT_ROOT/simulator_assets/adapters/mujoco/scene.xml"
 show_file "viewer_scene_point_cloud" "$PROJECT_ROOT/simulator_assets/viewer_plys/scene_3dgs_point_cloud.ply"
 show_file "viewer_scene_supersplat" "$PROJECT_ROOT/simulator_assets/viewer_plys/scene_3dgs_supersplat.ply"
 show_file "semantic_supersplat" "$PROJECT_ROOT/simulator_assets/viewer_plys/semantic_3dgs_supersplat.ply"
 show_glob "reconstruction_preview" "$PROJECT_ROOT/simulator_assets/reconstruction_preview/*"
 show_glob "semantic_preview" "$PROJECT_ROOT/simulator_assets/semantic_preview/*"
-show_glob "object_mesh" "$PROJECT_ROOT/simulator_assets/objects/*/mesh.*"
-show_glob "object_crop" "$PROJECT_ROOT/simulator_assets/object_images/*"
+show_glob "object_mesh" "$PROJECT_ROOT/simulator_assets/objects/*/*.obj"
+show_glob "object_crop" "$PROJECT_ROOT/objects/*/object_images/*"
 
 echo
 echo "Log: $LOG"

@@ -75,6 +75,26 @@ Refresh demo/advisor reports and list showable files with:
 bash tools/audit_showcase_artifacts.sh exports/<run>
 ```
 
+When exporting semantic masks for large GraphDECO runs, avoid generating viewer
+PLYs inside `export-splat-masks` if the semantic source PLY is already large:
+
+```bash
+python -m video2mesh.cli export-splat-masks \
+  --project-root exports/<run> \
+  --splat-ply exports/<run>/scene/reconstruction/point_cloud.ply \
+  --mask-source-ply exports/<run>/scene/reconstruction/point_cloud.ply \
+  --transfer-mode index \
+  --no-export-viewer-plys \
+  --output exports/<run>/simulator_assets/semantic_point_cloud_full.ply
+
+python -m video2mesh.cli export-viewer-plys \
+  --project-root exports/<run> \
+  --splat-ply exports/<run>/simulator_assets/semantic_point_cloud_full.ply \
+  --output-dir exports/<run>/simulator_assets/viewer_plys \
+  --prefix semantic_3dgs \
+  --include-labels
+```
+
 ## Key Docs
 
 - `Video2Mesh_PROJECT_README.md`: project overview.
