@@ -24,6 +24,12 @@ Remote server:
 cd /root/autodl-tmp/workspace/Video2Mesh
 source /etc/network_turbo >/dev/null 2>&1 || true
 
+bash run.sh --image_path dataset/<video>.mp4
+```
+
+Equivalent direct quick runner:
+
+```bash
 bash tools/run_video2mesh_quick.sh dataset/<video>.mp4
 ```
 
@@ -31,14 +37,15 @@ The quick entrypoint defaults to:
 
 - `GS_BACKEND=graphdeco`
 - `GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting`
-- `GRAPHDECO_DENSIFY_UNTIL_ITER=0`
+- `GRAPHDECO_ITERATIONS=30000`
 - `MASK_BACKEND=sam2`
 - full MASt3R point cloud for 3DGS and semantic fusion
 - simulator/export QA reports at the end
 
-The GraphDECO default keeps the full MASt3R initialization cloud, but disables
-densification by default. This avoids out-of-memory failures on 16M+ point
-initializations while preserving the original scan geometry as the 3DGS seed.
+The GraphDECO default is now the full training preset: full MASt3R point-cloud
+initialization, 30000 iterations, checkpoints at 7000 and 30000,
+densification/pruning, opacity reset, and SH degree 3 appearance enabled. Use
+smaller overrides only for explicit smoke tests or memory-constrained debugging.
 
 ## Long Video Rule
 

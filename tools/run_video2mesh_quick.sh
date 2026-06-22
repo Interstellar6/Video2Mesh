@@ -17,13 +17,24 @@ Optional environment overrides:
   SCENE_ID=my_scene
   RUN_SAM2=1|0
   RUN_MAST3R=1|0
+  MAST3R_CONFIG=config/base.yaml
+  MAST3R_CALIB=/path/to/intrinsics.yaml
   GS_BACKEND=graphdeco|minimal|none
   GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
-  GRAPHDECO_ITERATIONS=7000
-  GRAPHDECO_DENSIFY_UNTIL_ITER=0
-  GRAPHDECO_DENSIFY_FROM_ITER=100000000
-  GRAPHDECO_EXTRA_ARGS="--densification_interval 100"
+  GRAPHDECO_ITERATIONS=30000
+  GRAPHDECO_SAVE_ITERATIONS="7000 30000"
+  GRAPHDECO_TEST_ITERATIONS="7000 30000"
+  GRAPHDECO_DENSIFY_UNTIL_ITER=15000
+  GRAPHDECO_DENSIFY_FROM_ITER=500
+  GRAPHDECO_DENSIFICATION_INTERVAL=100
+  GRAPHDECO_OPACITY_RESET_INTERVAL=3000
+  GRAPHDECO_SH_DEGREE=3
+  GRAPHDECO_EXTRA_ARGS=""
   MAX_FRAMES=72
+  AUTO_PROMPT_MAX_OBJECTS=20
+  AUTO_PROMPT_MIN_AREA_RATIO=0.001
+  AUTO_PROMPT_GRANULARITY=balanced
+  MASK_MESH_METHOD=auto
   SAM_CHECKPOINT=/root/autodl-tmp/checkpoints/sam/sam_vit_b_01ec64.pth
 USAGE
 }
@@ -69,7 +80,8 @@ if [[ ! -x "$V2M_PYTHON" ]]; then
 fi
 
 MAST3R_ROOT="${MAST3R_ROOT:-/root/autodl-tmp/workspace/MASt3R-SLAM}"
-MAST3R_CONFIG="${MAST3R_CONFIG:-config/video_scan.yaml}"
+MAST3R_CONFIG="${MAST3R_CONFIG:-config/base.yaml}"
+MAST3R_CALIB="${MAST3R_CALIB:-}"
 SAM2_ROOT="${SAM2_ROOT:-/root/autodl-tmp/workspace/sam2}"
 SAM2_PYTHON="${SAM2_PYTHON:-/root/autodl-tmp/workspace/venvs/v2m-sam2-clean/bin/python}"
 SAM2_CHECKPOINT="${SAM2_CHECKPOINT:-${SAM2_ROOT}/checkpoints/sam2.1_hiera_tiny.pt}"
@@ -85,22 +97,37 @@ RUN_GSPLAT="${RUN_GSPLAT:-$([[ "$GS_BACKEND" == "minimal" ]] && printf 1 || prin
 RUN_SAM2="${RUN_SAM2:-1}"
 MAX_FRAMES="${MAX_FRAMES:-72}"
 EXTRACT_EVERY="${EXTRACT_EVERY:-2}"
-GRAPHDECO_ITERATIONS="${GRAPHDECO_ITERATIONS:-7000}"
+GRAPHDECO_ITERATIONS="${GRAPHDECO_ITERATIONS:-30000}"
 GRAPHDECO_RESOLUTION="${GRAPHDECO_RESOLUTION:-1}"
-GRAPHDECO_DENSIFY_UNTIL_ITER="${GRAPHDECO_DENSIFY_UNTIL_ITER:-0}"
-GRAPHDECO_DENSIFY_FROM_ITER="${GRAPHDECO_DENSIFY_FROM_ITER:-100000000}"
+GRAPHDECO_SAVE_ITERATIONS="${GRAPHDECO_SAVE_ITERATIONS:-7000 30000}"
+GRAPHDECO_TEST_ITERATIONS="${GRAPHDECO_TEST_ITERATIONS:-7000 30000}"
+GRAPHDECO_DENSIFY_UNTIL_ITER="${GRAPHDECO_DENSIFY_UNTIL_ITER:-15000}"
+GRAPHDECO_DENSIFY_FROM_ITER="${GRAPHDECO_DENSIFY_FROM_ITER:-500}"
+GRAPHDECO_DENSIFICATION_INTERVAL="${GRAPHDECO_DENSIFICATION_INTERVAL:-100}"
+GRAPHDECO_OPACITY_RESET_INTERVAL="${GRAPHDECO_OPACITY_RESET_INTERVAL:-3000}"
+GRAPHDECO_SH_DEGREE="${GRAPHDECO_SH_DEGREE:-3}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 GSPLAT_ITERATIONS="${GSPLAT_ITERATIONS:-500}"
 GSPLAT_MAX_FRAMES="${GSPLAT_MAX_FRAMES:-6}"
 GSPLAT_MAX_POINTS="${GSPLAT_MAX_POINTS:-24000}"
 GSPLAT_WIDTH="${GSPLAT_WIDTH:-432}"
 GSPLAT_HEIGHT="${GSPLAT_HEIGHT:-768}"
-AUTO_PROMPT_MAX_OBJECTS="${AUTO_PROMPT_MAX_OBJECTS:-8}"
+AUTO_PROMPT_MAX_OBJECTS="${AUTO_PROMPT_MAX_OBJECTS:-20}"
 AUTO_PROMPT_FRAME_INDEX="${AUTO_PROMPT_FRAME_INDEX:-10}"
+AUTO_PROMPT_MIN_AREA_RATIO="${AUTO_PROMPT_MIN_AREA_RATIO:-0.001}"
+AUTO_PROMPT_MAX_AREA_RATIO="${AUTO_PROMPT_MAX_AREA_RATIO:-0.35}"
+AUTO_PROMPT_MIN_WIDTH="${AUTO_PROMPT_MIN_WIDTH:-8}"
+AUTO_PROMPT_MIN_HEIGHT="${AUTO_PROMPT_MIN_HEIGHT:-8}"
+AUTO_PROMPT_NMS_IOU="${AUTO_PROMPT_NMS_IOU:-0.55}"
+AUTO_PROMPT_CONTAINMENT_OVERLAP="${AUTO_PROMPT_CONTAINMENT_OVERLAP:-0.93}"
+AUTO_PROMPT_CONTAINMENT_AREA_RATIO="${AUTO_PROMPT_CONTAINMENT_AREA_RATIO:-2.5}"
+AUTO_PROMPT_GRANULARITY="${AUTO_PROMPT_GRANULARITY:-balanced}"
+AUTO_PROMPT_MIN_PARENT_AREA_RATIO="${AUTO_PROMPT_MIN_PARENT_AREA_RATIO:-0.15}"
 TRACK_MAX_FRAMES="${TRACK_MAX_FRAMES:-$MAX_FRAMES}"
 PIXEL_STRIDE="${PIXEL_STRIDE:-3}"
 MAX_PIXELS_PER_MASK="${MAX_PIXELS_PER_MASK:-5000}"
 TOP_K="${TOP_K:-4}"
+MASK_MESH_METHOD="${MASK_MESH_METHOD:-auto}"
 
 AUTO_PROMPT_METHOD="${AUTO_PROMPT_METHOD:-sam}"
 if [[ "$AUTO_PROMPT_METHOD" == "sam" && ! -f "$SAM_CHECKPOINT" ]]; then
@@ -108,6 +135,10 @@ if [[ "$AUTO_PROMPT_METHOD" == "sam" && ! -f "$SAM_CHECKPOINT" ]]; then
   AUTO_PROMPT_METHOD="opencv"
 fi
 MASK_BACKEND="${MASK_BACKEND:-$([[ "$RUN_SAM2" == "1" || "$RUN_SAM2" == "true" ]] && printf sam2 || printf opencv)}"
+mast3r_calib_args=()
+if [[ -n "$MAST3R_CALIB" ]]; then
+  mast3r_calib_args=(--calib "$MAST3R_CALIB")
+fi
 if [[ "$MASK_BACKEND" == "sam2" ]]; then
   export PYTHONPATH="${SAM2_ROOT}:${ROOT}:${PYTHONPATH:-}"
   export SAM2_ROOT
@@ -149,7 +180,7 @@ if [[ "$GS_BACKEND" == "graphdeco" ]]; then
     --prepare-3dgs-source
     --g3dgs-output-path scene/reconstruction/3dgs_graphdeco
     --g3dgs-work-dir external/graphdeco_3dgs
-    --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_ITERATIONS} --test_iterations ${GRAPHDECO_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --densify_until_iter ${GRAPHDECO_DENSIFY_UNTIL_ITER} --densify_from_iter ${GRAPHDECO_DENSIFY_FROM_ITER} ${GRAPHDECO_EXTRA_ARGS} --disable_viewer"
+    --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_SAVE_ITERATIONS} --test_iterations ${GRAPHDECO_TEST_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --sh_degree ${GRAPHDECO_SH_DEGREE} --densify_until_iter ${GRAPHDECO_DENSIFY_UNTIL_ITER} --densify_from_iter ${GRAPHDECO_DENSIFY_FROM_ITER} --densification_interval ${GRAPHDECO_DENSIFICATION_INTERVAL} --opacity_reset_interval ${GRAPHDECO_OPACITY_RESET_INTERVAL} ${GRAPHDECO_EXTRA_ARGS} --disable_viewer"
   )
 elif [[ "$GS_BACKEND" == "minimal" ]]; then
   g3dgs_args=(
@@ -183,6 +214,7 @@ fi
   $([[ "$RUN_MAST3R" == "1" || "$RUN_MAST3R" == "true" ]] && printf '%s ' --run-mast3r-slam) \
   --mast3r-root "$MAST3R_ROOT" \
   --mast3r-config "$MAST3R_CONFIG" \
+  "${mast3r_calib_args[@]}" \
   --mast3r-save-as "$SCENE_ID" \
   --focal-scale 1.2 \
   --use-mast3r-keyframes \
@@ -198,7 +230,15 @@ fi
   --auto-prompt-method "$AUTO_PROMPT_METHOD" \
   --auto-prompt-frame-index "$AUTO_PROMPT_FRAME_INDEX" \
   --auto-prompt-max-objects "$AUTO_PROMPT_MAX_OBJECTS" \
-  --auto-prompt-granularity object \
+  --auto-prompt-min-area-ratio "$AUTO_PROMPT_MIN_AREA_RATIO" \
+  --auto-prompt-max-area-ratio "$AUTO_PROMPT_MAX_AREA_RATIO" \
+  --auto-prompt-min-width "$AUTO_PROMPT_MIN_WIDTH" \
+  --auto-prompt-min-height "$AUTO_PROMPT_MIN_HEIGHT" \
+  --auto-prompt-nms-iou "$AUTO_PROMPT_NMS_IOU" \
+  --auto-prompt-containment-overlap "$AUTO_PROMPT_CONTAINMENT_OVERLAP" \
+  --auto-prompt-containment-area-ratio "$AUTO_PROMPT_CONTAINMENT_AREA_RATIO" \
+  --auto-prompt-granularity "$AUTO_PROMPT_GRANULARITY" \
+  --auto-prompt-min-parent-area-ratio "$AUTO_PROMPT_MIN_PARENT_AREA_RATIO" \
   --sam-checkpoint "$SAM_CHECKPOINT" \
   --sam-model-type "$SAM_MODEL_TYPE" \
   --sam-device cuda \
@@ -231,7 +271,7 @@ fi
   --frame-svlgaussian-random-window 30 \
   --frame-svlgaussian-visibility-window 3 \
   --reconstruct-mask-meshes \
-  --mask-mesh-method bbox \
+  --mask-mesh-method "$MASK_MESH_METHOD" \
   --skip-failed-mask-meshes \
   --skip-export-image-blaster \
   --simulator-format mujoco unity \

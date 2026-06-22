@@ -33,9 +33,10 @@ bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 ```bash
 MAX_FRAMES=72 \
 EXTRACT_EVERY=2 \
-GRAPHDECO_ITERATIONS=7000 \
+GRAPHDECO_ITERATIONS=30000 \
+GRAPHDECO_SAVE_ITERATIONS="7000 30000" \
+GRAPHDECO_TEST_ITERATIONS="7000 30000" \
 GRAPHDECO_RESOLUTION=1 \
-GRAPHDECO_DENSIFY_UNTIL_ITER=0 \
 bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 ```
 
@@ -44,7 +45,7 @@ bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 - 输出到 `exports/<scene>_quick_<timestamp>`。
 - 使用 `/root/autodl-tmp/venvs/v2m-svpp/bin/python`。
 - 用 MASt3R-SLAM 生成 camera poses、keyframes、full point cloud。
-- 用 GraphDECO `train.py` 训练 3DGS，默认保留 full cloud 初始化并关闭 densification。
+- 用 GraphDECO `train.py` 训练满血 3DGS：full point cloud 初始化，30000 iter，保存/测试 7000 和 30000，开启 densification/pruning、opacity reset 和 SH appearance。
 - 用 SAM v1 自动生成 prompts。
 - 用 SAM2.1 Hiera Tiny 传播视频 masks。
 - 使用 full `point_cloud.ply` 做 mask fusion、semantic transfer 和 object mask clouds。
@@ -161,7 +162,7 @@ simulator_assets/adapters/unity/unity_adapter.json
 ```bash
 cd /root/autodl-tmp/workspace/Video2Mesh
 
-ITERATIONS=7000 RESOLUTION=1 \
+ITERATIONS=30000 SAVE_ITERATIONS="7000 30000" TEST_ITERATIONS="7000 30000" RESOLUTION=1 \
 bash tools/run_graphdeco_3dgs.sh /root/autodl-tmp/workspace/Video2Mesh/exports/<run>
 ```
 
@@ -176,11 +177,20 @@ bash tools/run_graphdeco_3dgs.sh /root/autodl-tmp/workspace/Video2Mesh/exports/<
 默认 GraphDECO 参数：
 
 ```text
---densify_until_iter 0
---densify_from_iter 100000000
+--iterations 30000
+--save_iterations 7000 30000
+--test_iterations 7000 30000
+--sh_degree 3
+--densify_from_iter 500
+--densify_until_iter 15000
+--densification_interval 100
+--opacity_reset_interval 3000
 ```
 
-原因是 MASt3R-SLAM 对短扫描片段可能给出千万级初始化点云。默认 GraphDECO densification 会继续扩点，在 32GB 显存上容易 OOM。当前约定是不降采样初始化点云，而是关闭 densification；如果后续使用更小点云或更大显存，可以通过 `GRAPHDECO_DENSIFY_UNTIL_ITER`、`GRAPHDECO_DENSIFY_FROM_ITER` 和 `GRAPHDECO_EXTRA_ARGS` 覆盖。
+这是默认生产训练档：不使用 `point_cloud_10k.ply` / `point_cloud_30000.ply`
+初始化，保留 full MASt3R point cloud，并启用 GraphDECO 的
+densification/pruning、opacity reset 和 SH appearance。只有显式做 smoke
+test 或显存调试时，才用环境变量覆盖为短训练或关闭 densification。
 
 GraphDECO 输出默认在：
 
@@ -206,25 +216,6 @@ simulator_assets/reconstruction_readiness_report.json
 | `simulator_assets/viewer_plys/*_supersplat.ply` | SuperSplat/GraphDECO 字段版本。 |
 
 SuperSplat 需要 `f_dc_*`、`opacity`、`scale_*`、`rot_*` 等 Gaussian 字段。只有普通 XYZ/RGB 的 PLY 能被 Mac Preview 打开，但不能被 SuperSplat 当作 3DGS 加载。
-
-大场景语义导出默认拆成两步，避免 `export-splat-masks` 在写语义源 PLY 的同时再生成一个巨大 SuperSplat 副本导致远端磁盘满：
-
-```bash
-python -m video2mesh.cli export-splat-masks \
-  --project-root exports/<run> \
-  --splat-ply exports/<run>/scene/reconstruction/point_cloud.ply \
-  --mask-source-ply exports/<run>/scene/reconstruction/point_cloud.ply \
-  --transfer-mode index \
-  --no-export-viewer-plys \
-  --output exports/<run>/simulator_assets/semantic_point_cloud_full.ply
-
-python -m video2mesh.cli export-viewer-plys \
-  --project-root exports/<run> \
-  --splat-ply exports/<run>/simulator_assets/semantic_point_cloud_full.ply \
-  --output-dir exports/<run>/simulator_assets/viewer_plys \
-  --prefix semantic_3dgs \
-  --include-labels
-```
 
 ## 6. 2D 到 3D 语义 mask
 
@@ -382,7 +373,7 @@ dataset/bedroom_100.mp4
   -> GraphDECO 未开始训练
   -> 裁剪最佳 10 秒片段 dataset/bedroom_100_first60_best10.mp4
   -> MASt3R 恢复 161 poses 和 full point_cloud.ply
-  -> GraphDECO 真实训练 7000 iter 完成，默认关闭 densification
+  -> GraphDECO 真实训练应使用默认满血档：30000 iter，保存 7000/30000，开启 densification/pruning、opacity reset、SH appearance
 ```
 
 该失败说明：裁剪前 60 秒并不保证可重建；如果视频开头缺乏足够视差、纹理或稳定运动，MASt3R 仍可能只输出单 pose/空点云。本次已按该诊断改用更合适的 10 秒片段继续 GraphDECO/SAM2 后半段。

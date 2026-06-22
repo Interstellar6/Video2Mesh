@@ -14,11 +14,16 @@ Optional environment overrides:
   V2M_PYTHON=/root/autodl-tmp/venvs/v2m-svpp/bin/python
   GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
   GRAPHDECO_PYTHON=/root/autodl-tmp/venvs/v2m-svpp/bin/python
-  ITERATIONS=7000
+  ITERATIONS=30000
+  SAVE_ITERATIONS="7000 30000"
+  TEST_ITERATIONS="7000 30000"
   RESOLUTION=1
-  DENSIFY_UNTIL_ITER=0
-  DENSIFY_FROM_ITER=100000000
-  GRAPHDECO_EXTRA_ARGS="--densification_interval 100"
+  DENSIFY_UNTIL_ITER=15000
+  DENSIFY_FROM_ITER=500
+  DENSIFICATION_INTERVAL=100
+  OPACITY_RESET_INTERVAL=3000
+  SH_DEGREE=3
+  GRAPHDECO_EXTRA_ARGS=""
   TRAIN_IMAGES=images
 USAGE
 }
@@ -39,10 +44,15 @@ ROOT="${VIDEO2MESH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 V2M_PYTHON="${V2M_PYTHON:-/root/autodl-tmp/venvs/v2m-svpp/bin/python}"
 GRAPHDECO_ROOT="${GRAPHDECO_ROOT:-/root/autodl-tmp/workspace/gaussian-splatting}"
 GRAPHDECO_PYTHON="${GRAPHDECO_PYTHON:-$V2M_PYTHON}"
-ITERATIONS="${ITERATIONS:-7000}"
+ITERATIONS="${ITERATIONS:-30000}"
 RESOLUTION="${RESOLUTION:-1}"
-DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER:-0}"
-DENSIFY_FROM_ITER="${DENSIFY_FROM_ITER:-100000000}"
+SAVE_ITERATIONS="${SAVE_ITERATIONS:-7000 30000}"
+TEST_ITERATIONS="${TEST_ITERATIONS:-7000 30000}"
+DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER:-15000}"
+DENSIFY_FROM_ITER="${DENSIFY_FROM_ITER:-500}"
+DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL:-100}"
+OPACITY_RESET_INTERVAL="${OPACITY_RESET_INTERVAL:-3000}"
+SH_DEGREE="${SH_DEGREE:-3}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 TRAIN_IMAGES="${TRAIN_IMAGES:-images}"
 SOURCE_PATH="${SOURCE_PATH:-$PROJECT_ROOT/external/graphdeco_3dgs/colmap_source}"
@@ -117,7 +127,7 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
   --camera-model PINHOLE \
   --image-mode copy \
   --prepare-only \
-  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $ITERATIONS --test_iterations $ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER $GRAPHDECO_EXTRA_ARGS --disable_viewer"
+  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $SAVE_ITERATIONS --test_iterations $TEST_ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --sh_degree $SH_DEGREE --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER --densification_interval $DENSIFICATION_INTERVAL --opacity_reset_interval $OPACITY_RESET_INTERVAL $GRAPHDECO_EXTRA_ARGS --disable_viewer"
 
 (
   cd "$GRAPHDECO_ROOT"
@@ -125,12 +135,15 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
     -s "$SOURCE_PATH" \
     -m "$OUTPUT_PATH" \
     --iterations "$ITERATIONS" \
-    --save_iterations "$ITERATIONS" \
-    --test_iterations "$ITERATIONS" \
+    --save_iterations $SAVE_ITERATIONS \
+    --test_iterations $TEST_ITERATIONS \
     --resolution "$RESOLUTION" \
     --images "$TRAIN_IMAGES" \
+    --sh_degree "$SH_DEGREE" \
     --densify_until_iter "$DENSIFY_UNTIL_ITER" \
     --densify_from_iter "$DENSIFY_FROM_ITER" \
+    --densification_interval "$DENSIFICATION_INTERVAL" \
+    --opacity_reset_interval "$OPACITY_RESET_INTERVAL" \
     $GRAPHDECO_EXTRA_ARGS \
     --disable_viewer
 ) 2>&1 | tee "$LOG"

@@ -65,7 +65,13 @@ def gsplat_train_manifest_for_output(output_dir: Path) -> dict[str, Any]:
 def default_3dgs_command_template(provider: str) -> str:
     normalized = _provider_slug(provider)
     if normalized in {"graphdeco", "gaussian-splatting", "graphdeco-gaussian-splatting"}:
-        return "python train.py -s {source_path} -m {output_path}"
+        return (
+            "python train.py -s {source_path} -m {output_path} "
+            "--iterations 30000 --save_iterations 7000 30000 --test_iterations 7000 30000 "
+            "--resolution 1 --images images --sh_degree 3 --densify_from_iter 500 "
+            "--densify_until_iter 15000 --densification_interval 100 --opacity_reset_interval 3000 "
+            "--disable_viewer"
+        )
     if normalized in {"nerfstudio", "splatfacto", "ns-splatfacto"}:
         return "ns-train splatfacto --data {source_path} --output-dir {output_path}"
     if normalized in {"gsplat", "full-gsplat"}:

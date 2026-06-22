@@ -39,11 +39,6 @@ from video2mesh.gsplat_utils import (
     gsplat_viewer_companion_paths,
     local_registered_path,
 )
-from video2mesh.viewer_ply_exports import (
-    alias_custom_viewer_export,
-    current_requested_exports,
-    update_manifest_viewer_artifacts,
-)
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -2025,12 +2020,15 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
 def high_quality_3dgs_backend_commands(source_path: Path, output_path: Path, project_root: Path) -> dict[str, dict[str, Any]]:
     return {
         "graphdeco": {
-            "command_template": "python train.py -s {source_path} -m {output_path}",
-            "command": f"python train.py -s {source_path} -m {output_path}",
+            "command_template": default_3dgs_command_template("graphdeco"),
+            "command": command_from_template(
+                default_3dgs_command_template("graphdeco"),
+                {"source_path": str(source_path), "output_path": str(output_path), "provider": "graphdeco"},
+            ),
             "expected_repo": "GraphDECO gaussian-splatting",
             "required_executable": "train.py",
-            "output_hints": ["point_cloud/iteration_*/point_cloud.ply"],
-            "notes": "Run from the gaussian-splatting repository root or adapt the command to its train.py path.",
+            "output_hints": ["point_cloud/iteration_7000/point_cloud.ply", "point_cloud/iteration_30000/point_cloud.ply"],
+            "notes": "Default full preset: full point-cloud initialization, 30000 iterations, saves/tests at 7000 and 30000, GraphDECO densification/pruning, opacity reset, and SH degree 3 enabled.",
         },
         "nerfstudio_splatfacto": {
             "command_template": "ns-train splatfacto --data {source_path} --output-dir {output_path}",
@@ -2166,7 +2164,7 @@ def high_quality_3dgs_job_spec(
         "execution_plan": [
             "Choose GraphDECO, nerfstudio/splatfacto, or a full gsplat trainer installed on the GPU server.",
             "Run run_high_quality_3dgs.sh from the selected backend repository root, or copy the command from trainer_backends and adapt paths.",
-            "Train with densification, pruning, opacity reset, SH appearance, multi-resolution scheduling, and exposure/white-balance handling when supported.",
+            "Train the default full GraphDECO preset unless explicitly overridden: full point-cloud initialization, 30000 iterations, save/test at 7000 and 30000, densification/pruning, opacity reset, and SH appearance enabled.",
             "Import the result with import-3dgs-result, render previews, audit full-point-cloud initialization, rerun production-readiness and verify-showcase-pack.",
         ],
         "input_contract": {
@@ -2205,6 +2203,9 @@ def high_quality_3dgs_job_spec(
         },
         "quality_targets": {
             "replaces": "video2mesh_minimal_gsplat",
+            "default_iterations": 30000,
+            "required_save_iterations": [7000, 30000],
+            "required_test_iterations": [7000, 30000],
             "preview_thresholds": {
                 "min_mean_psnr": 18.0,
                 "max_mean_l1": 0.08,
@@ -2217,6 +2218,8 @@ def high_quality_3dgs_job_spec(
                 "spherical_harmonics_appearance",
                 "multi_resolution_or_schedule",
                 "exposure_or_white_balance_handling",
+                "full_point_cloud_initialization",
+                "save_iterations_7000_and_30000",
                 "camera_model_consistency_check",
                 "render_preview_metrics",
             ],
@@ -11353,18 +11356,23 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
         if kind in {"semantic", "all"}:
             export_one("semantic", artifacts.get("semantic_splats_ply"), args.prefix or "semantic_3dgs", include_labels=True)
 
-    alias_custom_viewer_export(
-        results["exports"],
-        prefix=args.prefix,
-        source_ply=args.splat_ply,
-        include_labels=bool(args.include_labels),
-    )
-
     write_json(manifest_path, results)
-    update_manifest_viewer_artifacts(manifest, manifest_path, results["exports"])
+    manifest["artifacts"]["viewer_plys_manifest"] = str(manifest_path)
+    scene_export = results["exports"].get("scene")
+    if isinstance(scene_export, dict) and scene_export.get("ok"):
+        manifest["artifacts"]["scene_3dgs_point_cloud_ply"] = scene_export.get("point_cloud_ply")
+        manifest["artifacts"]["scene_3dgs_supersplat_ply"] = scene_export.get("supersplat_ply")
+    semantic_export = results["exports"].get("semantic")
+    if isinstance(semantic_export, dict) and semantic_export.get("ok"):
+        manifest["artifacts"]["semantic_point_cloud_ply"] = semantic_export.get("point_cloud_ply")
+        manifest["artifacts"]["semantic_supersplat_ply"] = semantic_export.get("supersplat_ply")
     save_manifest(project_root, manifest)
 
-    current_items = current_requested_exports(results["exports"], requested_exports)
+    current_items = {
+        name: item
+        for name, item in results["exports"].items()
+        if name in requested_exports and isinstance(item, dict)
+    }
     ok_count = len([item for item in current_items.values() if item.get("ok")])
     print(f"Viewer PLY exports: {ok_count}/{len(current_items)} succeeded")
     for name, item in current_items.items():
