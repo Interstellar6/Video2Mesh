@@ -1,13 +1,13 @@
 # Video2Mesh 当前流水线
 
-更新时间：2026-06-20
+更新时间：2026-06-24
 
 ## 1. 总体流程
 
 ```text
 输入视频
-  -> extract-frames
-  -> MASt3R-SLAM
+  -> extract-frames (uniform dense real frames, <=200)
+  -> COLMAP
   -> GraphDECO 3DGS
   -> SAM prompt + SAM2 tracking
   -> 2D-to-3D mask fusion
@@ -31,8 +31,8 @@ bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 常用覆盖：
 
 ```bash
-MAX_FRAMES=72 \
-EXTRACT_EVERY=2 \
+MAX_FRAMES=200 \
+EXTRACT_EVERY=1 \
 GRAPHDECO_ITERATIONS=30000 \
 GRAPHDECO_SAVE_ITERATIONS="7000 30000" \
 GRAPHDECO_TEST_ITERATIONS="7000 30000" \
@@ -40,82 +40,61 @@ GRAPHDECO_RESOLUTION=1 \
 bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 ```
 
+指定真实视频时间窗，例如 `bedroom_4` 的 47-56 秒：
+
+```bash
+START_SEC=47 \
+END_SEC=56 \
+MAX_FRAMES=200 \
+EXTRACT_EVERY=1 \
+bash tools/run_video2mesh_quick.sh dataset/bedroom_4_CmEIg9gMI74/bedroom_4_Cm.mp4
+```
+
 该脚本默认：
 
 - 输出到 `exports/<scene>_quick_<timestamp>`。
 - 使用 `/root/autodl-tmp/venvs/v2m-svpp/bin/python`。
-- 用 MASt3R-SLAM 生成 camera poses、keyframes、full point cloud。
-- 用 GraphDECO `train.py` 训练满血 3DGS：full point cloud 初始化，30000 iter，保存/测试 7000 和 30000，开启 densification/pruning、opacity reset 和 SH appearance。
+- 对输入视频/时间窗均匀抽取真实帧，默认 `MAX_FRAMES=200`、`EXTRACT_EVERY=1`。如果预估帧数超过上限，会在真实候选帧中均匀取样，不插值。
+- 用 COLMAP 生成 camera poses 和 full sparse `point_cloud.ply`。
+- 用 GraphDECO `train.py` 训练满血 3DGS：full COLMAP point cloud 初始化，30000 iter，保存/测试 7000 和 30000，开启 densification/pruning、opacity reset 和 SH appearance。
 - 用 SAM v1 自动生成 prompts。
 - 用 SAM2.1 Hiera Tiny 传播视频 masks。
 - 使用 full `point_cloud.ply` 做 mask fusion、semantic transfer 和 object mask clouds。
 - 导出 review pack、viewer PLY、simulator bundle 和 QA reports。
 
-## 3. MASt3R 超时裁剪策略
+## 3. COLMAP 默认重建
 
-如果 MASt3R-SLAM 对长视频运行超过 1.5 小时还没有输出：
+默认重建入口是：
+
+```bash
+python -m video2mesh.cli run-colmap \
+  --project-root exports/<run> \
+  --frames-dir exports/<run>/scene/frames
+```
+
+`run-pipeline --run-colmap` 会在抽帧后自动执行该阶段，并把 COLMAP text model 导入为：
 
 ```text
 scene/cameras/camera_info.json
 scene/reconstruction/point_cloud.ply
 ```
 
-则中断当前 MASt3R，裁剪视频前 60 秒作为新数据集：
+导入时只保留 COLMAP 成功注册位姿的真实帧，因此后续 3DGS、SAM2、mask fusion、preview 和 object frame selection 都使用同一个稠密帧目录，不使用 MASt3R keyframes。
+
+如果需要回退旧 MASt3R-SLAM 路径，显式设置：
 
 ```bash
-ffmpeg -y \
-  -i dataset/bedroom_100.mp4 \
-  -t 60 \
-  -c copy \
-  dataset/bedroom_100_first60.mp4
+RUN_COLMAP=0 RUN_MAST3R=1 bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 ```
 
-如果 stream copy 失败，用重编码 fallback：
+如果 COLMAP readiness 显示注册 pose 太少、空点云或帧-相机覆盖率不足，选择另一个真实时间窗重跑；不要用插值帧补齐输入。
 
-```bash
-ffmpeg -y \
-  -i dataset/bedroom_100.mp4 \
-  -t 60 \
-  -c:v libx264 -crf 18 -preset veryfast \
-  -c:a copy \
-  dataset/bedroom_100_first60.mp4
-```
-
-然后重新运行：
-
-```bash
-bash tools/run_video2mesh_quick.sh dataset/bedroom_100_first60.mp4
-```
-
-这个裁剪文件要保存在 `dataset/` 中，作为独立数据集记录，而不是临时文件。
-
-对 `*_first60.mp4` 二次实验使用 30 分钟 MASt3R 预算。如果 30 分钟内仍没有有效 `camera_info.json` / `point_cloud.ply`，或者虽然结束但 `reconstruction-readiness` 显示单 pose、空点云、`ready_for_gsplat_training=false`，则不再继续用该片段训练，改裁一个运动和视差更稳定的 10 秒片段，保存为 `dataset/<name>_best10.mp4` 后继续。
-
-无 `ffmpeg` 的远端环境使用 OpenCV 裁剪工具：
-
-```bash
-python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
-  --duration 10 \
-  --output dataset/bedroom_100_first60_best10.mp4 \
-  --force
-```
-
-如果只需要固定裁剪前 60 秒，也可以显式指定起点：
-
-```bash
-python tools/crop_best_video_window.py dataset/bedroom_100.mp4 \
-  --start 0 \
-  --duration 60 \
-  --output dataset/bedroom_100_first60.mp4 \
-  --force
-```
-
-如果已有 project 已经完成 MASt3R/GraphDECO，只需要恢复下游 SAM2、3D mask、选帧、mesh 和 simulator 资产，使用轻量恢复入口：
+如果已有 project 已经完成 COLMAP/GraphDECO，只需要恢复下游 SAM2、3D mask、选帧、mesh 和 simulator 资产，使用轻量恢复入口：
 
 ```bash
 bash tools/run_video2mesh_downstream_light.sh \
   exports/<run> \
-  dataset/bedroom_100_first60_best10.mp4
+  dataset/<video>.mp4
 ```
 
 默认 `SEMANTIC_SPLATS=0`，即先产出 3D object masks、object meshes 和 simulator bundle，跳过最重的 Gaussian semantic backprojection。需要语义 splat 时再显式打开：
@@ -125,7 +104,7 @@ SEMANTIC_SPLATS=1 GAUSSIAN_BACKPROJECT=0 \
 bash tools/run_video2mesh_downstream_light.sh exports/<run> dataset/<video>_best10.mp4
 ```
 
-该脚本仍用 full MASt3R point cloud 做 object mask fusion；为了避免背景结构 RANSAC 在千万级点云上压满机器，默认只对背景平面拟合采样：
+该脚本仍用 full scene point cloud 做 object mask fusion；为了避免背景结构 RANSAC 在千万级点云上压满机器，默认只对背景平面拟合采样：
 
 ```text
 BACKGROUND_RANSAC_MAX_POINTS=200000
@@ -188,7 +167,7 @@ bash tools/run_graphdeco_3dgs.sh /root/autodl-tmp/workspace/Video2Mesh/exports/<
 ```
 
 这是默认生产训练档：不使用 `point_cloud_10k.ply` / `point_cloud_30000.ply`
-初始化，保留 full MASt3R point cloud，并启用 GraphDECO 的
+初始化，保留 full COLMAP/重建 point cloud，并启用 GraphDECO 的
 densification/pruning、opacity reset 和 SH appearance。只有显式做 smoke
 test 或显存调试时，才用环境变量覆盖为短训练或关闭 densification。
 
@@ -204,13 +183,13 @@ scene/reconstruction/3dgs_graphdeco/
 simulator_assets/reconstruction_readiness_report.json
 ```
 
-这个报告检查帧数、相机 pose、帧-相机覆盖率和 `scene/reconstruction/point_cloud.ply` 点数。默认门槛是至少 3 帧、2 个 pose、100 个点、80% camera coverage。若 MASt3R 只得到单 pose 或空点云，pipeline 会在 3DGS 训练前失败，避免继续消耗训练时间。
+这个报告检查帧数、相机 pose、帧-相机覆盖率和 `scene/reconstruction/point_cloud.ply` 点数。默认门槛是至少 3 帧、2 个 pose、100 个点、80% camera coverage。若 COLMAP/重建阶段只得到单 pose 或空点云，pipeline 会在 3DGS 训练前失败，避免继续消耗训练时间。
 
 ## 5. 点云和 PLY 约定
 
 | 文件 | 含义 |
 |---|---|
-| `scene/reconstruction/point_cloud.ply` | MASt3R 原始全量点云，默认训练和语义源。 |
+| `scene/reconstruction/point_cloud.ply` | COLMAP/重建阶段原始全量点云，默认训练和语义源。 |
 | `scene/reconstruction/point_cloud_10k.ply` | 轻量预览点云，不作为默认训练/分割输入。 |
 | `simulator_assets/viewer_plys/*_point_cloud.ply` | 普通点云查看器友好版本。 |
 | `simulator_assets/viewer_plys/*_supersplat.ply` | SuperSplat/GraphDECO 字段版本。 |

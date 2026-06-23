@@ -7,7 +7,7 @@ Usage:
   bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 
 Convention-over-configuration quick entrypoint for the full Video2Mesh baseline:
-video -> frames -> MASt3R-SLAM full point cloud -> GraphDECO 3DGS -> SAM2 masks ->
+video -> dense real frames -> COLMAP sparse point cloud/poses -> GraphDECO 3DGS -> SAM2 masks ->
 3D semantic masks/probabilities -> SVLGaussian frame selection -> coarse meshes ->
 simulator assets and QA reports.
 
@@ -17,8 +17,11 @@ Optional environment overrides:
   SCENE_ID=my_scene
   RUN_SAM2=1|0
   RUN_MAST3R=1|0
+  RUN_COLMAP=1|0
   MAST3R_CONFIG=config/base.yaml
   MAST3R_CALIB=/path/to/intrinsics.yaml
+  COLMAP_BINARY=colmap
+  COLMAP_MATCHER=sequential
   GS_BACKEND=graphdeco|minimal|none
   GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
   GRAPHDECO_ITERATIONS=30000
@@ -30,7 +33,10 @@ Optional environment overrides:
   GRAPHDECO_OPACITY_RESET_INTERVAL=3000
   GRAPHDECO_SH_DEGREE=3
   GRAPHDECO_EXTRA_ARGS=""
-  MAX_FRAMES=72
+  MAX_FRAMES=200
+  START_SEC=
+  END_SEC=
+  DURATION_SEC=
   AUTO_PROMPT_MAX_OBJECTS=20
   AUTO_PROMPT_MIN_AREA_RATIO=0.001
   AUTO_PROMPT_GRANULARITY=balanced
@@ -91,12 +97,25 @@ SAM_MODEL_TYPE="${SAM_MODEL_TYPE:-vit_b}"
 GRAPHDECO_ROOT="${GRAPHDECO_ROOT:-/root/autodl-tmp/workspace/gaussian-splatting}"
 GRAPHDECO_PYTHON="${GRAPHDECO_PYTHON:-$V2M_PYTHON}"
 
-RUN_MAST3R="${RUN_MAST3R:-1}"
+RUN_MAST3R="${RUN_MAST3R:-0}"
+RUN_COLMAP="${RUN_COLMAP:-1}"
 GS_BACKEND="${GS_BACKEND:-graphdeco}"
 RUN_GSPLAT="${RUN_GSPLAT:-$([[ "$GS_BACKEND" == "minimal" ]] && printf 1 || printf 0)}"
 RUN_SAM2="${RUN_SAM2:-1}"
-MAX_FRAMES="${MAX_FRAMES:-72}"
-EXTRACT_EVERY="${EXTRACT_EVERY:-2}"
+MAX_FRAMES="${MAX_FRAMES:-200}"
+EXTRACT_EVERY="${EXTRACT_EVERY:-1}"
+START_SEC="${START_SEC:-}"
+END_SEC="${END_SEC:-}"
+DURATION_SEC="${DURATION_SEC:-}"
+COLMAP_BINARY="${COLMAP_BINARY:-colmap}"
+COLMAP_CAMERA_MODEL="${COLMAP_CAMERA_MODEL:-PINHOLE}"
+COLMAP_CAMERA_PARAMS="${COLMAP_CAMERA_PARAMS:-}"
+COLMAP_MATCHER="${COLMAP_MATCHER:-sequential}"
+COLMAP_SEQUENTIAL_OVERLAP="${COLMAP_SEQUENTIAL_OVERLAP:-20}"
+COLMAP_USE_GPU="${COLMAP_USE_GPU:-0}"
+COLMAP_REFINE_FOCAL_LENGTH="${COLMAP_REFINE_FOCAL_LENGTH:-1}"
+COLMAP_REFINE_PRINCIPAL_POINT="${COLMAP_REFINE_PRINCIPAL_POINT:-0}"
+COLMAP_REFINE_EXTRA_PARAMS="${COLMAP_REFINE_EXTRA_PARAMS:-0}"
 GRAPHDECO_ITERATIONS="${GRAPHDECO_ITERATIONS:-30000}"
 GRAPHDECO_RESOLUTION="${GRAPHDECO_RESOLUTION:-1}"
 GRAPHDECO_SAVE_ITERATIONS="${GRAPHDECO_SAVE_ITERATIONS:-7000 30000}"
@@ -173,6 +192,7 @@ echo "[Video2Mesh quick] python: $V2M_PYTHON" | tee -a "$LOG"
 echo "[Video2Mesh quick] auto_prompt_method: $AUTO_PROMPT_METHOD" | tee -a "$LOG"
 echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
+echo "[Video2Mesh quick] reconstruction: colmap=${RUN_COLMAP} mast3r=${RUN_MAST3R} max_frames=${MAX_FRAMES} every=${EXTRACT_EVERY}" | tee -a "$LOG"
 
 g3dgs_args=()
 if [[ "$GS_BACKEND" == "graphdeco" ]]; then
@@ -201,6 +221,51 @@ else
   exit 2
 fi
 
+time_window_args=()
+if [[ -n "$START_SEC" ]]; then
+  time_window_args+=(--start-sec "$START_SEC")
+fi
+if [[ -n "$END_SEC" ]]; then
+  time_window_args+=(--end-sec "$END_SEC")
+fi
+if [[ -n "$DURATION_SEC" ]]; then
+  time_window_args+=(--duration-sec "$DURATION_SEC")
+fi
+
+colmap_args=()
+if [[ "$RUN_COLMAP" == "1" || "$RUN_COLMAP" == "true" ]]; then
+  colmap_args=(
+    --run-colmap
+    --colmap-binary "$COLMAP_BINARY"
+    --colmap-camera-model "$COLMAP_CAMERA_MODEL"
+    --colmap-matcher "$COLMAP_MATCHER"
+    --colmap-sequential-overlap "$COLMAP_SEQUENTIAL_OVERLAP"
+  )
+  if [[ -n "$COLMAP_CAMERA_PARAMS" ]]; then
+    colmap_args+=(--colmap-camera-params "$COLMAP_CAMERA_PARAMS")
+  fi
+  if [[ "$COLMAP_USE_GPU" == "1" || "$COLMAP_USE_GPU" == "true" ]]; then
+    colmap_args+=(--colmap-use-gpu)
+  else
+    colmap_args+=(--no-colmap-use-gpu)
+  fi
+  if [[ "$COLMAP_REFINE_FOCAL_LENGTH" == "1" || "$COLMAP_REFINE_FOCAL_LENGTH" == "true" ]]; then
+    colmap_args+=(--colmap-refine-focal-length)
+  else
+    colmap_args+=(--no-colmap-refine-focal-length)
+  fi
+  if [[ "$COLMAP_REFINE_PRINCIPAL_POINT" == "1" || "$COLMAP_REFINE_PRINCIPAL_POINT" == "true" ]]; then
+    colmap_args+=(--colmap-refine-principal-point)
+  else
+    colmap_args+=(--no-colmap-refine-principal-point)
+  fi
+  if [[ "$COLMAP_REFINE_EXTRA_PARAMS" == "1" || "$COLMAP_REFINE_EXTRA_PARAMS" == "true" ]]; then
+    colmap_args+=(--colmap-refine-extra-params)
+  else
+    colmap_args+=(--no-colmap-refine-extra-params)
+  fi
+fi
+
 "$V2M_PYTHON" -B -m video2mesh.cli run-pipeline \
   --project-root "$PROJECT_ROOT" \
   --scene-id "$SCENE_ID" \
@@ -210,6 +275,7 @@ fi
   --extract-frames \
   --every "$EXTRACT_EVERY" \
   --max-frames "$MAX_FRAMES" \
+  "${time_window_args[@]}" \
   --overwrite-frames \
   $([[ "$RUN_MAST3R" == "1" || "$RUN_MAST3R" == "true" ]] && printf '%s ' --run-mast3r-slam) \
   --mast3r-root "$MAST3R_ROOT" \
@@ -217,7 +283,7 @@ fi
   "${mast3r_calib_args[@]}" \
   --mast3r-save-as "$SCENE_ID" \
   --focal-scale 1.2 \
-  --use-mast3r-keyframes \
+  "${colmap_args[@]}" \
   --render-reconstruction-preview \
   --reconstruction-preview-max-frames 4 \
   --reconstruction-preview-max-points 12000 \

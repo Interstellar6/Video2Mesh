@@ -1474,6 +1474,88 @@ def cmd_make_colmap_sample(args: argparse.Namespace) -> int:
     return 0
 
 
+def _frame_from_seconds(seconds: float | None, fps: float, default: int, *, end_frame: bool = False) -> int:
+    if seconds is None or fps <= 0:
+        return default
+    value = float(seconds) * fps
+    return int(math.ceil(value)) if end_frame else int(math.floor(value))
+
+
+def compute_uniform_frame_extraction_plan(
+    *,
+    source_frame_count: int,
+    fps: float,
+    every: int,
+    max_frames: int,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+    duration_sec: float | None = None,
+) -> dict[str, Any]:
+    if every < 1:
+        every = 1
+    if duration_sec is not None:
+        if duration_sec <= 0:
+            raise ValueError("--duration-sec must be positive.")
+        base_start = float(start_sec or 0.0)
+        computed_end = base_start + float(duration_sec)
+        if end_sec is not None and abs(float(end_sec) - computed_end) > 1e-6:
+            raise ValueError("Pass either --end-sec or --duration-sec, not conflicting values for both.")
+        end_sec = computed_end
+    if start_sec is not None and start_sec < 0:
+        raise ValueError("--start-sec must be non-negative.")
+    if end_sec is not None and end_sec < 0:
+        raise ValueError("--end-sec must be non-negative.")
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
+        raise ValueError("--end-sec must be greater than --start-sec.")
+
+    known_frame_count = int(source_frame_count) > 0
+    start_frame = max(0, _frame_from_seconds(start_sec, fps, 0))
+    if known_frame_count:
+        default_end = int(source_frame_count)
+        end_frame_exclusive = min(default_end, _frame_from_seconds(end_sec, fps, default_end, end_frame=True))
+    elif end_sec is not None and fps > 0:
+        end_frame_exclusive = max(start_frame, _frame_from_seconds(end_sec, fps, start_frame, end_frame=True))
+    else:
+        end_frame_exclusive = None
+
+    selected_indices: list[int] | None = None
+    possible_frame_count: int | None = None
+    planned_frame_count: int | None = None
+    strategy = "interval"
+    if end_frame_exclusive is not None:
+        range_count = max(0, int(end_frame_exclusive) - start_frame)
+        if range_count <= 0:
+            selected_indices = []
+            possible_frame_count = 0
+            planned_frame_count = 0
+        else:
+            possible_frame_count = (range_count + every - 1) // every
+            if max_frames > 0 and possible_frame_count > max_frames:
+                strategy = "uniform_limited"
+                if max_frames == 1:
+                    selected_positions = [0]
+                else:
+                    selected_positions = [
+                        int(round(i * (possible_frame_count - 1) / (max_frames - 1)))
+                        for i in range(max_frames)
+                    ]
+                selected_indices = [start_frame + position * every for position in selected_positions]
+            else:
+                selected_indices = list(range(start_frame, int(end_frame_exclusive), every))
+            planned_frame_count = len(selected_indices)
+
+    return {
+        "start_frame": start_frame,
+        "end_frame_exclusive": end_frame_exclusive,
+        "requested_every": every,
+        "max_frames": int(max_frames),
+        "possible_frame_count": possible_frame_count,
+        "planned_frame_count": planned_frame_count,
+        "selected_source_indices": selected_indices,
+        "selection_strategy": strategy,
+    }
+
+
 def cmd_extract_frames(args: argparse.Namespace) -> int:
     cv2 = import_cv2()
     project_root = args.project_root.resolve()
@@ -1499,12 +1581,43 @@ def cmd_extract_frames(args: argparse.Namespace) -> int:
     source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    plan = compute_uniform_frame_extraction_plan(
+        source_frame_count=source_frame_count,
+        fps=fps,
+        every=int(args.every),
+        max_frames=int(args.max_frames),
+        start_sec=args.start_sec,
+        end_sec=args.end_sec,
+        duration_sec=args.duration_sec,
+    )
+    selected_indices = plan["selected_source_indices"]
+    selected_index_set = set(selected_indices) if selected_indices is not None else None
+    start_frame = int(plan["start_frame"])
+    end_frame_exclusive = plan["end_frame_exclusive"]
+    effective_every = int(plan["requested_every"])
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frame_index = start_frame
+    print(
+        "Frame extraction plan: "
+        f"start_frame={start_frame}, "
+        f"end_frame_exclusive={end_frame_exclusive}, "
+        f"strategy={plan['selection_strategy']}, "
+        f"planned={plan['planned_frame_count']}, "
+        f"cap={int(args.max_frames)}"
+    )
     try:
         while True:
+            if end_frame_exclusive is not None and frame_index >= int(end_frame_exclusive):
+                break
             ok, frame = cap.read()
             if not ok:
                 break
-            if frame_index % args.every == 0:
+            if selected_index_set is not None:
+                should_write = frame_index in selected_index_set
+            else:
+                should_write = (frame_index - start_frame) % effective_every == 0
+            if should_write:
                 out_path = frames_dir / f"{written:06d}.png" if args.renumber else frames_dir / f"{frame_index:06d}.png"
                 if args.overwrite or not out_path.exists():
                     safe_cv2_imwrite(out_path, frame)
@@ -1540,6 +1653,10 @@ def cmd_extract_frames(args: argparse.Namespace) -> int:
             "source_height": height,
             "decoded_frame_count": int(frame_index),
             "written_frame_count": int(written),
+            "start_sec": args.start_sec,
+            "end_sec": args.end_sec,
+            "duration_sec": args.duration_sec,
+            "extraction_plan": plan,
             "frames": selected_frames,
         },
     )
@@ -1630,13 +1747,24 @@ def cmd_import_colmap(args: argparse.Namespace) -> int:
 
     if args.images_dir:
         frames_dir = ensure_dir(project_root / manifest["scene"]["frames_dir"])
+        same_frames_source = args.images_dir.resolve() == frames_dir.resolve()
+        if getattr(args, "clear_frames_output", False) and frames_dir.exists() and not same_frames_source:
+            for existing in frames_dir.iterdir():
+                if existing.is_file() and existing.suffix.lower() in IMAGE_EXTENSIONS:
+                    existing.unlink()
         copied = 0
+        kept_frame_files: set[str] = set()
         for image in images.values():
             src = args.images_dir / image["name"]
             if src.exists():
                 dst = frames_dir / f"{image_name_to_frame_id(image['name'], args.frame_id_regex)}{src.suffix.lower()}"
                 copy_or_link(src, dst, args.mode)
+                kept_frame_files.add(dst.name)
                 copied += 1
+        if getattr(args, "clear_frames_output", False) and same_frames_source:
+            for existing in frames_dir.iterdir():
+                if existing.is_file() and existing.suffix.lower() in IMAGE_EXTENSIONS and existing.name not in kept_frame_files:
+                    existing.unlink()
         manifest["artifacts"]["frames"] = str(frames_dir)
         manifest["artifacts"]["frames_imported"] = copied
 
@@ -1645,6 +1773,218 @@ def cmd_import_colmap(args: argparse.Namespace) -> int:
     print(f"Frames/cameras: {len(images)} images, {len(cameras)} camera(s)")
     if points3d_path.exists():
         print(f"Point cloud: {manifest['artifacts'].get('point_cloud', 'no points3D parsed')}")
+    return 0
+
+
+def _run_logged_command(command: list[str], *, cwd: Path | None, log_path: Path) -> int:
+    ensure_dir(log_path.parent)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("$ " + " ".join(shlex.quote(str(part)) for part in command) + "\n")
+        log_file.flush()
+        completed = subprocess.run(command, cwd=str(cwd) if cwd else None, stdout=log_file, stderr=subprocess.STDOUT, check=False)
+    return int(completed.returncode)
+
+
+def cmd_run_colmap(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    frames_dir = resolve_project_cli_path(args.frames_dir, project_root) if args.frames_dir else project_root / manifest["scene"]["frames_dir"]
+    frames = list_frame_images(frames_dir)
+    colmap_bin = shutil.which(args.colmap_binary) if not Path(args.colmap_binary).is_absolute() else args.colmap_binary
+    if not colmap_bin:
+        raise FileNotFoundError(f"COLMAP binary not found: {args.colmap_binary}")
+
+    workspace = resolve_project_relative_path(args.workspace, project_root) if args.workspace else project_root / "external" / "colmap"
+    database_path = resolve_project_relative_path(args.database_path, project_root) if args.database_path else workspace / "database.db"
+    sparse_root = resolve_project_relative_path(args.sparse_root, project_root) if args.sparse_root else workspace / "sparse"
+    sparse_model_dir = resolve_project_relative_path(args.sparse_model_dir, project_root) if args.sparse_model_dir else sparse_root / "0"
+    text_sparse_dir = resolve_project_relative_path(args.text_sparse_dir, project_root) if args.text_sparse_dir else workspace / "sparse_text" / "0"
+    logs_dir = ensure_dir(project_root / "logs" / "colmap")
+    ensure_dir(workspace)
+    ensure_dir(sparse_root)
+    ensure_dir(text_sparse_dir.parent)
+    ensure_dir(text_sparse_dir)
+    if args.overwrite:
+        for path in [database_path, sparse_root, text_sparse_dir.parent]:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        ensure_dir(sparse_root)
+        ensure_dir(text_sparse_dir.parent)
+        ensure_dir(text_sparse_dir)
+
+    first_width, first_height = image_shape(frames[0])
+    camera_model = args.camera_model
+    if args.single_camera:
+        camera_args = ["--ImageReader.single_camera", "1"]
+        if args.camera_params:
+            camera_args.extend(["--ImageReader.camera_params", args.camera_params])
+        else:
+            focal = float(args.focal) if args.focal is not None else float(max(first_width, first_height) * args.focal_scale)
+            if camera_model == "PINHOLE":
+                camera_args.extend(["--ImageReader.camera_params", f"{focal},{focal},{first_width / 2.0},{first_height / 2.0}"])
+            elif camera_model == "SIMPLE_PINHOLE":
+                camera_args.extend(["--ImageReader.camera_params", f"{focal},{first_width / 2.0},{first_height / 2.0}"])
+    else:
+        camera_args = ["--ImageReader.single_camera", "0"]
+
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "colmap_reconstruction",
+        "project_root": str(project_root),
+        "frames_dir": str(frames_dir),
+        "frame_count": len(frames),
+        "workspace": str(workspace),
+        "database_path": str(database_path),
+        "sparse_root": str(sparse_root),
+        "sparse_model_dir": str(sparse_model_dir),
+        "text_sparse_dir": str(text_sparse_dir),
+        "colmap_binary": str(colmap_bin),
+        "camera_model": camera_model,
+        "matcher": args.matcher,
+        "steps": [],
+    }
+
+    def run_step(name: str, command: list[str]) -> None:
+        log_path = logs_dir / f"{name}.log"
+        started = time.time()
+        returncode = _run_logged_command(command, cwd=project_root, log_path=log_path)
+        step = {
+            "name": name,
+            "command": " ".join(shlex.quote(str(part)) for part in command),
+            "returncode": returncode,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "log": str(log_path),
+        }
+        report["steps"].append(step)
+        write_json(workspace / "colmap_run_report.json", report)
+        if returncode != 0:
+            raise RuntimeError(f"COLMAP step {name} failed with exit code {returncode}. See {log_path}")
+
+    run_step(
+        "feature_extractor",
+        [
+            str(colmap_bin),
+            "feature_extractor",
+            "--database_path",
+            str(database_path),
+            "--image_path",
+            str(frames_dir),
+            "--ImageReader.camera_model",
+            camera_model,
+            *camera_args,
+            "--SiftExtraction.use_gpu",
+            "1" if args.use_gpu else "0",
+        ],
+    )
+    if args.matcher == "sequential":
+        matcher_command = [
+            str(colmap_bin),
+            "sequential_matcher",
+            "--database_path",
+            str(database_path),
+            "--SiftMatching.use_gpu",
+            "1" if args.use_gpu else "0",
+            "--SequentialMatching.overlap",
+            str(args.sequential_overlap),
+        ]
+    elif args.matcher == "exhaustive":
+        matcher_command = [
+            str(colmap_bin),
+            "exhaustive_matcher",
+            "--database_path",
+            str(database_path),
+            "--SiftMatching.use_gpu",
+            "1" if args.use_gpu else "0",
+        ]
+    else:
+        raise ValueError(f"Unsupported COLMAP matcher: {args.matcher}")
+    run_step(args.matcher + "_matcher", matcher_command)
+    run_step(
+        "mapper",
+        [
+            str(colmap_bin),
+            "mapper",
+            "--database_path",
+            str(database_path),
+            "--image_path",
+            str(frames_dir),
+            "--output_path",
+            str(sparse_root),
+            "--Mapper.ba_refine_focal_length",
+            "1" if args.refine_focal_length else "0",
+            "--Mapper.ba_refine_principal_point",
+            "1" if args.refine_principal_point else "0",
+            "--Mapper.ba_refine_extra_params",
+            "1" if args.refine_extra_params else "0",
+        ],
+    )
+    if not sparse_model_dir.exists():
+        candidates = sorted((path for path in sparse_root.iterdir() if path.is_dir()), key=lambda path: path.name)
+        if not candidates:
+            raise FileNotFoundError(f"COLMAP mapper did not produce a sparse model under {sparse_root}")
+        sparse_model_dir = candidates[0]
+        report["sparse_model_dir"] = str(sparse_model_dir)
+    run_step(
+        "model_converter",
+        [
+            str(colmap_bin),
+            "model_converter",
+            "--input_path",
+            str(sparse_model_dir),
+            "--output_path",
+            str(text_sparse_dir),
+            "--output_type",
+            "TXT",
+        ],
+    )
+
+    cmd_import_colmap(
+        argparse.Namespace(
+            project_root=project_root,
+            sparse_dir=text_sparse_dir,
+            images_dir=frames_dir,
+            frame_id_regex=None,
+            mode=args.mode,
+            clear_frames_output=True,
+        )
+    )
+    manifest = load_manifest(project_root)
+    imported_camera_info = project_root / manifest["scene"]["camera_info"]
+    imported_point_cloud = project_root / manifest["scene"]["point_cloud"]
+    point_count = 0
+    if imported_point_cloud.exists():
+        try:
+            points, _ = read_point_cloud(imported_point_cloud)
+            point_count = int(points.shape[0])
+        except Exception:
+            point_count = 0
+    report.update(
+        {
+            "status": "completed",
+            "camera_info": str(imported_camera_info),
+            "point_cloud": str(imported_point_cloud),
+            "registered_frame_count": len(read_json(imported_camera_info).get("extrinsic", {})) if imported_camera_info.exists() else 0,
+            "point_count": point_count,
+        }
+    )
+    report_path = workspace / "colmap_run_report.json"
+    write_json(report_path, report)
+    manifest.setdefault("artifacts", {})["colmap_run_report"] = str(report_path)
+    manifest.setdefault("artifacts", {})["colmap_workspace"] = str(workspace)
+    manifest.setdefault("external_stages", {})["colmap_reconstruction"] = {
+        "status": "completed",
+        "frames_dir": str(frames_dir),
+        "sparse_text_dir": str(text_sparse_dir),
+        "camera_info": str(imported_camera_info),
+        "point_cloud": str(imported_point_cloud),
+        "registered_frame_count": report["registered_frame_count"],
+        "point_count": point_count,
+    }
+    save_manifest(project_root, manifest)
+    print(f"COLMAP reconstruction complete: {text_sparse_dir}")
+    print(f"Registered frames: {report['registered_frame_count']}; points: {point_count}")
     return 0
 
 
@@ -29825,6 +30165,9 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     output_dir=None,
                     every=args.every,
                     max_frames=args.max_frames,
+                    start_sec=args.start_sec,
+                    end_sec=args.end_sec,
+                    duration_sec=args.duration_sec,
                     overwrite=args.overwrite_frames,
                     renumber=args.renumber_frames,
                 )
@@ -29853,6 +30196,35 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                 )
             )
             append_pipeline_step(steps, "run_mast3r_slam", "completed")
+            manifest = load_manifest(project_root)
+
+        if args.run_colmap:
+            cmd_run_colmap(
+                argparse.Namespace(
+                    project_root=project_root,
+                    frames_dir=None,
+                    workspace=args.colmap_workspace,
+                    database_path=args.colmap_database_path,
+                    sparse_root=args.colmap_sparse_root,
+                    sparse_model_dir=args.colmap_sparse_model_dir,
+                    text_sparse_dir=args.colmap_text_sparse_dir,
+                    colmap_binary=args.colmap_binary,
+                    camera_model=args.colmap_camera_model,
+                    single_camera=args.colmap_single_camera,
+                    camera_params=args.colmap_camera_params,
+                    focal=args.colmap_focal,
+                    focal_scale=args.focal_scale,
+                    matcher=args.colmap_matcher,
+                    sequential_overlap=args.colmap_sequential_overlap,
+                    use_gpu=args.colmap_use_gpu,
+                    refine_focal_length=args.colmap_refine_focal_length,
+                    refine_principal_point=args.colmap_refine_principal_point,
+                    refine_extra_params=args.colmap_refine_extra_params,
+                    overwrite=args.colmap_overwrite,
+                    mode=args.mode,
+                )
+            )
+            append_pipeline_step(steps, "run_colmap", "completed")
             manifest = load_manifest(project_root)
 
         if args.use_mast3r_keyframes:
@@ -30764,6 +31136,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, help="Defaults to scene/frames.")
     p.add_argument("--every", type=int, default=30)
     p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument("--start-sec", type=float, help="Only extract frames at or after this source-video timestamp.")
+    p.add_argument("--end-sec", type=float, help="Only extract frames before this source-video timestamp.")
+    p.add_argument("--duration-sec", type=float, help="Extract this many seconds starting at --start-sec.")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--renumber", action=argparse.BooleanOptionalAction, default=True, help="Write contiguous frame ids while preserving source indices in scene/frames_manifest.json.")
     p.set_defaults(func=cmd_extract_frames)
@@ -30792,8 +31167,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sparse-dir", type=Path, required=True, help="Directory containing cameras.txt/images.txt/points3D.txt.")
     p.add_argument("--images-dir", type=Path, help="Optional source images directory to copy/symlink into scene/frames.")
     p.add_argument("--frame-id-regex", help="Optional regex to extract frame id from image name.")
+    p.add_argument("--clear-frames-output", action="store_true", help="Remove scene frames that are not present in the imported COLMAP image list.")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_import_colmap)
+
+    p = sub.add_parser("run-colmap", help="Run COLMAP on scene frames and import camera poses plus sparse point cloud.")
+    add_common_project_arg(p)
+    p.add_argument("--frames-dir", type=Path, help="Defaults to scene/frames.")
+    p.add_argument("--workspace", type=Path, help="Defaults to external/colmap.")
+    p.add_argument("--database-path", type=Path)
+    p.add_argument("--sparse-root", type=Path)
+    p.add_argument("--sparse-model-dir", type=Path)
+    p.add_argument("--text-sparse-dir", type=Path)
+    p.add_argument("--colmap-binary", default="colmap")
+    p.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "OPENCV"], default="PINHOLE")
+    p.add_argument("--single-camera", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--camera-params", help="Explicit COLMAP camera params, e.g. fx,fy,cx,cy for PINHOLE.")
+    p.add_argument("--focal", type=float, help="Initial focal length in pixels when --camera-params is omitted.")
+    p.add_argument("--focal-scale", type=float, default=1.2)
+    p.add_argument("--matcher", choices=["sequential", "exhaustive"], default="sequential")
+    p.add_argument("--sequential-overlap", type=int, default=20)
+    p.add_argument("--use-gpu", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.set_defaults(func=cmd_run_colmap)
 
     p = sub.add_parser("export-colmap", help="Export Video2Mesh cameras/frames/point cloud as a COLMAP text dataset.")
     add_common_project_arg(p)
@@ -32019,6 +32419,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extract-frames", action="store_true")
     p.add_argument("--every", type=int, default=30)
     p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument("--start-sec", type=float, help="Only extract frames at or after this source-video timestamp.")
+    p.add_argument("--end-sec", type=float, help="Only extract frames before this source-video timestamp.")
+    p.add_argument("--duration-sec", type=float, help="Extract this many seconds starting at --start-sec.")
     p.add_argument("--overwrite-frames", action="store_true")
     p.add_argument("--renumber-frames", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--run-mast3r-slam", action="store_true")
@@ -32034,6 +32437,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cy", type=float)
     p.add_argument("--focal-scale", type=float, default=1.2)
     p.add_argument("--use-mast3r-keyframes", action="store_true", help="Use scene/mast3r_keyframes for 3DGS training, masks, previews, and frame selection after MASt3R-SLAM import.")
+    p.add_argument("--run-colmap", action="store_true", help="Run COLMAP on extracted dense scene frames and import sparse point cloud/camera poses.")
+    p.add_argument("--colmap-binary", default="colmap")
+    p.add_argument("--colmap-workspace", type=Path)
+    p.add_argument("--colmap-database-path", type=Path)
+    p.add_argument("--colmap-sparse-root", type=Path)
+    p.add_argument("--colmap-sparse-model-dir", type=Path)
+    p.add_argument("--colmap-text-sparse-dir", type=Path)
+    p.add_argument("--colmap-camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "OPENCV"], default="PINHOLE")
+    p.add_argument("--colmap-single-camera", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--colmap-camera-params")
+    p.add_argument("--colmap-focal", type=float)
+    p.add_argument("--colmap-matcher", choices=["sequential", "exhaustive"], default="sequential")
+    p.add_argument("--colmap-sequential-overlap", type=int, default=20)
+    p.add_argument("--colmap-use-gpu", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--colmap-refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--colmap-refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--colmap-refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--colmap-overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--downsample-point-cloud", action="store_true", help="Create a lightweight point cloud for preview/manual inspection. 3DGS init, mask fusion, background masks, semantic transfer, and mask-cloud meshes still use the full scene point cloud unless explicitly overridden.")
     p.add_argument("--downsample-source-point-cloud", type=Path, help="Defaults to scene/reconstruction/point_cloud.ply.")
     p.add_argument("--downsample-output", type=Path, help="Defaults to scene/reconstruction/point_cloud_<max_points>.ply.")

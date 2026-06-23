@@ -6,7 +6,8 @@ Current default pipeline:
 
 ```text
 video
-  -> MASt3R-SLAM poses + full point cloud
+  -> uniform dense real-frame extraction (<=200 frames)
+  -> COLMAP poses + full sparse point cloud
   -> GraphDECO 3D Gaussian Splatting
   -> SAM prompts + SAM2 video masks
   -> 2D-to-3D semantic mask fusion
@@ -33,46 +34,58 @@ Equivalent direct quick runner:
 bash tools/run_video2mesh_quick.sh dataset/<video>.mp4
 ```
 
+Run a fixed real-video window without interpolation:
+
+```bash
+START_SEC=47 END_SEC=56 MAX_FRAMES=200 EXTRACT_EVERY=1 \
+bash tools/run_video2mesh_quick.sh dataset/bedroom_4_CmEIg9gMI74/bedroom_4_Cm.mp4
+```
+
 The quick entrypoint defaults to:
 
+- `RUN_COLMAP=1`
+- `RUN_MAST3R=0`
+- `MAX_FRAMES=200`
 - `GS_BACKEND=graphdeco`
 - `GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting`
 - `GRAPHDECO_ITERATIONS=30000`
 - `MASK_BACKEND=sam2`
-- full MASt3R point cloud for 3DGS and semantic fusion
+- full COLMAP sparse `scene/reconstruction/point_cloud.ply` for 3DGS and semantic fusion
 - simulator/export QA reports at the end
 
-The GraphDECO default is now the full training preset: full MASt3R point-cloud
+Frame extraction first computes how many real frames the requested video/window
+would produce. If that exceeds `MAX_FRAMES`, it uniformly samples from those
+decoded source frames instead of interpolating or using synthetic frames.
+
+The GraphDECO default is now the full training preset: full COLMAP point-cloud
 initialization, 30000 iterations, checkpoints at 7000 and 30000,
 densification/pruning, opacity reset, and SH degree 3 appearance enabled. Use
 smaller overrides only for explicit smoke tests or memory-constrained debugging.
 
-## Long Video Rule
+## Frame Window Rule
 
-If MASt3R-SLAM runs longer than 1.5 hours without producing `camera_info.json` and `point_cloud.ply`, stop that run and crop the first 60 seconds into a new dataset file:
-
-```bash
-ffmpeg -y -i dataset/bedroom_100.mp4 -t 60 -c copy dataset/bedroom_100_first60.mp4
-bash tools/run_video2mesh_quick.sh dataset/bedroom_100_first60.mp4
-```
-
-For a `*_first60.mp4` retry, use a 30 minute MASt3R budget. If it exceeds that budget, or if readiness reports a single pose / empty point cloud even though it finished, crop a better-scored 10 second segment into `dataset/<name>_best10.mp4` and continue from that dataset.
+Frame extraction uses real decoded frames only. For a requested full video or
+time window, the pipeline estimates the candidate frame count first. If the
+candidate count exceeds `MAX_FRAMES`, it uniformly samples from those real
+frames so total input stays within the cap.
 
 ```bash
-python tools/crop_best_video_window.py dataset/bedroom_100_first60.mp4 \
-  --duration 10 \
-  --output dataset/bedroom_100_first60_best10.mp4 \
-  --force
+START_SEC=47 END_SEC=56 MAX_FRAMES=200 EXTRACT_EVERY=1 \
+bash tools/run_video2mesh_quick.sh dataset/bedroom_4_CmEIg9gMI74/bedroom_4_Cm.mp4
 ```
 
-After a project already has valid MASt3R/GraphDECO outputs, resume a lighter
+If COLMAP fails readiness because the segment has too little parallax or too
+few registered poses, choose a different real time window and rerun. Do not
+fill gaps with interpolated frames.
+
+After a project already has valid COLMAP/GraphDECO outputs, resume a lighter
 downstream pass with:
 
 ```bash
 bash tools/run_video2mesh_downstream_light.sh exports/<run> dataset/<video>_best10.mp4
 ```
 
-This resume script still fuses object masks against the full MASt3R point cloud,
+This resume script still fuses object masks against the full scene point cloud,
 but caps background-plane RANSAC sampling by default so recovery runs remain
 interactive on 16M+ point clouds.
 
