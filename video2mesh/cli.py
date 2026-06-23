@@ -1918,6 +1918,7 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
             "1" if args.refine_principal_point else "0",
             "--Mapper.ba_refine_extra_params",
             "1" if args.refine_extra_params else "0",
+            *shlex.split(args.mapper_extra_args or ""),
         ],
     )
     if not sparse_model_dir.exists():
@@ -30220,6 +30221,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     refine_focal_length=args.colmap_refine_focal_length,
                     refine_principal_point=args.colmap_refine_principal_point,
                     refine_extra_params=args.colmap_refine_extra_params,
+                    mapper_extra_args=args.colmap_mapper_extra_args,
                     overwrite=args.colmap_overwrite,
                     mode=args.mode,
                 )
@@ -31191,6 +31193,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mapper-extra-args", default="", help="Additional shell-style options appended to COLMAP mapper.")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_run_colmap)
@@ -32454,6 +32457,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colmap-refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--colmap-refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--colmap-refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--colmap-mapper-extra-args", default="", help="Additional shell-style options appended to COLMAP mapper.")
     p.add_argument("--colmap-overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--downsample-point-cloud", action="store_true", help="Create a lightweight point cloud for preview/manual inspection. 3DGS init, mask fusion, background masks, semantic transfer, and mask-cloud meshes still use the full scene point cloud unless explicitly overridden.")
     p.add_argument("--downsample-source-point-cloud", type=Path, help="Defaults to scene/reconstruction/point_cloud.ply.")

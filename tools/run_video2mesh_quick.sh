@@ -22,6 +22,7 @@ Optional environment overrides:
   MAST3R_CALIB=/path/to/intrinsics.yaml
   COLMAP_BINARY=colmap
   COLMAP_MATCHER=sequential
+  COLMAP_MAPPER_EXTRA_ARGS=""
   GS_BACKEND=graphdeco|minimal|none
   GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
   GRAPHDECO_ITERATIONS=30000
@@ -113,6 +114,7 @@ COLMAP_CAMERA_PARAMS="${COLMAP_CAMERA_PARAMS:-}"
 COLMAP_MATCHER="${COLMAP_MATCHER:-sequential}"
 COLMAP_SEQUENTIAL_OVERLAP="${COLMAP_SEQUENTIAL_OVERLAP:-20}"
 COLMAP_USE_GPU="${COLMAP_USE_GPU:-0}"
+COLMAP_MAPPER_EXTRA_ARGS="${COLMAP_MAPPER_EXTRA_ARGS:-}"
 COLMAP_REFINE_FOCAL_LENGTH="${COLMAP_REFINE_FOCAL_LENGTH:-1}"
 COLMAP_REFINE_PRINCIPAL_POINT="${COLMAP_REFINE_PRINCIPAL_POINT:-0}"
 COLMAP_REFINE_EXTRA_PARAMS="${COLMAP_REFINE_EXTRA_PARAMS:-0}"
@@ -243,6 +245,9 @@ if [[ "$RUN_COLMAP" == "1" || "$RUN_COLMAP" == "true" ]]; then
   )
   if [[ -n "$COLMAP_CAMERA_PARAMS" ]]; then
     colmap_args+=(--colmap-camera-params "$COLMAP_CAMERA_PARAMS")
+  fi
+  if [[ -n "$COLMAP_MAPPER_EXTRA_ARGS" ]]; then
+    colmap_args+=(--colmap-mapper-extra-args "$COLMAP_MAPPER_EXTRA_ARGS")
   fi
   if [[ "$COLMAP_USE_GPU" == "1" || "$COLMAP_USE_GPU" == "true" ]]; then
     colmap_args+=(--colmap-use-gpu)
