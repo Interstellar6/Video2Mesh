@@ -20,6 +20,7 @@ def _aggregate(detections):
         instance_center_distance=0.75,
         max_instances_per_label=4,
         merge_bed_parts=True,
+        single_instance_labels={"bed"},
         object_prefix="gdino_object",
     )
 
@@ -37,7 +38,7 @@ def test_bed_part_detections_merge_into_one_object_prompt():
     bed_prompts = [prompt for prompt in prompts if prompt["name"] == "bed"]
     assert len(bed_prompts) == 1
     assert bed_prompts[0]["detection_count"] == 4
-    assert bed_prompts[0]["bbox"] == [350, 275, 930, 500]
+    assert bed_prompts[0]["bbox"] == [330, 150, 950, 620]
     assert not skipped
 
 

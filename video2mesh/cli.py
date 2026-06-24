@@ -5441,6 +5441,7 @@ GROUNDINGDINO_OBJECT_LEVEL_LABELS = {
     "pillow": "bed",
     "mattress": "bed",
 }
+GROUNDINGDINO_DEFAULT_SINGLE_INSTANCE_LABELS = {"bed"}
 
 
 def normalize_detection_label(label: str) -> str:
@@ -5453,6 +5454,14 @@ def object_level_detection_label(label: str, merge_bed_parts: bool = True) -> st
     if merge_bed_parts and normalized in GROUNDINGDINO_OBJECT_LEVEL_LABELS:
         return GROUNDINGDINO_OBJECT_LEVEL_LABELS[normalized]
     return normalized
+
+
+def parse_label_set(value: str | None, default: set[str] | None = None) -> set[str]:
+    if value is None:
+        return set(default or set())
+    if value.strip() == "":
+        return set()
+    return {normalize_detection_label(item) for item in parse_query_list(value)}
 
 
 def select_anchor_frames(frames: list[Path], anchor_frame_count: int, frame_ids: list[str] | None = None) -> list[Path]:
@@ -5522,6 +5531,7 @@ def aggregate_object_level_detections(
     instance_center_distance: float,
     max_instances_per_label: int,
     merge_bed_parts: bool,
+    single_instance_labels: set[str] | None,
     object_prefix: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Merge frame-level open-vocabulary boxes into coarse object prompts.
@@ -5531,6 +5541,7 @@ def aggregate_object_level_detections(
     survive as multiple instances when their boxes are spatially distinct.
     """
 
+    single_instance_labels = set(single_instance_labels or set())
     candidates_by_frame: dict[str, list[dict[str, Any]]] = {}
     skipped: list[dict[str, Any]] = []
     for index, raw in enumerate(detections, start=1):
@@ -5591,11 +5602,14 @@ def aggregate_object_level_detections(
         label = str(candidate["group_label"])
         bbox = tuple(candidate["bbox"])
         assigned = None
-        for group in groups_by_label.setdefault(label, []):
-            reference = tuple(group["bbox"])
-            if bbox_iou(bbox, reference) >= instance_iou or bbox_center_distance_ratio(bbox, reference) <= instance_center_distance:
-                assigned = group
-                break
+        if label in single_instance_labels and groups_by_label.get(label):
+            assigned = groups_by_label[label][0]
+        else:
+            for group in groups_by_label.setdefault(label, []):
+                reference = tuple(group["bbox"])
+                if bbox_iou(bbox, reference) >= instance_iou or bbox_center_distance_ratio(bbox, reference) <= instance_center_distance:
+                    assigned = group
+                    break
         if assigned is None:
             if max_instances_per_label > 0 and len(groups_by_label[label]) >= max_instances_per_label:
                 skipped.append({"index": candidate.get("raw_index"), "reason": "max_instances_per_label", "label": label})
@@ -5613,7 +5627,12 @@ def aggregate_object_level_detections(
         assigned["detections"].append(candidate)
         assigned["bboxes"].append(tuple(candidate["bbox"]))
         assigned["scores"].append(float(candidate.get("score", 0.0)))
-        if float(candidate.get("score", 0.0)) > float(assigned["best"].get("score", 0.0)):
+        candidate_area = bbox_area(tuple(candidate["bbox"]))
+        best_area = bbox_area(tuple(assigned["best"]["bbox"]))
+        area_bonus = 1.25 if label in single_instance_labels else 1.0
+        candidate_rank = float(candidate.get("score", 0.0)) * (candidate_area ** 0.35) * area_bonus
+        best_rank = float(assigned["best"].get("score", 0.0)) * (best_area ** 0.35) * area_bonus
+        if candidate_rank > best_rank:
             assigned["best"] = candidate
         assigned["bbox"] = tuple(assigned["best"]["bbox"])
 
@@ -5858,6 +5877,7 @@ def cmd_discover_object_prompts(args: argparse.Namespace) -> int:
         instance_center_distance=args.instance_center_distance,
         max_instances_per_label=args.max_instances_per_label,
         merge_bed_parts=args.merge_bed_parts,
+        single_instance_labels=parse_label_set(args.single_instance_labels, GROUNDINGDINO_DEFAULT_SINGLE_INSTANCE_LABELS),
         object_prefix=args.object_prefix,
     )
 
@@ -5926,6 +5946,7 @@ def cmd_discover_object_prompts(args: argparse.Namespace) -> int:
             "instance_center_distance": args.instance_center_distance,
             "max_instances_per_label": args.max_instances_per_label,
             "merge_bed_parts": args.merge_bed_parts,
+            "single_instance_labels": sorted(parse_label_set(args.single_instance_labels, GROUNDINGDINO_DEFAULT_SINGLE_INSTANCE_LABELS)),
         },
         "raw_detections": raw_detections if args.keep_raw_detections else [],
         "preview_image": str(preview_path),
@@ -31027,6 +31048,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     instance_center_distance=args.object_prompt_instance_center_distance,
                     max_instances_per_label=args.object_prompt_max_instances_per_label,
                     merge_bed_parts=args.object_prompt_merge_bed_parts,
+                    single_instance_labels=args.object_prompt_single_instance_labels,
                     object_prefix=args.object_prompt_object_prefix,
                     keep_raw_detections=args.object_prompt_keep_raw_detections,
                     overwrite=True,
@@ -32105,6 +32127,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--instance-center-distance", type=float, default=0.75)
     p.add_argument("--max-instances-per-label", type=int, default=4)
     p.add_argument("--merge-bed-parts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--single-instance-labels", default="bed", help="Comma-separated labels that should collapse to one object instance. Empty string disables.")
     p.add_argument("--object-prefix", default="gdino_object")
     p.add_argument("--keep-raw-detections", action="store_true")
     p.add_argument("--overwrite", action="store_true")
@@ -33188,6 +33211,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--object-prompt-instance-center-distance", type=float, default=0.75)
     p.add_argument("--object-prompt-max-instances-per-label", type=int, default=4)
     p.add_argument("--object-prompt-merge-bed-parts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--object-prompt-single-instance-labels", default="bed")
     p.add_argument("--object-prompt-object-prefix", default="gdino_object")
     p.add_argument("--object-prompt-keep-raw-detections", action="store_true")
     p.add_argument("--auto-prompts", action="store_true", help="Generate bbox prompts automatically before track-masks when --prompts is not provided.")
