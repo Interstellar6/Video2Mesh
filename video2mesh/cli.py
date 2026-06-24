@@ -5615,10 +5615,7 @@ def aggregate_object_level_detections(
         assigned["scores"].append(float(candidate.get("score", 0.0)))
         if float(candidate.get("score", 0.0)) > float(assigned["best"].get("score", 0.0)):
             assigned["best"] = candidate
-        if label == "bed" and merge_bed_parts:
-            assigned["bbox"] = bbox_union(assigned["bboxes"])
-        else:
-            assigned["bbox"] = tuple(assigned["best"]["bbox"])
+        assigned["bbox"] = tuple(assigned["best"]["bbox"])
 
     prompts: list[dict[str, Any]] = []
     used_ids: set[str] = set()

@@ -37,8 +37,7 @@ def test_bed_part_detections_merge_into_one_object_prompt():
     bed_prompts = [prompt for prompt in prompts if prompt["name"] == "bed"]
     assert len(bed_prompts) == 1
     assert bed_prompts[0]["detection_count"] == 4
-    assert bed_prompts[0]["bbox"][0] <= 330
-    assert bed_prompts[0]["bbox"][2] >= 950
+    assert bed_prompts[0]["bbox"] == [350, 275, 930, 500]
     assert not skipped
 
 
