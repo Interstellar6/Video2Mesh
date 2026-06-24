@@ -5349,10 +5349,23 @@ def cmd_import_video_segmentation_masks(args: argparse.Namespace) -> int:
 
 def open_vocab_default_queries() -> list[str]:
     return [
+        "bed",
+        "mattress",
+        "blanket",
+        "quilt",
+        "comforter",
+        "bedding",
+        "bed skirt",
+        "headboard",
+        "pillow",
+        "nightstand",
+        "bedside table",
+        "lamp",
         "chair",
         "table",
         "sofa",
         "cabinet",
+        "dresser",
         "shelf",
         "box",
         "monitor",
@@ -5367,6 +5380,9 @@ def open_vocab_default_queries() -> list[str]:
         "floor",
         "ceiling",
         "counter",
+        "wall art",
+        "picture",
+        "curtain",
     ]
 
 
@@ -5391,6 +5407,558 @@ def parse_query_list(value: str | None) -> list[str]:
 
 
 OPEN_VOCAB_DETECTION_PROVIDERS = {"groundingdino", "grounded-sam", "grounded-sam2", "owl-vit", "owlv2", "yolo-world"}
+
+GROUNDINGDINO_BED_PART_LABELS = {
+    "bed",
+    "mattress",
+    "blanket",
+    "quilt",
+    "comforter",
+    "bedding",
+    "bed sheet",
+    "bed skirt",
+    "headboard",
+    "pillow",
+}
+GROUNDINGDINO_LABEL_ALIASES = {
+    "couch": "sofa",
+    "bedside table": "nightstand",
+    "side table": "nightstand",
+    "painting": "wall art",
+    "picture": "wall art",
+    "art": "wall art",
+    "window frame": "window",
+    "door frame": "door",
+    "comforter": "bedding",
+    "quilt": "bedding",
+    "blanket": "bedding",
+    "bed sheet": "bedding",
+}
+GROUNDINGDINO_OBJECT_LEVEL_LABELS = {
+    "bedding": "bed",
+    "bed skirt": "bed",
+    "headboard": "bed",
+    "pillow": "bed",
+    "mattress": "bed",
+}
+
+
+def normalize_detection_label(label: str) -> str:
+    value = re.sub(r"\s+", " ", str(label or "").strip().lower())
+    return GROUNDINGDINO_LABEL_ALIASES.get(value, value)
+
+
+def object_level_detection_label(label: str, merge_bed_parts: bool = True) -> str:
+    normalized = normalize_detection_label(label)
+    if merge_bed_parts and normalized in GROUNDINGDINO_OBJECT_LEVEL_LABELS:
+        return GROUNDINGDINO_OBJECT_LEVEL_LABELS[normalized]
+    return normalized
+
+
+def select_anchor_frames(frames: list[Path], anchor_frame_count: int, frame_ids: list[str] | None = None) -> list[Path]:
+    if frame_ids:
+        requested = {frame_stem(value) for value in frame_ids}
+        selected = [frame for frame in frames if frame_stem(frame.stem) in requested]
+        if selected:
+            return selected
+    if not frames:
+        return []
+    count = max(1, min(len(frames), int(anchor_frame_count or 1)))
+    if count == 1:
+        return [frames[len(frames) // 2]]
+    indices = [round(value) for value in linspace_indices(len(frames), count)]
+    unique_indices = []
+    for index in indices:
+        index = max(0, min(len(frames) - 1, int(index)))
+        if index not in unique_indices:
+            unique_indices.append(index)
+    return [frames[index] for index in unique_indices]
+
+
+def linspace_indices(length: int, count: int) -> list[float]:
+    if count <= 1:
+        return [float(max(0, length // 2))]
+    return [i * (length - 1) / (count - 1) for i in range(count)]
+
+
+def bbox_union(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def bbox_center_distance_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax = (a[0] + a[2]) * 0.5
+    ay = (a[1] + a[3]) * 0.5
+    bx = (b[0] + b[2]) * 0.5
+    by = (b[1] + b[3]) * 0.5
+    diag = math.sqrt(max(1.0, float(max(bbox_area(a), bbox_area(b)))))
+    return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2) / diag
+
+
+def detection_group_key(label: str, merge_bed_parts: bool) -> str:
+    return object_level_detection_label(label, merge_bed_parts=merge_bed_parts)
+
+
+def aggregate_object_level_detections(
+    detections: list[dict[str, Any]],
+    *,
+    width: int,
+    height: int,
+    max_objects: int,
+    min_area_ratio: float,
+    max_area_ratio: float,
+    min_width: int,
+    min_height: int,
+    nms_iou: float,
+    containment_overlap: float,
+    containment_area_ratio: float,
+    granularity: str,
+    min_parent_area_ratio: float,
+    instance_iou: float,
+    instance_center_distance: float,
+    max_instances_per_label: int,
+    merge_bed_parts: bool,
+    object_prefix: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Merge frame-level open-vocabulary boxes into coarse object prompts.
+
+    The result intentionally keeps object instances, not texture fragments: bed
+    part labels can merge to one bed instance, while separate windows/doors can
+    survive as multiple instances when their boxes are spatially distinct.
+    """
+
+    candidates_by_frame: dict[str, list[dict[str, Any]]] = {}
+    skipped: list[dict[str, Any]] = []
+    for index, raw in enumerate(detections, start=1):
+        try:
+            label, category = label_from_detection(raw, index)
+            grouped_label = detection_group_key(label, merge_bed_parts)
+            frame_id = frame_stem(raw.get("frame_id") or raw.get("frame") or "000000")
+            bbox = normalize_bbox(bbox_from_detection(raw), width, height, str(raw.get("bbox_format") or raw.get("format") or "xyxy"))
+            if bbox_area(bbox) <= 0:
+                skipped.append({"index": index, "reason": "empty_bbox"})
+                continue
+            item = dict(raw)
+            item.update(
+                {
+                    "raw_index": index,
+                    "label": normalize_detection_label(label),
+                    "category": object_level_detection_label(category or label, merge_bed_parts),
+                    "group_label": grouped_label,
+                    "frame_id": frame_id,
+                    "bbox": list(bbox),
+                    "bbox_format": "xyxy",
+                    "score": score_from_detection(raw),
+                    "mask_area": int(raw.get("mask_area") or bbox_area(bbox)),
+                    "description": raw.get("description") or raw.get("caption") or f"GroundingDINO detection: {label}.",
+                }
+            )
+            candidates_by_frame.setdefault(frame_id, []).append(item)
+        except Exception as exc:
+            skipped.append({"index": index, "reason": "parse_error", "error": str(exc)})
+
+    filtered: list[dict[str, Any]] = []
+    for _frame_id, frame_candidates in sorted(candidates_by_frame.items()):
+        per_label: dict[str, list[dict[str, Any]]] = {}
+        for item in frame_candidates:
+            per_label.setdefault(str(item["group_label"]), []).append(item)
+        for label, label_candidates in per_label.items():
+            label_containment_overlap = 2.0 if label == "bed" and merge_bed_parts else containment_overlap
+            filtered.extend(
+                filter_prompt_candidates(
+                    label_candidates,
+                    width,
+                    height,
+                    min_area_ratio,
+                    max_area_ratio,
+                    min_width,
+                    min_height,
+                    0,
+                    nms_iou,
+                    label_containment_overlap,
+                    containment_area_ratio,
+                    granularity,
+                    min_parent_area_ratio,
+                )
+            )
+
+    groups_by_label: dict[str, list[dict[str, Any]]] = {}
+    for candidate in sorted(filtered, key=lambda item: float(item.get("score", 0.0)), reverse=True):
+        label = str(candidate["group_label"])
+        bbox = tuple(candidate["bbox"])
+        assigned = None
+        for group in groups_by_label.setdefault(label, []):
+            reference = tuple(group["bbox"])
+            if bbox_iou(bbox, reference) >= instance_iou or bbox_center_distance_ratio(bbox, reference) <= instance_center_distance:
+                assigned = group
+                break
+        if assigned is None:
+            if max_instances_per_label > 0 and len(groups_by_label[label]) >= max_instances_per_label:
+                skipped.append({"index": candidate.get("raw_index"), "reason": "max_instances_per_label", "label": label})
+                continue
+            assigned = {
+                "label": label,
+                "category": label,
+                "detections": [],
+                "bboxes": [],
+                "scores": [],
+                "best": candidate,
+                "bbox": tuple(candidate["bbox"]),
+            }
+            groups_by_label[label].append(assigned)
+        assigned["detections"].append(candidate)
+        assigned["bboxes"].append(tuple(candidate["bbox"]))
+        assigned["scores"].append(float(candidate.get("score", 0.0)))
+        if float(candidate.get("score", 0.0)) > float(assigned["best"].get("score", 0.0)):
+            assigned["best"] = candidate
+        if label == "bed" and merge_bed_parts:
+            assigned["bbox"] = bbox_union(assigned["bboxes"])
+        else:
+            assigned["bbox"] = tuple(assigned["best"]["bbox"])
+
+    prompts: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    sorted_groups = sorted(
+        [group for groups in groups_by_label.values() for group in groups],
+        key=lambda group: (len(group["detections"]), max(group["scores"]) if group["scores"] else 0.0, bbox_area(tuple(group["bbox"]))),
+        reverse=True,
+    )
+    if max_objects > 0:
+        sorted_groups = sorted_groups[:max_objects]
+    for index, group in enumerate(sorted_groups, start=1):
+        label = str(group["label"])
+        best = group["best"]
+        object_id_base = slugify(f"{object_prefix}_{label}", fallback=f"{object_prefix}_{index:02d}")
+        object_id = object_id_base
+        suffix = 2
+        while object_id in used_ids:
+            object_id = f"{object_id_base}_{suffix}"
+            suffix += 1
+        used_ids.add(object_id)
+        bbox = normalize_bbox(group["bbox"], width, height)
+        source_labels = sorted({str(item.get("label") or label) for item in group["detections"]})
+        prompts.append(
+            {
+                "id": object_id,
+                "object_id": object_id,
+                "name": label,
+                "category": label,
+                "description": f"GroundingDINO object-level prompt merged from {len(group['detections'])} detection(s): {', '.join(source_labels)}.",
+                "frame_id": best["frame_id"],
+                "bbox": list(bbox),
+                "bbox_format": "xyxy",
+                "score": max(group["scores"]) if group["scores"] else 0.0,
+                "detection_count": len(group["detections"]),
+                "source": "groundingdino_object_discovery",
+                "open_vocab": {
+                    "provider": "groundingdino",
+                    "label": label,
+                    "source_labels": source_labels,
+                    "anchor_frames": sorted({str(item.get("frame_id")) for item in group["detections"]}),
+                },
+                "merged_detections": [
+                    {
+                        "frame_id": item.get("frame_id"),
+                        "label": item.get("label"),
+                        "bbox": item.get("bbox"),
+                        "score": item.get("score"),
+                        "raw_index": item.get("raw_index"),
+                    }
+                    for item in group["detections"]
+                ],
+            }
+        )
+    return prompts, skipped
+
+
+def groundingdino_caption_from_queries(queries: list[str]) -> str:
+    labels = []
+    seen = set()
+    for query in queries:
+        label = normalize_detection_label(query)
+        if label and label not in seen:
+            labels.append(label)
+            seen.add(label)
+    return " . ".join(labels) + " ."
+
+
+def resolve_groundingdino_config(config: Path | None, groundingdino_root: Path | None) -> str | None:
+    candidates: list[Path] = []
+    if config:
+        candidates.append(config)
+    if groundingdino_root:
+        root = groundingdino_root.expanduser().resolve()
+        candidates.extend(
+            [
+                root / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py",
+                root / "groundingdino" / "config" / "GroundingDINO_SwinB_cfg.py",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(config) if config else None
+
+
+def load_groundingdino_model(args: argparse.Namespace):
+    groundingdino_root = getattr(args, "groundingdino_root", None)
+    if groundingdino_root:
+        root = str(Path(groundingdino_root).expanduser().resolve())
+        if root not in sys.path:
+            sys.path.insert(0, root)
+    try:
+        from groundingdino.util.inference import load_image, load_model, predict  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "GroundingDINO is not installed or importable. Install GroundingDINO on the server, "
+            "or pass --groundingdino-root pointing at a cloned GroundingDINO repo."
+        ) from exc
+    config_path = resolve_groundingdino_config(getattr(args, "groundingdino_config", None), groundingdino_root)
+    if not config_path:
+        raise FileNotFoundError("GroundingDINO config not found. Pass --groundingdino-config.")
+    checkpoint = getattr(args, "groundingdino_checkpoint", None)
+    if checkpoint is None or not Path(checkpoint).exists():
+        raise FileNotFoundError("GroundingDINO checkpoint not found. Pass --groundingdino-checkpoint.")
+    device = str(getattr(args, "groundingdino_device", "auto") or "auto")
+    if device == "auto":
+        try:
+            import torch  # type: ignore
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+    return load_model(config_path, str(Path(checkpoint).resolve()), device=device), predict, load_image, device, config_path
+
+
+def groundingdino_boxes_to_xyxy(boxes: Any, width: int, height: int) -> list[tuple[int, int, int, int]]:
+    np = import_numpy()
+    values = boxes.detach().cpu().numpy() if hasattr(boxes, "detach") else np.asarray(boxes)
+    result = []
+    for box in values:
+        cx, cy, bw, bh = [float(value) for value in box[:4]]
+        x0 = (cx - bw * 0.5) * width
+        y0 = (cy - bh * 0.5) * height
+        x1 = (cx + bw * 0.5) * width
+        y1 = (cy + bh * 0.5) * height
+        result.append(normalize_bbox([x0, y0, x1, y1], width, height, "xyxy"))
+    return result
+
+
+def label_from_groundingdino_phrase(phrase: Any, queries: list[str]) -> str:
+    text = normalize_detection_label(str(phrase or ""))
+    if not text:
+        return queries[0] if queries else "object"
+    # GroundingDINO may return composite phrases; keep the first known query that
+    # appears in the phrase, otherwise keep the phrase itself.
+    for query in sorted(queries, key=len, reverse=True):
+        normalized_query = normalize_detection_label(query)
+        if normalized_query and normalized_query in text:
+            return normalized_query
+    return text.split(".")[0].strip() or text
+
+
+def run_groundingdino_detections(
+    *,
+    model: Any,
+    predict_fn: Any,
+    load_image_fn: Any,
+    frames: list[Path],
+    queries: list[str],
+    box_threshold: float,
+    text_threshold: float,
+    device: str,
+) -> list[dict[str, Any]]:
+    detections: list[dict[str, Any]] = []
+    caption = groundingdino_caption_from_queries(queries)
+    for frame in frames:
+        image_source, image_tensor = load_image_fn(str(frame))
+        height, width = int(image_source.shape[0]), int(image_source.shape[1])
+        try:
+            boxes, logits, phrases = predict_fn(
+                model=model,
+                image=image_tensor,
+                caption=caption,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                device=device,
+            )
+        except TypeError:
+            boxes, logits, phrases = predict_fn(
+                model=model,
+                image=image_tensor,
+                caption=caption,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+            )
+        bboxes = groundingdino_boxes_to_xyxy(boxes, width, height)
+        logit_values = logits.detach().cpu().tolist() if hasattr(logits, "detach") else list(logits)
+        for index, bbox in enumerate(bboxes):
+            phrase = phrases[index] if index < len(phrases) else ""
+            label = label_from_groundingdino_phrase(phrase, queries)
+            detections.append(
+                {
+                    "frame_id": frame_stem(frame.stem),
+                    "image": str(frame),
+                    "label": label,
+                    "category": object_level_detection_label(label, merge_bed_parts=False),
+                    "bbox": list(bbox),
+                    "bbox_format": "xyxy",
+                    "score": float(logit_values[index]) if index < len(logit_values) else 1.0,
+                    "source": "groundingdino",
+                    "phrase": str(phrase),
+                }
+            )
+    return detections
+
+
+def cmd_discover_object_prompts(args: argparse.Namespace) -> int:
+    cv2 = import_cv2()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    frames_dir = args.frames_dir or (project_root / manifest["scene"]["frames_dir"])
+    frames_dir = frames_dir.resolve()
+    frames = list_frame_images(frames_dir)
+    if args.max_frames and args.max_frames > 0:
+        frames = frames[: args.max_frames]
+    anchor_frames = select_anchor_frames(frames, args.anchor_frame_count, args.anchor_frame_ids)
+    if not anchor_frames:
+        raise FileNotFoundError(f"No frames available for object discovery in {frames_dir}")
+    width, height = image_shape(anchor_frames[0])
+    queries = parse_query_list(args.queries)
+    if args.provider != "groundingdino":
+        raise ValueError("discover-object-prompts currently supports --provider groundingdino.")
+
+    model, predict_fn, load_image_fn, device, config_path = load_groundingdino_model(args)
+    raw_detections = run_groundingdino_detections(
+        model=model,
+        predict_fn=predict_fn,
+        load_image_fn=load_image_fn,
+        frames=anchor_frames,
+        queries=queries,
+        box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold,
+        device=device,
+    )
+    objects, skipped = aggregate_object_level_detections(
+        raw_detections,
+        width=width,
+        height=height,
+        max_objects=args.max_objects,
+        min_area_ratio=args.min_area_ratio,
+        max_area_ratio=args.max_area_ratio,
+        min_width=args.min_width,
+        min_height=args.min_height,
+        nms_iou=args.nms_iou,
+        containment_overlap=args.containment_overlap,
+        containment_area_ratio=args.containment_area_ratio,
+        granularity=args.granularity,
+        min_parent_area_ratio=args.min_parent_area_ratio,
+        instance_iou=args.instance_iou,
+        instance_center_distance=args.instance_center_distance,
+        max_instances_per_label=args.max_instances_per_label,
+        merge_bed_parts=args.merge_bed_parts,
+        object_prefix=args.object_prefix,
+    )
+
+    output_path = args.output or (project_root / "masks" / "object_prompts_groundingdino.json")
+    output_path = output_path if output_path.is_absolute() else project_root / output_path
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Prompt file already exists: {output_path}. Pass --overwrite to replace it.")
+    preview_path = args.preview_output or output_path.with_name(f"{output_path.stem}_preview.png")
+    preview_path = preview_path if preview_path.is_absolute() else project_root / preview_path
+    preview_frame_id = objects[0]["frame_id"] if objects else frame_stem(anchor_frames[0].stem)
+    preview_frame = find_frame_image(frames_dir, preview_frame_id) or anchor_frames[0]
+    preview_image = cv2.imread(str(preview_frame))
+    if preview_image is None:
+        raise RuntimeError(f"Failed to read preview frame: {preview_frame}")
+    preview_objects = [obj for obj in objects if obj["frame_id"] == preview_frame_id] or objects
+    write_prompt_preview(preview_image, preview_objects, preview_path)
+
+    labels_path = args.object_labels or (project_root / "masks" / "object_labels.json")
+    labels_path = labels_path if labels_path.is_absolute() else project_root / labels_path
+    labels = load_object_labels(project_root, labels_path if labels_path.exists() else None)
+    for obj in objects:
+        labels[obj["object_id"]] = merge_object_label(
+            labels.get(obj["object_id"], {}),
+            {
+                "object_id": obj["object_id"],
+                "name": obj["name"],
+                "category": obj["category"],
+                "description": obj["description"],
+                "confidence": obj.get("score"),
+                "source": "groundingdino",
+                "open_vocab_labels": obj.get("open_vocab", {}).get("source_labels", [obj["name"]]),
+            },
+            True,
+        )
+
+    prompt_manifest = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": "groundingdino_object_level_discovery",
+        "provider": args.provider,
+        "frames_dir": str(frames_dir),
+        "anchor_frames": [str(frame) for frame in anchor_frames],
+        "queries": queries,
+        "image_size": {"w": width, "h": height},
+        "candidate_count": len(raw_detections),
+        "object_count": len(objects),
+        "skipped": skipped,
+        "groundingdino": {
+            "checkpoint": str(args.groundingdino_checkpoint.resolve()) if args.groundingdino_checkpoint else None,
+            "config": config_path,
+            "device": device,
+            "box_threshold": args.box_threshold,
+            "text_threshold": args.text_threshold,
+        },
+        "filters": {
+            "max_objects": args.max_objects,
+            "min_area_ratio": args.min_area_ratio,
+            "max_area_ratio": args.max_area_ratio,
+            "min_width": args.min_width,
+            "min_height": args.min_height,
+            "nms_iou": args.nms_iou,
+            "containment_overlap": args.containment_overlap,
+            "containment_area_ratio": args.containment_area_ratio,
+            "granularity": args.granularity,
+            "min_parent_area_ratio": args.min_parent_area_ratio,
+            "instance_iou": args.instance_iou,
+            "instance_center_distance": args.instance_center_distance,
+            "max_instances_per_label": args.max_instances_per_label,
+            "merge_bed_parts": args.merge_bed_parts,
+        },
+        "raw_detections": raw_detections if args.keep_raw_detections else [],
+        "preview_image": str(preview_path),
+        "objects": objects,
+        "notes": (
+            "GroundingDINO detections from multiple anchor frames were merged into object-level bbox prompts. "
+            "Use these prompts with SAM2 video tracking to generate dense multi-frame 2D masks."
+        ),
+    }
+    write_json(output_path, prompt_manifest)
+    write_json(labels_path, labels)
+    manifest.setdefault("artifacts", {})["groundingdino_object_prompts"] = str(output_path)
+    manifest.setdefault("artifacts", {})["tracking_prompts"] = str(output_path)
+    manifest.setdefault("artifacts", {})["groundingdino_object_prompts_preview"] = str(preview_path)
+    manifest.setdefault("artifacts", {})["object_labels"] = str(labels_path)
+    manifest.setdefault("external_stages", {})["open_vocab_object_discovery"] = {
+        "status": "groundingdino_object_prompts_generated",
+        "provider": "groundingdino",
+        "prompt_file": str(output_path),
+        "object_count": len(objects),
+        "candidate_count": len(raw_detections),
+        "anchor_frame_count": len(anchor_frames),
+        "notes": "Generated object-level prompts with GroundingDINO and coarse instance merging.",
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Generated {len(objects)} GroundingDINO object prompt(s): {output_path}")
+    print(f"Candidates: {len(raw_detections)}; anchor_frames={len(anchor_frames)}")
+    print(f"Preview: {preview_path}")
+    return 0
 
 
 def open_vocab_detection_template(
@@ -30429,6 +30997,52 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
             append_pipeline_step(steps, "render_gsplat_preview", "skipped", "--render-gsplat-preview not set")
 
         prompts_path = args.prompts
+        if args.discover_object_prompts and not prompts_path:
+            cmd_discover_object_prompts(
+                argparse.Namespace(
+                    project_root=project_root,
+                    frames_dir=working_frames_dir,
+                    provider="groundingdino",
+                    queries=args.object_prompt_queries,
+                    output=args.object_prompts_output,
+                    preview_output=None,
+                    object_labels=None,
+                    max_frames=args.object_prompt_max_frames,
+                    anchor_frame_count=args.object_prompt_anchor_frame_count,
+                    anchor_frame_ids=args.object_prompt_anchor_frame_ids,
+                    groundingdino_root=args.groundingdino_root,
+                    groundingdino_config=args.groundingdino_config,
+                    groundingdino_checkpoint=args.groundingdino_checkpoint,
+                    groundingdino_device=args.groundingdino_device,
+                    box_threshold=args.groundingdino_box_threshold,
+                    text_threshold=args.groundingdino_text_threshold,
+                    max_objects=args.object_prompt_max_objects,
+                    min_area_ratio=args.object_prompt_min_area_ratio,
+                    max_area_ratio=args.object_prompt_max_area_ratio,
+                    min_width=args.object_prompt_min_width,
+                    min_height=args.object_prompt_min_height,
+                    nms_iou=args.object_prompt_nms_iou,
+                    containment_overlap=args.object_prompt_containment_overlap,
+                    containment_area_ratio=args.object_prompt_containment_area_ratio,
+                    granularity=args.object_prompt_granularity,
+                    min_parent_area_ratio=args.object_prompt_min_parent_area_ratio,
+                    instance_iou=args.object_prompt_instance_iou,
+                    instance_center_distance=args.object_prompt_instance_center_distance,
+                    max_instances_per_label=args.object_prompt_max_instances_per_label,
+                    merge_bed_parts=args.object_prompt_merge_bed_parts,
+                    object_prefix=args.object_prompt_object_prefix,
+                    keep_raw_detections=args.object_prompt_keep_raw_detections,
+                    overwrite=True,
+                )
+            )
+            manifest = load_manifest(project_root)
+            prompts_path = Path(manifest.get("artifacts", {}).get("tracking_prompts", project_root / "masks" / "object_prompts_groundingdino.json"))
+            append_pipeline_step(steps, "discover_object_prompts", "completed", str(prompts_path))
+        elif args.discover_object_prompts:
+            append_pipeline_step(steps, "discover_object_prompts", "skipped", "--prompts provided")
+        else:
+            append_pipeline_step(steps, "discover_object_prompts", "skipped", "--discover-object-prompts not set")
+
         if args.auto_prompts and not prompts_path:
             cmd_auto_prompts(
                 argparse.Namespace(
@@ -31462,6 +32076,42 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.set_defaults(func=cmd_prepare_open_vocab_detection_jobs)
+
+    p = sub.add_parser("discover-object-prompts", help="Run GroundingDINO on anchor frames and merge detections into object-level bbox prompts.")
+    add_common_project_arg(p)
+    p.add_argument("--frames-dir", type=Path, help="Defaults to scene/frames.")
+    p.add_argument("--provider", choices=["groundingdino"], default="groundingdino")
+    p.add_argument("--queries", help="Comma-separated queries, a .txt file, or a JSON file with queries/labels/categories.")
+    p.add_argument("--output", type=Path, help="Defaults to masks/object_prompts_groundingdino.json.")
+    p.add_argument("--preview-output", type=Path, help="Defaults to masks/object_prompts_groundingdino_preview.png.")
+    p.add_argument("--object-labels", type=Path, help="Defaults to masks/object_labels.json.")
+    p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument("--anchor-frame-count", type=int, default=5)
+    p.add_argument("--anchor-frame-ids", nargs="+", help="Explicit frame ids to use as GroundingDINO anchor frames.")
+    p.add_argument("--groundingdino-root", type=Path, help="Optional cloned GroundingDINO repo root added to PYTHONPATH.")
+    p.add_argument("--groundingdino-config", type=Path, help="GroundingDINO config .py, e.g. GroundingDINO_SwinT_OGC.py.")
+    p.add_argument("--groundingdino-checkpoint", type=Path, help="GroundingDINO checkpoint .pth.")
+    p.add_argument("--groundingdino-device", default="auto")
+    p.add_argument("--box-threshold", type=float, default=0.28)
+    p.add_argument("--text-threshold", type=float, default=0.25)
+    p.add_argument("--max-objects", type=int, default=20)
+    p.add_argument("--min-area-ratio", type=float, default=0.001)
+    p.add_argument("--max-area-ratio", type=float, default=0.70)
+    p.add_argument("--min-width", type=int, default=8)
+    p.add_argument("--min-height", type=int, default=8)
+    p.add_argument("--nms-iou", type=float, default=0.65)
+    p.add_argument("--containment-overlap", type=float, default=0.9)
+    p.add_argument("--containment-area-ratio", type=float, default=1.8)
+    p.add_argument("--granularity", choices=MASK_GRANULARITY_CHOICES, default="object")
+    p.add_argument("--min-parent-area-ratio", type=float, default=0.03)
+    p.add_argument("--instance-iou", type=float, default=0.18)
+    p.add_argument("--instance-center-distance", type=float, default=0.75)
+    p.add_argument("--max-instances-per-label", type=int, default=4)
+    p.add_argument("--merge-bed-parts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--object-prefix", default="gdino_object")
+    p.add_argument("--keep-raw-detections", action="store_true")
+    p.add_argument("--overwrite", action="store_true")
+    p.set_defaults(func=cmd_discover_object_prompts)
 
     p = sub.add_parser("import-open-vocab-detections", help="Import external open-vocabulary detections as tracking prompts and object labels.")
     add_common_project_arg(p)
@@ -32515,6 +33165,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE"], default="PINHOLE")
     p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="copy")
     p.add_argument("--prompts", type=Path)
+    p.add_argument("--discover-object-prompts", action="store_true", help="Run GroundingDINO object-level prompt discovery before track-masks when --prompts is not provided.")
+    p.add_argument("--object-prompts-output", type=Path, help="Defaults to masks/object_prompts_groundingdino.json.")
+    p.add_argument("--object-prompt-queries", help="GroundingDINO query list: comma-separated, .txt, or JSON.")
+    p.add_argument("--object-prompt-max-frames", type=int, default=0)
+    p.add_argument("--object-prompt-anchor-frame-count", type=int, default=5)
+    p.add_argument("--object-prompt-anchor-frame-ids", nargs="+")
+    p.add_argument("--groundingdino-root", type=Path)
+    p.add_argument("--groundingdino-config", type=Path)
+    p.add_argument("--groundingdino-checkpoint", type=Path)
+    p.add_argument("--groundingdino-device", default="auto")
+    p.add_argument("--groundingdino-box-threshold", type=float, default=0.28)
+    p.add_argument("--groundingdino-text-threshold", type=float, default=0.25)
+    p.add_argument("--object-prompt-max-objects", type=int, default=20)
+    p.add_argument("--object-prompt-min-area-ratio", type=float, default=0.001)
+    p.add_argument("--object-prompt-max-area-ratio", type=float, default=0.70)
+    p.add_argument("--object-prompt-min-width", type=int, default=8)
+    p.add_argument("--object-prompt-min-height", type=int, default=8)
+    p.add_argument("--object-prompt-nms-iou", type=float, default=0.65)
+    p.add_argument("--object-prompt-containment-overlap", type=float, default=0.9)
+    p.add_argument("--object-prompt-containment-area-ratio", type=float, default=1.8)
+    p.add_argument("--object-prompt-granularity", choices=MASK_GRANULARITY_CHOICES, default="object")
+    p.add_argument("--object-prompt-min-parent-area-ratio", type=float, default=0.03)
+    p.add_argument("--object-prompt-instance-iou", type=float, default=0.18)
+    p.add_argument("--object-prompt-instance-center-distance", type=float, default=0.75)
+    p.add_argument("--object-prompt-max-instances-per-label", type=int, default=4)
+    p.add_argument("--object-prompt-merge-bed-parts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--object-prompt-object-prefix", default="gdino_object")
+    p.add_argument("--object-prompt-keep-raw-detections", action="store_true")
     p.add_argument("--auto-prompts", action="store_true", help="Generate bbox prompts automatically before track-masks when --prompts is not provided.")
     p.add_argument("--auto-prompts-output", type=Path, help="Defaults to masks/auto_prompts.json.")
     p.add_argument("--auto-prompt-frame-id")
