@@ -68,6 +68,7 @@ wandb/
 logs/
 tmp/
 temp/
+supersplat_server/
 
 # Unity generated state
 UnityProjectBedroom100/
