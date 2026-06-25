@@ -918,7 +918,15 @@ def write_supersplat_ply(
     quats,
     labels=None,
     probabilities=None,
+    normals=None,
+    f_rest=None,
 ) -> None:
+    """Write a strict SuperSplat/GraphDECO-style Gaussian PLY.
+
+    Object labels are intentionally not embedded here. Some SuperSplat builds
+    reject unknown vertex properties, so semantic metadata is written as a
+    sidecar by export_viewer_plys instead.
+    """
     np = import_numpy()
     means_np = np.asarray(means, dtype=np.float32)
     colors_np = np.clip(np.asarray(colors, dtype=np.float32), 0.0, 1.0)
@@ -926,26 +934,86 @@ def write_supersplat_ply(
     scales_np = np.log(np.clip(np.asarray(scales, dtype=np.float32), 1e-8, None))
     quats_np = np.asarray(quats, dtype=np.float32)
     dc_np = rgb_to_sh_dc(colors_np)
-    labels_np = None if labels is None else np.asarray(labels, dtype=np.int32).reshape(-1)
-    probabilities_np = None if probabilities is None else np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    normals_np = None if normals is None else np.asarray(normals, dtype=np.float32)
+    f_rest_np = None if f_rest is None else np.asarray(f_rest, dtype=np.float32)
     if not (means_np.shape[0] == colors_np.shape[0] == opacities_np.shape[0] == scales_np.shape[0] == quats_np.shape[0]):
         raise ValueError("Supersplat arrays must have the same vertex count")
-    if labels_np is not None and labels_np.shape[0] != means_np.shape[0]:
+    labels_np = None if labels is None else np.asarray(labels, dtype=np.int32).reshape(-1)
+    probabilities_np = None if probabilities is None else np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    vertex_count = means_np.shape[0]
+    if labels_np is not None and labels_np.shape[0] != vertex_count:
         raise ValueError("labels must match the vertex count")
-    if probabilities_np is not None and probabilities_np.shape[0] != means_np.shape[0]:
+    if probabilities_np is not None and probabilities_np.shape[0] != vertex_count:
         raise ValueError("probabilities must match the vertex count")
+    if normals_np is not None and normals_np.shape != (vertex_count, 3):
+        raise ValueError("normals must have shape (N, 3)")
+    if f_rest_np is not None and f_rest_np.shape != (vertex_count, 45):
+        raise ValueError("f_rest must have shape (N, 45)")
+    del labels_np, probabilities_np
+
+    dtype = np.dtype(
+        [
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("nx", "<f4"),
+            ("ny", "<f4"),
+            ("nz", "<f4"),
+            ("f_dc_0", "<f4"),
+            ("f_dc_1", "<f4"),
+            ("f_dc_2", "<f4"),
+            *[(f"f_rest_{idx}", "<f4") for idx in range(45)],
+            ("opacity", "<f4"),
+            ("scale_0", "<f4"),
+            ("scale_1", "<f4"),
+            ("scale_2", "<f4"),
+            ("rot_0", "<f4"),
+            ("rot_1", "<f4"),
+            ("rot_2", "<f4"),
+            ("rot_3", "<f4"),
+        ]
+    )
+    rows = np.zeros(vertex_count, dtype=dtype)
+    rows["x"] = means_np[:, 0]
+    rows["y"] = means_np[:, 1]
+    rows["z"] = means_np[:, 2]
+    if normals_np is not None:
+        rows["nx"] = normals_np[:, 0]
+        rows["ny"] = normals_np[:, 1]
+        rows["nz"] = normals_np[:, 2]
+    rows["f_dc_0"] = dc_np[:, 0]
+    rows["f_dc_1"] = dc_np[:, 1]
+    rows["f_dc_2"] = dc_np[:, 2]
+    if f_rest_np is not None:
+        for idx in range(45):
+            rows[f"f_rest_{idx}"] = f_rest_np[:, idx]
+    rows["opacity"] = opacities_np
+    rows["scale_0"] = scales_np[:, 0]
+    rows["scale_1"] = scales_np[:, 1]
+    rows["scale_2"] = scales_np[:, 2]
+    rows["rot_0"] = quats_np[:, 0]
+    rows["rot_1"] = quats_np[:, 1]
+    rows["rot_2"] = quats_np[:, 2]
+    rows["rot_3"] = quats_np[:, 3]
+
     ensure_dir(path.parent)
-    with path.open("w", encoding="utf-8") as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {means_np.shape[0]}\n")
-        for name in [
+    with path.open("wb") as f:
+        header_lines = [
+            "ply",
+            "format binary_little_endian 1.0",
+            f"element vertex {vertex_count}",
+        ]
+        for name in (
             "x",
             "y",
             "z",
+            "nx",
+            "ny",
+            "nz",
             "f_dc_0",
             "f_dc_1",
             "f_dc_2",
+            *[f"f_rest_{idx}" for idx in range(45)],
             "opacity",
             "scale_0",
             "scale_1",
@@ -954,35 +1022,42 @@ def write_supersplat_ply(
             "rot_1",
             "rot_2",
             "rot_3",
-        ]:
-            f.write(f"property float {name}\n")
-        if labels_np is not None:
-            f.write("property int object_id\n")
-        if probabilities_np is not None:
-            f.write("property float object_probability\n")
-        f.write("end_header\n")
-        for idx, (point, dc, opacity, scale, quat) in enumerate(zip(means_np, dc_np, opacities_np, scales_np, quats_np)):
-            values = [
-                f"{float(point[0]):.8f}",
-                f"{float(point[1]):.8f}",
-                f"{float(point[2]):.8f}",
-                f"{float(dc[0]):.8f}",
-                f"{float(dc[1]):.8f}",
-                f"{float(dc[2]):.8f}",
-                f"{float(opacity):.8f}",
-                f"{float(scale[0]):.8f}",
-                f"{float(scale[1]):.8f}",
-                f"{float(scale[2]):.8f}",
-                f"{float(quat[0]):.8f}",
-                f"{float(quat[1]):.8f}",
-                f"{float(quat[2]):.8f}",
-                f"{float(quat[3]):.8f}",
-            ]
-            if labels_np is not None:
-                values.append(str(int(labels_np[idx])))
-            if probabilities_np is not None:
-                values.append(f"{float(probabilities_np[idx]):.8f}")
-            f.write(" ".join(values) + "\n")
+        ):
+            header_lines.append(f"property float {name}")
+        header_lines.append("end_header")
+        f.write(("\n".join(header_lines) + "\n").encode("ascii"))
+        rows.tofile(f)
+
+
+def write_supersplat_label_sidecar(path: Path, labels, probabilities=None) -> Path | None:
+    if labels is None and probabilities is None:
+        return None
+    np = import_numpy()
+    labels_np = None if labels is None else np.asarray(labels, dtype=np.int32).reshape(-1)
+    probabilities_np = None if probabilities is None else np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    if labels_np is not None:
+        vertex_count = int(labels_np.shape[0])
+    elif probabilities_np is not None:
+        vertex_count = int(probabilities_np.shape[0])
+    else:
+        return None
+    if probabilities_np is not None and probabilities_np.shape[0] != vertex_count:
+        raise ValueError("probabilities must match the label sidecar vertex count")
+    sidecar = path.with_name(f"{path.stem}_labels.json")
+    payload: dict[str, Any] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source_ply": str(path),
+        "vertex_count": vertex_count,
+        "notes": "Per-vertex semantic metadata kept outside the SuperSplat PLY for viewer compatibility.",
+    }
+    if labels_np is not None:
+        unique, counts = np.unique(labels_np, return_counts=True)
+        payload["object_id"] = labels_np.astype(int).tolist()
+        payload["object_id_distribution"] = {str(int(label)): int(count) for label, count in zip(unique, counts)}
+    if probabilities_np is not None:
+        payload["object_probability"] = [float(value) for value in probabilities_np]
+    write_json(sidecar, payload)
+    return sidecar
 
 
 def qvec_to_rotmat(qvec: list[float]):
@@ -1833,6 +1908,83 @@ def _run_logged_command(command: list[str], *, cwd: Path | None, log_path: Path)
     return int(completed.returncode)
 
 
+def colmap_sparse_model_stats(model_dir: Path) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "path": str(model_dir),
+        "image_count": 0,
+        "point_count": 0,
+        "has_binary_model": all((model_dir / name).exists() for name in ("cameras.bin", "images.bin", "points3D.bin")),
+        "has_text_model": all((model_dir / name).exists() for name in ("cameras.txt", "images.txt", "points3D.txt")),
+    }
+    images_txt = model_dir / "images.txt"
+    points_txt = model_dir / "points3D.txt"
+    if images_txt.exists():
+        try:
+            stats["image_count"] = len(read_colmap_text_images(images_txt))
+        except Exception as exc:
+            stats["image_parse_error"] = str(exc)
+    if points_txt.exists():
+        stats["point_count"] = count_colmap_points3d(points_txt) or 0
+    return stats
+
+
+def select_colmap_sparse_model(
+    sparse_root: Path,
+    preferred_model_dir: Path | None = None,
+    *,
+    colmap_bin: str | Path | None = None,
+    text_output_root: Path | None = None,
+    logs_dir: Path | None = None,
+) -> tuple[Path, list[dict[str, Any]]]:
+    candidates = sorted((path for path in sparse_root.iterdir() if path.is_dir()), key=lambda path: path.name)
+    if not candidates:
+        raise FileNotFoundError(f"COLMAP mapper did not produce a sparse model under {sparse_root}")
+    if preferred_model_dir and preferred_model_dir.exists() and preferred_model_dir.is_dir() and preferred_model_dir not in candidates:
+        candidates.append(preferred_model_dir)
+
+    stats: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = colmap_sparse_model_stats(candidate)
+        if (
+            item["image_count"] == 0
+            and colmap_bin
+            and text_output_root
+            and item.get("has_binary_model")
+        ):
+            tmp_text = ensure_dir(text_output_root / f"_model_select_{candidate.name}")
+            log_path = (logs_dir or text_output_root) / f"model_converter_select_{candidate.name}.log"
+            returncode = _run_logged_command(
+                [
+                    str(colmap_bin),
+                    "model_converter",
+                    "--input_path",
+                    str(candidate),
+                    "--output_path",
+                    str(tmp_text),
+                    "--output_type",
+                    "TXT",
+                ],
+                cwd=None,
+                log_path=log_path,
+            )
+            item["selection_text_dir"] = str(tmp_text)
+            item["selection_converter_returncode"] = returncode
+            if returncode == 0:
+                item.update(colmap_sparse_model_stats(tmp_text))
+                item["path"] = str(candidate)
+        stats.append(item)
+
+    selected_stats = max(
+        stats,
+        key=lambda item: (
+            int(item.get("image_count") or 0),
+            int(item.get("point_count") or 0),
+            Path(str(item.get("path"))).name,
+        ),
+    )
+    return Path(str(selected_stats["path"])).resolve(), stats
+
+
 def cmd_run_colmap(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -1969,12 +2121,15 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
             *shlex.split(args.mapper_extra_args or ""),
         ],
     )
-    if not sparse_model_dir.exists():
-        candidates = sorted((path for path in sparse_root.iterdir() if path.is_dir()), key=lambda path: path.name)
-        if not candidates:
-            raise FileNotFoundError(f"COLMAP mapper did not produce a sparse model under {sparse_root}")
-        sparse_model_dir = candidates[0]
-        report["sparse_model_dir"] = str(sparse_model_dir)
+    sparse_model_dir, sparse_model_candidates = select_colmap_sparse_model(
+        sparse_root,
+        sparse_model_dir if sparse_model_dir.exists() else None,
+        colmap_bin=colmap_bin,
+        text_output_root=text_sparse_dir.parent,
+        logs_dir=logs_dir,
+    )
+    report["sparse_model_dir"] = str(sparse_model_dir)
+    report["sparse_model_candidates"] = sparse_model_candidates
     run_step(
         "model_converter",
         [
@@ -3639,12 +3794,28 @@ def read_gsplat_ply(path: Path) -> dict[str, Any]:
         ],
         axis=1,
     )
+    normals = None
+    if {"nx", "ny", "nz"}.issubset(names):
+        normals = np.stack(
+            [
+                np.asarray(data["nx"], dtype=np.float32),
+                np.asarray(data["ny"], dtype=np.float32),
+                np.asarray(data["nz"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+    f_rest = None
+    f_rest_names = [f"f_rest_{idx}" for idx in range(45)]
+    if set(f_rest_names).issubset(names):
+        f_rest = np.stack([np.asarray(data[name], dtype=np.float32) for name in f_rest_names], axis=1)
     return {
         "means": points,
         "colors": colors,
         "opacities": opacities,
         "scales": scales,
         "quats": quats,
+        "normals": normals,
+        "f_rest": f_rest,
         "properties": properties,
     }
 
@@ -3699,6 +3870,7 @@ def export_viewer_plys(
     display_colors = data["colors"]
     if labels is not None:
         display_colors = semantic_colors_for_labels(np.asarray(labels, dtype=np.int64)) / 255.0
+    f_rest = None if labels is not None else data.get("f_rest")
     plain_path = output_dir / f"{prefix}_point_cloud.ply"
     supersplat_path = output_dir / f"{prefix}_supersplat.ply"
     write_point_cloud_ascii_ply(plain_path, data["means"], display_colors)
@@ -3711,7 +3883,10 @@ def export_viewer_plys(
         data["quats"],
         labels=labels,
         probabilities=probabilities,
+        normals=data.get("normals"),
+        f_rest=f_rest,
     )
+    label_sidecar = write_supersplat_label_sidecar(supersplat_path, labels, probabilities)
     return {
         "source_ply": str(source_ply),
         "point_cloud_ply": str(plain_path),
@@ -3725,16 +3900,20 @@ def export_viewer_plys(
         "supersplat_ply_info": {
             "path": str(supersplat_path),
             "format": "graphdeco_supersplat_ply",
-            "includes_object_id": bool(labels is not None),
-            "includes_object_probability": bool(probabilities is not None),
+            "encoding": "binary_little_endian",
+            "includes_object_id": False,
+            "includes_object_probability": False,
+            "label_sidecar": str(label_sidecar) if label_sidecar else None,
         },
         "vertex_count": int(data["means"].shape[0]),
         "includes_object_id": bool(labels is not None),
         "includes_object_probability": bool(probabilities is not None),
+        "label_sidecar": str(label_sidecar) if label_sidecar else None,
         "notes": (
             "point_cloud_ply is a plain XYZ/RGB PLY for Preview/CloudCompare. "
-            "supersplat_ply uses GraphDECO/SuperSplat Gaussian fields f_dc_*, opacity, scale_*, and rot_*; "
-            "semantic exports preserve object_id/object_probability when present."
+            "supersplat_ply uses binary GraphDECO/SuperSplat Gaussian fields including f_dc_*, f_rest_*, "
+            "opacity, scale_*, and rot_*; semantic object_id/object_probability metadata is stored in "
+            "label_sidecar when present."
         ),
     }
 

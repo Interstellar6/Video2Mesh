@@ -1,11 +1,15 @@
+import json
 from argparse import Namespace
 from pathlib import Path
 
 from video2mesh.cli import (
     apply_3dgs_sparse_filter,
+    export_viewer_plys,
     filter_colmap_points3d_file,
     make_object_masks_exclusive,
+    parse_ply_vertex_header,
     prepare_3dgs_colmap_source,
+    select_colmap_sparse_model,
     source_labels_from_object_masks,
     write_json,
 )
@@ -208,3 +212,73 @@ def test_prepare_3dgs_source_reuses_real_colmap_sparse_then_filters(tmp_path: Pa
         if line and not line.startswith("#")
     ]
     assert [line.split()[0] for line in points_lines] == ["1"]
+
+
+def test_select_colmap_sparse_model_prefers_most_registered_images(tmp_path: Path):
+    sparse_root = tmp_path / "sparse"
+    model0 = sparse_root / "0"
+    model1 = sparse_root / "1"
+    for model, image_count, point_count in [(model0, 5, 50), (model1, 50, 10)]:
+        model.mkdir(parents=True)
+        (model / "cameras.txt").write_text("# Camera list\n1 PINHOLE 2 2 1 1 1 1\n", encoding="utf-8")
+        image_lines = ["# Image list"]
+        for idx in range(image_count):
+            image_lines.append(f"{idx + 1} 1 0 0 0 0 0 0 1 {idx:06d}.png")
+            image_lines.append("")
+        (model / "images.txt").write_text("\n".join(image_lines) + "\n", encoding="utf-8")
+        point_lines = ["# Point list"]
+        for idx in range(point_count):
+            point_lines.append(f"{idx + 1} 0 0 0 255 0 0 0.5 1 0 2 0")
+        (model / "points3D.txt").write_text("\n".join(point_lines) + "\n", encoding="utf-8")
+
+    selected, stats = select_colmap_sparse_model(sparse_root, model0)
+
+    assert selected == model1.resolve()
+    assert [(Path(item["path"]).name, item["image_count"]) for item in stats] == [("0", 5), ("1", 50)]
+
+
+def test_export_viewer_plys_keeps_semantic_labels_out_of_supersplat_ply(tmp_path: Path):
+    source = tmp_path / "semantic.ply"
+    source.write_text(
+        "\n".join(
+            [
+                "ply",
+                "format ascii 1.0",
+                "element vertex 2",
+                "property float x",
+                "property float y",
+                "property float z",
+                "property float f_dc_0",
+                "property float f_dc_1",
+                "property float f_dc_2",
+                "property float opacity",
+                "property float scale_0",
+                "property float scale_1",
+                "property float scale_2",
+                "property float rot_0",
+                "property float rot_1",
+                "property float rot_2",
+                "property float rot_3",
+                "property int object_id",
+                "property float object_probability",
+                "end_header",
+                "0 0 0 0 0 0 0 -4 -4 -4 1 0 0 0 3 0.9",
+                "1 0 0 0 0 0 0 -4 -4 -4 1 0 0 0 4 0.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = export_viewer_plys(source, tmp_path, "semantic", include_labels=True)
+
+    header = parse_ply_vertex_header(Path(report["supersplat_ply"]))
+    property_names = [name for name, _prop_type in header["properties"]]
+    assert header["format"] == "binary_little_endian"
+    assert "f_rest_44" in property_names
+    assert "object_id" not in property_names
+    assert "object_probability" not in property_names
+    sidecar = Path(report["label_sidecar"])
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["object_id"] == [3, 4]
+    assert payload["object_probability"] == [0.8999999761581421, 0.800000011920929]
