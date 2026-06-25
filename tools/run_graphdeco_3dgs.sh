@@ -18,9 +18,10 @@ Optional environment overrides:
   SAVE_ITERATIONS="7000 30000"
   TEST_ITERATIONS="7000 30000"
   RESOLUTION=1
-  DENSIFY_UNTIL_ITER=15000
-  DENSIFY_FROM_ITER=500
-  DENSIFICATION_INTERVAL=100
+  DENSIFY_UNTIL_ITER=5000
+  DENSIFY_FROM_ITER=1000
+  DENSIFICATION_INTERVAL=300
+  DENSIFY_GRAD_THRESHOLD=0.002
   OPACITY_RESET_INTERVAL=3000
   SH_DEGREE=3
   GRAPHDECO_EXTRA_ARGS=""
@@ -48,9 +49,10 @@ ITERATIONS="${ITERATIONS:-30000}"
 RESOLUTION="${RESOLUTION:-1}"
 SAVE_ITERATIONS="${SAVE_ITERATIONS:-7000 30000}"
 TEST_ITERATIONS="${TEST_ITERATIONS:-7000 30000}"
-DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER:-15000}"
-DENSIFY_FROM_ITER="${DENSIFY_FROM_ITER:-500}"
-DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL:-100}"
+DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER:-5000}"
+DENSIFY_FROM_ITER="${DENSIFY_FROM_ITER:-1000}"
+DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL:-300}"
+DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD:-0.002}"
 OPACITY_RESET_INTERVAL="${OPACITY_RESET_INTERVAL:-3000}"
 SH_DEGREE="${SH_DEGREE:-3}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
@@ -127,7 +129,7 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
   --camera-model PINHOLE \
   --image-mode copy \
   --prepare-only \
-  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $SAVE_ITERATIONS --test_iterations $TEST_ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --sh_degree $SH_DEGREE --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER --densification_interval $DENSIFICATION_INTERVAL --opacity_reset_interval $OPACITY_RESET_INTERVAL $GRAPHDECO_EXTRA_ARGS --disable_viewer"
+  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $SAVE_ITERATIONS --test_iterations $TEST_ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --sh_degree $SH_DEGREE --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER --densification_interval $DENSIFICATION_INTERVAL --densify_grad_threshold $DENSIFY_GRAD_THRESHOLD --opacity_reset_interval $OPACITY_RESET_INTERVAL $GRAPHDECO_EXTRA_ARGS --disable_viewer"
 
 (
   cd "$GRAPHDECO_ROOT"
@@ -143,6 +145,7 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
     --densify_until_iter "$DENSIFY_UNTIL_ITER" \
     --densify_from_iter "$DENSIFY_FROM_ITER" \
     --densification_interval "$DENSIFICATION_INTERVAL" \
+    --densify_grad_threshold "$DENSIFY_GRAD_THRESHOLD" \
     --opacity_reset_interval "$OPACITY_RESET_INTERVAL" \
     $GRAPHDECO_EXTRA_ARGS \
     --disable_viewer

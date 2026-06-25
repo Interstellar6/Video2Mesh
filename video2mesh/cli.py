@@ -46,6 +46,29 @@ MASK_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 MODEL_EXTENSIONS = {".blend", ".fbx", ".glb", ".obj", ".ply", ".stl", ".usdz"}
 MODEL_EXTENSION_PRIORITY = {".glb": 0, ".obj": 1, ".ply": 2, ".fbx": 3, ".stl": 4, ".usdz": 5, ".blend": 6}
 DEFAULT_SCHEMA_VERSION = 1
+DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES = [
+    "bed",
+    "sofa",
+    "chair",
+    "table",
+    "desk",
+    "nightstand",
+    "cabinet",
+    "dresser",
+    "shelf",
+    "lamp",
+    "plant",
+    "picture",
+    "wall art",
+    "curtain",
+    "door",
+    "window",
+    "floor",
+    "wall",
+    "ceiling",
+]
+DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH = 4
+DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR = 1.0
 SVLGAUSSIAN_TITLE = "SVLGaussian: Single View Language Gaussian Splatting"
 SVLGAUSSIAN_OFFICIAL_DOI = "10.1049/cit2.70148"
 SVLGAUSSIAN_OFFICIAL_URL = "https://ietresearch.onlinelibrary.wiley.com/doi/10.1049/cit2.70148"
@@ -2238,6 +2261,177 @@ def command_from_template(template: str, values: dict[str, str]) -> str:
         raise ValueError(f"Unknown run-3dgs template variable {exc}. Available: {available}") from exc
 
 
+def filter_colmap_points3d_file(
+    src: Path,
+    dst: Path,
+    *,
+    max_error: float,
+    min_track_length: int,
+) -> dict[str, Any]:
+    ensure_dir(dst.parent)
+    total = 0
+    kept = 0
+    skipped_malformed = 0
+    with_track = 0
+    with src.open("r", encoding="utf-8", errors="ignore") as f, dst.open("w", encoding="utf-8") as g:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                g.write(line)
+                continue
+            total += 1
+            parts = stripped.split()
+            if len(parts) < 8:
+                skipped_malformed += 1
+                continue
+            try:
+                error = float(parts[7])
+            except ValueError:
+                skipped_malformed += 1
+                continue
+            track_length = max(0, (len(parts) - 8) // 2)
+            if track_length > 0:
+                with_track += 1
+            if error <= max_error and track_length >= min_track_length:
+                g.write(line)
+                kept += 1
+    return {
+        "enabled": True,
+        "source_points3d": str(src),
+        "output_points3d": str(dst),
+        "max_reprojection_error": float(max_error),
+        "min_track_length": int(min_track_length),
+        "total": int(total),
+        "kept": int(kept),
+        "with_track": int(with_track),
+        "removed": int(total - kept),
+        "skipped_malformed": int(skipped_malformed),
+        "kept_ratio": float(kept / total) if total else 0.0,
+    }
+
+
+def apply_3dgs_sparse_filter(source_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    if not bool(getattr(args, "filter_sparse_points", True)):
+        return {"enabled": False, "reason": "--no-filter-sparse-points"}
+    points_path = source_path / "sparse" / "0" / "points3D.txt"
+    if not points_path.exists():
+        return {"enabled": False, "reason": f"missing {points_path}"}
+    tmp_path = points_path.with_suffix(".filtered.tmp")
+    report = filter_colmap_points3d_file(
+        points_path,
+        tmp_path,
+        max_error=float(getattr(args, "sparse_max_reprojection_error", DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)),
+        min_track_length=int(getattr(args, "sparse_min_track_length", DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)),
+    )
+    if report.get("total") and not report.get("with_track"):
+        tmp_path.unlink(missing_ok=True)
+        report.update(
+            {
+                "enabled": False,
+                "reason": "points3D.txt has no TRACK[] observations; likely exported from a PLY source, so track-length filtering was skipped.",
+                "kept": report.get("total"),
+                "removed": 0,
+                "kept_ratio": 1.0,
+            }
+        )
+        return report
+    shutil.move(str(tmp_path), str(points_path))
+    report["output_points3d"] = str(points_path)
+    return report
+
+
+def existing_colmap_sparse_text_dir(project_root: Path, manifest: dict[str, Any]) -> Path | None:
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    candidates = [
+        resolve_existing_path(artifacts.get("colmap_sparse_text"), project_root),
+        resolve_existing_path(artifacts.get("colmap_text_sparse_dir"), project_root),
+        project_root / "external" / "colmap" / "sparse_text" / "0",
+    ]
+    for candidate in candidates:
+        if candidate and all((candidate / name).exists() for name in ("cameras.txt", "images.txt", "points3D.txt")):
+            return candidate.resolve()
+    return None
+
+
+def prepare_3dgs_colmap_source(
+    project_root: Path,
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+    source_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    use_existing = (
+        getattr(args, "use_existing_colmap_sparse", True)
+        and getattr(args, "camera_info", None) is None
+        and getattr(args, "point_cloud", None) is None
+    )
+    existing_sparse = existing_colmap_sparse_text_dir(project_root, manifest) if use_existing else None
+    point_cloud = getattr(args, "point_cloud", None)
+    if point_cloud is None and existing_sparse is None and hasattr(args, "default_point_cloud"):
+        point_cloud = getattr(args, "default_point_cloud")
+    if existing_sparse is None:
+        export_args = argparse.Namespace(
+            project_root=project_root,
+            output_dir=source_path,
+            frames_dir=getattr(args, "frames_dir", None),
+            camera_info=getattr(args, "camera_info", None),
+            point_cloud=point_cloud,
+            camera_model=args.camera_model,
+            extrinsic_type=args.extrinsic_type,
+            mode=args.image_mode,
+        )
+        cmd_export_colmap(export_args)
+        refreshed = load_manifest(project_root)
+        return refreshed, {
+            "mode": "synthetic_export",
+            "source_path": str(source_path),
+            "notes": "Exported Video2Mesh camera_info/point_cloud to COLMAP text. points3D.txt may not contain TRACK[] observations.",
+        }
+
+    if source_path.exists() and not source_path.is_dir():
+        source_path.unlink()
+    ensure_dir(source_path)
+    images_dir = ensure_dir(source_path / "images")
+    sparse_dir = ensure_dir(source_path / "sparse" / "0")
+    for name in ("cameras.txt", "images.txt", "points3D.txt"):
+        copy_or_link(existing_sparse / name, sparse_dir / name, args.image_mode if args.image_mode in {"copy", "symlink"} else "copy")
+
+    frames_dir = resolve_project_cli_path(getattr(args, "frames_dir", None), project_root) if getattr(args, "frames_dir", None) else project_root / manifest["scene"]["frames_dir"]
+    images = read_colmap_text_images(existing_sparse / "images.txt")
+    copied_images = 0
+    missing_images: list[str] = []
+    for image in images.values():
+        src = frames_dir / image["name"]
+        if not src.exists():
+            missing_images.append(image["name"])
+            continue
+        if args.image_mode == "none":
+            continue
+        copy_or_link(src, images_dir / image["name"], args.image_mode)
+        copied_images += 1
+
+    manifest.setdefault("artifacts", {})["colmap_text_export"] = str(source_path / "video2mesh_colmap_export.json")
+    manifest["artifacts"]["colmap_text_sparse_dir"] = str(sparse_dir)
+    manifest["artifacts"]["colmap_text_images_dir"] = str(images_dir)
+    source_report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "format": "colmap_text",
+        "mode": "existing_colmap_sparse_text",
+        "source_path": str(source_path),
+        "source_sparse_dir": str(existing_sparse),
+        "sparse_dir": str(sparse_dir),
+        "images_dir": str(images_dir),
+        "frames_dir": str(frames_dir),
+        "image_count": len(images),
+        "images_linked_or_copied": copied_images,
+        "missing_images": missing_images,
+        "point_count": count_colmap_points3d(sparse_dir / "points3D.txt"),
+        "notes": "Prepared 3DGS source from the real COLMAP sparse text model so points3D.txt retains reprojection error and TRACK[] observations for filtering.",
+    }
+    write_json(source_path / "video2mesh_colmap_export.json", source_report)
+    save_manifest(project_root, manifest)
+    return manifest, source_report
+
+
 def cmd_run_3dgs(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -2247,18 +2441,8 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
     log_path = project_root / "logs" / "3dgs_run.log"
     ensure_dir(log_path.parent)
 
-    export_args = argparse.Namespace(
-        project_root=project_root,
-        output_dir=source_path,
-        frames_dir=args.frames_dir,
-        camera_info=args.camera_info,
-        point_cloud=args.point_cloud,
-        camera_model=args.camera_model,
-        extrinsic_type=args.extrinsic_type,
-        mode=args.image_mode,
-    )
-    cmd_export_colmap(export_args)
-    manifest = load_manifest(project_root)
+    manifest, source_report = prepare_3dgs_colmap_source(project_root, manifest, args, source_path)
+    sparse_filter_report = apply_3dgs_sparse_filter(source_path, args)
 
     command_values = {
         "source_path": str(source_path),
@@ -2278,6 +2462,8 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
         "command_template": args.command_template,
         "command": None,
         "status": "prepared",
+        "source_report": source_report,
+        "sparse_point_filter": sparse_filter_report,
         "notes": "COLMAP-style source prepared. Provide --command-template to launch an external 3DGS trainer.",
     }
 
@@ -2465,6 +2651,7 @@ def high_quality_3dgs_job_spec(
     output_path: Path,
     work_dir: Path,
     log_path: Path,
+    sparse_filter_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
     canonical_point_cloud = resolve_project_path(manifest["scene"]["point_cloud"], project_root).resolve()
@@ -2520,6 +2707,7 @@ def high_quality_3dgs_job_spec(
             "colmap_points3d_relative": rel_or_abs(points3d_path, project_root) if points3d_path else "",
             "colmap_points3d_exists": bool(points3d_path and points3d_path.exists()),
             "colmap_points3d_point_count": colmap_count,
+            "sparse_point_filter": sparse_filter_report or {},
             "colmap_matches_canonical_point_count": matches_canonical,
             "colmap_matches_downsampled_point_count": uses_downsampled,
             "use_full_point_cloud_required": True,
@@ -2788,20 +2976,9 @@ def cmd_prepare_high_quality_3dgs_job(args: argparse.Namespace) -> int:
     output_path = args.output_path.resolve() if args.output_path else project_root / "scene" / "reconstruction" / f"3dgs_{slugify(provider)}"
     log_path = project_root / "logs" / f"{slugify(provider)}_3dgs_train.log"
     ensure_dir(log_path.parent)
-    canonical_point_cloud = resolve_project_path(manifest["scene"]["point_cloud"], project_root)
-
-    export_args = argparse.Namespace(
-        project_root=project_root,
-        output_dir=source_path,
-        frames_dir=args.frames_dir,
-        camera_info=args.camera_info,
-        point_cloud=args.point_cloud or canonical_point_cloud,
-        camera_model=args.camera_model,
-        extrinsic_type=args.extrinsic_type,
-        mode=args.image_mode,
-    )
-    cmd_export_colmap(export_args)
-    manifest = load_manifest(project_root)
+    args.default_point_cloud = resolve_project_path(manifest["scene"]["point_cloud"], project_root)
+    manifest, source_report = prepare_3dgs_colmap_source(project_root, manifest, args, source_path)
+    sparse_filter_report = apply_3dgs_sparse_filter(source_path, args)
 
     command_template = args.command_template or default_3dgs_command_template(provider)
     values = {
@@ -2822,6 +2999,7 @@ def cmd_prepare_high_quality_3dgs_job(args: argparse.Namespace) -> int:
         output_path=output_path,
         work_dir=stage_root,
         log_path=log_path,
+        sparse_filter_report=sparse_filter_report,
     )
     job = {
         "schema_version": DEFAULT_SCHEMA_VERSION,
@@ -2836,6 +3014,8 @@ def cmd_prepare_high_quality_3dgs_job(args: argparse.Namespace) -> int:
         "camera_model": args.camera_model,
         "command_template": command_template,
         "command": command,
+        "source_report": source_report,
+        "sparse_point_filter": sparse_filter_report,
         "expected_registration": {
             "command": f"python -m video2mesh.cli import-3dgs-result --project-root {project_root} --path {output_path} --provider {provider} --mode symlink",
             "notes": "After external training finishes, import/register the output and export point-cloud, SuperSplat, semantic, and QA artifacts where possible.",
@@ -6536,6 +6716,66 @@ def load_object_labels(project_root: Path, labels_path: Path | None = None) -> d
         if isinstance(data, dict):
             return {slugify(k): dict(v) for k, v in data.items()}
     return {}
+
+
+def parse_priority_categories(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return list(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES)
+    raw_items = value if isinstance(value, list) else re.split(r"[,;\n]+", str(value))
+    categories = [normalize_detection_label(item) for item in raw_items if str(item).strip()]
+    return categories or list(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES)
+
+
+def object_mask_priority_key(
+    object_id: str,
+    label: dict[str, Any],
+    priority_categories: list[str],
+) -> tuple[int, int, str]:
+    object_text = normalize_detection_label(object_id)
+    category = normalize_detection_label(label.get("category") or "")
+    name = normalize_detection_label(label.get("name") or "")
+    rank = len(priority_categories)
+    for index, candidate in enumerate(priority_categories):
+        if candidate and (candidate == category or candidate == name or candidate in object_text):
+            rank = index
+            break
+    return (rank, 0 if category not in {"unknown", "object"} else 1, object_id)
+
+
+def make_object_masks_exclusive(
+    candidates: dict[str, Any],
+    *,
+    labels: dict[str, dict[str, Any]],
+    priority_categories: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    np = import_numpy()
+    ordered = sorted(candidates, key=lambda object_id: object_mask_priority_key(object_id, labels.get(object_id, {}), priority_categories))
+    occupied: set[int] = set()
+    exclusive: dict[str, Any] = {}
+    report: list[dict[str, Any]] = []
+    for object_id in ordered:
+        raw_indices = np.asarray(candidates[object_id], dtype=np.int64)
+        unique_indices = np.unique(raw_indices)
+        if occupied:
+            keep_mask = np.fromiter((int(index) not in occupied for index in unique_indices.tolist()), dtype=bool, count=unique_indices.size)
+            kept_indices = unique_indices[keep_mask]
+        else:
+            kept_indices = unique_indices
+        removed = int(unique_indices.size - kept_indices.size)
+        exclusive[object_id] = kept_indices.astype(np.int64)
+        occupied.update(int(index) for index in kept_indices.tolist())
+        report.append(
+            {
+                "object_id": object_id,
+                "candidate_points": int(unique_indices.size),
+                "kept_points": int(kept_indices.size),
+                "removed_overlap_points": removed,
+                "priority": list(object_mask_priority_key(object_id, labels.get(object_id, {}), priority_categories)),
+                "name": labels.get(object_id, {}).get("name", object_id.replace("_", " ")),
+                "category": labels.get(object_id, {}).get("category", "unknown"),
+            }
+        )
+    return exclusive, report, ordered
 
 
 def normalize_object_label_record(raw: Any, object_id: str) -> dict[str, Any]:
@@ -10867,7 +11107,11 @@ def source_labels_from_object_masks(
     object_id_to_semantic = {"background": 0}
     project_root = objects_dir.parent
 
-    for semantic_id, object_json in enumerate(sorted(objects_dir.glob("*/object.json")), start=1):
+    object_jsons = sorted(
+        objects_dir.glob("*/object.json"),
+        key=lambda path: object_mask_priority_key(path.parent.name, safe_read_json(path) or {}, DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES),
+    )
+    for semantic_id, object_json in enumerate(object_jsons, start=1):
         obj = read_json(object_json)
         object_id = obj["object_id"]
         mask_3d = obj.get("mask_3d") if isinstance(obj.get("mask_3d"), dict) else {}
@@ -10884,6 +11128,8 @@ def source_labels_from_object_masks(
         assigned_probabilities = []
         for index in indices:
             if 0 <= index < len(labels):
+                if labels[index] != 0:
+                    continue
                 labels[index] = semantic_id
                 probability = float(np.clip(probability_by_index.get(int(index), 1.0), 0.0, 1.0))
                 probabilities[index] = probability
@@ -13721,9 +13967,37 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
             )
         frame_stats[record.object_id][record.frame_id] = record_stats
 
+    candidate_indices_by_object = {
+        object_id: np.flatnonzero(votes[object_id] >= args.min_votes).astype(np.int64)
+        for object_id in object_ids
+    }
+    priority_categories = parse_priority_categories(getattr(args, "object_priority_categories", None))
+    exclusive_objects = bool(getattr(args, "exclusive_objects", True))
+    if exclusive_objects:
+        indices_by_object, exclusivity_report, object_write_order = make_object_masks_exclusive(
+            candidate_indices_by_object,
+            labels=labels,
+            priority_categories=priority_categories,
+        )
+    else:
+        indices_by_object = candidate_indices_by_object
+        object_write_order = object_ids
+        exclusivity_report = [
+            {
+                "object_id": object_id,
+                "candidate_points": int(candidate_indices_by_object[object_id].size),
+                "kept_points": int(candidate_indices_by_object[object_id].size),
+                "removed_overlap_points": 0,
+                "priority": list(object_mask_priority_key(object_id, labels.get(object_id, {}), priority_categories)),
+                "name": labels.get(object_id, {}).get("name", object_id.replace("_", " ")),
+                "category": labels.get(object_id, {}).get("category", "unknown"),
+            }
+            for object_id in object_write_order
+        ]
+
     object_summaries: dict[str, Any] = {}
-    for object_id in object_ids:
-        indices = np.flatnonzero(votes[object_id] >= args.min_votes).astype(np.int64)
+    for object_id in object_write_order:
+        indices = indices_by_object[object_id]
         object_dir = ensure_dir(objects_dir / object_id)
         object_mask_dir = ensure_dir(mask_3d_dir / object_id)
         np.save(object_mask_dir / "point_indices.npy", indices)
@@ -13783,6 +14057,7 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
             "bbox_3d": bbox,
             "mask_3d": mask_3d,
             "frame_scores": frame_stats[object_id],
+            "candidate_point_count": int(candidate_indices_by_object[object_id].size),
         }
         write_json(object_dir / "object.json", object_info)
         write_json(object_dir / "frame_scores.json", frame_stats[object_id])
@@ -13806,6 +14081,9 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
             "occlusion_filter": bool(args.occlusion_filter),
             "depth_tolerance": args.depth_tolerance,
             "relative_depth_tolerance": args.relative_depth_tolerance,
+            "exclusive_objects": exclusive_objects,
+            "object_priority_categories": priority_categories,
+            "exclusivity_report": exclusivity_report,
             "notes": "Probability mode treats mask intensity / probability_scale as a per-pixel semantic probability, thresholds it by min_probability, and back-projects it to visible 3D points. This is a lightweight SVLGaussian-style baseline, not yet ray-to-Gaussian Top-N distance-weighted accumulation.",
         },
     }
@@ -30969,6 +31247,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
             )
             append_pipeline_step(steps, "train_gsplat", "completed")
         elif args.g3dgs_command_template or args.prepare_3dgs_source:
+            g3dgs_source_point_cloud = None if args.g3dgs_use_existing_colmap_sparse else g3dgs_point_cloud
             cmd_run_3dgs(
                 argparse.Namespace(
                     project_root=project_root,
@@ -30980,10 +31259,14 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     prepare_only=args.g3dgs_prepare_only,
                     frames_dir=working_frames_dir,
                     camera_info=None,
-                    point_cloud=g3dgs_point_cloud,
+                    point_cloud=g3dgs_source_point_cloud,
                     camera_model=args.camera_model,
                     extrinsic_type=args.extrinsic_type,
                     image_mode=args.image_mode,
+                    use_existing_colmap_sparse=args.g3dgs_use_existing_colmap_sparse,
+                    filter_sparse_points=args.g3dgs_filter_sparse_points,
+                    sparse_max_reprojection_error=args.g3dgs_sparse_max_reprojection_error,
+                    sparse_min_track_length=args.g3dgs_sparse_min_track_length,
                     register_mode=args.mode,
                     no_register=args.no_register_3dgs,
                 )
@@ -31160,6 +31443,8 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     min_probability=args.min_probability,
                     probability_scale=args.probability_scale,
                     min_votes=args.min_votes,
+                    exclusive_objects=args.exclusive_object_masks,
+                    object_priority_categories=args.object_priority_categories,
                     occlusion_filter=args.occlusion_filter,
                     depth_tolerance=args.depth_tolerance,
                     relative_depth_tolerance=args.relative_depth_tolerance,
@@ -31649,6 +31934,8 @@ def cmd_run_local(args: argparse.Namespace) -> int:
         min_probability=getattr(args, "min_probability", 0.5),
         probability_scale=getattr(args, "probability_scale", 255.0),
         min_votes=args.min_votes,
+        exclusive_objects=getattr(args, "exclusive_objects", True),
+        object_priority_categories=getattr(args, "object_priority_categories", None),
         occlusion_filter=args.occlusion_filter,
         depth_tolerance=args.depth_tolerance,
         relative_depth_tolerance=args.relative_depth_tolerance,
@@ -31820,7 +32107,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera-params", help="Explicit COLMAP camera params, e.g. fx,fy,cx,cy for PINHOLE.")
     p.add_argument("--focal", type=float, help="Initial focal length in pixels when --camera-params is omitted.")
     p.add_argument("--focal-scale", type=float, default=1.2)
-    p.add_argument("--matcher", choices=["sequential", "exhaustive"], default="sequential")
+    p.add_argument("--matcher", choices=["sequential", "exhaustive"], default="exhaustive")
     p.add_argument("--sequential-overlap", type=int, default=20)
     p.add_argument("--use-gpu", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
@@ -31863,6 +32150,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE"], default="PINHOLE")
     p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="copy")
+    p.add_argument("--use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model already imported by run-colmap, preserving TRACK[] for filtering.")
+    p.add_argument("--filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before 3DGS training by reprojection error and track length.")
+    p.add_argument("--sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
+    p.add_argument("--sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
     p.add_argument("--register-mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--no-register", action="store_true", help="Do not call register-3dgs after a successful command.")
     p.set_defaults(func=cmd_run_3dgs)
@@ -31879,6 +32170,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE"], default="PINHOLE")
     p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="symlink")
+    p.add_argument("--use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model already imported by run-colmap, preserving TRACK[] for filtering.")
+    p.add_argument("--filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before 3DGS training by reprojection error and track length.")
+    p.add_argument("--sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
+    p.add_argument("--sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
     p.add_argument("--command-template", help="Optional command template with {provider}, {source_path}, {output_path}, {project_root}, {work_dir}, {scene_id}, {log_path}.")
     p.set_defaults(func=cmd_prepare_high_quality_3dgs_job)
 
@@ -32276,6 +32571,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5, help="Probability threshold used in probability fusion mode, matching the SVLGaussian lambda default.")
     p.add_argument("--probability-scale", type=float, default=255.0, help="Mask value divisor used to convert grayscale masks to [0, 1] probabilities.")
     p.add_argument("--min-votes", type=int, default=1)
+    p.add_argument("--exclusive-objects", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using object-priority order.")
+    p.add_argument("--object-priority-categories", default=",".join(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES), help="Comma-separated category priority used when --exclusive-objects is enabled.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
@@ -33067,6 +33364,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--probability-scale", type=float, default=255.0)
     p.add_argument("--min-votes", type=int, default=1)
+    p.add_argument("--exclusive-objects", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using object-priority order.")
+    p.add_argument("--object-priority-categories", default=",".join(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES), help="Comma-separated category priority used when --exclusive-objects is enabled.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
@@ -33121,7 +33420,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colmap-single-camera", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--colmap-camera-params")
     p.add_argument("--colmap-focal", type=float)
-    p.add_argument("--colmap-matcher", choices=["sequential", "exhaustive"], default="sequential")
+    p.add_argument("--colmap-matcher", choices=["sequential", "exhaustive"], default="exhaustive")
     p.add_argument("--colmap-sequential-overlap", type=int, default=20)
     p.add_argument("--colmap-use-gpu", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--colmap-refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
@@ -33156,6 +33455,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-output-path", type=Path)
     p.add_argument("--g3dgs-work-dir", type=Path)
     p.add_argument("--g3dgs-prepare-only", action="store_true")
+    p.add_argument("--g3dgs-use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model for 3DGS source preparation.")
+    p.add_argument("--g3dgs-filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before GraphDECO/full 3DGS training.")
+    p.add_argument("--g3dgs-sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
+    p.add_argument("--g3dgs-sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
     p.add_argument("--no-register-3dgs", action="store_true")
     p.add_argument("--train-gsplat", action="store_true", help="Run the built-in minimal gsplat trainer and register its output.")
     p.add_argument("--gsplat-point-cloud", type=Path, help="Initialization point cloud for the built-in trainer. Defaults to the original scene/reconstruction/point_cloud.ply, not any downsampled working cloud.")
@@ -33264,6 +33567,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--probability-scale", type=float, default=255.0)
     p.add_argument("--min-votes", type=int, default=1)
+    p.add_argument("--exclusive-object-masks", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using object-priority order.")
+    p.add_argument("--object-priority-categories", default=",".join(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES), help="Comma-separated category priority used when --exclusive-object-masks is enabled.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)

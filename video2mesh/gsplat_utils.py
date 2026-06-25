@@ -68,8 +68,9 @@ def default_3dgs_command_template(provider: str) -> str:
         return (
             "python train.py -s {source_path} -m {output_path} "
             "--iterations 30000 --save_iterations 7000 30000 --test_iterations 7000 30000 "
-            "--resolution 1 --images images --sh_degree 3 --densify_from_iter 500 "
-            "--densify_until_iter 15000 --densification_interval 100 --opacity_reset_interval 3000 "
+            "--resolution 1 --images images --sh_degree 3 --densify_from_iter 1000 "
+            "--densify_until_iter 5000 --densification_interval 300 --densify_grad_threshold 0.002 "
+            "--opacity_reset_interval 3000 "
             "--disable_viewer"
         )
     if normalized in {"nerfstudio", "splatfacto", "ns-splatfacto"}:
