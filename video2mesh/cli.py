@@ -46,27 +46,52 @@ MASK_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 MODEL_EXTENSIONS = {".blend", ".fbx", ".glb", ".obj", ".ply", ".stl", ".usdz"}
 MODEL_EXTENSION_PRIORITY = {".glb": 0, ".obj": 1, ".ply": 2, ".fbx": 3, ".stl": 4, ".usdz": 5, ".blend": 6}
 DEFAULT_SCHEMA_VERSION = 1
-DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES = [
+DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES: list[str] = []
+COMMON_BACKGROUND_STRUCTURE_CATEGORIES = {
+    "background",
+    "ceiling",
+    "floor",
+    "ground",
+    "road",
+    "room",
+    "sky",
+    "terrain",
+    "wall",
+    "window",
+}
+COMMON_THING_CATEGORY_HINTS = {
     "bed",
-    "sofa",
-    "chair",
-    "table",
-    "desk",
-    "nightstand",
+    "bench",
     "cabinet",
+    "car",
+    "chair",
+    "couch",
+    "desk",
     "dresser",
-    "shelf",
     "lamp",
+    "nightstand",
+    "person",
     "plant",
+    "sofa",
+    "table",
+}
+COMMON_BACKGROUND_CATEGORY_HINTS = {
+    "ceiling",
+    "floor",
+    "ground",
+    "road",
+    "sky",
+    "wall",
+}
+COMMON_DECOR_OR_SURFACE_CATEGORIES = {
     "picture",
     "wall art",
     "curtain",
     "door",
+    "mirror",
+    "poster",
     "window",
-    "floor",
-    "wall",
-    "ceiling",
-]
+}
 DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH = 4
 DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR = 1.0
 SVLGAUSSIAN_TITLE = "SVLGaussian: Single View Language Gaussian Splatting"
@@ -6720,26 +6745,88 @@ def load_object_labels(project_root: Path, labels_path: Path | None = None) -> d
 
 def parse_priority_categories(value: str | list[str] | None) -> list[str]:
     if value is None:
-        return list(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES)
+        return []
     raw_items = value if isinstance(value, list) else re.split(r"[,;\n]+", str(value))
     categories = [normalize_detection_label(item) for item in raw_items if str(item).strip()]
-    return categories or list(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES)
+    return categories
 
 
-def object_mask_priority_key(
+def object_label_terms(object_id: str, label: dict[str, Any]) -> set[str]:
+    raw_terms = [object_id, label.get("category") or "", label.get("name") or ""]
+    terms: set[str] = set()
+    for term in raw_terms:
+        normalized = normalize_detection_label(str(term))
+        if normalized:
+            terms.add(normalized)
+            terms.update(piece for piece in re.split(r"[_/\s-]+", normalized) if piece)
+    return terms
+
+
+def object_mask_category_role(object_id: str, label: dict[str, Any]) -> str:
+    category = normalize_detection_label(label.get("category") or "")
+    terms = object_label_terms(object_id, label)
+    asset_role = normalize_detection_label(label.get("asset_role") or "")
+    if asset_role in {"background", "background structure", "structure"}:
+        return "background"
+    if category in COMMON_BACKGROUND_STRUCTURE_CATEGORIES:
+        return "background"
+    if terms & COMMON_THING_CATEGORY_HINTS:
+        return "thing"
+    if terms & COMMON_BACKGROUND_CATEGORY_HINTS:
+        return "background"
+    if terms & COMMON_DECOR_OR_SURFACE_CATEGORIES:
+        return "surface_or_fixture"
+    if category in {"unknown", "object", ""}:
+        return "unknown"
+    return "thing"
+
+
+def object_mask_role_rank(object_id: str, label: dict[str, Any]) -> int:
+    role = object_mask_category_role(object_id, label)
+    if role == "thing":
+        return 0
+    if role == "surface_or_fixture":
+        return 1
+    if role == "unknown":
+        return 2
+    return 3
+
+
+def object_mask_category_priority_rank(
+    object_id: str,
+    label: dict[str, Any],
+    priority_categories: list[str],
+) -> int:
+    if not priority_categories:
+        return 0
+    object_text = normalize_detection_label(object_id)
+    category = normalize_detection_label(label.get("category") or "")
+    name = normalize_detection_label(label.get("name") or "")
+    for index, candidate in enumerate(priority_categories):
+        if candidate and (candidate == category or candidate == name or candidate in object_text):
+            return index
+    return len(priority_categories)
+
+
+def object_mask_tiebreak_key(
     object_id: str,
     label: dict[str, Any],
     priority_categories: list[str],
 ) -> tuple[int, int, str]:
-    object_text = normalize_detection_label(object_id)
-    category = normalize_detection_label(label.get("category") or "")
-    name = normalize_detection_label(label.get("name") or "")
-    rank = len(priority_categories)
-    for index, candidate in enumerate(priority_categories):
-        if candidate and (candidate == category or candidate == name or candidate in object_text):
-            rank = index
-            break
-    return (rank, 0 if category not in {"unknown", "object"} else 1, object_id)
+    return (
+        object_mask_category_priority_rank(object_id, label, priority_categories),
+        object_mask_role_rank(object_id, label),
+        object_id,
+    )
+
+
+def object_evidence_sort_key(item: tuple[str, float, int, int, dict[str, Any]], priority_categories: list[str]) -> tuple[int, float, int, int, float, str]:
+    object_id, probability, observations, candidate_count, label = item
+    category_rank = object_mask_category_priority_rank(object_id, label, priority_categories)
+    role_rank = object_mask_role_rank(object_id, label)
+    # Lower tuple wins. Evidence comes before generic category role so the default path is data-driven.
+    size_penalty = candidate_count ** 0.5 if candidate_count > 0 else 0.0
+    return (category_rank, -float(probability), -int(observations), role_rank, size_penalty, object_id)
 
 
 def make_object_masks_exclusive(
@@ -6747,32 +6834,71 @@ def make_object_masks_exclusive(
     *,
     labels: dict[str, dict[str, Any]],
     priority_categories: list[str],
+    probability_max_by_object: dict[str, Any] | None = None,
+    observation_count_by_object: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     np = import_numpy()
-    ordered = sorted(candidates, key=lambda object_id: object_mask_priority_key(object_id, labels.get(object_id, {}), priority_categories))
-    occupied: set[int] = set()
+    probability_max_by_object = probability_max_by_object or {}
+    observation_count_by_object = observation_count_by_object or {}
+    candidate_arrays: dict[str, Any] = {}
+    point_to_objects: dict[int, list[tuple[str, float, int, int, dict[str, Any]]]] = {}
+    for object_id, raw_indices in candidates.items():
+        raw_indices = np.asarray(candidates[object_id], dtype=np.int64)
+        unique_indices, unique_positions = np.unique(raw_indices, return_index=True)
+        candidate_arrays[object_id] = unique_indices
+        prob_values = np.asarray(probability_max_by_object.get(object_id, []), dtype=np.float32)
+        obs_values = np.asarray(observation_count_by_object.get(object_id, []), dtype=np.int64)
+        if prob_values.shape[0] == raw_indices.shape[0]:
+            prob_values = prob_values[unique_positions]
+        elif prob_values.shape[0] != unique_indices.shape[0]:
+            prob_values = np.ones(unique_indices.shape[0], dtype=np.float32)
+        if obs_values.shape[0] == raw_indices.shape[0]:
+            obs_values = obs_values[unique_positions]
+        elif obs_values.shape[0] != unique_indices.shape[0]:
+            obs_values = np.ones(unique_indices.shape[0], dtype=np.int64)
+        label = labels.get(object_id, {})
+        for index, probability, observations in zip(unique_indices.tolist(), prob_values.tolist(), obs_values.tolist()):
+            point_to_objects.setdefault(int(index), []).append(
+                (object_id, float(probability), int(observations), int(unique_indices.size), label)
+            )
+
+    kept_by_object: dict[str, list[int]] = {object_id: [] for object_id in candidates}
+    removed_by_object: dict[str, int] = {object_id: 0 for object_id in candidates}
+    for point_index, entries in point_to_objects.items():
+        winner = min(entries, key=lambda item: object_evidence_sort_key(item, priority_categories))
+        kept_by_object[winner[0]].append(int(point_index))
+        for entry in entries:
+            if entry[0] != winner[0]:
+                removed_by_object[entry[0]] += 1
+
     exclusive: dict[str, Any] = {}
     report: list[dict[str, Any]] = []
+    ordered = sorted(candidates, key=lambda object_id: object_mask_tiebreak_key(object_id, labels.get(object_id, {}), priority_categories))
     for object_id in ordered:
-        raw_indices = np.asarray(candidates[object_id], dtype=np.int64)
-        unique_indices = np.unique(raw_indices)
-        if occupied:
-            keep_mask = np.fromiter((int(index) not in occupied for index in unique_indices.tolist()), dtype=bool, count=unique_indices.size)
-            kept_indices = unique_indices[keep_mask]
+        kept_indices = np.asarray(sorted(kept_by_object.get(object_id, [])), dtype=np.int64)
+        candidate_count = int(candidate_arrays[object_id].size)
+        exclusive[object_id] = kept_indices
+        label = labels.get(object_id, {})
+        role = object_mask_category_role(object_id, label)
+        priority = {
+            "category_rank": object_mask_category_priority_rank(object_id, label, priority_categories),
+            "role_rank": object_mask_role_rank(object_id, label),
+            "role": role,
+            "category_priority_enabled": bool(priority_categories),
+        }
+        if priority_categories:
+            priority["category_priority"] = list(object_mask_tiebreak_key(object_id, label, priority_categories))
         else:
-            kept_indices = unique_indices
-        removed = int(unique_indices.size - kept_indices.size)
-        exclusive[object_id] = kept_indices.astype(np.int64)
-        occupied.update(int(index) for index in kept_indices.tolist())
+            priority["category_priority"] = None
         report.append(
             {
                 "object_id": object_id,
-                "candidate_points": int(unique_indices.size),
+                "candidate_points": candidate_count,
                 "kept_points": int(kept_indices.size),
-                "removed_overlap_points": removed,
-                "priority": list(object_mask_priority_key(object_id, labels.get(object_id, {}), priority_categories)),
-                "name": labels.get(object_id, {}).get("name", object_id.replace("_", " ")),
-                "category": labels.get(object_id, {}).get("category", "unknown"),
+                "removed_overlap_points": int(removed_by_object.get(object_id, 0)),
+                "priority": priority,
+                "name": label.get("name", object_id.replace("_", " ")),
+                "category": label.get("category", "unknown"),
             }
         )
     return exclusive, report, ordered
@@ -11109,7 +11235,7 @@ def source_labels_from_object_masks(
 
     object_jsons = sorted(
         objects_dir.glob("*/object.json"),
-        key=lambda path: object_mask_priority_key(path.parent.name, safe_read_json(path) or {}, DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES),
+        key=lambda path: object_mask_tiebreak_key(path.parent.name, safe_read_json(path) or {}, DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES),
     )
     for semantic_id, object_json in enumerate(object_jsons, start=1):
         obj = read_json(object_json)
@@ -13971,6 +14097,13 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
         object_id: np.flatnonzero(votes[object_id] >= args.min_votes).astype(np.int64)
         for object_id in object_ids
     }
+    candidate_probability_by_object: dict[str, Any] = {}
+    candidate_observation_count_by_object: dict[str, Any] = {}
+    if fusion_mode == "probability":
+        for object_id, indices in candidate_indices_by_object.items():
+            counts = probability_counts[object_id][indices].astype(np.int64)
+            candidate_probability_by_object[object_id] = probability_max[object_id][indices].astype(np.float32)
+            candidate_observation_count_by_object[object_id] = counts
     priority_categories = parse_priority_categories(getattr(args, "object_priority_categories", None))
     exclusive_objects = bool(getattr(args, "exclusive_objects", True))
     if exclusive_objects:
@@ -13978,6 +14111,8 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
             candidate_indices_by_object,
             labels=labels,
             priority_categories=priority_categories,
+            probability_max_by_object=candidate_probability_by_object,
+            observation_count_by_object=candidate_observation_count_by_object,
         )
     else:
         indices_by_object = candidate_indices_by_object
@@ -13988,7 +14123,12 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
                 "candidate_points": int(candidate_indices_by_object[object_id].size),
                 "kept_points": int(candidate_indices_by_object[object_id].size),
                 "removed_overlap_points": 0,
-                "priority": list(object_mask_priority_key(object_id, labels.get(object_id, {}), priority_categories)),
+                "priority": {
+                    "category_rank": object_mask_category_priority_rank(object_id, labels.get(object_id, {}), priority_categories),
+                    "role_rank": object_mask_role_rank(object_id, labels.get(object_id, {})),
+                    "role": object_mask_category_role(object_id, labels.get(object_id, {})),
+                    "category_priority_enabled": bool(priority_categories),
+                },
                 "name": labels.get(object_id, {}).get("name", object_id.replace("_", " ")),
                 "category": labels.get(object_id, {}).get("category", "unknown"),
             }
@@ -14083,6 +14223,7 @@ def cmd_fuse_masks(args: argparse.Namespace) -> int:
             "relative_depth_tolerance": args.relative_depth_tolerance,
             "exclusive_objects": exclusive_objects,
             "object_priority_categories": priority_categories,
+            "exclusive_assignment_strategy": "per_point_evidence_role_size_tiebreak",
             "exclusivity_report": exclusivity_report,
             "notes": "Probability mode treats mask intensity / probability_scale as a per-pixel semantic probability, thresholds it by min_probability, and back-projects it to visible 3D points. This is a lightweight SVLGaussian-style baseline, not yet ray-to-Gaussian Top-N distance-weighted accumulation.",
         },
@@ -32571,8 +32712,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5, help="Probability threshold used in probability fusion mode, matching the SVLGaussian lambda default.")
     p.add_argument("--probability-scale", type=float, default=255.0, help="Mask value divisor used to convert grayscale masks to [0, 1] probabilities.")
     p.add_argument("--min-votes", type=int, default=1)
-    p.add_argument("--exclusive-objects", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using object-priority order.")
-    p.add_argument("--object-priority-categories", default=",".join(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES), help="Comma-separated category priority used when --exclusive-objects is enabled.")
+    p.add_argument("--exclusive-objects", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using generic evidence-based ranking.")
+    p.add_argument("--object-priority-categories", default="", help="Optional comma-separated category override for exclusive object assignment. Defaults to generic evidence-based ranking.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
@@ -33364,8 +33505,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--probability-scale", type=float, default=255.0)
     p.add_argument("--min-votes", type=int, default=1)
-    p.add_argument("--exclusive-objects", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using object-priority order.")
-    p.add_argument("--object-priority-categories", default=",".join(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES), help="Comma-separated category priority used when --exclusive-objects is enabled.")
+    p.add_argument("--exclusive-objects", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using generic evidence-based ranking.")
+    p.add_argument("--object-priority-categories", default="", help="Optional comma-separated category override for exclusive object assignment. Defaults to generic evidence-based ranking.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
@@ -33567,8 +33708,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--probability-scale", type=float, default=255.0)
     p.add_argument("--min-votes", type=int, default=1)
-    p.add_argument("--exclusive-object-masks", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using object-priority order.")
-    p.add_argument("--object-priority-categories", default=",".join(DEFAULT_OBJECT_MASK_PRIORITY_CATEGORIES), help="Comma-separated category priority used when --exclusive-object-masks is enabled.")
+    p.add_argument("--exclusive-object-masks", action=argparse.BooleanOptionalAction, default=True, help="Assign each 3D point to at most one object mask using generic evidence-based ranking.")
+    p.add_argument("--object-priority-categories", default="", help="Optional comma-separated category override for exclusive object assignment. Defaults to generic evidence-based ranking.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)

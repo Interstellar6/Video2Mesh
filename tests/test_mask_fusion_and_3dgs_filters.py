@@ -38,6 +38,40 @@ def test_exclusive_object_masks_keep_bed_points_before_large_structures():
     assert removed["gdino_object_floor"] == 2
 
 
+def test_exclusive_object_masks_default_uses_evidence_not_scene_categories():
+    candidates = {
+        "thing_a": [1, 2, 3],
+        "thing_b": [2, 3, 4],
+        "structure": [1, 2, 3, 4],
+    }
+    labels = {
+        "thing_a": {"name": "mug", "category": "mug"},
+        "thing_b": {"name": "book", "category": "book"},
+        "structure": {"name": "surface", "category": "wall"},
+    }
+
+    exclusive, _report, ordered = make_object_masks_exclusive(
+        candidates,
+        labels=labels,
+        priority_categories=[],
+        probability_max_by_object={
+            "thing_a": [0.9, 0.6, 0.6],
+            "thing_b": [0.8, 0.8, 0.8],
+            "structure": [0.7, 0.7, 0.7, 0.7],
+        },
+        observation_count_by_object={
+            "thing_a": [3, 2, 2],
+            "thing_b": [2, 4, 4],
+            "structure": [1, 1, 1, 1],
+        },
+    )
+
+    assert ordered == ["thing_a", "thing_b", "structure"]
+    assert exclusive["thing_a"].tolist() == [1]
+    assert exclusive["thing_b"].tolist() == [2, 3, 4]
+    assert exclusive["structure"].tolist() == []
+
+
 def test_filter_colmap_points3d_uses_track_length_and_error(tmp_path: Path):
     src = tmp_path / "points3D.txt"
     dst = tmp_path / "filtered.txt"
