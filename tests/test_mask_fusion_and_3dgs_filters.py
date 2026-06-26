@@ -18,14 +18,18 @@ from video2mesh.cli import (
     filter_points_by_multiview_mask_consistency,
     filter_points_by_pca_quantiles,
     filter_points_by_quantile_bbox,
+    filter_points_by_support_quantile_bbox,
+    filter_observation_points_by_multiview_depth_consistency,
     filter_mask_by_depth_edges,
     export_viewer_plys,
     filter_colmap_points3d_file,
     make_object_masks_exclusive,
+    mesh_support_quality_report,
     parse_ply_vertex_header,
     postprocess_mesh_with_point_support,
     prepare_3dgs_colmap_source,
     quantile_bounds_from_points,
+    resolve_export_record_path,
     scaled_intrinsic_for_size,
     select_colmap_sparse_model,
     source_labels_from_object_masks,
@@ -571,6 +575,105 @@ def test_postprocess_mesh_with_point_support_crops_outlying_vertices():
     assert report["support_bbox_crop"]["removed_vertices"] == 1
 
 
+def test_filter_observation_points_by_multiview_depth_consistency_uses_mask_and_depth(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    mask_path = tmp_path / "mask.png"
+    Image.fromarray(np.full((5, 5), 255, dtype=np.uint8), mode="L").save(mask_path)
+    depth_path = tmp_path / "depth.npy"
+    np.save(depth_path, np.ones((5, 5), dtype=np.float32) * 2.0)
+    frames = [
+        {
+            "frame_id": "a",
+            "mask": str(mask_path),
+            "depth_npy": str(depth_path),
+            "width": 5,
+            "height": 5,
+            "intrinsic": {"fx": 1.0, "fy": 1.0, "cx": 2.0, "cy": 2.0},
+            "world_to_camera": np.eye(4).tolist(),
+        },
+        {
+            "frame_id": "b",
+            "mask": str(mask_path),
+            "depth_npy": str(depth_path),
+            "width": 5,
+            "height": 5,
+            "intrinsic": {"fx": 1.0, "fy": 1.0, "cx": 2.0, "cy": 2.0},
+            "world_to_camera": np.eye(4).tolist(),
+        },
+    ]
+    points = np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 4.0]], dtype=np.float64)
+    colors = np.ones((2, 3), dtype=np.float64)
+    source_frames = np.array([0, 0], dtype=np.int32)
+    args = Namespace(
+        min_points=1,
+        surface_consistency_min_probability=0.5,
+        surface_consistency_depth_tolerance=0.05,
+        surface_consistency_min_hits=1,
+        surface_consistency_min_projected=1,
+        surface_consistency_min_hit_ratio=0.0,
+        surface_consistency_max_frames=0,
+        surface_consistency_fallback_keep_original=False,
+    )
+
+    filtered, filtered_colors, report = filter_observation_points_by_multiview_depth_consistency(points, colors, source_frames, frames, args)
+
+    np.testing.assert_allclose(filtered, np.array([[0.0, 0.0, 2.0]], dtype=np.float64))
+    assert filtered_colors.shape == (1, 3)
+    assert report["removed_points"] == 1
+
+
+def test_filter_points_by_support_quantile_bbox_removes_spatial_tail():
+    np = pytest.importorskip("numpy")
+    points = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float64)
+    colors = np.ones((4, 3), dtype=np.float64)
+    args = Namespace(
+        min_points=1,
+        surface_crop_to_quantile_bbox=True,
+        surface_bbox_quantile_min=0.0,
+        surface_bbox_quantile_max=0.75,
+        surface_bbox_padding_ratio=0.0,
+        surface_crop_fallback_keep_original=False,
+    )
+
+    filtered, filtered_colors, report = filter_points_by_support_quantile_bbox(points, colors, args)
+
+    assert filtered.shape == (3, 3)
+    assert filtered_colors.shape == (3, 3)
+    assert report["removed_points"] == 1
+
+
+def test_mesh_support_quality_report_rejects_oversized_mesh():
+    np = pytest.importorskip("numpy")
+    o3d = pytest.importorskip("open3d")
+    mesh = o3d.geometry.TriangleMesh.create_box(width=5.0, height=1.0, depth=1.0)
+    support = np.array([[0.0, 0.0, 0.0], [1.0, 0.2, 0.2], [0.5, 0.1, 0.1]], dtype=np.float64)
+    args = Namespace(
+        quality_guard=True,
+        quality_bbox_quantile_min=0.0,
+        quality_bbox_quantile_max=1.0,
+        quality_bbox_padding_ratio=0.0,
+        quality_max_diagonal_ratio=1.5,
+        quality_max_longest_axis_ratio=1.5,
+        quality_max_center_distance_ratio=1.0,
+    )
+
+    report = mesh_support_quality_report(mesh, support, args)
+
+    assert report["passed"] is False
+    assert "mesh_longest_axis_exceeds_support" in report["issues"]
+
+
+def test_resolve_export_record_path_remaps_stale_export_root(tmp_path: Path):
+    project_root = tmp_path / "run_a"
+    target = project_root / "simulator_assets" / "foo.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("ok")
+    stale = Path("/root/autodl-tmp/workspace/Video2Mesh/exports/run_a/simulator_assets/foo.txt")
+
+    assert resolve_export_record_path(stale, project_root) == target
+
+
 def test_observation_depth_to_point_cloud_uses_mask_and_camera(tmp_path: Path):
     np = pytest.importorskip("numpy")
     Image = pytest.importorskip("PIL.Image")
@@ -609,6 +712,11 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
     assert recon.proxy_mesh == "none"
+    assert recon.surface_consistency_filter is True
+    assert recon.surface_consistency_min_projected == 2
+    assert recon.surface_consistency_min_hit_ratio == pytest.approx(0.35)
+    assert recon.surface_crop_to_quantile_bbox is True
+    assert recon.quality_guard is True
     assert semantic_recon.func.__name__ == "cmd_reconstruct_semantic_3dgs_object_meshes"
     assert semantic_recon.gaussian_attribute_filter is True
     assert semantic_recon.max_scale_quantile == pytest.approx(0.90)

@@ -366,6 +366,31 @@ def resolve_project_relative_path(path: Path, project_root: Path) -> Path:
     return (project_root / path).resolve()
 
 
+def resolve_export_record_path(value: str | Path, project_root: Path | None = None) -> Path:
+    path = Path(value)
+    if path.exists():
+        return path
+    if project_root is not None:
+        project_root = project_root.resolve()
+        if not path.is_absolute():
+            candidate = project_root / path
+            if candidate.exists():
+                return candidate
+        parts = path.parts
+        for index, part in enumerate(parts):
+            if part == project_root.name:
+                candidate = project_root.joinpath(*parts[index + 1 :])
+                if candidate.exists():
+                    return candidate
+        if "exports" in parts:
+            index = parts.index("exports")
+            if index + 2 < len(parts) and parts[index + 1] == project_root.name:
+                candidate = project_root.joinpath(*parts[index + 2 :])
+                if candidate.exists():
+                    return candidate
+    return path
+
+
 def resolve_active_mask_root(project_root: Path, manifest: dict[str, Any]) -> Path:
     artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
     active = resolve_existing_path(artifacts.get("object_masks_2d"), project_root)
@@ -14578,14 +14603,14 @@ def camera_to_world_from_record(frame: dict[str, Any]):
     return np.linalg.inv(w2c)
 
 
-def observation_depth_to_point_cloud(frame: dict[str, Any], min_depth: float, max_depth: float, stride: int):
+def observation_depth_to_point_cloud(frame: dict[str, Any], min_depth: float, max_depth: float, stride: int, project_root: Path | None = None):
     np = import_numpy()
-    depth = np.load(frame["depth_npy"]).astype(np.float32)
-    mask = load_mask_probability_image(Path(frame["mask"]), int(frame["width"]), int(frame["height"]), 255.0) >= 0.5
+    depth = np.load(resolve_export_record_path(frame["depth_npy"], project_root)).astype(np.float32)
+    mask = load_mask_probability_image(resolve_export_record_path(frame["mask"], project_root), int(frame["width"]), int(frame["height"]), 255.0) >= 0.5
     rgb = None
     try:
         Image = import_pil_image()
-        with Image.open(frame["rgb"]) as image:
+        with Image.open(resolve_export_record_path(frame["rgb"], project_root)) as image:
             rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
     except Exception:
         rgb = np.full((*depth.shape, 3), 0.7, dtype=np.float32)
@@ -14613,18 +14638,199 @@ def observation_depth_to_point_cloud(frame: dict[str, Any], min_depth: float, ma
     return world, colors
 
 
-def build_observation_point_cloud(frames: list[dict[str, Any]], min_depth: float, max_depth: float, stride: int):
+def build_observation_point_cloud(
+    frames: list[dict[str, Any]],
+    min_depth: float,
+    max_depth: float,
+    stride: int,
+    return_frame_indices: bool = False,
+    project_root: Path | None = None,
+):
     np = import_numpy()
     points_list = []
     colors_list = []
-    for frame in frames:
-        points, colors = observation_depth_to_point_cloud(frame, min_depth, max_depth, stride)
+    frame_indices_list = []
+    for frame_index, frame in enumerate(frames):
+        points, colors = observation_depth_to_point_cloud(frame, min_depth, max_depth, stride, project_root)
         if points.shape[0]:
             points_list.append(points)
             colors_list.append(colors)
+            if return_frame_indices:
+                frame_indices_list.append(np.full(points.shape[0], frame_index, dtype=np.int32))
     if not points_list:
-        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
-    return np.concatenate(points_list, axis=0), np.concatenate(colors_list, axis=0)
+        empty_points = np.zeros((0, 3), dtype=np.float64)
+        empty_colors = np.zeros((0, 3), dtype=np.float64)
+        if return_frame_indices:
+            return empty_points, empty_colors, np.zeros((0,), dtype=np.int32)
+        return empty_points, empty_colors
+    points = np.concatenate(points_list, axis=0)
+    colors = np.concatenate(colors_list, axis=0)
+    if return_frame_indices:
+        return points, colors, np.concatenate(frame_indices_list, axis=0)
+    return points, colors
+
+
+def filter_observation_points_by_multiview_depth_consistency(
+    points,
+    colors,
+    frame_indices,
+    frames: list[dict[str, Any]],
+    args: argparse.Namespace,
+    project_root: Path | None = None,
+):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
+        return points_np, colors, None
+    if len(frames) < 2:
+        return points_np, colors, {"enabled": True, "reason": "need_at_least_two_frames", "kept_points": int(points_np.shape[0]), "removed_points": 0}
+    source_indices = np.asarray(frame_indices, dtype=np.int32).reshape(-1)
+    if source_indices.shape[0] != points_np.shape[0]:
+        return points_np, colors, {"enabled": True, "reason": "missing_source_frame_indices", "kept_points": int(points_np.shape[0]), "removed_points": 0}
+
+    min_probability = float(getattr(args, "surface_consistency_min_probability", 0.5))
+    depth_tolerance = float(getattr(args, "surface_consistency_depth_tolerance", 0.08))
+    min_hits = max(1, int(getattr(args, "surface_consistency_min_hits", 1)))
+    min_projected = max(1, int(getattr(args, "surface_consistency_min_projected", 1)))
+    min_hit_ratio = max(0.0, min(1.0, float(getattr(args, "surface_consistency_min_hit_ratio", 0.0))))
+    max_frames = int(getattr(args, "surface_consistency_max_frames", 0) or 0)
+    candidate_indices = list(range(len(frames)))
+    if max_frames > 0:
+        candidate_indices = candidate_indices[:max_frames]
+
+    projected = np.zeros(points_np.shape[0], dtype=np.int32)
+    hits = np.zeros(points_np.shape[0], dtype=np.int32)
+    homo = np.concatenate([points_np, np.ones((points_np.shape[0], 1), dtype=np.float64)], axis=1)
+    frame_reports: list[dict[str, Any]] = []
+    for frame_index in candidate_indices:
+        frame = frames[frame_index]
+        target_mask = source_indices != int(frame_index)
+        if not target_mask.any():
+            frame_reports.append({"frame_id": frame.get("frame_id"), "projected_points": 0, "hit_points": 0, "skipped": True, "reason": "only_source_frame_points"})
+            continue
+        intrinsic = frame["intrinsic"]
+        width = int(frame["width"])
+        height = int(frame["height"])
+        w2c = np.asarray(frame["world_to_camera"], dtype=np.float64)
+        if w2c.shape != (4, 4):
+            frame_reports.append({"frame_id": frame.get("frame_id"), "skipped": True, "reason": "invalid_world_to_camera"})
+            continue
+        cam = (w2c @ homo.T).T
+        z = cam[:, 2]
+        fx = float(intrinsic["fx"])
+        fy = float(intrinsic.get("fy", fx))
+        cx = float(intrinsic["cx"])
+        cy = float(intrinsic["cy"])
+        valid_z = z > 1e-8
+        u = fx * cam[:, 0] / np.maximum(z, 1e-8) + cx
+        v = fy * cam[:, 1] / np.maximum(z, 1e-8) + cy
+        inside = target_mask & valid_z & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        indices = np.flatnonzero(inside)
+        if indices.size == 0:
+            frame_reports.append({"frame_id": frame.get("frame_id"), "projected_points": 0, "hit_points": 0})
+            continue
+        mask_prob = load_mask_probability_image(resolve_export_record_path(frame["mask"], project_root), width, height, 255.0)
+        depth = np.load(resolve_export_record_path(frame["depth_npy"], project_root)).astype(np.float32)
+        ui = np.clip(np.floor(u[indices]).astype(np.int64), 0, width - 1)
+        vi = np.clip(np.floor(v[indices]).astype(np.int64), 0, height - 1)
+        mask_hit = mask_prob[vi, ui] >= min_probability
+        rendered_depth = depth[vi, ui].astype(np.float64)
+        depth_hit = np.isfinite(rendered_depth) & (rendered_depth > 0.0) & (np.abs(rendered_depth - z[indices]) <= max(depth_tolerance, 1e-6) * np.maximum(rendered_depth, 1e-6))
+        hit_local = mask_hit & depth_hit
+        projected[indices] += 1
+        if hit_local.any():
+            hits[indices[hit_local]] += 1
+        frame_reports.append(
+            {
+                "frame_id": frame.get("frame_id"),
+                "projected_points": int(indices.size),
+                "hit_points": int(hit_local.sum()),
+                "hit_ratio": float(hit_local.sum() / max(1, indices.size)),
+            }
+        )
+
+    ratios = np.zeros(points_np.shape[0], dtype=np.float32)
+    valid_projected = projected > 0
+    ratios[valid_projected] = hits[valid_projected] / np.maximum(projected[valid_projected], 1)
+    keep = (projected >= min_projected) & (hits >= min_hits) & (ratios >= min_hit_ratio)
+    kept = int(keep.sum())
+    if kept < int(args.min_points) and bool(getattr(args, "surface_consistency_fallback_keep_original", True)):
+        return points_np, colors, {
+            "enabled": True,
+            "fallback": "too_few_points_after_surface_consistency",
+            "candidate_kept_points": kept,
+            "kept_points": int(points_np.shape[0]),
+            "removed_points": 0,
+            "parameters": {
+                "min_projected": min_projected,
+                "min_hits": min_hits,
+                "min_hit_ratio": min_hit_ratio,
+                "depth_tolerance": depth_tolerance,
+                "min_probability": min_probability,
+                "max_frames": max_frames,
+            },
+            "frames": frame_reports,
+        }
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "enabled": True,
+        "kept_points": kept,
+        "removed_points": int(points_np.shape[0] - kept),
+        "mean_projected_observations": float(projected.mean()) if projected.size else 0.0,
+        "mean_hit_observations": float(hits.mean()) if hits.size else 0.0,
+        "mean_hit_ratio_kept": float(ratios[keep].mean()) if keep.any() else 0.0,
+        "parameters": {
+            "min_projected": min_projected,
+            "min_hits": min_hits,
+            "min_hit_ratio": min_hit_ratio,
+            "depth_tolerance": depth_tolerance,
+            "min_probability": min_probability,
+            "max_frames": max_frames,
+        },
+        "frames": frame_reports,
+    }
+
+
+def filter_points_by_support_quantile_bbox(points, colors, args: argparse.Namespace):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if not bool(getattr(args, "surface_crop_to_quantile_bbox", False)):
+        return points_np, colors, None
+    bounds = quantile_bounds_from_points(
+        points_np,
+        float(getattr(args, "surface_bbox_quantile_min", 0.01)),
+        float(getattr(args, "surface_bbox_quantile_max", 0.99)),
+        float(getattr(args, "surface_bbox_padding_ratio", 0.02)),
+    )
+    if bounds is None:
+        return points_np, colors, None
+    lower, upper = bounds
+    keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
+    kept = int(keep.sum())
+    if kept < int(args.min_points) and bool(getattr(args, "surface_crop_fallback_keep_original", True)):
+        return points_np, colors, {
+            "enabled": True,
+            "fallback": "too_few_points_after_surface_bbox_crop",
+            "candidate_kept_points": kept,
+            "kept_points": int(points_np.shape[0]),
+            "removed_points": 0,
+            "q_min": float(getattr(args, "surface_bbox_quantile_min", 0.01)),
+            "q_max": float(getattr(args, "surface_bbox_quantile_max", 0.99)),
+            "padding_ratio": float(getattr(args, "surface_bbox_padding_ratio", 0.02)),
+            "min": [float(value) for value in lower.tolist()],
+            "max": [float(value) for value in upper.tolist()],
+        }
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "enabled": True,
+        "kept_points": kept,
+        "removed_points": int(points_np.shape[0] - kept),
+        "q_min": float(getattr(args, "surface_bbox_quantile_min", 0.01)),
+        "q_max": float(getattr(args, "surface_bbox_quantile_max", 0.99)),
+        "padding_ratio": float(getattr(args, "surface_bbox_padding_ratio", 0.02)),
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+    }
 
 
 def quantile_bounds_from_points(points, q_min: float, q_max: float, padding_ratio: float):
@@ -14659,6 +14865,96 @@ def crop_triangle_mesh_to_bounds(mesh, bounds):
         "max": [float(value) for value in upper.tolist()],
         "removed_vertices": removed,
     }
+
+
+def mesh_support_quality_report(mesh, support_points, args: argparse.Namespace):
+    np = import_numpy()
+    points_np = np.asarray(support_points, dtype=np.float64)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    report: dict[str, Any] = {
+        "enabled": bool(getattr(args, "quality_guard", True)),
+        "passed": True,
+    }
+    if not bool(getattr(args, "quality_guard", True)):
+        return report
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0 or vertices.size == 0:
+        report.update({"passed": True, "reason": "missing_support_or_mesh_vertices"})
+        return report
+    finite_vertices = np.isfinite(vertices).all(axis=1)
+    nonfinite_vertices = int((~finite_vertices).sum())
+    if nonfinite_vertices > 0:
+        vertices = vertices[finite_vertices]
+        if vertices.size == 0:
+            report.update(
+                {
+                    "passed": False,
+                    "issues": ["mesh_has_no_finite_vertices"],
+                    "nonfinite_vertices": nonfinite_vertices,
+                }
+            )
+            return report
+    support_bounds = quantile_bounds_from_points(
+        points_np,
+        float(getattr(args, "quality_bbox_quantile_min", 0.05)),
+        float(getattr(args, "quality_bbox_quantile_max", 0.95)),
+        float(getattr(args, "quality_bbox_padding_ratio", 0.08)),
+    )
+    if support_bounds is None:
+        report.update({"passed": True, "reason": "missing_support_bounds"})
+        return report
+    support_min, support_max = support_bounds
+    support_size = np.maximum(support_max - support_min, 1e-8)
+    support_center = (support_min + support_max) * 0.5
+    mesh_min = vertices.min(axis=0)
+    mesh_max = vertices.max(axis=0)
+    mesh_size = np.maximum(mesh_max - mesh_min, 1e-8)
+    mesh_center = (mesh_min + mesh_max) * 0.5
+    support_diag = float(np.linalg.norm(support_size))
+    mesh_diag = float(np.linalg.norm(mesh_size))
+    diagonal_ratio = mesh_diag / max(support_diag, 1e-8)
+    longest_axis_ratio = float(mesh_size.max() / max(support_size.max(), 1e-8))
+    center_distance_ratio = float(np.linalg.norm(mesh_center - support_center) / max(support_diag, 1e-8))
+    max_diagonal_ratio = float(getattr(args, "quality_max_diagonal_ratio", 1.35))
+    max_longest_axis_ratio = float(getattr(args, "quality_max_longest_axis_ratio", 1.35))
+    max_center_distance_ratio = float(getattr(args, "quality_max_center_distance_ratio", 0.35))
+    issues = []
+    if diagonal_ratio > max_diagonal_ratio:
+        issues.append("mesh_diagonal_exceeds_support")
+    if longest_axis_ratio > max_longest_axis_ratio:
+        issues.append("mesh_longest_axis_exceeds_support")
+    if center_distance_ratio > max_center_distance_ratio:
+        issues.append("mesh_center_far_from_support")
+    if nonfinite_vertices > 0:
+        issues.append("mesh_has_nonfinite_vertices")
+    report.update(
+        {
+            "passed": not issues,
+            "issues": issues,
+            "nonfinite_vertices": nonfinite_vertices,
+            "support_point_count": int(points_np.shape[0]),
+            "support_bbox": {
+                "min": [float(value) for value in support_min.tolist()],
+                "max": [float(value) for value in support_max.tolist()],
+                "size": [float(value) for value in support_size.tolist()],
+                "diagonal": support_diag,
+            },
+            "mesh_bbox": {
+                "min": [float(value) for value in mesh_min.tolist()],
+                "max": [float(value) for value in mesh_max.tolist()],
+                "size": [float(value) for value in mesh_size.tolist()],
+                "diagonal": mesh_diag,
+            },
+            "diagonal_ratio": float(diagonal_ratio),
+            "longest_axis_ratio": float(longest_axis_ratio),
+            "center_distance_ratio": float(center_distance_ratio),
+            "thresholds": {
+                "max_diagonal_ratio": max_diagonal_ratio,
+                "max_longest_axis_ratio": max_longest_axis_ratio,
+                "max_center_distance_ratio": max_center_distance_ratio,
+            },
+        }
+    )
+    return report
 
 
 def bbox_proxy_mesh_from_points(points, q_min: float, q_max: float, padding_ratio: float, min_extent: float):
@@ -14883,7 +15179,7 @@ def mesh_from_observation_point_cloud(points, colors, args):
     }
 
 
-def tsdf_mesh_from_observations(frames: list[dict[str, Any]], args):
+def tsdf_mesh_from_observations(frames: list[dict[str, Any]], args, project_root: Path | None = None):
     np = import_numpy()
     o3d = import_open3d()
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
@@ -14893,14 +15189,14 @@ def tsdf_mesh_from_observations(frames: list[dict[str, Any]], args):
     )
     integrated = 0
     for frame in frames:
-        depth = np.load(frame["depth_npy"]).astype(np.float32)
-        mask = load_mask_probability_image(Path(frame["mask"]), int(frame["width"]), int(frame["height"]), 255.0) >= 0.5
+        depth = np.load(resolve_export_record_path(frame["depth_npy"], project_root)).astype(np.float32)
+        mask = load_mask_probability_image(resolve_export_record_path(frame["mask"], project_root), int(frame["width"]), int(frame["height"]), 255.0) >= 0.5
         valid = mask & np.isfinite(depth) & (depth > float(args.min_depth)) & (depth < float(args.max_depth))
         if int(valid.sum()) < int(args.min_mask_pixels):
             continue
         depth_masked = np.where(valid, depth, 0.0).astype(np.float32)
         Image = import_pil_image()
-        with Image.open(frame["rgb"]) as image:
+        with Image.open(resolve_export_record_path(frame["rgb"], project_root)) as image:
             rgb_np = np.asarray(image.convert("RGB"), dtype=np.uint8)
         color = o3d.geometry.Image(rgb_np)
         depth_o3d = o3d.geometry.Image(depth_masked)
@@ -14932,6 +15228,7 @@ def tsdf_mesh_from_observations(frames: list[dict[str, Any]], args):
             float(args.min_depth),
             float(args.max_depth),
             int(getattr(args, "bbox_point_stride", args.point_stride) or 1),
+            project_root=project_root,
         )
         bounds = quantile_bounds_from_points(
             points,
@@ -14979,24 +15276,84 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
         mesh_path = object_mesh_dir / f"{object_id}.{args.format}"
         try:
             method_used = args.method
+            support_points_for_quality = None
             if args.method == "tsdf":
-                mesh, reconstruction = tsdf_mesh_from_observations(frames, args)
+                mesh, reconstruction = tsdf_mesh_from_observations(frames, args, project_root)
+                support_points_for_quality, _support_colors = build_observation_point_cloud(
+                    frames,
+                    float(args.min_depth),
+                    float(args.max_depth),
+                    int(args.bbox_point_stride or args.point_stride or 1),
+                    project_root=project_root,
+                )
             elif args.method == "poisson":
-                points, colors = build_observation_point_cloud(frames, float(args.min_depth), float(args.max_depth), int(args.point_stride))
+                points, colors, frame_indices = build_observation_point_cloud(
+                    frames,
+                    float(args.min_depth),
+                    float(args.max_depth),
+                    int(args.point_stride),
+                    return_frame_indices=True,
+                    project_root=project_root,
+                )
+                surface_consistency = None
+                if bool(getattr(args, "surface_consistency_filter", True)):
+                    points, colors, surface_consistency = filter_observation_points_by_multiview_depth_consistency(
+                        points,
+                        colors,
+                        frame_indices,
+                        frames,
+                        args,
+                        project_root,
+                    )
+                surface_bbox_crop = None
+                points, colors, surface_bbox_crop = filter_points_by_support_quantile_bbox(points, colors, args)
+                support_points_for_quality = points
                 mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
+                reconstruction["surface_consistency_filter"] = surface_consistency
+                reconstruction["surface_bbox_crop"] = surface_bbox_crop
             else:
                 try:
-                    mesh, reconstruction = tsdf_mesh_from_observations(frames, args)
-                    method_used = "tsdf"
-                except Exception as tsdf_exc:
-                    points, colors = build_observation_point_cloud(frames, float(args.min_depth), float(args.max_depth), int(args.point_stride))
+                    points, colors, frame_indices = build_observation_point_cloud(
+                        frames,
+                        float(args.min_depth),
+                        float(args.max_depth),
+                        int(args.point_stride),
+                        return_frame_indices=True,
+                        project_root=project_root,
+                    )
+                    surface_consistency = None
+                    if bool(getattr(args, "surface_consistency_filter", True)):
+                        points, colors, surface_consistency = filter_observation_points_by_multiview_depth_consistency(
+                            points,
+                            colors,
+                            frame_indices,
+                            frames,
+                            args,
+                            project_root,
+                        )
+                    surface_bbox_crop = None
+                    points, colors, surface_bbox_crop = filter_points_by_support_quantile_bbox(points, colors, args)
+                    support_points_for_quality = points
                     mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
                     method_used = "poisson"
-                    reconstruction["tsdf_fallback_reason"] = str(tsdf_exc)
+                    reconstruction["surface_consistency_filter"] = surface_consistency
+                    reconstruction["surface_bbox_crop"] = surface_bbox_crop
+                except Exception as poisson_exc:
+                    mesh, reconstruction = tsdf_mesh_from_observations(frames, args, project_root)
+                    method_used = "tsdf"
+                    reconstruction["poisson_fallback_reason"] = str(poisson_exc)
+                    support_points_for_quality, _support_colors = build_observation_point_cloud(
+                        frames,
+                        float(args.min_depth),
+                        float(args.max_depth),
+                        int(args.bbox_point_stride or args.point_stride or 1),
+                        project_root=project_root,
+                    )
             ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
             if not ok:
                 raise RuntimeError(f"Open3D failed to write mesh: {mesh_path}")
             mesh_summary = summarize_triangle_mesh(mesh_path)
+            quality_guard = mesh_support_quality_report(mesh, support_points_for_quality, args)
             asset_path = mesh_path
             proxy_metadata = None
             proxy_path = None
@@ -15007,6 +15364,7 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                         float(args.min_depth),
                         float(args.max_depth),
                         int(args.bbox_point_stride or 1),
+                        project_root=project_root,
                     )
                     proxy_mesh, proxy_reconstruction = bbox_proxy_mesh_from_points(
                         points,
@@ -15029,7 +15387,8 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                     }
                 except Exception as proxy_exc:
                     proxy_metadata = {"error": str(proxy_exc)}
-            if args.copy_to_assets:
+            should_publish_asset = bool(args.copy_to_assets) and (bool(quality_guard.get("passed", True)) or bool(getattr(args, "quality_guard_publish_failed", False)))
+            if should_publish_asset:
                 src_asset = asset_path
                 dst = sim_objects_dir / object_id / src_asset.name
                 if src_asset.resolve() != dst.resolve():
@@ -15048,13 +15407,20 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                 "method": method_used,
                 "reconstruction": reconstruction,
                 "qa": mesh_summary,
+                "quality_guard": quality_guard,
                 "proxy_mesh": proxy_metadata,
                 "asset_source": "surface_mesh",
                 "notes": "Mesh reconstructed from 3DGS-rendered multi-view depth/normal/mask observations. Proxy meshes are diagnostic/collision helpers and are never used as visual assets.",
             }
+            if not should_publish_asset:
+                metadata["asset_path"] = None
+                metadata["asset_rejected"] = {
+                    "reason": "quality_guard_failed" if not quality_guard.get("passed", True) else "copy_to_assets_disabled",
+                    "source_mesh": str(mesh_path),
+                }
             write_json(object_mesh_dir / "reconstruction.json", metadata)
             object_json = project_root / manifest["objects_dir"] / object_id / "object.json"
-            if object_json.exists():
+            if object_json.exists() and should_publish_asset:
                 obj = read_json(object_json)
                 obj["mesh_asset"] = metadata
                 write_json(object_json, obj)
@@ -34892,6 +35258,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tsdf-sdf-trunc", type=float, default=0.12)
     p.add_argument("--point-stride", type=int, default=2)
     p.add_argument("--min-points", type=int, default=200)
+    p.add_argument("--surface-consistency-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--surface-consistency-min-projected", type=int, default=2)
+    p.add_argument("--surface-consistency-min-hits", type=int, default=2)
+    p.add_argument("--surface-consistency-min-hit-ratio", type=float, default=0.35)
+    p.add_argument("--surface-consistency-depth-tolerance", type=float, default=0.08)
+    p.add_argument("--surface-consistency-min-probability", type=float, default=0.5)
+    p.add_argument("--surface-consistency-max-frames", type=int, default=0)
+    p.add_argument("--surface-consistency-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--surface-crop-to-quantile-bbox", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--surface-bbox-quantile-min", type=float, default=0.02)
+    p.add_argument("--surface-bbox-quantile-max", type=float, default=0.98)
+    p.add_argument("--surface-bbox-padding-ratio", type=float, default=0.02)
+    p.add_argument("--surface-crop-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--voxel-size", type=float, default=0.02)
     p.add_argument("--remove-outliers", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--outlier-nb-neighbors", type=int, default=20)
@@ -34908,6 +35287,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bbox-quantile-min", type=float, default=0.01)
     p.add_argument("--bbox-quantile-max", type=float, default=0.99)
     p.add_argument("--bbox-padding-ratio", type=float, default=0.02)
+    p.add_argument("--quality-guard", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--quality-bbox-quantile-min", type=float, default=0.20)
+    p.add_argument("--quality-bbox-quantile-max", type=float, default=0.80)
+    p.add_argument("--quality-bbox-padding-ratio", type=float, default=0.08)
+    p.add_argument("--quality-max-diagonal-ratio", type=float, default=1.25)
+    p.add_argument("--quality-max-longest-axis-ratio", type=float, default=1.25)
+    p.add_argument("--quality-max-center-distance-ratio", type=float, default=0.35)
+    p.add_argument("--quality-guard-publish-failed", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--proxy-mesh", choices=["diagnostic", "none"], default="none")
     p.add_argument("--proxy-bbox-quantile-min", type=float, default=0.20)
     p.add_argument("--proxy-bbox-quantile-max", type=float, default=0.80)
