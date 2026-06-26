@@ -23,6 +23,7 @@ from video2mesh.cli import (
     filter_points_by_bounds,
     filter_observation_points_by_multiview_depth_consistency,
     filter_mask_by_depth_edges,
+    filter_mask_by_world_bounds,
     export_viewer_plys,
     filter_colmap_points3d_file,
     gaussian_occupancy_mesh_from_points,
@@ -802,15 +803,35 @@ def test_observation_depth_to_point_cloud_uses_mask_and_camera(tmp_path: Path):
     assert points[0].tolist() == pytest.approx([0.0, 0.0, 2.0])
 
 
+def test_filter_mask_by_world_bounds_reprojects_depth_pixels():
+    np = pytest.importorskip("numpy")
+    mask = np.ones((5, 5), dtype=bool)
+    depth = np.ones((5, 5), dtype=np.float32) * 2.0
+    intrinsic = {"fx": 2.0, "fy": 2.0, "cx": 2.0, "cy": 2.0}
+    world_to_camera = np.eye(4)
+    bounds = (np.array([-0.1, -0.1, 1.5]), np.array([0.1, 0.1, 2.5]))
+
+    filtered, report = filter_mask_by_world_bounds(mask, depth, intrinsic, world_to_camera, bounds)
+
+    assert int(filtered.sum()) == 1
+    assert filtered[2, 2]
+    assert report["kept_pixels"] == 1
+    assert report["removed_pixels"] == 24
+
+
 def test_3dgs_mesh_cli_commands_are_registered():
     parser = build_parser()
 
     obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
+    obs_with_support = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj", "--semantic-support-filter"])
     recon = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj"])
     semantic_recon = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj"])
     neus = parser.parse_args(["prepare-neus-surface-jobs", "--project-root", "proj"])
 
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
+    assert obs.semantic_support_filter is False
+    assert obs_with_support.semantic_support_filter is True
+    assert obs.max_scale_quantile == pytest.approx(0.90)
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
     assert recon.proxy_mesh == "none"
     assert recon.surface_consistency_filter is True

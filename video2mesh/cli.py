@@ -4420,6 +4420,41 @@ def filter_mask_by_depth_edges(mask, depth, edge_quantile: float = 0.85, edge_ma
     return filtered, {"threshold": threshold, "quantile_threshold": q_threshold, "edge_quantile": float(edge_quantile), "edge_max": float(edge_max)}
 
 
+def filter_mask_by_world_bounds(mask, depth, intrinsic: dict[str, Any], world_to_camera, bounds):
+    np = import_numpy()
+    mask_np = np.asarray(mask, dtype=bool)
+    if bounds is None or not mask_np.any():
+        return mask_np, None
+    depth_np = np.asarray(depth, dtype=np.float32)
+    valid = mask_np & np.isfinite(depth_np) & (depth_np > 0)
+    if int(valid.sum()) == 0:
+        return mask_np, None
+    ys, xs = np.nonzero(valid)
+    z = depth_np[ys, xs].astype(np.float64)
+    fx = float(intrinsic["fx"])
+    fy = float(intrinsic.get("fy", fx))
+    cx = float(intrinsic["cx"])
+    cy = float(intrinsic["cy"])
+    x = (xs.astype(np.float64) - cx) * z / max(fx, 1e-8)
+    y = (ys.astype(np.float64) - cy) * z / max(fy, 1e-8)
+    cam_points = np.stack([x, y, z, np.ones_like(z)], axis=1)
+    c2w = np.linalg.inv(np.asarray(world_to_camera, dtype=np.float64))
+    world = (c2w @ cam_points.T).T[:, :3]
+    lower, upper = bounds
+    keep_values = np.all((world >= lower) & (world <= upper), axis=1)
+    filtered = np.zeros_like(mask_np, dtype=bool)
+    filtered[ys[keep_values], xs[keep_values]] = True
+    return filtered, {
+        "enabled": True,
+        "input_pixels": int(mask_np.sum()),
+        "valid_depth_pixels": int(valid.sum()),
+        "kept_pixels": int(filtered.sum()),
+        "removed_pixels": int(mask_np.sum() - int(filtered.sum())),
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+    }
+
+
 def mean_or_none(values: list[float]) -> float | None:
     if not values:
         return None
@@ -4667,6 +4702,7 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
             if not object_records:
                 skipped[object_id] = "missing_2d_masks"
                 continue
+            semantic_support_bounds, semantic_support_source = semantic_support_bounds_for_object(project_root, manifest, object_id, args)
             object_dir = ensure_dir(output_dir / object_id)
             frame_reports: list[dict[str, Any]] = []
             for record in object_records:
@@ -4712,6 +4748,21 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                         edge_quantile=float(args.depth_edge_quantile),
                         edge_max=float(args.depth_edge_max),
                     )
+                semantic_support_filter = None
+                if semantic_support_bounds is not None:
+                    w2c_np = world_to_camera_matrix(
+                        resolve_extrinsic(camera_info["extrinsic"], record.frame_id),
+                        camera_info.get("extrinsic_type") or args.extrinsic_type,
+                    )
+                    object_mask, semantic_support_filter = filter_mask_by_world_bounds(
+                        object_mask,
+                        depth_np,
+                        intrinsic,
+                        w2c_np,
+                        semantic_support_bounds,
+                    )
+                elif semantic_support_source is not None:
+                    semantic_support_filter = semantic_support_source
                 normal_np = depth_to_normal_map(depth_np, float(intrinsic["fx"]), float(intrinsic.get("fy", intrinsic["fx"])))
                 frame_dir = ensure_dir(object_dir / record.frame_id)
                 rgb_path = frame_dir / "rgb.png"
@@ -4764,6 +4815,7 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                             "depth_clip": depth_clip,
                             "depth_edge_filter": bool(args.depth_edge_filter),
                             "depth_edge": depth_edge_filter,
+                            "semantic_support_filter": semantic_support_filter,
                         },
                         "alpha_mean": float(alpha_np.mean()),
                         "depth_min": float(depth_np[object_mask].min()) if object_mask.any() else None,
@@ -35070,6 +35122,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-edge-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-edge-quantile", type=float, default=0.85)
     p.add_argument("--depth-edge-max", type=float, default=0.35)
+    p.add_argument("--semantic-support-filter", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--semantic-support-ply", type=Path, help="Semantic 3DGS PLY used to bound rendered-depth masks.")
+    p.add_argument("--semantic-support-manifest", type=Path, help="Semantic splat manifest used to map object ids to semantic ids.")
+    p.add_argument("--semantic-support-min-probability", type=float, default=0.5)
+    p.add_argument("--semantic-support-use-gaussian-attributes", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--min-opacity", type=float, default=0.05)
+    p.add_argument("--max-scale", type=float, help="Optional absolute maximum semantic support Gaussian scale.")
+    p.add_argument("--max-scale-quantile", type=float, default=0.90)
+    p.add_argument("--max-anisotropy", type=float, help="Optional absolute maximum semantic support Gaussian anisotropy.")
+    p.add_argument("--max-anisotropy-quantile", type=float, default=0.95)
+    p.add_argument("--gaussian-attribute-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--semantic-support-bbox-quantile-min", type=float, default=0.20)
+    p.add_argument("--semantic-support-bbox-quantile-max", type=float, default=0.80)
+    p.add_argument("--semantic-support-bbox-padding-ratio", type=float, default=0.12)
+    p.add_argument("--semantic-support-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--include-background-structures", action="store_true")
     p.set_defaults(func=cmd_export_3dgs_mesh_observations)
 
