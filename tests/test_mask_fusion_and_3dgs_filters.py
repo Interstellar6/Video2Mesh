@@ -898,6 +898,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert recon.surface_consistency_min_projected == 2
     assert recon.surface_consistency_min_hit_ratio == pytest.approx(0.35)
     assert recon.surface_crop_to_quantile_bbox is True
+    assert recon.surface_bbox_quantile_min == pytest.approx(0.15)
+    assert recon.surface_bbox_quantile_max == pytest.approx(0.85)
     assert recon.quality_guard is True
     assert semantic_recon.func.__name__ == "cmd_reconstruct_semantic_3dgs_object_meshes"
     semantic_occupancy = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj", "--method", "gaussian_occupancy"])
