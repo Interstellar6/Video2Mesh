@@ -14,7 +14,7 @@ Video2Mesh 的目标是把一段真实空间扫描视频转换为可展示、可
   -> 场景级 3D Gaussian Splatting
   -> 物体/背景结构级 3D semantic masks
   -> 每个物体的相关帧与裁图
-  -> 每个物体 mesh
+  -> 每个物体 3DGS-derived mesh
   -> MuJoCo / Unity / Isaac 可消费的资产包
 ```
 
@@ -28,7 +28,8 @@ Video2Mesh 的目标是把一段真实空间扫描视频转换为可展示、可
 - SAM2.1 Hiera Tiny：做 video mask propagation。
 - Video2Mesh fusion：把 2D masks 通过相机投影融合成 3D masks，并回写到 Gaussian / viewer PLY。
 - SVLGaussian-style frame selection：采用 SVLGaussian 论文的 view-selection protocol（DOI `10.1049/cit2.70148`），为每个物体选择 anchor、5/10 frame offset、30-frame random-window 补充帧；这不是完整复现其 Flash3D/Qwen/SAM 单图 pipeline。
-- baseline mesh exporter：先从 3D mask cloud 得到粗 mesh；后续可替换为 Hunyuan/Meshy/多视角 mesh。
+- baseline mesh exporter：先从 3D mask cloud 得到可查看 OBJ，只用于 debug、尺度检查和 simulator 接口验证；这类 mesh 当前会明显碎片化，常见问题是 disconnected triangle islands、holes、floating sheets 和非 watertight。
+- production mesh route：从训练好的 3DGS 按真实相机位姿渲染多视角 depth/normal/mask，再做 TSDF fusion / Poisson / NeuS-style surface extraction，得到更接近真实几何的物体 mesh。
 - simulator exporter：导出 object pose、mesh、collider、physics stub、语义 ID 和仿真器 adapter。
 
 内置 minimal `train-gsplat` 只作为 smoke/debug fallback；真实实验默认使用 GraphDECO。
@@ -170,7 +171,7 @@ Viewer PLY 约定：
 - GraphDECO 已接入为默认 trainer，但长视频重建质量仍受 MASt3R 位姿、帧选择、显存和训练时间影响。
 - SAM2.1 tiny 比 SAM v1 bbox tracking 更稳定，但对折叠椅、植物、透明/反光/细结构仍会过分割或漂移。
 - 物体语义名还需要开放词汇检测或 VLM 回流。
-- 当前物体 mesh 多为 object mask cloud baseline，适合验证尺度和接口，不是最终仿真质量。
+- 当前物体 OBJ 多为 object mask cloud baseline，适合验证尺度和接口，不是最终仿真质量；它们会有碎片化、破洞、悬浮面片和非 watertight 问题。生产路线应升级为 3DGS 多视角渲染 depth/normal/mask 后的 TSDF fusion / Poisson / NeuS-style surface extraction，并配套 connected-component filtering、hole filling、simplification 和 watertight QA。
 - 背景结构仍以 floor/wall/ceiling 等 baseline 为主，door/window/cabinet 等需要更强 scene structure segmentation。
 - 仿真器资产仍需要真实尺度标定、碰撞体质量检查和物理属性测量。
 

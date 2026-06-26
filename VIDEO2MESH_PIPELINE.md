@@ -14,7 +14,7 @@
   -> semantic/probability splat export
   -> object frame selection
   -> object images
-  -> object mesh
+  -> object mesh (3DGS rendered depth/normal/mask -> fusion/extraction)
   -> simulator assets
   -> QA / readiness / showcase reports
 ```
@@ -259,7 +259,7 @@ python -m video2mesh.cli prepare-object-images \
   --skip-missing
 ```
 
-baseline mesh：
+临时 baseline mesh：
 
 ```bash
 python -m video2mesh.cli reconstruct-object-meshes \
@@ -268,11 +268,34 @@ python -m video2mesh.cli reconstruct-object-meshes \
   --skip-failed
 ```
 
-生产 mesh 后续应替换为：
+这一步只把 fused 3D mask cloud 先转成可查看的 OBJ，方便检查物体尺度、
+位置和 simulator 导出接口；它不是最终的 3DGS-to-mesh 技术路线。
+当前这类 mesh 明显会太碎：会出现大量 disconnected triangle islands、
+holes、floating sheets，很多对象不是 watertight。原因是直接从稀疏/不均匀
+mask cloud 做 surface reconstruction 时，点支持不足且噪声点会被连成片。
+因此它只能作为 debug/baseline，不能作为最终物体模型展示。
 
-- Hunyuan 3D / Meshy / image-blaster 单物体生成。
-- 多视角物体重建。
-- 从 3D mask cloud 做更稳定的 surface reconstruction。
+生产 mesh 默认路线改为：
+
+```text
+trained GraphDECO 3DGS
+  + object masks
+  + registered camera poses
+  -> render object-centric multi-view RGB/depth/normal/mask
+  -> TSDF fusion over masked depth/normal observations
+  -> marching cubes / Poisson surface extraction
+  -> optional NeuS-style SDF refinement
+  -> texture baking + mesh simplification + collider generation
+  -> simulator-ready OBJ/GLB
+```
+
+实现要求：
+
+- depth、normal、mask 来自真实相机位姿下的 3DGS 多视角渲染，不用插值帧。
+- TSDF fusion 是默认几何融合路径，Poisson 可作为 normal-oriented surface extraction fallback。
+- NeuS-style refinement 作为高质量后处理，用同一组真实视角和 mask 约束优化 SDF surface。
+- surface extraction 后需要做 connected-component filtering、hole filling、mesh simplification 和 watertight/fragment QA，避免再次输出碎片化 mesh。
+- 旧的 object-mask-cloud meshing 只保留为 debug/baseline，不作为生产质量结果。
 
 ## 8. 仿真器导出
 
@@ -334,7 +357,7 @@ python -m video2mesh.cli verify-showcase-pack \
 1. GraphDECO 高质量训练稳定化：长迭代、合适分辨率、preview 指标、导入验证。
 2. SAM2 base/large 或 DEVA/XMem：减少椅子、花草等物体过分割。
 3. GroundingDINO / YOLO-World / OWL-ViT + VLM：给 object_id 生成可靠类别和描述。
-4. 多视角物体 mesh：替换 bbox/object-mask-cloud baseline mesh。
+4. 3DGS-to-mesh：从 3DGS 多视角渲染 depth/normal/mask，再做 TSDF fusion / Poisson / NeuS-style surface extraction，替换 bbox/object-mask-cloud baseline mesh。
 5. 背景结构语义：floor、wall、ceiling、door、window、cabinet。
 6. 真实尺度标定、碰撞体简化、质量/摩擦/恢复系数估计。
 7. SceneVerse++ / PQ3D 数据桥接和评估。

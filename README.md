@@ -1,6 +1,6 @@
 # Video2Mesh
 
-Video2Mesh turns a spatial scan video into a scene-level 3DGS, object/background 3D semantic masks, object reference frames, coarse object meshes, and simulator-ready assets.
+Video2Mesh turns a spatial scan video into a scene-level 3DGS, object/background 3D semantic masks, object reference frames, 3DGS-derived object meshes, and simulator-ready assets.
 
 Current default pipeline:
 
@@ -61,6 +61,33 @@ The GraphDECO default is now the full training preset: full COLMAP point-cloud
 initialization, 30000 iterations, checkpoints at 7000 and 30000,
 densification/pruning, opacity reset, and SH degree 3 appearance enabled. Use
 smaller overrides only for explicit smoke tests or memory-constrained debugging.
+
+## Object Mesh Route
+
+`reconstruct-object-meshes` can still export quick OBJ baselines from fused
+object mask point clouds so the simulator/export path has concrete geometry to
+inspect. Those OBJ files are not the target 3DGS-to-mesh method.
+
+Current mask-cloud OBJ output is expected to be fragmented: sparse/uneven point
+support creates many disconnected triangle islands, holes, floating sheets, and
+non-watertight surfaces. Treat these meshes as debug geometry only, useful for
+checking object scale, rough placement, and export wiring. They should not be
+shown as final object assets.
+
+The default production direction is:
+
+```text
+trained 3DGS + object 2D/3D masks + registered cameras
+  -> render multi-view RGB/depth/normal/mask observations
+  -> fuse masked depth/normal evidence with TSDF fusion
+  -> extract surfaces with marching cubes / Poisson reconstruction
+  -> optionally refine with NeuS-style SDF optimization
+  -> bake texture, simplify collider, export simulator mesh
+```
+
+This route treats 3DGS as the geometric scene representation and extracts a
+surface from rendered multi-view evidence, rather than meshing raw sparse
+points directly.
 
 ## Frame Window Rule
 

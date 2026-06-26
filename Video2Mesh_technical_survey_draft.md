@@ -651,7 +651,9 @@ mesh generation 可以分为三个阶段。
 
 第二阶段是多图辅助：为同一物体选择多个互补视角，先用 image editing 生成 clean object references，再用支持多视角或 image set 的 3D reconstruction/generation 模型。
 
-第三阶段是几何约束：用 3D mask 裁剪出 object-centric point cloud 或 Gaussian subset，结合 selected frames 做 mesh extraction / reconstruction，让 mesh 更贴近真实场景几何。
+第三阶段是 3DGS-to-mesh：用 object masks 和注册相机位姿，从训练好的 3DGS 渲染 object-centric 多视角 RGB/depth/normal/mask，再把 masked depth/normal 观测融合成 surface。这个阶段不应只把 sparse point cloud 或 Gaussian centers 直接连成网格；那只能作为 debug baseline。
+
+当前 object mask cloud 直接转 mesh 的失败形态已经很明确：表面会被打碎成大量 disconnected triangle islands，伴随 holes、floating sheets 和非 watertight 区域。根因是点云本身稀疏、不均匀、带悬浮噪声，并且局部三角化会把错误邻域硬连成薄片。因此这条路线只能用于快速看位置和 bbox 规模，不能作为最终物体 mesh。
 
 早期推荐路线：
 
@@ -667,9 +669,12 @@ best object crop
 长期推荐路线：
 
 ```text
-multi-view selected frames + object masks + camera poses + object 3D mask
-  -> object-centric reconstruction
-  -> mesh extraction / refinement
+trained 3DGS + object masks + registered camera poses
+  -> object-centric multi-view RGB/depth/normal/mask rendering
+  -> TSDF fusion over masked observations
+  -> marching cubes / Poisson surface extraction
+  -> optional NeuS-style SDF refinement
+  -> connected-component filtering / hole filling / simplification / watertight QA
   -> texture baking
   -> physics collider generation
   -> simulator export
@@ -984,7 +989,7 @@ video -> 3DGS -> object masks -> selected frames -> object meshes -> viewer/expo
 
 1. 单图 mesh：只使用每个物体的最佳帧 crop。
 2. 多图 mesh：使用多个 selected frames。
-3. 3D mask mesh：从 object-centric point cloud / Gaussian subset 中提取或辅助重建。
+3. 3DGS-to-mesh：从 3DGS 多视角渲染 depth/normal/mask，再做 TSDF fusion / Poisson / NeuS-style surface extraction。
 
 比较维度包括：
 
@@ -1144,7 +1149,7 @@ data/
   + simulator export
 ```
 
-短期最现实的路线是：先用传统 SfM/3DGS 跑通真实扫描场景，再用 2D segmentation 和 tracking 生成物体 tracks，通过投影融合得到 3D masks，最后复用 image-blaster 风格的单图 mesh generation 生成可导入仿真器的物体资产。长期路线则应将单图 mesh generation 升级为多视角、受 3D mask 约束的 object-centric reconstruction，从而提高真实几何一致性。
+短期最现实的路线是：先用传统 SfM/3DGS 跑通真实扫描场景，再用 2D segmentation 和 tracking 生成物体 tracks，通过投影融合得到 3D masks，并用 object mask cloud OBJ 作为临时 debug mesh 检查尺度、位置和导出接口。这个 OBJ baseline 会很碎，只能证明链路闭合，不能代表最终资产质量。长期和生产路线应升级为 3DGS-to-mesh：从 3DGS 在真实相机位姿下渲染多视角 depth/normal/mask，再用 TSDF fusion、Poisson surface extraction 或 NeuS-style SDF refinement 提取物体表面，从而提高真实几何一致性。
 
 ## 13. 下一步建议
 
@@ -1154,8 +1159,8 @@ data/
 2. 跑通 COLMAP + 3DGS。
 3. 对抽帧运行 2D segmentation 和 tracking。
 4. 将 2D masks 投影融合到点云，得到 object-level 3D masks。
-5. 为每个 object 自动选一张最佳 crop。
-6. 调用单图 mesh generation 得到 `.glb`。
+5. 为每个 object 自动选多视角真实帧和 mask。
+6. 从 3DGS 渲染 object-centric depth/normal/mask，做 TSDF fusion / Poisson / NeuS-style surface extraction 得到 `.obj` 或 `.glb`。
 7. 用 viewer 检查场景 3DGS、object mask 和 mesh 是否能对齐。
 
 这个 prototype 一旦跑通，就可以围绕失败案例逐步增强：更好的 tracking、更稳的 3D fusion、更好的选帧、多视角 mesh、仿真器专用导出和人工校正界面。
