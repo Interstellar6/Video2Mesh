@@ -14892,6 +14892,7 @@ def semantic_support_bounds_for_object(
     args: argparse.Namespace,
 ):
     np = import_numpy()
+    min_points = int(getattr(args, "min_points", 200))
     if not bool(getattr(args, "semantic_support_filter", False)):
         return None, None
     artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
@@ -14917,7 +14918,7 @@ def semantic_support_bounds_for_object(
     probabilities = np.asarray(probabilities_raw if probabilities_raw is not None else np.ones(points.shape[0]), dtype=np.float32)
     selected = (labels == int(semantic_id)) & (probabilities >= float(getattr(args, "semantic_support_min_probability", 0.5)))
     selected_indices = np.flatnonzero(selected)
-    if selected_indices.shape[0] < int(args.min_points):
+    if selected_indices.shape[0] < min_points:
         return None, {
             "enabled": True,
             "reason": "too_few_semantic_support_points",
