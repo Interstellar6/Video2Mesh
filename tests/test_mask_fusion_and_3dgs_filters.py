@@ -992,6 +992,10 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert g3dgs.prefer_dense_colmap_init is True
     assert g3dgs.clean_3dgs_floaters is True
     assert g3dgs.clean_max_elongation == pytest.approx(25.0)
+    pipeline = parser.parse_args(["run-pipeline", "--project-root", "proj"])
+    assert pipeline.g3dgs_prefer_dense_colmap_init is True
+    assert pipeline.g3dgs_clean_3dgs_floaters is True
+    assert pipeline.g3dgs_clean_max_elongation == pytest.approx(25.0)
     assert clean.func.__name__ == "cmd_clean_3dgs_floaters"
     assert clean.knn == 24
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"

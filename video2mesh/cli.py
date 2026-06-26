@@ -34600,6 +34600,13 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     filter_sparse_points=args.g3dgs_filter_sparse_points,
                     sparse_max_reprojection_error=args.g3dgs_sparse_max_reprojection_error,
                     sparse_min_track_length=args.g3dgs_sparse_min_track_length,
+                    clean_3dgs_floaters=args.g3dgs_clean_3dgs_floaters,
+                    clean_knn=args.g3dgs_clean_knn,
+                    clean_outlier_mad=args.g3dgs_clean_outlier_mad,
+                    clean_max_elongation=args.g3dgs_clean_max_elongation,
+                    clean_min_opacity=args.g3dgs_clean_min_opacity,
+                    clean_low_opacity=args.g3dgs_clean_low_opacity,
+                    clean_remove_low_opacity=args.g3dgs_clean_remove_low_opacity,
                     register_mode=args.mode,
                     no_register=args.no_register_3dgs,
                 )
@@ -37062,6 +37069,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before GraphDECO/full 3DGS training.")
     p.add_argument("--g3dgs-sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--g3dgs-sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
+    p.add_argument("--g3dgs-clean-3dgs-floaters", action=argparse.BooleanOptionalAction, default=True, help="After external 3DGS training, clean isolated/elongated/transparent splats before registration.")
+    p.add_argument("--g3dgs-clean-knn", type=int, default=24)
+    p.add_argument("--g3dgs-clean-outlier-mad", type=float, default=2.5)
+    p.add_argument("--g3dgs-clean-max-elongation", type=float, default=25.0)
+    p.add_argument("--g3dgs-clean-min-opacity", type=float, default=0.01)
+    p.add_argument("--g3dgs-clean-low-opacity", type=float, default=0.08)
+    p.add_argument("--g3dgs-clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--no-register-3dgs", action="store_true")
     p.add_argument("--train-gsplat", action="store_true", help="Run the built-in minimal gsplat trainer and register its output.")
     p.add_argument("--gsplat-point-cloud", type=Path, help="Initialization point cloud for the built-in trainer. Defaults to the original scene/reconstruction/point_cloud.ply, not any downsampled working cloud.")
