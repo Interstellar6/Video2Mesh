@@ -16000,6 +16000,7 @@ def selected_gaussian_attributes(gsplat_data: dict[str, Any] | None, selected_in
 
 def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[str, Any] | None, args: argparse.Namespace, return_mask: bool = False):
     np = import_numpy()
+    min_points = int(getattr(args, "min_points", 200))
     points_np = np.asarray(points, dtype=np.float64)
     if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
         result = (points_np, colors, None)
@@ -16066,7 +16067,7 @@ def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[st
                 keep &= anisotropy <= threshold
 
     kept = int(keep.sum())
-    if kept < int(args.min_points) and bool(getattr(args, "gaussian_attribute_fallback_keep_original", True)):
+    if kept < min_points and bool(getattr(args, "gaussian_attribute_fallback_keep_original", True)):
         report = {
             "enabled": True,
             "fallback": "too_few_points_after_gaussian_attribute_filter",
