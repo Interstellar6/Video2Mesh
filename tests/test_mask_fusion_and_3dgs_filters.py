@@ -7,6 +7,7 @@ import pytest
 
 from video2mesh.cli import (
     apply_3dgs_sparse_filter,
+    augment_points_from_gaussian_support,
     build_observation_point_cloud,
     build_parser,
     bbox_proxy_mesh_from_points,
@@ -514,6 +515,52 @@ def test_filter_points_by_gaussian_attributes_removes_low_quality_gaussians():
     assert report["thresholds"]["max_scale"] == pytest.approx(1.0)
 
 
+def test_filter_points_by_gaussian_attributes_can_return_keep_mask():
+    np = pytest.importorskip("numpy")
+    points = np.zeros((3, 3), dtype=np.float64)
+    attrs = {"opacities": np.array([0.9, 0.01, 0.8], dtype=np.float32)}
+    args = Namespace(
+        min_points=1,
+        min_opacity=0.05,
+        max_scale=None,
+        max_scale_quantile=None,
+        max_anisotropy=None,
+        max_anisotropy_quantile=None,
+        gaussian_attribute_fallback_keep_original=False,
+    )
+
+    filtered, _colors, _report, keep = filter_points_by_gaussian_attributes(points, None, attrs, args, return_mask=True)
+
+    assert filtered.shape == (2, 3)
+    assert keep.tolist() == [True, False, True]
+
+
+def test_augment_points_from_gaussian_support_adds_oriented_axis_samples():
+    np = pytest.importorskip("numpy")
+    points = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
+    colors = np.array([[0.2, 0.3, 0.4]], dtype=np.float64)
+    attrs = {
+        "scales": np.array([[0.1, 0.2, 0.3]], dtype=np.float64),
+        "quats": np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float64),
+    }
+    args = Namespace(
+        gaussian_support_augmentation=True,
+        gaussian_support_samples_per_gaussian=2,
+        gaussian_support_scale_multiplier=0.5,
+        gaussian_support_scale_quantile=1.0,
+        gaussian_support_min_scale=0.001,
+        gaussian_support_max_points=0,
+        seed=7,
+    )
+
+    augmented, augmented_colors, report = augment_points_from_gaussian_support(points, colors, attrs, args)
+
+    assert augmented.shape == (3, 3)
+    np.testing.assert_allclose(augmented[1:], np.array([[1.05, 2.0, 3.0], [0.95, 2.0, 3.0]], dtype=np.float64))
+    assert augmented_colors.shape == (3, 3)
+    assert report["added_points"] == 2
+
+
 def test_bbox_proxy_mesh_from_points_returns_box_mesh():
     np = pytest.importorskip("numpy")
     pytest.importorskip("open3d")
@@ -721,4 +768,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert semantic_recon.gaussian_attribute_filter is True
     assert semantic_recon.max_scale_quantile == pytest.approx(0.90)
     assert semantic_recon.mesh_crop_to_support_bbox is True
+    assert semantic_recon.gaussian_support_augmentation is False
+    assert semantic_recon.gaussian_support_samples_per_gaussian == 2
+    assert semantic_recon.gaussian_support_scale_multiplier == pytest.approx(0.20)
+    assert semantic_recon.gaussian_support_max_points == 3000
     assert neus.func.__name__ == "cmd_prepare_neus_surface_jobs"

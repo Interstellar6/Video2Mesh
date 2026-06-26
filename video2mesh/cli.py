@@ -15481,16 +15481,17 @@ def semantic_id_for_object_id(semantic_manifest: dict[str, Any] | None, object_i
     return None
 
 
-def filter_points_by_quantile_bbox(points, colors, q_min: float, q_max: float, padding_ratio: float):
+def filter_points_by_quantile_bbox(points, colors, q_min: float, q_max: float, padding_ratio: float, return_mask: bool = False):
     np = import_numpy()
     bounds = quantile_bounds_from_points(points, q_min, q_max, padding_ratio)
     if bounds is None:
-        return points, colors, None
+        result = (points, colors, None)
+        return (*result, None) if return_mask else result
     lower, upper = bounds
     points_np = np.asarray(points, dtype=np.float64)
     keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
     filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
-    return points_np[keep], filtered_colors, {
+    report = {
         "min": [float(value) for value in lower.tolist()],
         "max": [float(value) for value in upper.tolist()],
         "kept_points": int(keep.sum()),
@@ -15498,6 +15499,93 @@ def filter_points_by_quantile_bbox(points, colors, q_min: float, q_max: float, p
         "q_min": float(q_min),
         "q_max": float(q_max),
         "padding_ratio": float(padding_ratio),
+    }
+    result = (points_np[keep], filtered_colors, report)
+    return (*result, keep) if return_mask else result
+
+
+def apply_mask_to_gaussian_attrs(gaussian_attrs: dict[str, Any] | None, keep):
+    if not gaussian_attrs:
+        return gaussian_attrs
+    np = import_numpy()
+    keep_np = np.asarray(keep, dtype=bool)
+    filtered: dict[str, Any] = {}
+    for key, value in gaussian_attrs.items():
+        array = np.asarray(value)
+        if array.shape[0] == keep_np.shape[0]:
+            filtered[key] = array[keep_np]
+    return filtered or None
+
+
+def augment_points_from_gaussian_support(points, colors, gaussian_attrs: dict[str, Any] | None, args: argparse.Namespace):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if not bool(getattr(args, "gaussian_support_augmentation", False)):
+        return points_np, colors, None
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0 or not gaussian_attrs:
+        return points_np, colors, {"enabled": True, "reason": "missing_points_or_gaussian_attributes", "input_points": int(points_np.shape[0]), "output_points": int(points_np.shape[0])}
+    scales = gaussian_attrs.get("scales")
+    quats = gaussian_attrs.get("quats")
+    if scales is None or quats is None:
+        return points_np, colors, {"enabled": True, "reason": "missing_scales_or_quats", "input_points": int(points_np.shape[0]), "output_points": int(points_np.shape[0])}
+    scales_np = np.asarray(scales, dtype=np.float64)
+    quats_np = np.asarray(quats, dtype=np.float64)
+    if scales_np.shape[0] != points_np.shape[0] or quats_np.shape[0] != points_np.shape[0] or scales_np.ndim != 2 or scales_np.shape[1] < 3 or quats_np.ndim != 2 or quats_np.shape[1] < 4:
+        return points_np, colors, {"enabled": True, "reason": "attribute_shape_mismatch", "input_points": int(points_np.shape[0]), "output_points": int(points_np.shape[0])}
+
+    scale_abs = np.abs(scales_np[:, :3])
+    scale_max = scale_abs.max(axis=1)
+    scale_quantile = float(getattr(args, "gaussian_support_scale_quantile", 0.85))
+    scale_threshold = float(np.quantile(scale_max, max(0.0, min(1.0, scale_quantile)))) if scale_max.size else 0.0
+    min_scale = float(getattr(args, "gaussian_support_min_scale", 0.005))
+    scale_multiplier = float(getattr(args, "gaussian_support_scale_multiplier", 0.45))
+    clipped_scales = np.clip(scale_abs, min_scale, max(scale_threshold, min_scale)) * scale_multiplier
+    max_points = int(getattr(args, "gaussian_support_max_points", 0) or 0)
+    source_indices = np.arange(points_np.shape[0], dtype=np.int64)
+    if max_points > 0 and points_np.shape[0] > max_points:
+        rng = np.random.default_rng(int(getattr(args, "seed", 7)))
+        source_indices = np.sort(rng.choice(points_np.shape[0], size=max_points, replace=False))
+
+    base_offsets = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=np.float64,
+    )
+    samples_per_gaussian = max(0, min(base_offsets.shape[0], int(getattr(args, "gaussian_support_samples_per_gaussian", 6))))
+    if samples_per_gaussian <= 0:
+        return points_np, colors, {"enabled": True, "reason": "zero_samples_per_gaussian", "input_points": int(points_np.shape[0]), "output_points": int(points_np.shape[0])}
+    base_offsets = base_offsets[:samples_per_gaussian]
+    augmented_points = [points_np]
+    augmented_colors = [np.asarray(colors, dtype=np.float64)] if colors is not None else []
+    for idx in source_indices:
+        quat = quats_np[idx, :4]
+        norm = float(np.linalg.norm(quat))
+        rot = np.eye(3, dtype=np.float64) if norm < 1e-8 else qvec_to_rotmat((quat / norm).tolist())
+        local_offsets = base_offsets * clipped_scales[idx][None, :]
+        world_offsets = local_offsets @ rot.T
+        augmented_points.append(points_np[idx][None, :] + world_offsets)
+        if colors is not None:
+            color = np.asarray(colors, dtype=np.float64)[idx]
+            augmented_colors.append(np.repeat(color[None, :], world_offsets.shape[0], axis=0))
+    output_points = np.concatenate(augmented_points, axis=0)
+    output_colors = np.concatenate(augmented_colors, axis=0) if colors is not None else colors
+    return output_points, output_colors, {
+        "enabled": True,
+        "input_points": int(points_np.shape[0]),
+        "sampled_gaussians": int(source_indices.shape[0]),
+        "samples_per_gaussian": int(samples_per_gaussian),
+        "added_points": int(output_points.shape[0] - points_np.shape[0]),
+        "output_points": int(output_points.shape[0]),
+        "scale_multiplier": float(scale_multiplier),
+        "scale_quantile": float(scale_quantile),
+        "scale_threshold": float(scale_threshold),
+        "min_scale": float(min_scale),
     }
 
 
@@ -15516,17 +15604,19 @@ def sample_points_and_colors(points, colors, max_points: int, seed: int):
     }
 
 
-def filter_points_by_pca_quantiles(points, colors, q_min: float, q_max: float, padding_ratio: float):
+def filter_points_by_pca_quantiles(points, colors, q_min: float, q_max: float, padding_ratio: float, return_mask: bool = False):
     np = import_numpy()
     points_np = np.asarray(points, dtype=np.float64)
     if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] < 4:
-        return points_np, colors, None
+        result = (points_np, colors, None)
+        return (*result, None) if return_mask else result
     center = points_np.mean(axis=0)
     centered = points_np - center
     try:
         _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
     except Exception:
-        return points_np, colors, None
+        result = (points_np, colors, None)
+        return (*result, None) if return_mask else result
     projected = centered @ vh.T
     low_q = max(0.0, min(1.0, float(q_min)))
     high_q = max(low_q, min(1.0, float(q_max)))
@@ -15538,7 +15628,7 @@ def filter_points_by_pca_quantiles(points, colors, q_min: float, q_max: float, p
     upper += padding
     keep = np.all((projected >= lower) & (projected <= upper), axis=1)
     filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
-    return points_np[keep], filtered_colors, {
+    report = {
         "kept_points": int(keep.sum()),
         "removed_points": int(points_np.shape[0] - int(keep.sum())),
         "q_min": low_q,
@@ -15549,21 +15639,25 @@ def filter_points_by_pca_quantiles(points, colors, q_min: float, q_max: float, p
         "projected_min": [float(value) for value in lower.tolist()],
         "projected_max": [float(value) for value in upper.tolist()],
     }
+    result = (points_np[keep], filtered_colors, report)
+    return (*result, keep) if return_mask else result
 
 
-def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_points: int):
+def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_points: int, return_mask: bool = False):
     np = import_numpy()
     points_np = np.asarray(points, dtype=np.float64)
     if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] < max(1, int(min_points)):
-        return points_np, colors, None
+        result = (points_np, colors, None)
+        return (*result, None) if return_mask else result
     if float(eps) <= 0:
-        return points_np, colors, None
+        result = (points_np, colors, None)
+        return (*result, None) if return_mask else result
     o3d = import_open3d()
     pcd = point_cloud_from_arrays(points_np, colors)
     labels = np.asarray(pcd.cluster_dbscan(eps=float(eps), min_points=max(1, int(min_points)), print_progress=False), dtype=np.int64)
     valid_labels = labels[labels >= 0]
     if valid_labels.size == 0:
-        return points_np, colors, {
+        report = {
             "enabled": True,
             "eps": float(eps),
             "min_points": int(min_points),
@@ -15572,11 +15666,13 @@ def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_poin
             "removed_points": 0,
             "reason": "no_clusters",
         }
+        result = (points_np, colors, report)
+        return (*result, None) if return_mask else result
     unique, counts = np.unique(valid_labels, return_counts=True)
     keep_label = int(unique[int(np.argmax(counts))])
     keep = labels == keep_label
     filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
-    return points_np[keep], filtered_colors, {
+    report = {
         "enabled": True,
         "eps": float(eps),
         "min_points": int(min_points),
@@ -15587,6 +15683,8 @@ def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_poin
         "kept_points": int(keep.sum()),
         "removed_points": int(points_np.shape[0] - int(keep.sum())),
     }
+    result = (points_np[keep], filtered_colors, report)
+    return (*result, keep) if return_mask else result
 
 
 def selected_gaussian_attributes(gsplat_data: dict[str, Any] | None, selected_indices):
@@ -15608,13 +15706,15 @@ def selected_gaussian_attributes(gsplat_data: dict[str, Any] | None, selected_in
     return attrs or None
 
 
-def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[str, Any] | None, args: argparse.Namespace):
+def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[str, Any] | None, args: argparse.Namespace, return_mask: bool = False):
     np = import_numpy()
     points_np = np.asarray(points, dtype=np.float64)
     if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
-        return points_np, colors, None
+        result = (points_np, colors, None)
+        return (*result, None) if return_mask else result
     if not gaussian_attrs:
-        return points_np, colors, {"enabled": True, "reason": "missing_gaussian_attributes", "kept_points": int(points_np.shape[0]), "removed_points": 0}
+        result = (points_np, colors, {"enabled": True, "reason": "missing_gaussian_attributes", "kept_points": int(points_np.shape[0]), "removed_points": 0})
+        return (*result, None) if return_mask else result
 
     keep = np.ones(points_np.shape[0], dtype=bool)
     thresholds: dict[str, float] = {}
@@ -15675,7 +15775,7 @@ def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[st
 
     kept = int(keep.sum())
     if kept < int(args.min_points) and bool(getattr(args, "gaussian_attribute_fallback_keep_original", True)):
-        return points_np, colors, {
+        report = {
             "enabled": True,
             "fallback": "too_few_points_after_gaussian_attribute_filter",
             "candidate_kept_points": kept,
@@ -15684,14 +15784,18 @@ def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[st
             "thresholds": thresholds,
             "summaries": summaries,
         }
+        result = (points_np, colors, report)
+        return (*result, None) if return_mask else result
     filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
-    return points_np[keep], filtered_colors, {
+    report = {
         "enabled": True,
         "kept_points": kept,
         "removed_points": int(points_np.shape[0] - kept),
         "thresholds": thresholds,
         "summaries": summaries,
     }
+    result = (points_np[keep], filtered_colors, report)
+    return (*result, keep) if return_mask else result
 
 
 def filter_points_by_multiview_mask_consistency(
@@ -15869,12 +15973,14 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
             mask_consistency = None
             gaussian_attribute_filter = None
             if bool(args.gaussian_attribute_filter):
-                selected_points, selected_colors, gaussian_attribute_filter = filter_points_by_gaussian_attributes(
+                selected_points, selected_colors, gaussian_attribute_filter, keep_mask = filter_points_by_gaussian_attributes(
                     selected_points,
                     selected_colors,
                     selected_attrs,
                     args,
+                    return_mask=True,
                 )
+                selected_attrs = apply_mask_to_gaussian_attrs(selected_attrs, keep_mask)
             if bool(args.mask_consistency_filter):
                 selected_points, selected_colors, mask_consistency = filter_points_by_multiview_mask_consistency(
                     selected_points,
@@ -15886,30 +15992,45 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                 )
             quantile_crop = None
             if bool(args.crop_to_quantile_bbox):
-                selected_points, selected_colors, quantile_crop = filter_points_by_quantile_bbox(
+                selected_points, selected_colors, quantile_crop, keep_mask = filter_points_by_quantile_bbox(
                     selected_points,
                     selected_colors,
                     float(args.bbox_quantile_min),
                     float(args.bbox_quantile_max),
                     float(args.bbox_padding_ratio),
+                    return_mask=True,
                 )
+                selected_attrs = apply_mask_to_gaussian_attrs(selected_attrs, keep_mask)
             pca_crop = None
             if bool(args.crop_to_pca_quantiles):
-                selected_points, selected_colors, pca_crop = filter_points_by_pca_quantiles(
+                selected_points, selected_colors, pca_crop, keep_mask = filter_points_by_pca_quantiles(
                     selected_points,
                     selected_colors,
                     float(args.pca_quantile_min),
                     float(args.pca_quantile_max),
                     float(args.pca_padding_ratio),
+                    return_mask=True,
                 )
+                selected_attrs = apply_mask_to_gaussian_attrs(selected_attrs, keep_mask)
             dbscan_filter = None
             if bool(args.keep_largest_dbscan_cluster):
-                selected_points, selected_colors, dbscan_filter = filter_points_by_dbscan_largest_cluster(
+                selected_points, selected_colors, dbscan_filter, keep_mask = filter_points_by_dbscan_largest_cluster(
                     selected_points,
                     selected_colors,
                     float(args.dbscan_eps),
                     int(args.dbscan_min_points),
+                    return_mask=True,
                 )
+                selected_attrs = apply_mask_to_gaussian_attrs(selected_attrs, keep_mask)
+            gaussian_support_augmentation = None
+            pre_aug_points = selected_points
+            pre_aug_colors = selected_colors
+            selected_points, selected_colors, gaussian_support_augmentation = augment_points_from_gaussian_support(
+                selected_points,
+                selected_colors,
+                selected_attrs,
+                args,
+            )
             sample_report = None
             selected_points, selected_colors, sample_report = sample_points_and_colors(
                 selected_points,
@@ -15917,7 +16038,21 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                 int(args.max_points),
                 int(args.seed),
             )
-            mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
+            try:
+                mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
+            except Exception as mesh_exc:
+                fallback_report = gaussian_support_augmentation
+                if fallback_report and fallback_report.get("enabled") and bool(getattr(args, "gaussian_support_fallback_without_augmentation", True)):
+                    selected_points = pre_aug_points
+                    selected_colors = pre_aug_colors
+                    gaussian_support_augmentation = {
+                        **fallback_report,
+                        "fallback": "reconstructed_without_gaussian_support_augmentation",
+                        "fallback_reason": str(mesh_exc),
+                    }
+                    mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
+                else:
+                    raise
             mesh, mesh_postprocess = postprocess_mesh_with_point_support(mesh, selected_points, args)
             ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
             if not ok:
@@ -15947,6 +16082,7 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                     "quantile_crop": quantile_crop,
                     "pca_crop": pca_crop,
                     "dbscan_filter": dbscan_filter,
+                    "gaussian_support_augmentation": gaussian_support_augmentation,
                     "sampling": sample_report,
                     "mesh_postprocess": mesh_postprocess,
                     "min_probability": float(args.min_probability),
@@ -35361,6 +35497,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--poisson-normal-neighbors", type=int, default=40)
     p.add_argument("--simplify-triangles", type=int, default=40000)
     p.add_argument("--smooth-iterations", type=int, default=3)
+    p.add_argument("--gaussian-support-augmentation", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--gaussian-support-samples-per-gaussian", type=int, default=2)
+    p.add_argument("--gaussian-support-scale-multiplier", type=float, default=0.20)
+    p.add_argument("--gaussian-support-scale-quantile", type=float, default=0.70)
+    p.add_argument("--gaussian-support-min-scale", type=float, default=0.005)
+    p.add_argument("--gaussian-support-max-points", type=int, default=3000)
+    p.add_argument("--gaussian-support-fallback-without-augmentation", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mesh-crop-to-support-bbox", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mesh-crop-quantile-min", type=float, default=0.01)
     p.add_argument("--mesh-crop-quantile-max", type=float, default=0.99)
