@@ -11,6 +11,7 @@ from video2mesh.cli import (
     build_observation_point_cloud,
     build_parser,
     bbox_proxy_mesh_from_points,
+    clean_3dgs_floaters,
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
     depth_to_normal_map,
@@ -40,6 +41,7 @@ from video2mesh.cli import (
     select_colmap_sparse_model,
     source_labels_from_object_masks,
     write_json,
+    write_supersplat_ply,
 )
 
 
@@ -218,6 +220,7 @@ def test_prepare_3dgs_source_reuses_real_colmap_sparse_then_filters(tmp_path: Pa
             use_existing_colmap_sparse=True,
             camera_info=None,
             point_cloud=None,
+            prefer_dense_colmap_init=False,
             frames_dir=None,
             camera_model="PINHOLE",
             extrinsic_type="world_to_camera",
@@ -240,6 +243,60 @@ def test_prepare_3dgs_source_reuses_real_colmap_sparse_then_filters(tmp_path: Pa
         if line and not line.startswith("#")
     ]
     assert [line.split()[0] for line in points_lines] == ["1"]
+
+
+def test_prepare_3dgs_source_prefers_colmap_dense_fused_init(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    project = tmp_path / "project"
+    sparse = project / "external" / "colmap" / "sparse_text" / "0"
+    frames = project / "scene" / "frames"
+    dense = project / "external" / "colmap" / "dense"
+    sparse.mkdir(parents=True)
+    frames.mkdir(parents=True)
+    dense.mkdir(parents=True)
+    (frames / "000000.png").write_bytes(b"fake")
+    (sparse / "cameras.txt").write_text("# Camera list\n1 PINHOLE 2 2 1 1 1 1\n", encoding="utf-8")
+    (sparse / "images.txt").write_text("# Image list\n1 1 0 0 0 0 0 0 1 000000.png\n\n", encoding="utf-8")
+    (sparse / "points3D.txt").write_text("# header\n1 0 0 0 255 0 0 0.5 1 0 2 0\n", encoding="utf-8")
+    dense_ply = dense / "fused.ply"
+    write_supersplat_ply(
+        dense_ply,
+        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32),
+        np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        np.array([0.5, 0.5], dtype=np.float32),
+        np.ones((2, 3), dtype=np.float32) * 0.02,
+        np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (2, 1)),
+    )
+    manifest = {
+        "scene": {"frames_dir": "scene/frames", "point_cloud": "scene/reconstruction/point_cloud.ply"},
+        "artifacts": {"colmap_sparse_text": str(sparse), "colmap_dense_fused_ply": str(dense_ply)},
+    }
+
+    source_path = project / "external" / "3dgs" / "colmap_source"
+    _manifest, source_report = prepare_3dgs_colmap_source(
+        project,
+        manifest,
+        Namespace(
+            use_existing_colmap_sparse=True,
+            prefer_dense_colmap_init=True,
+            camera_info=None,
+            point_cloud=None,
+            frames_dir=None,
+            camera_model="PINHOLE",
+            extrinsic_type="world_to_camera",
+            image_mode="copy",
+        ),
+        source_path,
+    )
+
+    points_lines = [
+        line
+        for line in (source_path / "sparse" / "0" / "points3D.txt").read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert source_report["dense_init"]["point_count"] == 2
+    assert len(points_lines) == 2
+    assert points_lines[0].split()[1:4] == ["1", "2", "3"]
 
 
 def test_select_colmap_sparse_model_prefers_most_registered_images(tmp_path: Path):
@@ -555,6 +612,52 @@ def test_filter_points_by_gaussian_attributes_can_return_keep_mask():
     assert keep.tolist() == [True, False, True]
 
 
+def test_clean_3dgs_floaters_removes_outliers_and_elongated_low_opacity(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    source = tmp_path / "splats.ply"
+    output = tmp_path / "splats_clean.ply"
+    means = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.03, 0.0, 0.0],
+            [0.0, 0.03, 0.0],
+            [0.03, 0.03, 0.0],
+            [10.0, 10.0, 10.0],
+            [0.02, 0.02, 0.02],
+        ],
+        dtype=np.float32,
+    )
+    scales = np.ones((6, 3), dtype=np.float32) * 0.02
+    scales[5] = np.array([1.0, 0.01, 0.01], dtype=np.float32)
+    opacities = np.array([0.6, 0.6, 0.6, 0.6, 0.6, 0.02], dtype=np.float32)
+    write_supersplat_ply(
+        source,
+        means,
+        np.ones((6, 3), dtype=np.float32) * 0.5,
+        opacities,
+        scales,
+        np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (6, 1)),
+    )
+
+    report = clean_3dgs_floaters(
+        source,
+        output,
+        knn=2,
+        outlier_mad=2.0,
+        max_elongation=25.0,
+        min_opacity=0.01,
+        low_opacity=0.08,
+        remove_low_opacity=False,
+    )
+    header = parse_ply_vertex_header(output)
+
+    assert report["input_count"] == 6
+    assert report["kept_count"] == 4
+    assert report["geometry_outlier"]["removed_count"] >= 1
+    assert report["elongated_low_opacity"]["removed_count"] == 1
+    assert header["vertex_count"] == 4
+
+
 def test_augment_points_from_gaussian_support_adds_oriented_axis_samples():
     np = pytest.importorskip("numpy")
     points = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
@@ -865,6 +968,9 @@ def test_filter_mask_by_projected_support_points_keeps_near_projected_surface():
 def test_3dgs_mesh_cli_commands_are_registered():
     parser = build_parser()
 
+    colmap = parser.parse_args(["run-colmap", "--project-root", "proj"])
+    g3dgs = parser.parse_args(["run-3dgs", "--project-root", "proj"])
+    clean = parser.parse_args(["clean-3dgs-floaters", "--project-root", "proj", "--input", "splats.ply"])
     obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
     obs_with_support = parser.parse_args(
         [
@@ -881,6 +987,11 @@ def test_3dgs_mesh_cli_commands_are_registered():
     semantic_recon = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj"])
     neus = parser.parse_args(["prepare-neus-surface-jobs", "--project-root", "proj"])
 
+    assert colmap.dense_reconstruction is True
+    assert colmap.dense_max_image_size == 2000
+    assert g3dgs.prefer_dense_colmap_init is True
+    assert clean.func.__name__ == "cmd_clean_3dgs_floaters"
+    assert clean.knn == 24
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
     assert obs.semantic_support_filter is False
     assert obs.depth_mode_band_filter is False

@@ -66,7 +66,11 @@ if [[ ! -d "$FRAMES_DIR" ]]; then
   FRAMES_DIR="$PROJECT_ROOT/scene/frames"
 fi
 CAMERA_INFO="${CAMERA_INFO:-$PROJECT_ROOT/scene/cameras/camera_info.json}"
-POINT_CLOUD="${POINT_CLOUD:-$PROJECT_ROOT/scene/reconstruction/point_cloud.ply}"
+DEFAULT_POINT_CLOUD="$PROJECT_ROOT/scene/reconstruction/point_cloud.ply"
+if [[ -f "$PROJECT_ROOT/external/colmap/dense/fused.ply" ]]; then
+  DEFAULT_POINT_CLOUD="$PROJECT_ROOT/external/colmap/dense/fused.ply"
+fi
+POINT_CLOUD="${POINT_CLOUD:-$DEFAULT_POINT_CLOUD}"
 
 if [[ ! -x "$V2M_PYTHON" ]]; then
   echo "[Video2Mesh GraphDECO] Missing V2M_PYTHON: $V2M_PYTHON" >&2

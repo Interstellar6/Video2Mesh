@@ -1085,6 +1085,36 @@ def write_supersplat_label_sidecar(path: Path, labels, probabilities=None) -> Pa
     return sidecar
 
 
+def write_filtered_vertex_ply(source_ply: Path, output_ply: Path, keep_mask) -> int:
+    np = import_numpy()
+    vertex_data = read_ply_vertex_data(source_ply)
+    properties: list[tuple[str, str]] = vertex_data["properties"]
+    data = vertex_data["data"]
+    vertex_count = int(vertex_data["vertex_count"])
+    keep = np.asarray(keep_mask, dtype=bool).reshape(-1)
+    if keep.shape[0] != vertex_count:
+        raise ValueError(f"Keep mask length {keep.shape[0]} does not match vertex count {vertex_count}.")
+    kept = int(keep.sum())
+    ensure_dir(output_ply.parent)
+    dtype_fields = []
+    for name, prop_type in properties:
+        dtype_code = PLY_NUMPY_DTYPES.get(prop_type)
+        if dtype_code is None:
+            raise RuntimeError(f"Unsupported PLY property type {prop_type!r}: {source_ply}")
+        dtype_fields.append((name, np.dtype("<" + dtype_code)))
+    rows = np.zeros(kept, dtype=np.dtype(dtype_fields))
+    for name, prop_type in properties:
+        rows[name] = np.asarray(data[name])[keep].astype(np.dtype("<" + PLY_NUMPY_DTYPES[prop_type]), copy=False)
+    with output_ply.open("wb") as f:
+        header_lines = ["ply", "format binary_little_endian 1.0", f"element vertex {kept}"]
+        for name, prop_type in properties:
+            header_lines.append(f"property {prop_type} {name}")
+        header_lines.append("end_header")
+        f.write(("\n".join(header_lines) + "\n").encode("ascii"))
+        rows.tofile(f)
+    return kept
+
+
 def qvec_to_rotmat(qvec: list[float]):
     np = import_numpy()
     qw, qx, qy, qz = qvec
@@ -2024,13 +2054,15 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
     sparse_root = resolve_project_relative_path(args.sparse_root, project_root) if args.sparse_root else workspace / "sparse"
     sparse_model_dir = resolve_project_relative_path(args.sparse_model_dir, project_root) if args.sparse_model_dir else sparse_root / "0"
     text_sparse_dir = resolve_project_relative_path(args.text_sparse_dir, project_root) if args.text_sparse_dir else workspace / "sparse_text" / "0"
+    dense_root = resolve_project_relative_path(args.dense_root, project_root) if getattr(args, "dense_root", None) else workspace / "dense"
+    fused_ply = resolve_project_relative_path(args.fused_ply, project_root) if getattr(args, "fused_ply", None) else dense_root / "fused.ply"
     logs_dir = ensure_dir(project_root / "logs" / "colmap")
     ensure_dir(workspace)
     ensure_dir(sparse_root)
     ensure_dir(text_sparse_dir.parent)
     ensure_dir(text_sparse_dir)
     if args.overwrite:
-        for path in [database_path, sparse_root, text_sparse_dir.parent]:
+        for path in [database_path, sparse_root, text_sparse_dir.parent, dense_root]:
             if path.is_dir():
                 shutil.rmtree(path)
             elif path.exists() or path.is_symlink():
@@ -2065,9 +2097,12 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
         "sparse_root": str(sparse_root),
         "sparse_model_dir": str(sparse_model_dir),
         "text_sparse_dir": str(text_sparse_dir),
+        "dense_root": str(dense_root),
+        "fused_ply": str(fused_ply),
         "colmap_binary": str(colmap_bin),
         "camera_model": camera_model,
         "matcher": args.matcher,
+        "dense_reconstruction": bool(args.dense_reconstruction),
         "steps": [],
     }
 
@@ -2169,6 +2204,63 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
         ],
     )
 
+    dense_point_count = 0
+    if bool(args.dense_reconstruction):
+        ensure_dir(dense_root)
+        run_step(
+            "image_undistorter",
+            [
+                str(colmap_bin),
+                "image_undistorter",
+                "--image_path",
+                str(frames_dir),
+                "--input_path",
+                str(sparse_model_dir),
+                "--output_path",
+                str(dense_root),
+                "--output_type",
+                "COLMAP",
+                "--max_image_size",
+                str(int(args.dense_max_image_size)),
+            ],
+        )
+        run_step(
+            "patch_match_stereo",
+            [
+                str(colmap_bin),
+                "patch_match_stereo",
+                "--workspace_path",
+                str(dense_root),
+                "--workspace_format",
+                "COLMAP",
+                "--PatchMatchStereo.geom_consistency",
+                "1" if args.dense_geom_consistency else "0",
+                "--PatchMatchStereo.gpu_index",
+                str(args.dense_gpu_index),
+            ],
+        )
+        run_step(
+            "stereo_fusion",
+            [
+                str(colmap_bin),
+                "stereo_fusion",
+                "--workspace_path",
+                str(dense_root),
+                "--workspace_format",
+                "COLMAP",
+                "--input_type",
+                "geometric" if args.dense_geom_consistency else "photometric",
+                "--output_path",
+                str(fused_ply),
+            ],
+        )
+        if fused_ply.exists():
+            try:
+                dense_points, _dense_colors = read_point_cloud(fused_ply)
+                dense_point_count = int(dense_points.shape[0])
+            except Exception:
+                dense_point_count = 0
+
     cmd_import_colmap(
         argparse.Namespace(
             project_root=project_root,
@@ -2194,22 +2286,30 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
             "status": "completed",
             "camera_info": str(imported_camera_info),
             "point_cloud": str(imported_point_cloud),
+            "dense_point_cloud": str(fused_ply) if fused_ply.exists() else None,
             "registered_frame_count": len(read_json(imported_camera_info).get("extrinsic", {})) if imported_camera_info.exists() else 0,
             "point_count": point_count,
+            "dense_point_count": dense_point_count,
         }
     )
     report_path = workspace / "colmap_run_report.json"
     write_json(report_path, report)
     manifest.setdefault("artifacts", {})["colmap_run_report"] = str(report_path)
     manifest.setdefault("artifacts", {})["colmap_workspace"] = str(workspace)
+    if fused_ply.exists():
+        manifest["artifacts"]["colmap_dense_workspace"] = str(dense_root)
+        manifest["artifacts"]["colmap_dense_fused_ply"] = str(fused_ply)
     manifest.setdefault("external_stages", {})["colmap_reconstruction"] = {
         "status": "completed",
         "frames_dir": str(frames_dir),
         "sparse_text_dir": str(text_sparse_dir),
+        "dense_workspace": str(dense_root) if fused_ply.exists() else None,
+        "dense_fused_ply": str(fused_ply) if fused_ply.exists() else None,
         "camera_info": str(imported_camera_info),
         "point_cloud": str(imported_point_cloud),
         "registered_frame_count": report["registered_frame_count"],
         "point_count": point_count,
+        "dense_point_count": dense_point_count,
     }
     save_manifest(project_root, manifest)
     print(f"COLMAP reconstruction complete: {text_sparse_dir}")
@@ -2545,6 +2645,121 @@ def apply_3dgs_sparse_filter(source_path: Path, args: argparse.Namespace) -> dic
     return report
 
 
+def clean_3dgs_floaters(
+    input_ply: Path,
+    output_ply: Path,
+    *,
+    knn: int,
+    outlier_mad: float,
+    max_elongation: float,
+    min_opacity: float,
+    low_opacity: float,
+    remove_low_opacity: bool,
+) -> dict[str, Any]:
+    np = import_numpy()
+    o3d = import_open3d()
+    data = read_gsplat_ply(input_ply)
+    means = np.asarray(data["means"], dtype=np.float64)
+    opacities = np.asarray(data["opacities"], dtype=np.float64).reshape(-1)
+    scales = np.asarray(data["scales"], dtype=np.float64)
+    if means.ndim != 2 or means.shape[1] != 3:
+        raise ValueError(f"Expected Gaussian centers with shape Nx3, got {means.shape}")
+    count = int(means.shape[0])
+    if count == 0:
+        raise ValueError(f"No Gaussian vertices found: {input_ply}")
+
+    neighbor_count = min(max(1, int(knn)), max(1, count - 1))
+    mean_neighbor_distance = np.zeros(count, dtype=np.float64)
+    if count > 1:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(means)
+        tree = o3d.geometry.KDTreeFlann(pcd)
+        for idx in range(count):
+            _found, _indices, distances2 = tree.search_knn_vector_3d(pcd.points[idx], neighbor_count + 1)
+            values = np.sqrt(np.asarray(distances2[1:], dtype=np.float64)) if len(distances2) > 1 else np.asarray([], dtype=np.float64)
+            mean_neighbor_distance[idx] = float(values.mean()) if values.size else 0.0
+    median_distance = float(np.median(mean_neighbor_distance))
+    mad = float(np.median(np.abs(mean_neighbor_distance - median_distance)))
+    robust_sigma = 1.4826 * mad if mad > 0 else float(np.std(mean_neighbor_distance))
+    distance_threshold = median_distance + float(outlier_mad) * max(robust_sigma, 1e-12)
+    geometric_outlier = mean_neighbor_distance > distance_threshold
+
+    scale_abs = np.maximum(np.abs(scales[:, :3]), 1e-12)
+    elongation = scale_abs.max(axis=1) / scale_abs.min(axis=1)
+    elongated = elongation > float(max_elongation)
+    transparent = opacities < float(min_opacity)
+    weak = opacities < float(low_opacity)
+    remove = geometric_outlier | (elongated & weak)
+    if remove_low_opacity:
+        remove |= transparent
+    keep = ~remove
+    kept = write_filtered_vertex_ply(input_ply, output_ply, keep)
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "input_ply": str(input_ply),
+        "output_ply": str(output_ply),
+        "input_count": count,
+        "kept_count": int(kept),
+        "removed_count": int(remove.sum()),
+        "removed_ratio": float(remove.sum() / count),
+        "parameters": {
+            "knn": int(knn),
+            "outlier_mad": float(outlier_mad),
+            "max_elongation": float(max_elongation),
+            "min_opacity": float(min_opacity),
+            "low_opacity": float(low_opacity),
+            "remove_low_opacity": bool(remove_low_opacity),
+        },
+        "geometry_outlier": {
+            "removed_count": int(geometric_outlier.sum()),
+            "median_mean_neighbor_distance": median_distance,
+            "mad": mad,
+            "threshold": distance_threshold,
+        },
+        "elongated_low_opacity": {
+            "removed_count": int((elongated & weak).sum()),
+            "max_elongation_observed": float(np.max(elongation)) if elongation.size else 0.0,
+        },
+        "low_opacity": {
+            "candidate_count": int(transparent.sum()),
+            "threshold": float(min_opacity),
+        },
+    }
+    return report
+
+
+def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve() if getattr(args, "project_root", None) else Path.cwd()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {}
+    input_ply = resolve_project_cli_path(args.input, project_root) if args.input else resolve_existing_path(
+        (manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}).get("scene_3dgs_ply"),
+        project_root,
+    )
+    if input_ply is None or not input_ply.exists():
+        raise FileNotFoundError("No input 3DGS PLY found. Pass --input or register a scene_3dgs_ply artifact.")
+    output_ply = resolve_project_relative_path(args.output, project_root) if args.output else input_ply.with_name(f"{input_ply.stem}_clean.ply")
+    report = clean_3dgs_floaters(
+        input_ply,
+        output_ply,
+        knn=int(args.knn),
+        outlier_mad=float(args.outlier_mad),
+        max_elongation=float(args.max_elongation),
+        min_opacity=float(args.min_opacity),
+        low_opacity=float(args.low_opacity),
+        remove_low_opacity=bool(args.remove_low_opacity),
+    )
+    report_path = resolve_project_relative_path(args.report, project_root) if args.report else output_ply.with_suffix(".clean_report.json")
+    write_json(report_path, report)
+    if bool(args.register) and manifest:
+        manifest.setdefault("artifacts", {})["scene_3dgs_ply_raw"] = str(input_ply)
+        manifest["artifacts"]["scene_3dgs_ply"] = str(output_ply)
+        manifest["artifacts"]["scene_3dgs_clean_report"] = str(report_path)
+        save_manifest(project_root, manifest)
+    print(f"Cleaned 3DGS PLY: {output_ply}")
+    print(f"Removed {report['removed_count']} / {report['input_count']} Gaussian(s). Report: {report_path}")
+    return 0
+
+
 def existing_colmap_sparse_text_dir(project_root: Path, manifest: dict[str, Any]) -> Path | None:
     artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
     candidates = [
@@ -2554,6 +2769,18 @@ def existing_colmap_sparse_text_dir(project_root: Path, manifest: dict[str, Any]
     ]
     for candidate in candidates:
         if candidate and all((candidate / name).exists() for name in ("cameras.txt", "images.txt", "points3D.txt")):
+            return candidate.resolve()
+    return None
+
+
+def existing_colmap_dense_fused_ply(project_root: Path, manifest: dict[str, Any]) -> Path | None:
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    candidates = [
+        resolve_existing_path(artifacts.get("colmap_dense_fused_ply"), project_root),
+        project_root / "external" / "colmap" / "dense" / "fused.ply",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists():
             return candidate.resolve()
     return None
 
@@ -2570,7 +2797,10 @@ def prepare_3dgs_colmap_source(
         and getattr(args, "point_cloud", None) is None
     )
     existing_sparse = existing_colmap_sparse_text_dir(project_root, manifest) if use_existing else None
+    dense_fused_ply = existing_colmap_dense_fused_ply(project_root, manifest) if bool(getattr(args, "prefer_dense_colmap_init", True)) else None
     point_cloud = getattr(args, "point_cloud", None)
+    if point_cloud is None and dense_fused_ply is not None:
+        point_cloud = dense_fused_ply
     if point_cloud is None and existing_sparse is None and hasattr(args, "default_point_cloud"):
         point_cloud = getattr(args, "default_point_cloud")
     if existing_sparse is None:
@@ -2614,6 +2844,33 @@ def prepare_3dgs_colmap_source(
         copy_or_link(src, images_dir / image["name"], args.image_mode)
         copied_images += 1
 
+    init_point_cloud = resolve_project_cli_path(point_cloud, project_root) if point_cloud else None
+    dense_init_export = None
+    if init_point_cloud is not None and init_point_cloud.exists():
+        points, colors = read_point_cloud(init_point_cloud)
+        points_lines = [
+            "# 3D point list with one line of data per point:",
+            "# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]",
+        ]
+        if colors is None:
+            color_values = [(128, 128, 128) for _ in range(points.shape[0])]
+        else:
+            np = import_numpy()
+            clipped = np.clip(np.rint(colors * 255.0), 0, 255).astype(np.uint8)
+            color_values = [(int(rgb[0]), int(rgb[1]), int(rgb[2])) for rgb in clipped]
+        for point_id, (point, color) in enumerate(zip(points, color_values), start=1):
+            r, g, b = color
+            points_lines.append(
+                f"{point_id} {fmt_colmap_float(point[0])} {fmt_colmap_float(point[1])} {fmt_colmap_float(point[2])} {r} {g} {b} 0"
+            )
+        (sparse_dir / "points3D.txt").write_text("\n".join(points_lines) + "\n", encoding="utf-8")
+        dense_init_export = {
+            "source_point_cloud": str(init_point_cloud),
+            "point_count": int(points.shape[0]),
+            "track_observations": False,
+            "notes": "points3D.txt was initialized from a dense/fused point cloud; cameras/images still come from real COLMAP sparse reconstruction.",
+        }
+
     manifest.setdefault("artifacts", {})["colmap_text_export"] = str(source_path / "video2mesh_colmap_export.json")
     manifest["artifacts"]["colmap_text_sparse_dir"] = str(sparse_dir)
     manifest["artifacts"]["colmap_text_images_dir"] = str(images_dir)
@@ -2630,7 +2887,11 @@ def prepare_3dgs_colmap_source(
         "images_linked_or_copied": copied_images,
         "missing_images": missing_images,
         "point_count": count_colmap_points3d(sparse_dir / "points3D.txt"),
-        "notes": "Prepared 3DGS source from the real COLMAP sparse text model so points3D.txt retains reprojection error and TRACK[] observations for filtering.",
+        "dense_init": dense_init_export,
+        "notes": (
+            "Prepared 3DGS source from real COLMAP cameras/images. "
+            "points3D.txt uses dense COLMAP fused initialization when available; otherwise it preserves sparse points with TRACK[] observations."
+        ),
     }
     write_json(source_path / "video2mesh_colmap_export.json", source_report)
     save_manifest(project_root, manifest)
@@ -34117,6 +34378,8 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     sparse_root=args.colmap_sparse_root,
                     sparse_model_dir=args.colmap_sparse_model_dir,
                     text_sparse_dir=args.colmap_text_sparse_dir,
+                    dense_root=args.colmap_dense_root,
+                    fused_ply=args.colmap_fused_ply,
                     colmap_binary=args.colmap_binary,
                     camera_model=args.colmap_camera_model,
                     single_camera=args.colmap_single_camera,
@@ -34130,6 +34393,10 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     refine_principal_point=args.colmap_refine_principal_point,
                     refine_extra_params=args.colmap_refine_extra_params,
                     mapper_extra_args=args.colmap_mapper_extra_args,
+                    dense_reconstruction=args.colmap_dense_reconstruction,
+                    dense_max_image_size=args.colmap_dense_max_image_size,
+                    dense_geom_consistency=args.colmap_dense_geom_consistency,
+                    dense_gpu_index=args.colmap_dense_gpu_index,
                     overwrite=args.colmap_overwrite,
                     mode=args.mode,
                 )
@@ -34308,6 +34575,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     extrinsic_type=args.extrinsic_type,
                     image_mode=args.image_mode,
                     use_existing_colmap_sparse=args.g3dgs_use_existing_colmap_sparse,
+                    prefer_dense_colmap_init=args.g3dgs_prefer_dense_colmap_init,
                     filter_sparse_points=args.g3dgs_filter_sparse_points,
                     sparse_max_reprojection_error=args.g3dgs_sparse_max_reprojection_error,
                     sparse_min_track_length=args.g3dgs_sparse_min_track_length,
@@ -35145,6 +35413,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sparse-root", type=Path)
     p.add_argument("--sparse-model-dir", type=Path)
     p.add_argument("--text-sparse-dir", type=Path)
+    p.add_argument("--dense-root", type=Path)
+    p.add_argument("--fused-ply", type=Path)
     p.add_argument("--colmap-binary", default="colmap")
     p.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "OPENCV"], default="PINHOLE")
     p.add_argument("--single-camera", action=argparse.BooleanOptionalAction, default=True)
@@ -35158,6 +35428,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--mapper-extra-args", default="", help="Additional shell-style options appended to COLMAP mapper.")
+    p.add_argument("--dense-reconstruction", action=argparse.BooleanOptionalAction, default=True, help="Run COLMAP dense stereo and register fused.ply for 3DGS initialization.")
+    p.add_argument("--dense-max-image-size", type=int, default=2000)
+    p.add_argument("--dense-geom-consistency", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--dense-gpu-index", default="-1")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_run_colmap)
@@ -35195,12 +35469,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="copy")
     p.add_argument("--use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model already imported by run-colmap, preserving TRACK[] for filtering.")
+    p.add_argument("--prefer-dense-colmap-init", action=argparse.BooleanOptionalAction, default=True, help="When COLMAP dense fused.ply exists, use it as points3D.txt initialization for 3DGS while keeping sparse cameras/images.")
     p.add_argument("--filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before 3DGS training by reprojection error and track length.")
     p.add_argument("--sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
     p.add_argument("--register-mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--no-register", action="store_true", help="Do not call register-3dgs after a successful command.")
     p.set_defaults(func=cmd_run_3dgs)
+
+    p = sub.add_parser("clean-3dgs-floaters", help="Remove isolated, transparent, or elongated Gaussian splats from a GraphDECO/SuperSplat PLY.")
+    add_common_project_arg(p)
+    p.add_argument("--input", type=Path, help="Input GraphDECO/SuperSplat PLY. Defaults to artifacts.scene_3dgs_ply.")
+    p.add_argument("--output", type=Path, help="Defaults to <input>_clean.ply.")
+    p.add_argument("--report", type=Path, help="Defaults to <output>.clean_report.json.")
+    p.add_argument("--knn", type=int, default=24)
+    p.add_argument("--outlier-mad", type=float, default=2.5)
+    p.add_argument("--max-elongation", type=float, default=25.0)
+    p.add_argument("--min-opacity", type=float, default=0.01)
+    p.add_argument("--low-opacity", type=float, default=0.08)
+    p.add_argument("--remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--register", action=argparse.BooleanOptionalAction, default=False, help="Register the cleaned PLY as artifacts.scene_3dgs_ply.")
+    p.set_defaults(func=cmd_clean_3dgs_floaters)
 
     p = sub.add_parser("prepare-high-quality-3dgs-job", help="Prepare a provider-specific high-quality 3DGS training job without running it.")
     add_common_project_arg(p)
@@ -35215,6 +35504,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="symlink")
     p.add_argument("--use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model already imported by run-colmap, preserving TRACK[] for filtering.")
+    p.add_argument("--prefer-dense-colmap-init", action=argparse.BooleanOptionalAction, default=True, help="When COLMAP dense fused.ply exists, use it as points3D.txt initialization for 3DGS while keeping sparse cameras/images.")
     p.add_argument("--filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before 3DGS training by reprojection error and track length.")
     p.add_argument("--sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
@@ -36694,6 +36984,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colmap-sparse-root", type=Path)
     p.add_argument("--colmap-sparse-model-dir", type=Path)
     p.add_argument("--colmap-text-sparse-dir", type=Path)
+    p.add_argument("--colmap-dense-root", type=Path)
+    p.add_argument("--colmap-fused-ply", type=Path)
     p.add_argument("--colmap-camera-model", choices=["PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "OPENCV"], default="PINHOLE")
     p.add_argument("--colmap-single-camera", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--colmap-camera-params")
@@ -36705,6 +36997,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colmap-refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--colmap-refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--colmap-mapper-extra-args", default="", help="Additional shell-style options appended to COLMAP mapper.")
+    p.add_argument("--colmap-dense-reconstruction", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--colmap-dense-max-image-size", type=int, default=2000)
+    p.add_argument("--colmap-dense-geom-consistency", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--colmap-dense-gpu-index", default="-1")
     p.add_argument("--colmap-overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--downsample-point-cloud", action="store_true", help="Create a lightweight point cloud for preview/manual inspection. 3DGS init, mask fusion, background masks, semantic transfer, and mask-cloud meshes still use the full scene point cloud unless explicitly overridden.")
     p.add_argument("--downsample-source-point-cloud", type=Path, help="Defaults to scene/reconstruction/point_cloud.ply.")
@@ -36734,6 +37030,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-work-dir", type=Path)
     p.add_argument("--g3dgs-prepare-only", action="store_true")
     p.add_argument("--g3dgs-use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model for 3DGS source preparation.")
+    p.add_argument("--g3dgs-prefer-dense-colmap-init", action=argparse.BooleanOptionalAction, default=True, help="Use COLMAP dense fused.ply for GraphDECO 3DGS initialization when available.")
     p.add_argument("--g3dgs-filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before GraphDECO/full 3DGS training.")
     p.add_argument("--g3dgs-sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--g3dgs-sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
