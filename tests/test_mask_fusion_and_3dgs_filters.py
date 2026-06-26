@@ -990,6 +990,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert colmap.dense_reconstruction is True
     assert colmap.dense_max_image_size == 2000
     assert g3dgs.prefer_dense_colmap_init is True
+    assert g3dgs.clean_3dgs_floaters is True
+    assert g3dgs.clean_max_elongation == pytest.approx(25.0)
     assert clean.func.__name__ == "cmd_clean_3dgs_floaters"
     assert clean.knn == 24
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"

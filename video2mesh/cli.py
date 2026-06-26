@@ -2980,12 +2980,33 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
     elif not args.prepare_only:
         print("No --command-template provided; prepared COLMAP source only.")
 
+    splat_ply_for_registration = args.splat_ply
+    if command and completed.returncode == 0 and bool(getattr(args, "clean_3dgs_floaters", True)):
+        raw_splat_ply = resolve_project_cli_path(args.splat_ply, project_root) if args.splat_ply else find_latest_splat_ply(output_path)
+        clean_splat_ply = raw_splat_ply.with_name(f"{raw_splat_ply.stem}_clean.ply")
+        clean_report_path = clean_splat_ply.with_suffix(".clean_report.json")
+        clean_report = clean_3dgs_floaters(
+            raw_splat_ply,
+            clean_splat_ply,
+            knn=int(args.clean_knn),
+            outlier_mad=float(args.clean_outlier_mad),
+            max_elongation=float(args.clean_max_elongation),
+            min_opacity=float(args.clean_min_opacity),
+            low_opacity=float(args.clean_low_opacity),
+            remove_low_opacity=bool(args.clean_remove_low_opacity),
+        )
+        write_json(clean_report_path, clean_report)
+        run_manifest["clean_3dgs_floaters"] = clean_report
+        run_manifest["clean_3dgs_floaters_report"] = str(clean_report_path)
+        run_manifest["splat_ply_for_registration"] = str(clean_splat_ply)
+        splat_ply_for_registration = clean_splat_ply
+
     write_json(stage_root / "3dgs_run_manifest.json", run_manifest)
     manifest["artifacts"]["3dgs_run_manifest"] = str(stage_root / "3dgs_run_manifest.json")
     save_manifest(project_root, manifest)
 
     if command and not args.no_register:
-        register_args = argparse.Namespace(project_root=project_root, path=output_path, splat_ply=args.splat_ply, mode=args.register_mode)
+        register_args = argparse.Namespace(project_root=project_root, path=output_path, splat_ply=splat_ply_for_registration, mode=args.register_mode)
         result = cmd_register_3dgs(register_args)
         manifest = load_manifest(project_root)
         manifest["external_stages"]["video_to_3dgs"] = {
@@ -35473,6 +35494,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before 3DGS training by reprojection error and track length.")
     p.add_argument("--sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
+    p.add_argument("--clean-3dgs-floaters", action=argparse.BooleanOptionalAction, default=True, help="After a successful external 3DGS command, clean isolated/elongated/transparent splats before registration.")
+    p.add_argument("--clean-knn", type=int, default=24)
+    p.add_argument("--clean-outlier-mad", type=float, default=2.5)
+    p.add_argument("--clean-max-elongation", type=float, default=25.0)
+    p.add_argument("--clean-min-opacity", type=float, default=0.01)
+    p.add_argument("--clean-low-opacity", type=float, default=0.08)
+    p.add_argument("--clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--register-mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--no-register", action="store_true", help="Do not call register-3dgs after a successful command.")
     p.set_defaults(func=cmd_run_3dgs)

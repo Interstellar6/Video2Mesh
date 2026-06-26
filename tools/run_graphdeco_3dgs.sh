@@ -24,6 +24,12 @@ Optional environment overrides:
   DENSIFY_GRAD_THRESHOLD=0.002
   OPACITY_RESET_INTERVAL=3000
   SH_DEGREE=3
+  CLEAN_3DGS_FLOATERS=1
+  CLEAN_KNN=24
+  CLEAN_OUTLIER_MAD=2.5
+  CLEAN_MAX_ELONGATION=25
+  CLEAN_MIN_OPACITY=0.01
+  CLEAN_LOW_OPACITY=0.08
   GRAPHDECO_EXTRA_ARGS=""
   TRAIN_IMAGES=images
 USAGE
@@ -55,6 +61,12 @@ DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL:-300}"
 DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD:-0.002}"
 OPACITY_RESET_INTERVAL="${OPACITY_RESET_INTERVAL:-3000}"
 SH_DEGREE="${SH_DEGREE:-3}"
+CLEAN_3DGS_FLOATERS="${CLEAN_3DGS_FLOATERS:-1}"
+CLEAN_KNN="${CLEAN_KNN:-24}"
+CLEAN_OUTLIER_MAD="${CLEAN_OUTLIER_MAD:-2.5}"
+CLEAN_MAX_ELONGATION="${CLEAN_MAX_ELONGATION:-25}"
+CLEAN_MIN_OPACITY="${CLEAN_MIN_OPACITY:-0.01}"
+CLEAN_LOW_OPACITY="${CLEAN_LOW_OPACITY:-0.08}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 TRAIN_IMAGES="${TRAIN_IMAGES:-images}"
 SOURCE_PATH="${SOURCE_PATH:-$PROJECT_ROOT/external/graphdeco_3dgs/colmap_source}"
@@ -155,9 +167,30 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
     --disable_viewer
 ) 2>&1 | tee "$LOG"
 
+RAW_SPLAT="$OUTPUT_PATH/point_cloud/iteration_$ITERATIONS/point_cloud.ply"
+CLEAN_SPLAT="$OUTPUT_PATH/point_cloud/iteration_$ITERATIONS/point_cloud_clean.ply"
+IMPORT_SPLAT="$RAW_SPLAT"
+if [[ "$CLEAN_3DGS_FLOATERS" == "1" ]]; then
+  if [[ ! -f "$RAW_SPLAT" ]]; then
+    echo "[Video2Mesh GraphDECO] Missing trained 3DGS PLY for cleaning: $RAW_SPLAT" >&2
+    exit 2
+  fi
+  "$V2M_PYTHON" -B -m video2mesh.cli clean-3dgs-floaters \
+    --project-root "$PROJECT_ROOT" \
+    --input "$RAW_SPLAT" \
+    --output "$CLEAN_SPLAT" \
+    --knn "$CLEAN_KNN" \
+    --outlier-mad "$CLEAN_OUTLIER_MAD" \
+    --max-elongation "$CLEAN_MAX_ELONGATION" \
+    --min-opacity "$CLEAN_MIN_OPACITY" \
+    --low-opacity "$CLEAN_LOW_OPACITY"
+  IMPORT_SPLAT="$CLEAN_SPLAT"
+fi
+
 "$V2M_PYTHON" -B -m video2mesh.cli import-3dgs-result \
   --project-root "$PROJECT_ROOT" \
   --path "$OUTPUT_PATH" \
+  --splat-ply "$IMPORT_SPLAT" \
   --provider graphdeco \
   --mode symlink \
   --preview-max-frames 6 \
