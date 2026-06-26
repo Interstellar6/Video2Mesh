@@ -4185,6 +4185,65 @@ def save_rgb_image(path: Path, image_array) -> None:
     Image.fromarray(rgb, mode="RGB").save(path)
 
 
+def save_gray_u8_image(path: Path, image_array) -> None:
+    np = import_numpy()
+    Image = import_pil_image()
+    ensure_dir(path.parent)
+    arr = np.asarray(image_array, dtype=np.float32)
+    u8 = np.clip(np.rint(arr * 255.0), 0, 255).astype(np.uint8)
+    Image.fromarray(u8, mode="L").save(path)
+
+
+def save_depth_preview(path: Path, depth, valid_mask=None, max_depth: float | None = None) -> None:
+    np = import_numpy()
+    depth_np = np.asarray(depth, dtype=np.float32)
+    valid = np.isfinite(depth_np) & (depth_np > 0)
+    if valid_mask is not None:
+        valid &= np.asarray(valid_mask, dtype=bool)
+    if max_depth is None:
+        values = depth_np[valid]
+        max_depth = float(np.percentile(values, 98)) if values.size else 1.0
+    denom = max(float(max_depth), 1e-6)
+    preview = np.zeros(depth_np.shape, dtype=np.float32)
+    preview[valid] = np.clip(depth_np[valid] / denom, 0.0, 1.0)
+    save_gray_u8_image(path, preview)
+
+
+def save_normal_image(path: Path, normal) -> None:
+    np = import_numpy()
+    Image = import_pil_image()
+    normal_np = np.asarray(normal, dtype=np.float32)
+    rgb = np.clip(np.rint((normal_np * 0.5 + 0.5) * 255.0), 0, 255).astype(np.uint8)
+    ensure_dir(path.parent)
+    Image.fromarray(rgb, mode="RGB").save(path)
+
+
+def depth_to_normal_map(depth, fx: float, fy: float):
+    np = import_numpy()
+    depth_np = np.asarray(depth, dtype=np.float32)
+    valid = np.isfinite(depth_np) & (depth_np > 0)
+    dz_dy, dz_dx = np.gradient(np.where(valid, depth_np, 0.0))
+    normal = np.dstack((-dz_dx * float(fx), -dz_dy * float(fy), np.ones_like(depth_np, dtype=np.float32)))
+    norm = np.linalg.norm(normal, axis=2, keepdims=True)
+    normal = normal / np.maximum(norm, 1e-8)
+    normal[~valid] = 0.0
+    return normal.astype(np.float32)
+
+
+def load_mask_probability_image(mask_path: Path, width: int, height: int, probability_scale: float = 255.0):
+    np = import_numpy()
+    Image = import_pil_image()
+    try:
+        with Image.open(mask_path) as image:
+            image = image.convert("L")
+            if image.size != (int(width), int(height)):
+                image = image.resize((int(width), int(height)), Image.Resampling.BILINEAR)
+            mask = np.asarray(image, dtype=np.float32)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read mask image: {mask_path}") from exc
+    return clamp_probability_array(mask / max(float(probability_scale), 1e-6))
+
+
 def mean_or_none(values: list[float]) -> float | None:
     if not values:
         return None
@@ -4307,6 +4366,228 @@ def cmd_render_gsplat_preview(args: argparse.Namespace) -> int:
     print(f"Rendered {len(frame_metrics)} gsplat preview frame(s) to {output_dir}")
     print(f"mean_l1={mean_l1:.6f} mean_psnr={mean_psnr:.3f}" if mean_l1 is not None and mean_psnr is not None else "No preview frames rendered.")
     print(f"Preview manifest: {preview_manifest_path}")
+    return 0
+
+
+def _load_gsplat_tensors_for_render(splat_ply: Path, device: str):
+    torch, _gsplat = import_torch_and_gsplat()
+    data = read_gsplat_ply(splat_ply)
+    return data, {
+        "means": torch.tensor(data["means"], device=device, dtype=torch.float32),
+        "colors": torch.tensor(data["colors"], device=device, dtype=torch.float32),
+        "opacities": torch.tensor(data["opacities"], device=device, dtype=torch.float32),
+        "scales": torch.tensor(data["scales"], device=device, dtype=torch.float32),
+        "quats": torch.tensor(data["quats"], device=device, dtype=torch.float32),
+    }
+
+
+def render_gsplat_rgb_depth(
+    tensors: dict[str, Any],
+    viewmat,
+    K,
+    width: int,
+    height: int,
+    background,
+):
+    _torch, gsplat = import_torch_and_gsplat()
+    render, alphas, meta = gsplat.rasterization(
+        tensors["means"],
+        tensors["quats"],
+        tensors["scales"],
+        tensors["opacities"],
+        tensors["colors"],
+        viewmat[None],
+        K[None],
+        width=int(width),
+        height=int(height),
+        packed=False,
+        backgrounds=background,
+        render_mode="RGB+ED",
+    )
+    image_depth = render[0]
+    rgb = image_depth[..., :3].clamp(0.0, 1.0)
+    depth = image_depth[..., 3].clamp(min=0.0)
+    alpha = alphas[0]
+    if alpha.ndim == 3 and alpha.shape[-1] == 1:
+        alpha = alpha[..., 0]
+    return rgb, depth, alpha, meta
+
+
+def object_render_frame_records(
+    object_id: str,
+    records_by_object: dict[str, list[MaskRecord]],
+    frames_by_id: dict[str, Path],
+    max_frames: int,
+) -> list[MaskRecord]:
+    records = [record for record in records_by_object.get(object_id, []) if record.frame_id in frames_by_id]
+    records.sort(key=lambda record: frame_sort_key(Path(record.frame_id)))
+    if max_frames and max_frames > 0:
+        records = records[: int(max_frames)]
+    return records
+
+
+def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    torch, _gsplat = import_torch_and_gsplat()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    frames_dir = resolve_project_cli_path(args.frames_dir, project_root) if args.frames_dir else (project_root / manifest["scene"]["frames_dir"])
+    camera_info_path = resolve_project_cli_path(args.camera_info, project_root) if args.camera_info else (project_root / manifest["scene"]["camera_info"])
+    mask_root = resolve_project_cli_path(args.mask_root, project_root) if args.mask_root else resolve_active_mask_root(project_root, manifest)
+    splat_ply = resolve_project_cli_path(args.splat_ply, project_root) if args.splat_ply else resolve_existing_path(artifacts.get("scene_3dgs_ply"), project_root)
+    if splat_ply is None or not splat_ply.exists():
+        raise FileNotFoundError("No renderable 3DGS PLY found. Run/import 3DGS or pass --splat-ply.")
+    output_dir = ensure_dir(resolve_project_relative_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "3dgs_mesh_observations"))
+
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is False.")
+
+    _data, tensors = _load_gsplat_tensors_for_render(splat_ply, device)
+    camera_info = load_camera_info(camera_info_path)
+    frames = list_frame_images(frames_dir)
+    frames_by_id = {frame_id_for_path(frame): frame for frame in frames}
+    records_by_object = mask_records_by_object(mask_root)
+    object_table, _object_id_to_semantic, records_by_id = object_table_from_records(project_root, manifest)
+    requested = {slugify(value) for value in (args.object_ids or [])}
+    object_reports: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    with torch.no_grad():
+        for item in object_table:
+            object_id = slugify(item.get("object_id") or "")
+            if object_id == "background":
+                continue
+            obj = records_by_id.get(object_id, {})
+            if is_background_structure_record(obj) and not args.include_background_structures:
+                skipped[object_id] = "background_structure"
+                continue
+            if requested and object_id not in requested:
+                skipped[object_id] = "not_requested"
+                continue
+            object_records = object_render_frame_records(object_id, records_by_object, frames_by_id, int(args.max_frames_per_object or 0))
+            if not object_records:
+                skipped[object_id] = "missing_2d_masks"
+                continue
+            object_dir = ensure_dir(output_dir / object_id)
+            frame_reports: list[dict[str, Any]] = []
+            for record in object_records:
+                frame_path = frames_by_id[record.frame_id]
+                base_intrinsic = intrinsic_for_frame(camera_info, record.frame_id)
+                width = int(args.width or base_intrinsic["w"])
+                height = int(args.height or base_intrinsic["h"])
+                intrinsic, viewmat, K = camera_tensors_for_frame(camera_info, record.frame_id, args.extrinsic_type, device, width, height)
+                background = None
+                if args.background == "white":
+                    background = torch.ones((1, 3), device=device, dtype=torch.float32)
+                elif args.background == "black":
+                    background = torch.zeros((1, 3), device=device, dtype=torch.float32)
+                elif args.background == "target_mean":
+                    target = load_frame_tensor(frame_path, width, height, device)
+                    background = target.reshape(-1, 3).mean(dim=0, keepdim=True)
+                rgb, depth, alpha, _meta = render_gsplat_rgb_depth(tensors, viewmat, K, width, height, background)
+                depth_np = depth.detach().cpu().numpy().astype(np.float32)
+                alpha_np = alpha.detach().cpu().numpy().astype(np.float32)
+                mask_prob = load_mask_probability_image(record.path, width, height, args.probability_scale)
+                render_valid = (alpha_np >= float(args.min_alpha)) & (depth_np > 0)
+                object_mask = (mask_prob >= float(args.min_probability)) & render_valid
+                normal_np = depth_to_normal_map(depth_np, float(intrinsic["fx"]), float(intrinsic.get("fy", intrinsic["fx"])))
+                frame_dir = ensure_dir(object_dir / record.frame_id)
+                rgb_path = frame_dir / "rgb.png"
+                depth_npy_path = frame_dir / "depth.npy"
+                depth_png_path = frame_dir / "depth.png"
+                normal_npy_path = frame_dir / "normal.npy"
+                normal_png_path = frame_dir / "normal.png"
+                mask_path = frame_dir / "mask.png"
+                alpha_path = frame_dir / "alpha.png"
+                save_rgb_image(rgb_path, rgb)
+                np.save(depth_npy_path, depth_np)
+                save_depth_preview(depth_png_path, depth_np, object_mask)
+                np.save(normal_npy_path, normal_np)
+                save_normal_image(normal_png_path, normal_np)
+                save_gray_u8_image(mask_path, object_mask.astype(np.float32))
+                save_gray_u8_image(alpha_path, alpha_np)
+                camera_record = {
+                    "frame_id": record.frame_id,
+                    "source_image": str(frame_path),
+                    "mask_source": str(record.path),
+                    "width": width,
+                    "height": height,
+                    "intrinsic": intrinsic,
+                    "extrinsic_type": camera_info.get("extrinsic_type") or args.extrinsic_type,
+                    "world_to_camera": world_to_camera_matrix(
+                        resolve_extrinsic(camera_info["extrinsic"], record.frame_id),
+                        camera_info.get("extrinsic_type") or args.extrinsic_type,
+                    ).tolist(),
+                }
+                write_json(frame_dir / "camera.json", camera_record)
+                frame_reports.append(
+                    {
+                        **camera_record,
+                        "rgb": str(rgb_path),
+                        "depth_npy": str(depth_npy_path),
+                        "depth_preview": str(depth_png_path),
+                        "normal_npy": str(normal_npy_path),
+                        "normal_preview": str(normal_png_path),
+                        "mask": str(mask_path),
+                        "alpha": str(alpha_path),
+                        "mask_pixels": int(object_mask.sum()),
+                        "alpha_mean": float(alpha_np.mean()),
+                        "depth_min": float(depth_np[object_mask].min()) if object_mask.any() else None,
+                        "depth_max": float(depth_np[object_mask].max()) if object_mask.any() else None,
+                    }
+                )
+            object_manifest = {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "object_id": object_id,
+                "name": item.get("name", object_id),
+                "category": item.get("category", "unknown"),
+                "output_dir": str(object_dir),
+                "frame_count": len(frame_reports),
+                "frames": frame_reports,
+            }
+            write_json(object_dir / "observations.json", object_manifest)
+            object_reports[object_id] = object_manifest
+
+    manifest_path = output_dir / "3dgs_mesh_observations.json"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "splat_ply": str(splat_ply),
+        "frames_dir": str(frames_dir),
+        "camera_info": str(camera_info_path),
+        "mask_root": str(mask_root),
+        "output_dir": str(output_dir),
+        "device": device,
+        "method": "3dgs_multiview_rgb_depth_normal_mask_rendering",
+        "objects": object_reports,
+        "skipped_objects": skipped,
+        "parameters": {
+            "max_frames_per_object": int(args.max_frames_per_object or 0),
+            "min_probability": float(args.min_probability),
+            "min_alpha": float(args.min_alpha),
+            "background": args.background,
+            "width": args.width,
+            "height": args.height,
+        },
+        "notes": "Object-centric observations rendered from 3DGS using registered real camera poses. Depth uses gsplat RGB+ED expected-depth output; normals are derived from the rendered depth map.",
+    }
+    write_json(manifest_path, report)
+    manifest.setdefault("artifacts", {})["3dgs_mesh_observations"] = str(manifest_path)
+    manifest.setdefault("external_stages", {})["3dgs_mesh_observation_rendering"] = {
+        "status": "completed" if object_reports else "empty",
+        "manifest": str(manifest_path),
+        "object_count": len(object_reports),
+        "skipped_objects": skipped,
+    }
+    save_manifest(project_root, manifest)
+    print(f"Rendered 3DGS mesh observations for {len(object_reports)} object(s): {manifest_path}")
+    if skipped:
+        print(f"Skipped objects: {len(skipped)}")
     return 0
 
 
@@ -14031,6 +14312,402 @@ def cmd_reconstruct_object_meshes(args: argparse.Namespace) -> int:
         print(f"Missing mask clouds: {', '.join(missing)}")
     if failed:
         print(f"Failed meshes: {', '.join(failed)}")
+    return 0
+
+
+def camera_to_world_from_record(frame: dict[str, Any]):
+    np = import_numpy()
+    w2c = np.asarray(frame.get("world_to_camera"), dtype=np.float64)
+    if w2c.shape != (4, 4):
+        raise ValueError("Observation camera record missing 4x4 world_to_camera matrix.")
+    return np.linalg.inv(w2c)
+
+
+def observation_depth_to_point_cloud(frame: dict[str, Any], min_depth: float, max_depth: float, stride: int):
+    np = import_numpy()
+    depth = np.load(frame["depth_npy"]).astype(np.float32)
+    mask = load_mask_probability_image(Path(frame["mask"]), int(frame["width"]), int(frame["height"]), 255.0) >= 0.5
+    rgb = None
+    try:
+        Image = import_pil_image()
+        with Image.open(frame["rgb"]) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    except Exception:
+        rgb = np.full((*depth.shape, 3), 0.7, dtype=np.float32)
+    intrinsic = frame["intrinsic"]
+    fx = float(intrinsic["fx"])
+    fy = float(intrinsic.get("fy", fx))
+    cx = float(intrinsic["cx"])
+    cy = float(intrinsic["cy"])
+    valid = mask & np.isfinite(depth) & (depth > float(min_depth)) & (depth < float(max_depth))
+    step = max(1, int(stride))
+    if step > 1:
+        sample = np.zeros_like(valid, dtype=bool)
+        sample[::step, ::step] = True
+        valid &= sample
+    ys, xs = np.nonzero(valid)
+    if xs.size == 0:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+    z = depth[ys, xs].astype(np.float64)
+    x = (xs.astype(np.float64) - cx) * z / max(fx, 1e-8)
+    y = (ys.astype(np.float64) - cy) * z / max(fy, 1e-8)
+    cam_points = np.stack([x, y, z, np.ones_like(z)], axis=1)
+    c2w = camera_to_world_from_record(frame)
+    world = (c2w @ cam_points.T).T[:, :3]
+    colors = rgb[ys, xs].astype(np.float64)
+    return world, colors
+
+
+def build_observation_point_cloud(frames: list[dict[str, Any]], min_depth: float, max_depth: float, stride: int):
+    np = import_numpy()
+    points_list = []
+    colors_list = []
+    for frame in frames:
+        points, colors = observation_depth_to_point_cloud(frame, min_depth, max_depth, stride)
+        if points.shape[0]:
+            points_list.append(points)
+            colors_list.append(colors)
+    if not points_list:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+    return np.concatenate(points_list, axis=0), np.concatenate(colors_list, axis=0)
+
+
+def postprocess_triangle_mesh(mesh, args):
+    o3d = import_open3d()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    if getattr(args, "largest_component", True):
+        try:
+            triangle_clusters, cluster_n_triangles, _cluster_area = mesh.cluster_connected_triangles()
+            labels = list(triangle_clusters)
+            if labels:
+                keep_label = max(range(len(cluster_n_triangles)), key=lambda idx: int(cluster_n_triangles[idx]))
+                keep = [idx for idx, label in enumerate(labels) if int(label) == int(keep_label)]
+                remove = [idx for idx, label in enumerate(labels) if int(label) != int(keep_label)]
+                if remove:
+                    mesh.remove_triangles_by_index(remove)
+                    mesh.remove_unreferenced_vertices()
+        except Exception:
+            pass
+    target_triangles = int(getattr(args, "simplify_triangles", 0) or 0)
+    if target_triangles > 0 and len(mesh.triangles) > target_triangles:
+        mesh = mesh.simplify_quadric_decimation(target_triangles)
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+    try:
+        mesh.compute_vertex_normals()
+    except Exception:
+        pass
+    return mesh
+
+
+def mesh_from_observation_point_cloud(points, colors, args):
+    np = import_numpy()
+    o3d = import_open3d()
+    if points.shape[0] < int(args.min_points):
+        raise ValueError(f"Only {points.shape[0]} depth point(s), below --min-points {args.min_points}")
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(np.clip(np.asarray(colors, dtype=np.float64), 0.0, 1.0))
+    if float(args.voxel_size or 0) > 0:
+        pcd = pcd.voxel_down_sample(float(args.voxel_size))
+    if bool(args.remove_outliers) and len(pcd.points) >= int(args.outlier_nb_neighbors):
+        pcd, _ind = pcd.remove_statistical_outlier(nb_neighbors=int(args.outlier_nb_neighbors), std_ratio=float(args.outlier_std_ratio))
+    if len(pcd.points) < int(args.min_points):
+        raise ValueError(f"Only {len(pcd.points)} filtered depth point(s), below --min-points {args.min_points}")
+    radius = float(args.normal_radius or max(float(args.voxel_size or 0.02) * 3.0, 0.02))
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
+    pcd.orient_normals_consistent_tangent_plane(max(10, int(args.poisson_normal_neighbors)))
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=int(args.poisson_depth))
+    densities_np = np.asarray(densities)
+    if densities_np.size and float(args.poisson_density_quantile) > 0:
+        threshold = float(np.quantile(densities_np, float(args.poisson_density_quantile)))
+        mesh.remove_vertices_by_mask(densities_np < threshold)
+    return postprocess_triangle_mesh(mesh, args), {
+        "method": "poisson_from_3dgs_rendered_depth_point_cloud",
+        "input_depth_point_count": int(points.shape[0]),
+        "filtered_point_count": int(len(pcd.points)),
+        "poisson_depth": int(args.poisson_depth),
+        "poisson_density_quantile": float(args.poisson_density_quantile),
+    }
+
+
+def tsdf_mesh_from_observations(frames: list[dict[str, Any]], args):
+    np = import_numpy()
+    o3d = import_open3d()
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=float(args.tsdf_voxel_length),
+        sdf_trunc=float(args.tsdf_sdf_trunc),
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+    )
+    integrated = 0
+    for frame in frames:
+        depth = np.load(frame["depth_npy"]).astype(np.float32)
+        mask = load_mask_probability_image(Path(frame["mask"]), int(frame["width"]), int(frame["height"]), 255.0) >= 0.5
+        valid = mask & np.isfinite(depth) & (depth > float(args.min_depth)) & (depth < float(args.max_depth))
+        if int(valid.sum()) < int(args.min_mask_pixels):
+            continue
+        depth_masked = np.where(valid, depth, 0.0).astype(np.float32)
+        Image = import_pil_image()
+        with Image.open(frame["rgb"]) as image:
+            rgb_np = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        color = o3d.geometry.Image(rgb_np)
+        depth_o3d = o3d.geometry.Image(depth_masked)
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color,
+            depth_o3d,
+            depth_scale=1.0,
+            depth_trunc=float(args.max_depth),
+            convert_rgb_to_intensity=False,
+        )
+        intrinsic = frame["intrinsic"]
+        pinhole = o3d.camera.PinholeCameraIntrinsic(
+            int(frame["width"]),
+            int(frame["height"]),
+            float(intrinsic["fx"]),
+            float(intrinsic.get("fy", intrinsic["fx"])),
+            float(intrinsic["cx"]),
+            float(intrinsic["cy"]),
+        )
+        volume.integrate(rgbd, pinhole, np.asarray(frame["world_to_camera"], dtype=np.float64))
+        integrated += 1
+    if integrated == 0:
+        raise ValueError("No observation frame had enough valid masked depth for TSDF fusion.")
+    mesh = volume.extract_triangle_mesh()
+    mesh = postprocess_triangle_mesh(mesh, args)
+    return mesh, {"method": "tsdf_fusion_from_3dgs_rendered_depth_masks", "integrated_frames": integrated}
+
+
+def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    import_open3d()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    observations_manifest_path = resolve_project_cli_path(args.observations, project_root) if args.observations else resolve_existing_path(manifest.get("artifacts", {}).get("3dgs_mesh_observations"), project_root)
+    if observations_manifest_path is None or not observations_manifest_path.exists():
+        raise FileNotFoundError("Missing 3DGS mesh observations. Run export-3dgs-mesh-observations first.")
+    observations_manifest = read_json(observations_manifest_path)
+    output_dir = ensure_dir(resolve_project_relative_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "3dgs_object_meshes"))
+    sim_objects_dir = ensure_dir(project_root / manifest["simulator_assets_dir"] / "objects")
+    requested = {slugify(value) for value in (args.object_ids or [])}
+    reconstructed: dict[str, Any] = {}
+    failed: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    for object_id, object_obs in sorted((observations_manifest.get("objects") or {}).items()):
+        object_id = slugify(object_id)
+        if requested and object_id not in requested:
+            skipped[object_id] = "not_requested"
+            continue
+        frames = list(object_obs.get("frames") or [])
+        if args.max_frames_per_object and int(args.max_frames_per_object) > 0:
+            frames = frames[: int(args.max_frames_per_object)]
+        if not frames:
+            skipped[object_id] = "missing_observation_frames"
+            continue
+        object_mesh_dir = ensure_dir(output_dir / object_id)
+        mesh_path = object_mesh_dir / f"{object_id}.{args.format}"
+        try:
+            method_used = args.method
+            if args.method == "tsdf":
+                mesh, reconstruction = tsdf_mesh_from_observations(frames, args)
+            elif args.method == "poisson":
+                points, colors = build_observation_point_cloud(frames, float(args.min_depth), float(args.max_depth), int(args.point_stride))
+                mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
+            else:
+                try:
+                    mesh, reconstruction = tsdf_mesh_from_observations(frames, args)
+                    method_used = "tsdf"
+                except Exception as tsdf_exc:
+                    points, colors = build_observation_point_cloud(frames, float(args.min_depth), float(args.max_depth), int(args.point_stride))
+                    mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
+                    method_used = "poisson"
+                    reconstruction["tsdf_fallback_reason"] = str(tsdf_exc)
+            ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
+            if not ok:
+                raise RuntimeError(f"Open3D failed to write mesh: {mesh_path}")
+            mesh_summary = summarize_triangle_mesh(mesh_path)
+            asset_path = mesh_path
+            if args.copy_to_assets:
+                dst = sim_objects_dir / object_id / mesh_path.name
+                if mesh_path.resolve() != dst.resolve():
+                    asset_path = copy_or_link(mesh_path, dst, args.mode)
+                else:
+                    asset_path = dst
+            metadata = {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "object_id": object_id,
+                "source": "3dgs_rendered_multiview_surface_extraction",
+                "source_observations": str(observations_manifest_path),
+                "source_mesh": str(mesh_path),
+                "asset_path": str(asset_path),
+                "format": args.format,
+                "coordinate_frame": "video2mesh_scene",
+                "method": method_used,
+                "reconstruction": reconstruction,
+                "qa": mesh_summary,
+                "notes": "Mesh reconstructed from 3DGS-rendered multi-view depth/normal/mask observations using TSDF fusion and/or Poisson surface extraction.",
+            }
+            write_json(object_mesh_dir / "reconstruction.json", metadata)
+            object_json = project_root / manifest["objects_dir"] / object_id / "object.json"
+            if object_json.exists():
+                obj = read_json(object_json)
+                obj["mesh_asset"] = metadata
+                write_json(object_json, obj)
+            reconstructed[object_id] = metadata
+        except Exception as exc:
+            failed[object_id] = {"error": str(exc), "frame_count": len(frames)}
+            if not args.skip_failed:
+                raise
+
+    mesh_index_path = output_dir / "object_meshes.json"
+    write_json(
+        mesh_index_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "observations": str(observations_manifest_path),
+            "output_dir": str(output_dir),
+            "method": args.method,
+            "objects": reconstructed,
+            "failed_objects": failed,
+            "skipped_objects": skipped,
+        },
+    )
+    manifest.setdefault("artifacts", {})["3dgs_object_meshes"] = str(mesh_index_path)
+    manifest["artifacts"]["object_meshes"] = str(mesh_index_path)
+    manifest.setdefault("external_stages", {})["mesh_generation"] = {
+        "status": "3dgs_surface_meshes_reconstructed" if reconstructed and not failed else "3dgs_surface_meshes_partial" if reconstructed else "3dgs_surface_meshes_failed",
+        "method": "3dgs_rendered_depth_normal_mask_to_tsdf_poisson_surface",
+        "observations": str(observations_manifest_path),
+        "object_count": len(reconstructed),
+        "failed_objects": sorted(failed),
+        "skipped_objects": skipped,
+    }
+    save_manifest(project_root, manifest)
+    print(f"Reconstructed {len(reconstructed)} 3DGS-derived object mesh(es). Index: {mesh_index_path}")
+    if failed:
+        print(f"Failed meshes: {', '.join(sorted(failed))}")
+    return 0
+
+
+def cmd_prepare_neus_surface_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    observations_manifest_path = resolve_project_cli_path(args.observations, project_root) if args.observations else resolve_existing_path(manifest.get("artifacts", {}).get("3dgs_mesh_observations"), project_root)
+    if observations_manifest_path is None or not observations_manifest_path.exists():
+        raise FileNotFoundError("Missing 3DGS mesh observations. Run export-3dgs-mesh-observations first.")
+    observations_manifest = read_json(observations_manifest_path)
+    output_dir = ensure_dir(resolve_project_relative_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "neus_surface_jobs"))
+    jobs_dir = ensure_dir(output_dir / "jobs")
+    mesh_output_dir = ensure_dir(resolve_project_relative_path(args.mesh_output_dir, project_root) if args.mesh_output_dir else (output_dir / "meshes"))
+    requested = {slugify(value) for value in (args.object_ids or [])}
+    jobs: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+
+    for object_id, object_obs in sorted((observations_manifest.get("objects") or {}).items()):
+        object_id = slugify(object_id)
+        if requested and object_id not in requested:
+            skipped[object_id] = "not_requested"
+            continue
+        frames = list(object_obs.get("frames") or [])
+        if args.max_frames_per_object and int(args.max_frames_per_object) > 0:
+            frames = frames[: int(args.max_frames_per_object)]
+        if not frames:
+            skipped[object_id] = "missing_observation_frames"
+            continue
+        object_job_dir = ensure_dir(jobs_dir / object_id)
+        frame_manifest = object_job_dir / "frames.json"
+        mesh_output = mesh_output_dir / f"{object_id}.{args.mesh_format}"
+        job = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "neus_style_surface_extraction",
+            "provider": args.provider,
+            "project_root": str(project_root),
+            "object_id": object_id,
+            "object_name": object_obs.get("name", object_id),
+            "category": object_obs.get("category", "unknown"),
+            "observations_manifest": str(observations_manifest_path),
+            "job_dir": str(object_job_dir),
+            "frames_manifest": str(frame_manifest),
+            "mesh_output": str(mesh_output),
+            "mesh_format": args.mesh_format,
+            "frame_count": len(frames),
+            "frames": frames,
+            "input_modalities": ["rgb", "depth", "normal", "mask", "camera"],
+            "coordinate_frame": "video2mesh_scene",
+            "surface_route": "3DGS rendered depth/normal/mask -> NeuS-style SDF optimization -> marching cubes mesh extraction",
+            "requirements": [
+                "Use the provided registered camera intrinsics and world_to_camera matrices.",
+                "Use mask.png as the object silhouette constraint for every frame.",
+                "Use depth.npy and normal.npy as geometric priors or SDF supervision.",
+                "Write the reconstructed mesh to mesh_output in video2mesh_scene coordinates.",
+            ],
+        }
+        command = None
+        if args.command_template:
+            command = command_from_template(
+                args.command_template,
+                {
+                    "job_path": str(object_job_dir / "job.json"),
+                    "frames_manifest": str(frame_manifest),
+                    "object_id": object_id,
+                    "output_dir": str(object_job_dir),
+                    "mesh_output": str(mesh_output),
+                    "project_root": str(project_root),
+                    "provider": args.provider,
+                },
+            )
+            job["command"] = command
+        write_json(frame_manifest, {"schema_version": DEFAULT_SCHEMA_VERSION, "object_id": object_id, "frames": frames})
+        write_json(object_job_dir / "job.json", job)
+        jobs[object_id] = {**job, "job_path": str(object_job_dir / "job.json")}
+
+    run_script = output_dir / "run_neus_surface_jobs.sh"
+    script_lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
+    if jobs:
+        for job in jobs.values():
+            command = job.get("command")
+            if command:
+                script_lines.extend([f'echo "Running NeuS-style job for {job["object_id"]}"', str(command), ""])
+            else:
+                script_lines.append(f'echo "Prepared {job["job_path"]}; provide --command-template to execute an external NeuS/SDF backend."')
+    else:
+        script_lines.append('echo "No NeuS-style jobs prepared."')
+    run_script.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+    run_script.chmod(0o755)
+
+    manifest_path = output_dir / "neus_surface_jobs.json"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "observations": str(observations_manifest_path),
+        "output_dir": str(output_dir),
+        "jobs_dir": str(jobs_dir),
+        "mesh_output_dir": str(mesh_output_dir),
+        "provider": args.provider,
+        "job_count": len(jobs),
+        "jobs": jobs,
+        "skipped_objects": skipped,
+        "run_script": str(run_script),
+        "command_template": args.command_template,
+        "notes": "Prepared NeuS-style SDF surface extraction jobs from 3DGS-rendered RGB/depth/normal/mask observations. This command defines the backend contract; it does not train an in-repo neural SDF.",
+    }
+    write_json(manifest_path, report)
+    manifest.setdefault("artifacts", {})["neus_surface_jobs"] = str(manifest_path)
+    manifest.setdefault("external_stages", {})["neus_style_surface_extraction"] = {
+        "status": "jobs_prepared",
+        "manifest": str(manifest_path),
+        "job_count": len(jobs),
+        "provider": args.provider,
+    }
+    save_manifest(project_root, manifest)
+    print(f"Prepared {len(jobs)} NeuS-style surface job(s): {manifest_path}")
+    print(f"Run script: {run_script}")
     return 0
 
 
@@ -32579,6 +33256,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--update-manifest", action=argparse.BooleanOptionalAction, default=True, help="Update artifacts.gsplat_preview. Disable for trial previews.")
     p.set_defaults(func=cmd_render_gsplat_preview)
 
+    p = sub.add_parser("export-3dgs-mesh-observations", help="Render object-centric multi-view RGB/depth/normal/mask observations from the active 3DGS.")
+    add_common_project_arg(p)
+    p.add_argument("--splat-ply", type=Path, help="Renderable 3DGS PLY. Defaults to artifacts.scene_3dgs_ply.")
+    p.add_argument("--frames-dir", type=Path, help="Defaults to scene/frames.")
+    p.add_argument("--camera-info", type=Path, help="Defaults to scene/cameras/camera_info.json.")
+    p.add_argument("--mask-root", type=Path, help="Defaults to active 2D mask root.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/3dgs_mesh_observations.")
+    p.add_argument("--object-ids", nargs="+", help="Optional object ids to render. Defaults to all foreground objects with 2D masks.")
+    p.add_argument("--max-frames-per-object", type=int, default=6)
+    p.add_argument("--width", type=int, help="Optional render width; defaults to camera intrinsic width.")
+    p.add_argument("--height", type=int, help="Optional render height; defaults to camera intrinsic height.")
+    p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
+    p.add_argument("--background", choices=["target_mean", "white", "black", "none"], default="black")
+    p.add_argument("--min-probability", type=float, default=0.5)
+    p.add_argument("--probability-scale", type=float, default=255.0)
+    p.add_argument("--min-alpha", type=float, default=0.02)
+    p.add_argument("--include-background-structures", action="store_true")
+    p.set_defaults(func=cmd_export_3dgs_mesh_observations)
+
     p = sub.add_parser("select-gsplat-trial", help="Select the best gsplat trial by preview metrics and optionally register it.")
     add_common_project_arg(p)
     p.add_argument("--trial-root", type=Path, required=True, help="Directory containing trial subdirectories with preview/preview_manifest.json.")
@@ -33125,6 +33822,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-missing", action="store_true")
     p.add_argument("--skip-failed", action="store_true")
     p.set_defaults(func=cmd_reconstruct_object_meshes)
+
+    p = sub.add_parser("reconstruct-3dgs-object-meshes", help="Reconstruct object meshes from 3DGS-rendered depth/normal/mask observations via TSDF fusion or Poisson extraction.")
+    add_common_project_arg(p)
+    p.add_argument("--observations", type=Path, help="3dgs_mesh_observations.json. Defaults to artifacts.3dgs_mesh_observations.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/3dgs_object_meshes.")
+    p.add_argument("--object-ids", nargs="+", help="Optional object ids to reconstruct. Defaults to all observation objects.")
+    p.add_argument("--method", choices=["auto", "tsdf", "poisson"], default="auto")
+    p.add_argument("--format", choices=["obj", "ply", "stl"], default="obj")
+    p.add_argument("--max-frames-per-object", type=int, default=0)
+    p.add_argument("--min-depth", type=float, default=0.01)
+    p.add_argument("--max-depth", type=float, default=20.0)
+    p.add_argument("--min-mask-pixels", type=int, default=64)
+    p.add_argument("--tsdf-voxel-length", type=float, default=0.03)
+    p.add_argument("--tsdf-sdf-trunc", type=float, default=0.12)
+    p.add_argument("--point-stride", type=int, default=2)
+    p.add_argument("--min-points", type=int, default=200)
+    p.add_argument("--voxel-size", type=float, default=0.02)
+    p.add_argument("--remove-outliers", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--outlier-nb-neighbors", type=int, default=20)
+    p.add_argument("--outlier-std-ratio", type=float, default=2.0)
+    p.add_argument("--normal-radius", type=float)
+    p.add_argument("--poisson-depth", type=int, default=8)
+    p.add_argument("--poisson-density-quantile", type=float, default=0.02)
+    p.add_argument("--poisson-normal-neighbors", type=int, default=30)
+    p.add_argument("--largest-component", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--simplify-triangles", type=int, default=50000)
+    p.add_argument("--ascii", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--copy-to-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--skip-failed", action="store_true")
+    p.set_defaults(func=cmd_reconstruct_3dgs_object_meshes)
+
+    p = sub.add_parser("prepare-neus-surface-jobs", help="Prepare external NeuS-style SDF surface extraction jobs from 3DGS-rendered RGB/depth/normal/mask observations.")
+    add_common_project_arg(p)
+    p.add_argument("--observations", type=Path, help="3dgs_mesh_observations.json. Defaults to artifacts.3dgs_mesh_observations.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/neus_surface_jobs.")
+    p.add_argument("--mesh-output-dir", type=Path, help="Defaults to <output-dir>/meshes.")
+    p.add_argument("--object-ids", nargs="+", help="Optional object ids to prepare. Defaults to all observation objects.")
+    p.add_argument("--provider", default="external_neus_sdf")
+    p.add_argument("--mesh-format", choices=["obj", "ply", "glb", "stl"], default="obj")
+    p.add_argument("--max-frames-per-object", type=int, default=0)
+    p.add_argument("--command-template", help="Optional external command with {job_path}, {frames_manifest}, {object_id}, {output_dir}, {mesh_output}, {project_root}, {provider}.")
+    p.set_defaults(func=cmd_prepare_neus_surface_jobs)
 
     p = sub.add_parser("extract-svpp-object-meshes", help="Extract per-object meshes from an imported official SceneVerse++ scene mesh.")
     add_common_project_arg(p)

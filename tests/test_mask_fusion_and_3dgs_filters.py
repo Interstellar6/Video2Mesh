@@ -6,6 +6,9 @@ import pytest
 
 from video2mesh.cli import (
     apply_3dgs_sparse_filter,
+    build_observation_point_cloud,
+    build_parser,
+    depth_to_normal_map,
     export_viewer_plys,
     filter_colmap_points3d_file,
     make_object_masks_exclusive,
@@ -305,3 +308,54 @@ def test_scaled_intrinsic_for_size_scales_focal_length_and_principal_point():
     assert scaled["fy"] == pytest.approx(725.3333333333333)
     assert scaled["cx"] == 216.0
     assert scaled["cy"] == 384.0
+
+
+def test_depth_to_normal_map_returns_forward_normals_for_flat_depth():
+    np = pytest.importorskip("numpy")
+    depth = np.ones((4, 5), dtype=np.float32) * 2.0
+
+    normals = depth_to_normal_map(depth, 100.0, 100.0)
+
+    assert normals.shape == (4, 5, 3)
+    assert normals[2, 2, 0] == pytest.approx(0.0)
+    assert normals[2, 2, 1] == pytest.approx(0.0)
+    assert normals[2, 2, 2] == pytest.approx(1.0)
+
+
+def test_observation_depth_to_point_cloud_uses_mask_and_camera(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    depth = np.ones((2, 2), dtype=np.float32) * 2.0
+    depth_path = tmp_path / "depth.npy"
+    np.save(depth_path, depth)
+    mask_path = tmp_path / "mask.png"
+    rgb_path = tmp_path / "rgb.png"
+    Image.fromarray(np.array([[255, 0], [0, 0]], dtype=np.uint8), mode="L").save(mask_path)
+    Image.fromarray(np.full((2, 2, 3), 128, dtype=np.uint8), mode="RGB").save(rgb_path)
+    frame = {
+        "depth_npy": str(depth_path),
+        "mask": str(mask_path),
+        "rgb": str(rgb_path),
+        "width": 2,
+        "height": 2,
+        "intrinsic": {"fx": 2.0, "fy": 2.0, "cx": 0.0, "cy": 0.0},
+        "world_to_camera": np.eye(4).tolist(),
+    }
+
+    points, colors = build_observation_point_cloud([frame], min_depth=0.1, max_depth=5.0, stride=1)
+
+    assert points.shape == (1, 3)
+    assert colors.shape == (1, 3)
+    assert points[0].tolist() == pytest.approx([0.0, 0.0, 2.0])
+
+
+def test_3dgs_mesh_cli_commands_are_registered():
+    parser = build_parser()
+
+    obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
+    recon = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj"])
+    neus = parser.parse_args(["prepare-neus-surface-jobs", "--project-root", "proj"])
+
+    assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
+    assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
+    assert neus.func.__name__ == "cmd_prepare_neus_surface_jobs"

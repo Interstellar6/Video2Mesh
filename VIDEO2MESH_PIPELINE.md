@@ -297,6 +297,33 @@ trained GraphDECO 3DGS
 - surface extraction 后需要做 connected-component filtering、hole filling、mesh simplification 和 watertight/fragment QA，避免再次输出碎片化 mesh。
 - 旧的 object-mask-cloud meshing 只保留为 debug/baseline，不作为生产质量结果。
 
+当前实现入口：
+
+```bash
+python -m video2mesh.cli export-3dgs-mesh-observations \
+  --project-root exports/<run> \
+  --max-frames-per-object 6 \
+  --device cuda
+
+python -m video2mesh.cli reconstruct-3dgs-object-meshes \
+  --project-root exports/<run> \
+  --method auto \
+  --format obj \
+  --skip-failed
+
+python -m video2mesh.cli prepare-neus-surface-jobs \
+  --project-root exports/<run> \
+  --provider external_neus_sdf
+```
+
+第一步从 active 3DGS 和真实注册相机位姿渲染每个 object 的
+`rgb.png`、`depth.npy/png`、`normal.npy/png`、`mask.png`。第二步默认先尝试
+TSDF fusion；如果 TSDF 没有足够 masked depth，会回退到从这些 3DGS-rendered
+depth observations 反投影点云，再用 Poisson surface extraction 出 mesh。
+第三步把同一批观测打包成 NeuS-style SDF optimization 的外部 backend 作业；
+仓库内不伪装实现神经 SDF 训练器，但会固定输入/输出合同，后续可接 NeuS/VolSDF/NeuS2
+等后端。
+
 ## 8. 仿真器导出
 
 ```bash
