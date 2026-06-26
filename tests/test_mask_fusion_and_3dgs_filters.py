@@ -14,6 +14,7 @@ from video2mesh.cli import (
     clip_mask_by_depth_quantiles,
     depth_to_normal_map,
     filter_points_by_dbscan_largest_cluster,
+    filter_points_by_gaussian_attributes,
     filter_points_by_multiview_mask_consistency,
     filter_points_by_pca_quantiles,
     filter_points_by_quantile_bbox,
@@ -22,6 +23,7 @@ from video2mesh.cli import (
     filter_colmap_points3d_file,
     make_object_masks_exclusive,
     parse_ply_vertex_header,
+    postprocess_mesh_with_point_support,
     prepare_3dgs_colmap_source,
     quantile_bounds_from_points,
     scaled_intrinsic_for_size,
@@ -465,6 +467,49 @@ def test_filter_points_by_multiview_mask_consistency_keeps_mask_hits(tmp_path: P
     assert report["removed_points"] == 1
 
 
+def test_filter_points_by_gaussian_attributes_removes_low_quality_gaussians():
+    np = pytest.importorskip("numpy")
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    colors = np.ones((4, 3), dtype=np.float64)
+    attrs = {
+        "opacities": np.array([0.9, 0.8, 0.01, 0.9], dtype=np.float32),
+        "scales": np.array(
+            [
+                [0.03, 0.03, 0.03],
+                [0.04, 0.04, 0.04],
+                [0.03, 0.03, 0.03],
+                [100.0, 0.001, 0.001],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    args = Namespace(
+        min_points=1,
+        min_opacity=0.05,
+        max_scale=1.0,
+        max_scale_quantile=None,
+        max_anisotropy=None,
+        max_anisotropy_quantile=None,
+        gaussian_attribute_fallback_keep_original=False,
+    )
+
+    filtered, filtered_colors, report = filter_points_by_gaussian_attributes(points, colors, attrs, args)
+
+    np.testing.assert_allclose(filtered, np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64))
+    assert filtered_colors.shape == (2, 3)
+    assert report["removed_points"] == 2
+    assert report["thresholds"]["min_opacity"] == pytest.approx(0.05)
+    assert report["thresholds"]["max_scale"] == pytest.approx(1.0)
+
+
 def test_bbox_proxy_mesh_from_points_returns_box_mesh():
     np = pytest.importorskip("numpy")
     pytest.importorskip("open3d")
@@ -488,6 +533,42 @@ def test_bbox_proxy_mesh_from_points_returns_box_mesh():
     assert len(mesh.triangles) == 12
     assert report["method"] == "quantile_aabb_proxy_from_observation_points"
     assert report["extent"] == pytest.approx([2.0, 1.0, 0.5])
+
+
+def test_postprocess_mesh_with_point_support_crops_outlying_vertices():
+    np = pytest.importorskip("numpy")
+    o3d = pytest.importorskip("open3d")
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [10.0, 10.0, 10.0],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(triangles),
+    )
+    support = vertices[:3]
+    args = Namespace(
+        min_points=1,
+        mesh_crop_to_support_bbox=True,
+        mesh_crop_quantile_min=0.0,
+        mesh_crop_quantile_max=1.0,
+        mesh_crop_padding_ratio=0.0,
+        mesh_keep_largest_component=True,
+        simplify_triangles=0,
+        smooth_iterations=0,
+    )
+
+    processed, report = postprocess_mesh_with_point_support(mesh, support, args)
+
+    assert len(processed.vertices) == 3
+    assert len(processed.triangles) == 1
+    assert report["support_bbox_crop"]["removed_vertices"] == 1
 
 
 def test_observation_depth_to_point_cloud_uses_mask_and_camera(tmp_path: Path):
@@ -529,4 +610,7 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
     assert recon.proxy_mesh == "none"
     assert semantic_recon.func.__name__ == "cmd_reconstruct_semantic_3dgs_object_meshes"
+    assert semantic_recon.gaussian_attribute_filter is True
+    assert semantic_recon.max_scale_quantile == pytest.approx(0.90)
+    assert semantic_recon.mesh_crop_to_support_bbox is True
     assert neus.func.__name__ == "cmd_prepare_neus_surface_jobs"

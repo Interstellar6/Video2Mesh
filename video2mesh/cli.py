@@ -14765,6 +14765,93 @@ def postprocess_triangle_mesh(mesh, args):
     return mesh
 
 
+def postprocess_mesh_with_point_support(mesh, support_points, args: argparse.Namespace):
+    np = import_numpy()
+    report: dict[str, Any] = {
+        "enabled": True,
+        "input_vertices": int(len(mesh.vertices)),
+        "input_triangles": int(len(mesh.triangles)),
+    }
+    mesh = clean_triangle_mesh(mesh)
+    crop_report = None
+    if bool(getattr(args, "mesh_crop_to_support_bbox", False)) and len(mesh.vertices) > 0:
+        bounds = quantile_bounds_from_points(
+            support_points,
+            float(getattr(args, "mesh_crop_quantile_min", 0.01)),
+            float(getattr(args, "mesh_crop_quantile_max", 0.99)),
+            float(getattr(args, "mesh_crop_padding_ratio", 0.04)),
+        )
+        if bounds is not None:
+            lower, upper = bounds
+            vertices_np = np.asarray(mesh.vertices, dtype=np.float64)
+            keep_vertices = np.all((vertices_np >= lower) & (vertices_np <= upper), axis=1)
+            removed_vertices = int((~keep_vertices).sum())
+            if removed_vertices > 0 and int(keep_vertices.sum()) >= 3:
+                mesh.remove_vertices_by_mask(~keep_vertices)
+                mesh = clean_triangle_mesh(mesh)
+            crop_report = {
+                "enabled": True,
+                "removed_vertices": removed_vertices,
+                "remaining_vertices": int(len(mesh.vertices)),
+                "remaining_triangles": int(len(mesh.triangles)),
+                "q_min": float(getattr(args, "mesh_crop_quantile_min", 0.01)),
+                "q_max": float(getattr(args, "mesh_crop_quantile_max", 0.99)),
+                "padding_ratio": float(getattr(args, "mesh_crop_padding_ratio", 0.04)),
+                "min": [float(value) for value in lower.tolist()],
+                "max": [float(value) for value in upper.tolist()],
+            }
+
+    component_report = None
+    if bool(getattr(args, "mesh_keep_largest_component", True)) and len(mesh.triangles) > 0:
+        try:
+            triangle_clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
+            labels = np.asarray(triangle_clusters, dtype=np.int64)
+            counts = np.asarray(cluster_n_triangles, dtype=np.int64)
+            areas = np.asarray(cluster_area, dtype=np.float64)
+            if labels.size and counts.size > 1:
+                keep_label = int(np.argmax(counts))
+                remove = np.flatnonzero(labels != keep_label).astype(np.int32)
+                removed_triangles = int(remove.shape[0])
+                if removed_triangles > 0:
+                    mesh.remove_triangles_by_index(remove.tolist())
+                    mesh = clean_triangle_mesh(mesh)
+                component_report = {
+                    "enabled": True,
+                    "component_count": int(counts.shape[0]),
+                    "kept_component": keep_label,
+                    "kept_triangles": int(counts[keep_label]),
+                    "removed_triangles": removed_triangles,
+                    "kept_area": float(areas[keep_label]) if areas.size > keep_label else None,
+                }
+            else:
+                component_report = {
+                    "enabled": True,
+                    "component_count": int(counts.shape[0]) if counts.size else 0,
+                    "removed_triangles": 0,
+                }
+        except Exception as exc:
+            component_report = {"enabled": True, "error": str(exc)}
+
+    if int(getattr(args, "simplify_triangles", 0) or 0) > 0 and len(mesh.triangles) > int(args.simplify_triangles):
+        mesh = mesh.simplify_quadric_decimation(int(args.simplify_triangles))
+        mesh = clean_triangle_mesh(mesh)
+    if int(getattr(args, "smooth_iterations", 0) or 0) > 0 and len(mesh.triangles) > 0:
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=int(args.smooth_iterations))
+        mesh = clean_triangle_mesh(mesh)
+
+    report.update(
+        {
+            "output_vertices": int(len(mesh.vertices)),
+            "output_triangles": int(len(mesh.triangles)),
+            "support_bbox_crop": crop_report,
+            "largest_component": component_report,
+            "simplify_triangles": int(getattr(args, "simplify_triangles", 0) or 0),
+            "smooth_iterations": int(getattr(args, "smooth_iterations", 0) or 0),
+        }
+    )
+    return mesh, report
+
+
 def mesh_from_observation_point_cloud(points, colors, args):
     np = import_numpy()
     o3d = import_open3d()
@@ -15136,6 +15223,111 @@ def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_poin
     }
 
 
+def selected_gaussian_attributes(gsplat_data: dict[str, Any] | None, selected_indices):
+    if not gsplat_data:
+        return None
+    np = import_numpy()
+    indices = np.asarray(selected_indices, dtype=np.int64)
+    if indices.size == 0:
+        return None
+    attrs: dict[str, Any] = {}
+    for key in ("opacities", "scales", "quats", "normals"):
+        value = gsplat_data.get(key)
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.shape[0] <= int(indices.max()):
+            continue
+        attrs[key] = array[indices]
+    return attrs or None
+
+
+def filter_points_by_gaussian_attributes(points, colors, gaussian_attrs: dict[str, Any] | None, args: argparse.Namespace):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
+        return points_np, colors, None
+    if not gaussian_attrs:
+        return points_np, colors, {"enabled": True, "reason": "missing_gaussian_attributes", "kept_points": int(points_np.shape[0]), "removed_points": 0}
+
+    keep = np.ones(points_np.shape[0], dtype=bool)
+    thresholds: dict[str, float] = {}
+    summaries: dict[str, Any] = {}
+
+    opacities = gaussian_attrs.get("opacities")
+    if opacities is not None:
+        opacity = np.asarray(opacities, dtype=np.float64).reshape(-1)
+        if opacity.shape[0] == points_np.shape[0]:
+            summaries["opacity"] = {
+                "min": float(opacity.min()) if opacity.size else 0.0,
+                "max": float(opacity.max()) if opacity.size else 0.0,
+                "median": float(np.median(opacity)) if opacity.size else 0.0,
+            }
+            min_opacity = getattr(args, "min_opacity", None)
+            if min_opacity is not None and float(min_opacity) > 0:
+                thresholds["min_opacity"] = float(min_opacity)
+                keep &= opacity >= float(min_opacity)
+
+    scales = gaussian_attrs.get("scales")
+    if scales is not None:
+        scales_np = np.asarray(scales, dtype=np.float64)
+        if scales_np.ndim == 2 and scales_np.shape[0] == points_np.shape[0] and scales_np.shape[1] >= 3:
+            scale_abs = np.abs(scales_np[:, :3])
+            scale_max = np.max(scale_abs, axis=1)
+            scale_min = np.maximum(np.min(scale_abs, axis=1), 1e-9)
+            anisotropy = scale_max / scale_min
+            summaries["scale_max"] = {
+                "min": float(scale_max.min()) if scale_max.size else 0.0,
+                "max": float(scale_max.max()) if scale_max.size else 0.0,
+                "median": float(np.median(scale_max)) if scale_max.size else 0.0,
+            }
+            summaries["anisotropy"] = {
+                "min": float(anisotropy.min()) if anisotropy.size else 0.0,
+                "max": float(anisotropy.max()) if anisotropy.size else 0.0,
+                "median": float(np.median(anisotropy)) if anisotropy.size else 0.0,
+            }
+            max_scale = getattr(args, "max_scale", None)
+            if max_scale is not None and float(max_scale) > 0:
+                thresholds["max_scale"] = float(max_scale)
+                keep &= scale_max <= float(max_scale)
+            max_scale_quantile = getattr(args, "max_scale_quantile", None)
+            if max_scale_quantile is not None and 0.0 < float(max_scale_quantile) < 1.0 and scale_max.size:
+                threshold = float(np.quantile(scale_max, float(max_scale_quantile)))
+                thresholds["max_scale_quantile"] = float(max_scale_quantile)
+                thresholds["max_scale_quantile_value"] = threshold
+                keep &= scale_max <= threshold
+            max_anisotropy = getattr(args, "max_anisotropy", None)
+            if max_anisotropy is not None and float(max_anisotropy) > 0:
+                thresholds["max_anisotropy"] = float(max_anisotropy)
+                keep &= anisotropy <= float(max_anisotropy)
+            max_anisotropy_quantile = getattr(args, "max_anisotropy_quantile", None)
+            if max_anisotropy_quantile is not None and 0.0 < float(max_anisotropy_quantile) < 1.0 and anisotropy.size:
+                threshold = float(np.quantile(anisotropy, float(max_anisotropy_quantile)))
+                thresholds["max_anisotropy_quantile"] = float(max_anisotropy_quantile)
+                thresholds["max_anisotropy_quantile_value"] = threshold
+                keep &= anisotropy <= threshold
+
+    kept = int(keep.sum())
+    if kept < int(args.min_points) and bool(getattr(args, "gaussian_attribute_fallback_keep_original", True)):
+        return points_np, colors, {
+            "enabled": True,
+            "fallback": "too_few_points_after_gaussian_attribute_filter",
+            "candidate_kept_points": kept,
+            "kept_points": int(points_np.shape[0]),
+            "removed_points": 0,
+            "thresholds": thresholds,
+            "summaries": summaries,
+        }
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "enabled": True,
+        "kept_points": kept,
+        "removed_points": int(points_np.shape[0] - kept),
+        "thresholds": thresholds,
+        "summaries": summaries,
+    }
+
+
 def filter_points_by_multiview_mask_consistency(
     points,
     colors,
@@ -15261,6 +15453,14 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
     requested = {slugify(value) for value in (args.object_ids or [])}
     object_table, _object_id_to_semantic, records_by_id = object_table_from_records(project_root, manifest)
     points, labels, colors = read_semantic_ply(semantic_ply)
+    gsplat_data = None
+    if bool(args.gaussian_attribute_filter):
+        try:
+            candidate_gsplat_data = read_gsplat_ply(semantic_ply)
+            if np.asarray(candidate_gsplat_data.get("means")).shape[0] == points.shape[0]:
+                gsplat_data = candidate_gsplat_data
+        except Exception:
+            gsplat_data = None
     probabilities_raw = read_ascii_ply_float_property(semantic_ply, "object_probability")
     probabilities = np.asarray(probabilities_raw if probabilities_raw is not None else np.ones(points.shape[0]), dtype=np.float32)
     records_by_object = mask_records_by_object(mask_root) if bool(args.mask_consistency_filter) else {}
@@ -15290,8 +15490,10 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
             skipped[object_id] = "missing_semantic_id"
             continue
         selected = (labels == int(semantic_id)) & (probabilities >= float(args.min_probability))
-        selected_points = points[selected]
-        selected_colors = None if colors is None else colors[selected]
+        selected_indices = np.flatnonzero(selected)
+        selected_points = points[selected_indices]
+        selected_colors = None if colors is None else colors[selected_indices]
+        selected_attrs = selected_gaussian_attributes(gsplat_data, selected_indices)
         if selected_points.shape[0] < int(args.min_points):
             skipped[object_id] = f"too_few_points:{selected_points.shape[0]}"
             continue
@@ -15299,6 +15501,14 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
         mesh_path = object_mesh_dir / f"{object_id}.{args.format}"
         try:
             mask_consistency = None
+            gaussian_attribute_filter = None
+            if bool(args.gaussian_attribute_filter):
+                selected_points, selected_colors, gaussian_attribute_filter = filter_points_by_gaussian_attributes(
+                    selected_points,
+                    selected_colors,
+                    selected_attrs,
+                    args,
+                )
             if bool(args.mask_consistency_filter):
                 selected_points, selected_colors, mask_consistency = filter_points_by_multiview_mask_consistency(
                     selected_points,
@@ -15342,12 +15552,7 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                 int(args.seed),
             )
             mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
-            if int(args.simplify_triangles or 0) > 0 and len(mesh.triangles) > int(args.simplify_triangles):
-                mesh = mesh.simplify_quadric_decimation(int(args.simplify_triangles))
-                mesh = clean_triangle_mesh(mesh)
-            if int(args.smooth_iterations or 0) > 0 and len(mesh.triangles) > 0:
-                mesh = mesh.filter_smooth_taubin(number_of_iterations=int(args.smooth_iterations))
-                mesh = clean_triangle_mesh(mesh)
+            mesh, mesh_postprocess = postprocess_mesh_with_point_support(mesh, selected_points, args)
             ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
             if not ok:
                 raise RuntimeError(f"Open3D failed to write mesh: {mesh_path}")
@@ -15371,11 +15576,13 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                     **reconstruction,
                     "selected_semantic_points": int(selected.sum()),
                     "points_after_quantile_crop": int(selected_points.shape[0]),
+                    "gaussian_attribute_filter": gaussian_attribute_filter,
                     "mask_consistency": mask_consistency,
                     "quantile_crop": quantile_crop,
                     "pca_crop": pca_crop,
                     "dbscan_filter": dbscan_filter,
                     "sampling": sample_report,
+                    "mesh_postprocess": mesh_postprocess,
                     "min_probability": float(args.min_probability),
                 },
                 "qa": summarize_triangle_mesh(mesh_path),
@@ -34726,6 +34933,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--min-points", type=int, default=200)
     p.add_argument("--max-points", type=int, default=0)
+    p.add_argument("--gaussian-attribute-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--min-opacity", type=float, default=0.05)
+    p.add_argument("--max-scale", type=float, help="Optional absolute maximum Gaussian scale before meshing.")
+    p.add_argument("--max-scale-quantile", type=float, default=0.90)
+    p.add_argument("--max-anisotropy", type=float, help="Optional absolute maximum ratio between largest and smallest Gaussian scale.")
+    p.add_argument("--max-anisotropy-quantile", type=float, default=0.95)
+    p.add_argument("--gaussian-attribute-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mask-consistency-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--consistency-max-frames", type=int, default=12)
     p.add_argument("--consistency-min-probability", type=float, default=0.5)
@@ -34760,6 +34974,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--poisson-normal-neighbors", type=int, default=40)
     p.add_argument("--simplify-triangles", type=int, default=40000)
     p.add_argument("--smooth-iterations", type=int, default=3)
+    p.add_argument("--mesh-crop-to-support-bbox", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mesh-crop-quantile-min", type=float, default=0.01)
+    p.add_argument("--mesh-crop-quantile-max", type=float, default=0.99)
+    p.add_argument("--mesh-crop-padding-ratio", type=float, default=0.03)
+    p.add_argument("--mesh-keep-largest-component", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--include-background-structures", action="store_true")
     p.add_argument("--update-object-asset", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--copy-to-assets", action=argparse.BooleanOptionalAction, default=True)
