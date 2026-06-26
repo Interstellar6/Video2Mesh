@@ -15516,20 +15516,20 @@ def mesh_from_observation_point_cloud(points, colors, args):
         pcd, _ind = pcd.remove_statistical_outlier(nb_neighbors=int(args.outlier_nb_neighbors), std_ratio=float(args.outlier_std_ratio))
     if len(pcd.points) < int(args.min_points):
         raise ValueError(f"Only {len(pcd.points)} filtered depth point(s), below --min-points {args.min_points}")
-    radius = float(args.normal_radius or max(float(args.voxel_size or 0.02) * 3.0, 0.02))
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
-    pcd.orient_normals_consistent_tangent_plane(max(10, int(args.poisson_normal_neighbors)))
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=int(args.poisson_depth))
-    densities_np = np.asarray(densities)
-    if densities_np.size and float(args.poisson_density_quantile) > 0:
-        threshold = float(np.quantile(densities_np, float(args.poisson_density_quantile)))
-        mesh.remove_vertices_by_mask(densities_np < threshold)
-    return postprocess_triangle_mesh(mesh, args), {
-        "method": "poisson_from_3dgs_rendered_depth_point_cloud",
+    colors_array = np.asarray(pcd.colors, dtype=np.float64)
+    points_array = np.asarray(pcd.points, dtype=np.float64)
+    method_args = argparse.Namespace(**vars(args))
+    if str(method_args.method) == "auto":
+        method_args.method = "alpha_shape"
+    mesh, reconstruction = reconstruct_mesh_from_object_points(points_array, colors_array, method_args)
+    mesh = postprocess_triangle_mesh(mesh, args)
+    selected = reconstruction.get("selected") if isinstance(reconstruction, dict) else {}
+    return mesh, {
+        "method": f"{method_args.method}_from_3dgs_rendered_depth_point_cloud",
         "input_depth_point_count": int(points.shape[0]),
         "filtered_point_count": int(len(pcd.points)),
-        "poisson_depth": int(args.poisson_depth),
-        "poisson_density_quantile": float(args.poisson_density_quantile),
+        "selected": selected,
+        "attempts": reconstruction.get("attempts") if isinstance(reconstruction, dict) else None,
     }
 
 
@@ -15688,10 +15688,11 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                         semantic_support_source,
                     )
                     reconstruction["semantic_support_filter"] = semantic_support_filter
-            elif args.method == "poisson":
+            elif args.method in {"poisson", "alpha_shape", "ball_pivoting"}:
                 points, colors, semantic_support_filter, surface_consistency, surface_bbox_crop = build_filtered_surface_points()
                 support_points_for_quality = points
                 mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
+                method_used = args.method
                 reconstruction["semantic_support_filter"] = semantic_support_filter
                 reconstruction["surface_consistency_filter"] = surface_consistency
                 reconstruction["surface_bbox_crop"] = surface_bbox_crop
@@ -15699,8 +15700,10 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                 try:
                     points, colors, semantic_support_filter, surface_consistency, surface_bbox_crop = build_filtered_surface_points()
                     support_points_for_quality = points
-                    mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
-                    method_used = "poisson"
+                    args_for_auto = argparse.Namespace(**vars(args))
+                    args_for_auto.method = "alpha_shape"
+                    mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args_for_auto)
+                    method_used = "alpha_shape"
                     reconstruction["semantic_support_filter"] = semantic_support_filter
                     reconstruction["surface_consistency_filter"] = surface_consistency
                     reconstruction["surface_bbox_crop"] = surface_bbox_crop
@@ -35886,7 +35889,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--observations", type=Path, help="3dgs_mesh_observations.json. Defaults to artifacts.3dgs_mesh_observations.")
     p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/3dgs_object_meshes.")
     p.add_argument("--object-ids", nargs="+", help="Optional object ids to reconstruct. Defaults to all observation objects.")
-    p.add_argument("--method", choices=["auto", "tsdf", "poisson"], default="auto")
+    p.add_argument("--method", choices=["auto", "tsdf", "poisson", "alpha_shape", "ball_pivoting"], default="auto")
     p.add_argument("--format", choices=["obj", "ply", "stl"], default="obj")
     p.add_argument("--max-frames-per-object", type=int, default=0)
     p.add_argument("--min-depth", type=float, default=0.01)
@@ -35929,6 +35932,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--outlier-nb-neighbors", type=int, default=20)
     p.add_argument("--outlier-std-ratio", type=float, default=2.0)
     p.add_argument("--normal-radius", type=float)
+    p.add_argument("--alpha", type=float, help="Alpha value for alpha-shape reconstruction. Defaults to spacing * --alpha-multiplier.")
+    p.add_argument("--alpha-multiplier", type=float, default=4.0)
+    p.add_argument("--ball-radius-multipliers", type=float, nargs="+", default=[1.5, 2.5, 4.0])
+    p.add_argument("--min-extent", type=float, default=0.02)
     p.add_argument("--poisson-depth", type=int, default=8)
     p.add_argument("--poisson-density-quantile", type=float, default=0.02)
     p.add_argument("--poisson-normal-neighbors", type=int, default=30)

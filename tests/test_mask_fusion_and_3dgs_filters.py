@@ -877,6 +877,7 @@ def test_3dgs_mesh_cli_commands_are_registered():
         ]
     )
     recon = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj"])
+    recon_alpha = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj", "--method", "alpha_shape"])
     semantic_recon = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj"])
     neus = parser.parse_args(["prepare-neus-surface-jobs", "--project-root", "proj"])
 
@@ -891,6 +892,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert obs.projected_support_radius == pytest.approx(18.0)
     assert obs.max_scale_quantile == pytest.approx(0.90)
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
+    assert recon_alpha.method == "alpha_shape"
+    assert recon.alpha_multiplier == pytest.approx(4.0)
     assert recon.proxy_mesh == "none"
     assert recon.surface_consistency_filter is True
     assert recon.semantic_support_filter is False
