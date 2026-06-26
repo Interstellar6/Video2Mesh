@@ -24,6 +24,7 @@ from video2mesh.cli import (
     filter_mask_by_depth_edges,
     export_viewer_plys,
     filter_colmap_points3d_file,
+    gaussian_occupancy_mesh_from_points,
     make_object_masks_exclusive,
     mesh_support_quality_report,
     parse_ply_vertex_header,
@@ -561,6 +562,37 @@ def test_augment_points_from_gaussian_support_adds_oriented_axis_samples():
     assert report["added_points"] == 2
 
 
+def test_gaussian_occupancy_mesh_from_points_generates_surface():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("open3d")
+    pytest.importorskip("skimage.measure")
+    points = np.array([[0.0, 0.0, 0.0], [0.12, 0.0, 0.0], [0.0, 0.12, 0.0], [0.0, 0.0, 0.12]], dtype=np.float64)
+    colors = np.ones((4, 3), dtype=np.float64)
+    attrs = {
+        "scales": np.full((4, 3), 0.08, dtype=np.float64),
+        "quats": np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float64), (4, 1)),
+    }
+    args = Namespace(
+        min_points=1,
+        occupancy_voxel_size=0.04,
+        occupancy_max_grid_dim=64,
+        occupancy_padding=0.1,
+        occupancy_sigma_multiplier=0.7,
+        occupancy_min_sigma=0.0,
+        occupancy_support_radius_multiplier=2.5,
+        occupancy_scale_quantile=1.0,
+        occupancy_level_ratio=0.25,
+        occupancy_max_gaussians=0,
+        seed=7,
+    )
+
+    mesh, report = gaussian_occupancy_mesh_from_points(points, colors, attrs, args)
+
+    assert len(mesh.vertices) > 0
+    assert len(mesh.triangles) > 0
+    assert report["method"] == "gaussian_occupancy_marching_cubes"
+
+
 def test_bbox_proxy_mesh_from_points_returns_box_mesh():
     np = pytest.importorskip("numpy")
     pytest.importorskip("open3d")
@@ -765,6 +797,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert recon.surface_crop_to_quantile_bbox is True
     assert recon.quality_guard is True
     assert semantic_recon.func.__name__ == "cmd_reconstruct_semantic_3dgs_object_meshes"
+    semantic_occupancy = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj", "--method", "gaussian_occupancy"])
+    assert semantic_occupancy.method == "gaussian_occupancy"
     assert semantic_recon.gaussian_attribute_filter is True
     assert semantic_recon.max_scale_quantile == pytest.approx(0.90)
     assert semantic_recon.mesh_crop_to_support_bbox is True

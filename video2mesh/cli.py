@@ -15589,6 +15589,106 @@ def augment_points_from_gaussian_support(points, colors, gaussian_attrs: dict[st
     }
 
 
+def gaussian_occupancy_mesh_from_points(points, colors, gaussian_attrs: dict[str, Any] | None, args: argparse.Namespace):
+    np = import_numpy()
+    o3d = import_open3d()
+    try:
+        from skimage import measure
+    except Exception as exc:
+        raise RuntimeError("gaussian_occupancy requires scikit-image. Install scikit-image or use --method poisson.") from exc
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] < max(1, int(args.min_points)):
+        raise ValueError(f"Expected at least {args.min_points} Nx3 Gaussian centers, got shape {points_np.shape}")
+    if not gaussian_attrs or gaussian_attrs.get("scales") is None:
+        raise ValueError("gaussian_occupancy requires Gaussian scale attributes.")
+    scales_np = np.asarray(gaussian_attrs["scales"], dtype=np.float64)
+    if scales_np.ndim != 2 or scales_np.shape[0] != points_np.shape[0] or scales_np.shape[1] < 3:
+        raise ValueError("Gaussian scale attributes do not match selected points.")
+
+    voxel_size = float(getattr(args, "occupancy_voxel_size", 0.04) or 0.04)
+    max_grid_dim = max(16, int(getattr(args, "occupancy_max_grid_dim", 160) or 160))
+    padding = float(getattr(args, "occupancy_padding", 0.08) or 0.08)
+    sigma_multiplier = float(getattr(args, "occupancy_sigma_multiplier", 0.55) or 0.55)
+    support_radius_multiplier = float(getattr(args, "occupancy_support_radius_multiplier", 2.0) or 2.0)
+    quantile = float(getattr(args, "occupancy_scale_quantile", 0.80) or 0.80)
+    level_ratio = float(getattr(args, "occupancy_level_ratio", 0.22) or 0.22)
+    max_gaussians = int(getattr(args, "occupancy_max_gaussians", 0) or 0)
+    selected_indices = np.arange(points_np.shape[0], dtype=np.int64)
+    if max_gaussians > 0 and selected_indices.shape[0] > max_gaussians:
+        rng = np.random.default_rng(int(getattr(args, "seed", 7)))
+        selected_indices = np.sort(rng.choice(selected_indices, size=max_gaussians, replace=False))
+    points_work = points_np[selected_indices]
+    scales_work = np.abs(scales_np[selected_indices, :3])
+    scale_max = scales_work.max(axis=1)
+    scale_threshold = float(np.quantile(scale_max, max(0.0, min(1.0, quantile)))) if scale_max.size else voxel_size
+    min_sigma = max(voxel_size * 0.75, float(getattr(args, "occupancy_min_sigma", 0.0) or 0.0))
+    sigmas = np.clip(scales_work * sigma_multiplier, min_sigma, max(scale_threshold * sigma_multiplier, min_sigma))
+
+    mins = points_work.min(axis=0)
+    maxs = points_work.max(axis=0)
+    extent = np.maximum(maxs - mins, voxel_size)
+    lower = mins - extent * padding - voxel_size * 2.0
+    upper = maxs + extent * padding + voxel_size * 2.0
+    dims = np.ceil((upper - lower) / voxel_size).astype(np.int64) + 1
+    largest_dim = int(dims.max())
+    effective_voxel_size = voxel_size
+    if largest_dim > max_grid_dim:
+        scale = largest_dim / float(max_grid_dim)
+        effective_voxel_size = voxel_size * scale
+        dims = np.ceil((upper - lower) / effective_voxel_size).astype(np.int64) + 1
+    if np.any(dims < 4):
+        dims = np.maximum(dims, 4)
+    if int(np.prod(dims)) > int(max_grid_dim) ** 3:
+        raise RuntimeError(f"Occupancy grid too large: {dims.tolist()}")
+
+    grid = np.zeros(tuple(int(v) for v in dims), dtype=np.float32)
+    for point, sigma in zip(points_work, sigmas):
+        radius = np.maximum(sigma * support_radius_multiplier, effective_voxel_size)
+        start = np.maximum(np.floor((point - radius - lower) / effective_voxel_size).astype(np.int64), 0)
+        end = np.minimum(np.ceil((point + radius - lower) / effective_voxel_size).astype(np.int64) + 1, dims)
+        if np.any(end <= start):
+            continue
+        xs = lower[0] + np.arange(start[0], end[0], dtype=np.float64) * effective_voxel_size
+        ys = lower[1] + np.arange(start[1], end[1], dtype=np.float64) * effective_voxel_size
+        zs = lower[2] + np.arange(start[2], end[2], dtype=np.float64) * effective_voxel_size
+        dx = ((xs - point[0]) / max(float(sigma[0]), 1e-8)) ** 2
+        dy = ((ys - point[1]) / max(float(sigma[1]), 1e-8)) ** 2
+        dz = ((zs - point[2]) / max(float(sigma[2]), 1e-8)) ** 2
+        density = np.exp(-0.5 * (dx[:, None, None] + dy[None, :, None] + dz[None, None, :])).astype(np.float32)
+        grid[start[0] : end[0], start[1] : end[1], start[2] : end[2]] = np.maximum(
+            grid[start[0] : end[0], start[1] : end[1], start[2] : end[2]],
+            density,
+        )
+    max_density = float(grid.max()) if grid.size else 0.0
+    if max_density <= 0.0:
+        raise RuntimeError("Gaussian occupancy grid is empty.")
+    level = max_density * max(1e-4, min(0.99, level_ratio))
+    if not (float(grid.min()) <= level <= float(grid.max())):
+        raise RuntimeError(f"Invalid occupancy level {level}; grid range is {float(grid.min())}..{float(grid.max())}")
+    verts, faces, _normals, _values = measure.marching_cubes(grid, level=level, spacing=(effective_voxel_size, effective_voxel_size, effective_voxel_size))
+    verts = verts + lower[None, :]
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(verts.astype(np.float64)),
+        o3d.utility.Vector3iVector(faces.astype(np.int32)),
+    )
+    paint_mesh_from_points(mesh, colors)
+    return clean_triangle_mesh(mesh), {
+        "method": "gaussian_occupancy_marching_cubes",
+        "input_point_count": int(points_np.shape[0]),
+        "used_gaussians": int(points_work.shape[0]),
+        "voxel_size": float(effective_voxel_size),
+        "requested_voxel_size": float(voxel_size),
+        "grid_dims": [int(value) for value in dims.tolist()],
+        "level": float(level),
+        "level_ratio": float(level_ratio),
+        "max_density": float(max_density),
+        "sigma_multiplier": float(sigma_multiplier),
+        "support_radius_multiplier": float(support_radius_multiplier),
+        "scale_quantile": float(quantile),
+        "scale_threshold": float(scale_threshold),
+    }
+
+
 def sample_points_and_colors(points, colors, max_points: int, seed: int):
     np = import_numpy()
     points_np = np.asarray(points, dtype=np.float64)
@@ -16025,12 +16125,13 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
             gaussian_support_augmentation = None
             pre_aug_points = selected_points
             pre_aug_colors = selected_colors
-            selected_points, selected_colors, gaussian_support_augmentation = augment_points_from_gaussian_support(
-                selected_points,
-                selected_colors,
-                selected_attrs,
-                args,
-            )
+            if args.method != "gaussian_occupancy":
+                selected_points, selected_colors, gaussian_support_augmentation = augment_points_from_gaussian_support(
+                    selected_points,
+                    selected_colors,
+                    selected_attrs,
+                    args,
+                )
             sample_report = None
             selected_points, selected_colors, sample_report = sample_points_and_colors(
                 selected_points,
@@ -16038,21 +16139,25 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                 int(args.max_points),
                 int(args.seed),
             )
-            try:
-                mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
-            except Exception as mesh_exc:
-                fallback_report = gaussian_support_augmentation
-                if fallback_report and fallback_report.get("enabled") and bool(getattr(args, "gaussian_support_fallback_without_augmentation", True)):
-                    selected_points = pre_aug_points
-                    selected_colors = pre_aug_colors
-                    gaussian_support_augmentation = {
-                        **fallback_report,
-                        "fallback": "reconstructed_without_gaussian_support_augmentation",
-                        "fallback_reason": str(mesh_exc),
-                    }
+            if args.method == "gaussian_occupancy":
+                mesh, reconstruction = gaussian_occupancy_mesh_from_points(selected_points, selected_colors, selected_attrs, args)
+                reconstruction = {"selected": reconstruction, "attempts": [reconstruction]}
+            else:
+                try:
                     mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
-                else:
-                    raise
+                except Exception as mesh_exc:
+                    fallback_report = gaussian_support_augmentation
+                    if fallback_report and fallback_report.get("enabled") and bool(getattr(args, "gaussian_support_fallback_without_augmentation", True)):
+                        selected_points = pre_aug_points
+                        selected_colors = pre_aug_colors
+                        gaussian_support_augmentation = {
+                            **fallback_report,
+                            "fallback": "reconstructed_without_gaussian_support_augmentation",
+                            "fallback_reason": str(mesh_exc),
+                        }
+                        mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
+                    else:
+                        raise
             mesh, mesh_postprocess = postprocess_mesh_with_point_support(mesh, selected_points, args)
             ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
             if not ok:
@@ -35451,7 +35556,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mask-root", type=Path, help="Defaults to the active masks/2d root when --mask-consistency-filter is enabled.")
     p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_3dgs_object_meshes.")
     p.add_argument("--object-ids", nargs="+", help="Optional object ids to reconstruct. Defaults to all foreground objects.")
-    p.add_argument("--method", choices=["auto", "poisson", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="poisson")
+    p.add_argument("--method", choices=["auto", "poisson", "gaussian_occupancy", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="poisson")
     p.add_argument("--format", choices=["obj", "ply", "stl"], default="obj")
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--min-points", type=int, default=200)
@@ -35504,6 +35609,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gaussian-support-min-scale", type=float, default=0.005)
     p.add_argument("--gaussian-support-max-points", type=int, default=3000)
     p.add_argument("--gaussian-support-fallback-without-augmentation", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--occupancy-voxel-size", type=float, default=0.045)
+    p.add_argument("--occupancy-max-grid-dim", type=int, default=160)
+    p.add_argument("--occupancy-padding", type=float, default=0.08)
+    p.add_argument("--occupancy-sigma-multiplier", type=float, default=0.55)
+    p.add_argument("--occupancy-min-sigma", type=float, default=0.0)
+    p.add_argument("--occupancy-support-radius-multiplier", type=float, default=2.0)
+    p.add_argument("--occupancy-scale-quantile", type=float, default=0.80)
+    p.add_argument("--occupancy-level-ratio", type=float, default=0.22)
+    p.add_argument("--occupancy-max-gaussians", type=int, default=8000)
     p.add_argument("--mesh-crop-to-support-bbox", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mesh-crop-quantile-min", type=float, default=0.01)
     p.add_argument("--mesh-crop-quantile-max", type=float, default=0.99)
