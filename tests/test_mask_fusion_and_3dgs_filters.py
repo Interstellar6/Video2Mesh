@@ -23,6 +23,7 @@ from video2mesh.cli import (
     filter_points_by_bounds,
     filter_observation_points_by_multiview_depth_consistency,
     filter_mask_by_depth_edges,
+    filter_mask_by_depth_mode_band,
     filter_mask_by_world_bounds,
     export_viewer_plys,
     filter_colmap_points3d_file,
@@ -378,6 +379,21 @@ def test_filter_mask_by_depth_edges_removes_large_depth_jump():
     assert int(filtered.sum()) < int(mask.sum())
     assert not filtered[2, 3]
     assert info["threshold"] <= 0.5
+
+
+def test_filter_mask_by_depth_mode_band_keeps_dominant_surface():
+    np = pytest.importorskip("numpy")
+    mask = np.ones((5, 5), dtype=bool)
+    depth = np.ones((5, 5), dtype=np.float32) * 2.0
+    depth[:, 4] = 8.0
+
+    filtered, info = filter_mask_by_depth_mode_band(mask, depth, bins=12, padding=0.05, min_pixels=4)
+
+    assert int(filtered.sum()) == 20
+    assert not filtered[:, 4].any()
+    assert info["kept_pixels"] == 20
+    assert info["removed_pixels"] == 5
+    assert info["min_depth"] < 2.0 < info["max_depth"]
 
 
 def test_quantile_bounds_from_points_ignores_outlier_tail():
@@ -823,14 +839,19 @@ def test_3dgs_mesh_cli_commands_are_registered():
     parser = build_parser()
 
     obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
-    obs_with_support = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj", "--semantic-support-filter"])
+    obs_with_support = parser.parse_args(
+        ["export-3dgs-mesh-observations", "--project-root", "proj", "--semantic-support-filter", "--depth-mode-band-filter"]
+    )
     recon = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj"])
     semantic_recon = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj"])
     neus = parser.parse_args(["prepare-neus-surface-jobs", "--project-root", "proj"])
 
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
     assert obs.semantic_support_filter is False
+    assert obs.depth_mode_band_filter is False
     assert obs_with_support.semantic_support_filter is True
+    assert obs_with_support.depth_mode_band_filter is True
+    assert obs.depth_mode_bins == 48
     assert obs.max_scale_quantile == pytest.approx(0.90)
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
     assert recon.proxy_mesh == "none"

@@ -4420,6 +4420,64 @@ def filter_mask_by_depth_edges(mask, depth, edge_quantile: float = 0.85, edge_ma
     return filtered, {"threshold": threshold, "quantile_threshold": q_threshold, "edge_quantile": float(edge_quantile), "edge_max": float(edge_max)}
 
 
+def filter_mask_by_depth_mode_band(mask, depth, bins: int = 48, padding: float = 0.12, min_pixels: int = 64):
+    np = import_numpy()
+    mask_np = np.asarray(mask, dtype=bool)
+    depth_np = np.asarray(depth, dtype=np.float32)
+    if not mask_np.any():
+        return mask_np, None
+    valid = mask_np & np.isfinite(depth_np) & (depth_np > 0)
+    values = depth_np[valid]
+    if values.size < max(2, int(min_pixels)):
+        return mask_np, None
+    bin_count = max(4, int(bins))
+    counts, edges = np.histogram(values, bins=bin_count)
+    if counts.size == 0 or int(counts.max()) <= 0:
+        return mask_np, None
+    peak = int(np.argmax(counts))
+    min_count = max(1, int(round(float(counts[peak]) * 0.15)))
+    left = peak
+    while left > 0 and int(counts[left - 1]) >= min_count:
+        left -= 1
+    right = peak
+    while right + 1 < counts.size and int(counts[right + 1]) >= min_count:
+        right += 1
+    low = float(edges[left])
+    high = float(edges[right + 1])
+    pad = max(0.0, float(padding)) * max(high - low, 1e-6)
+    low -= pad
+    high += pad
+    filtered = mask_np & np.isfinite(depth_np) & (depth_np >= low) & (depth_np <= high)
+    kept = int(filtered.sum())
+    if kept < int(min_pixels):
+        return mask_np, {
+            "enabled": True,
+            "fallback": "too_few_pixels_after_depth_mode_band",
+            "candidate_kept_pixels": kept,
+            "kept_pixels": int(mask_np.sum()),
+            "removed_pixels": 0,
+            "mode_bin": peak,
+            "mode_count": int(counts[peak]),
+            "min_depth": low,
+            "max_depth": high,
+            "bins": bin_count,
+            "padding": float(padding),
+        }
+    return filtered, {
+        "enabled": True,
+        "input_pixels": int(mask_np.sum()),
+        "valid_depth_pixels": int(values.size),
+        "kept_pixels": kept,
+        "removed_pixels": int(mask_np.sum() - kept),
+        "mode_bin": peak,
+        "mode_count": int(counts[peak]),
+        "min_depth": low,
+        "max_depth": high,
+        "bins": bin_count,
+        "padding": float(padding),
+    }
+
+
 def filter_mask_by_world_bounds(mask, depth, intrinsic: dict[str, Any], world_to_camera, bounds):
     np = import_numpy()
     mask_np = np.asarray(mask, dtype=bool)
@@ -4733,6 +4791,7 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                     erode_iterations=int(args.mask_erode_iterations),
                 )
                 depth_clip = None
+                depth_mode_band = None
                 depth_edge_filter = None
                 if bool(args.depth_quantile_clip):
                     object_mask, depth_clip = clip_mask_by_depth_quantiles(
@@ -4740,6 +4799,14 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                         depth_np,
                         float(args.depth_quantile_min),
                         float(args.depth_quantile_max),
+                    )
+                if bool(args.depth_mode_band_filter):
+                    object_mask, depth_mode_band = filter_mask_by_depth_mode_band(
+                        object_mask,
+                        depth_np,
+                        bins=int(args.depth_mode_bins),
+                        padding=float(args.depth_mode_padding),
+                        min_pixels=int(args.min_component_pixels),
                     )
                 if bool(args.depth_edge_filter):
                     object_mask, depth_edge_filter = filter_mask_by_depth_edges(
@@ -4813,6 +4880,8 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                             "min_component_pixels": int(args.min_component_pixels),
                             "depth_quantile_clip": bool(args.depth_quantile_clip),
                             "depth_clip": depth_clip,
+                            "depth_mode_band_filter": bool(args.depth_mode_band_filter),
+                            "depth_mode_band": depth_mode_band,
                             "depth_edge_filter": bool(args.depth_edge_filter),
                             "depth_edge": depth_edge_filter,
                             "semantic_support_filter": semantic_support_filter,
@@ -35121,6 +35190,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-quantile-clip", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-quantile-min", type=float, default=0.02)
     p.add_argument("--depth-quantile-max", type=float, default=0.90)
+    p.add_argument("--depth-mode-band-filter", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--depth-mode-bins", type=int, default=48)
+    p.add_argument("--depth-mode-padding", type=float, default=0.12)
     p.add_argument("--depth-edge-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-edge-quantile", type=float, default=0.85)
     p.add_argument("--depth-edge-max", type=float, default=0.35)
