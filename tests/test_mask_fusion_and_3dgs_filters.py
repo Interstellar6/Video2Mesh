@@ -20,6 +20,7 @@ from video2mesh.cli import (
     filter_points_by_pca_quantiles,
     filter_points_by_quantile_bbox,
     filter_points_by_support_quantile_bbox,
+    filter_points_by_bounds,
     filter_observation_points_by_multiview_depth_consistency,
     filter_mask_by_depth_edges,
     export_viewer_plys,
@@ -722,6 +723,27 @@ def test_filter_points_by_support_quantile_bbox_removes_spatial_tail():
     assert report["removed_points"] == 1
 
 
+def test_filter_points_by_bounds_can_return_keep_mask():
+    np = pytest.importorskip("numpy")
+    points = np.array([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5], [2.0, 2.0, 2.0]], dtype=np.float64)
+    colors = np.ones((3, 3), dtype=np.float64)
+    args = Namespace(min_points=1, semantic_support_fallback_keep_original=False)
+
+    filtered, filtered_colors, report, keep = filter_points_by_bounds(
+        points,
+        colors,
+        (np.array([-0.1, -0.1, -0.1]), np.array([1.0, 1.0, 1.0])),
+        args,
+        {"enabled": True, "object_id": "obj"},
+        return_mask=True,
+    )
+
+    assert filtered.shape == (2, 3)
+    assert filtered_colors.shape == (2, 3)
+    assert keep.tolist() == [True, True, False]
+    assert report["removed_points"] == 1
+
+
 def test_mesh_support_quality_report_rejects_oversized_mesh():
     np = pytest.importorskip("numpy")
     o3d = pytest.importorskip("open3d")
@@ -792,6 +814,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
     assert recon.proxy_mesh == "none"
     assert recon.surface_consistency_filter is True
+    assert recon.semantic_support_filter is False
+    assert recon.max_scale_quantile == pytest.approx(0.90)
     assert recon.surface_consistency_min_projected == 2
     assert recon.surface_consistency_min_hit_ratio == pytest.approx(0.35)
     assert recon.surface_crop_to_quantile_bbox is True

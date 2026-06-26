@@ -14833,6 +14833,124 @@ def filter_points_by_support_quantile_bbox(points, colors, args: argparse.Namesp
     }
 
 
+def semantic_support_bounds_for_object(
+    project_root: Path,
+    manifest: dict[str, Any],
+    object_id: str,
+    args: argparse.Namespace,
+):
+    np = import_numpy()
+    if not bool(getattr(args, "semantic_support_filter", False)):
+        return None, None
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    semantic_ply = resolve_project_cli_path(args.semantic_support_ply, project_root) if getattr(args, "semantic_support_ply", None) else resolve_existing_path(
+        artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+        project_root,
+    )
+    if semantic_ply is None or not semantic_ply.exists():
+        return None, {"enabled": True, "reason": "missing_semantic_support_ply", "object_id": object_id}
+    semantic_manifest_path = resolve_project_cli_path(args.semantic_support_manifest, project_root) if getattr(args, "semantic_support_manifest", None) else resolve_existing_path(
+        artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"),
+        project_root,
+    )
+    if semantic_manifest_path is None:
+        fallback_manifest = project_root / "simulator_assets" / "semantic_splats_manifest.json"
+        semantic_manifest_path = fallback_manifest if fallback_manifest.exists() else None
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
+    semantic_id = semantic_id_for_object_id(semantic_manifest, object_id)
+    if semantic_id is None:
+        return None, {"enabled": True, "reason": "missing_semantic_id", "object_id": object_id, "semantic_manifest": str(semantic_manifest_path) if semantic_manifest_path else None}
+    points, labels, colors = read_semantic_ply(semantic_ply)
+    probabilities_raw = read_ascii_ply_float_property(semantic_ply, "object_probability")
+    probabilities = np.asarray(probabilities_raw if probabilities_raw is not None else np.ones(points.shape[0]), dtype=np.float32)
+    selected = (labels == int(semantic_id)) & (probabilities >= float(getattr(args, "semantic_support_min_probability", 0.5)))
+    selected_indices = np.flatnonzero(selected)
+    if selected_indices.shape[0] < int(args.min_points):
+        return None, {
+            "enabled": True,
+            "reason": "too_few_semantic_support_points",
+            "object_id": object_id,
+            "semantic_id": int(semantic_id),
+            "selected_points": int(selected_indices.shape[0]),
+        }
+    selected_points = points[selected_indices]
+    selected_colors = None if colors is None else colors[selected_indices]
+    selected_attrs = None
+    if bool(getattr(args, "semantic_support_use_gaussian_attributes", True)):
+        try:
+            gsplat_data = read_gsplat_ply(semantic_ply)
+            if np.asarray(gsplat_data.get("means")).shape[0] == points.shape[0]:
+                selected_attrs = selected_gaussian_attributes(gsplat_data, selected_indices)
+        except Exception:
+            selected_attrs = None
+    gaussian_filter = None
+    if selected_attrs is not None:
+        selected_points, selected_colors, gaussian_filter, _keep = filter_points_by_gaussian_attributes(
+            selected_points,
+            selected_colors,
+            selected_attrs,
+            args,
+            return_mask=True,
+        )
+    bounds = quantile_bounds_from_points(
+        selected_points,
+        float(getattr(args, "semantic_support_bbox_quantile_min", 0.20)),
+        float(getattr(args, "semantic_support_bbox_quantile_max", 0.80)),
+        float(getattr(args, "semantic_support_bbox_padding_ratio", 0.12)),
+    )
+    if bounds is None:
+        return None, {"enabled": True, "reason": "empty_semantic_support_bounds", "object_id": object_id}
+    lower, upper = bounds
+    return bounds, {
+        "enabled": True,
+        "object_id": object_id,
+        "semantic_id": int(semantic_id),
+        "semantic_ply": str(semantic_ply),
+        "semantic_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
+        "selected_points": int(selected.sum()),
+        "points_after_gaussian_filter": int(selected_points.shape[0]),
+        "gaussian_filter": gaussian_filter,
+        "q_min": float(getattr(args, "semantic_support_bbox_quantile_min", 0.20)),
+        "q_max": float(getattr(args, "semantic_support_bbox_quantile_max", 0.80)),
+        "padding_ratio": float(getattr(args, "semantic_support_bbox_padding_ratio", 0.12)),
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+    }
+
+
+def filter_points_by_bounds(points, colors, bounds, args: argparse.Namespace, report_prefix: dict[str, Any] | None = None, return_mask: bool = False):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if bounds is None:
+        result = (points_np, colors, report_prefix)
+        return (*result, None) if return_mask else result
+    lower, upper = bounds
+    keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
+    kept = int(keep.sum())
+    if kept < int(args.min_points) and bool(getattr(args, "semantic_support_fallback_keep_original", True)):
+        report = dict(report_prefix or {})
+        report.update(
+            {
+                "fallback": "too_few_points_after_semantic_support_filter",
+                "candidate_kept_points": kept,
+                "kept_points": int(points_np.shape[0]),
+                "removed_points": 0,
+            }
+        )
+        result = (points_np, colors, report)
+        return (*result, None) if return_mask else result
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    report = dict(report_prefix or {})
+    report.update(
+        {
+            "kept_points": kept,
+            "removed_points": int(points_np.shape[0] - kept),
+        }
+    )
+    result = (points_np[keep], filtered_colors, report)
+    return (*result, keep) if return_mask else result
+
+
 def quantile_bounds_from_points(points, q_min: float, q_max: float, padding_ratio: float):
     np = import_numpy()
     points_np = np.asarray(points, dtype=np.float64)
@@ -15277,16 +15395,9 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
         try:
             method_used = args.method
             support_points_for_quality = None
-            if args.method == "tsdf":
-                mesh, reconstruction = tsdf_mesh_from_observations(frames, args, project_root)
-                support_points_for_quality, _support_colors = build_observation_point_cloud(
-                    frames,
-                    float(args.min_depth),
-                    float(args.max_depth),
-                    int(args.bbox_point_stride or args.point_stride or 1),
-                    project_root=project_root,
-                )
-            elif args.method == "poisson":
+            semantic_support_bounds, semantic_support_source = semantic_support_bounds_for_object(project_root, manifest, object_id, args)
+
+            def build_filtered_surface_points():
                 points, colors, frame_indices = build_observation_point_cloud(
                     frames,
                     float(args.min_depth),
@@ -15295,6 +15406,20 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                     return_frame_indices=True,
                     project_root=project_root,
                 )
+                semantic_support_filter = None
+                if semantic_support_bounds is not None:
+                    points, colors, semantic_support_filter, keep_mask = filter_points_by_bounds(
+                        points,
+                        colors,
+                        semantic_support_bounds,
+                        args,
+                        semantic_support_source,
+                        return_mask=True,
+                    )
+                    if keep_mask is not None:
+                        frame_indices = frame_indices[keep_mask]
+                else:
+                    semantic_support_filter = semantic_support_source
                 surface_consistency = None
                 if bool(getattr(args, "surface_consistency_filter", True)):
                     points, colors, surface_consistency = filter_observation_points_by_multiview_depth_consistency(
@@ -15307,35 +15432,40 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                     )
                 surface_bbox_crop = None
                 points, colors, surface_bbox_crop = filter_points_by_support_quantile_bbox(points, colors, args)
+                return points, colors, semantic_support_filter, surface_consistency, surface_bbox_crop
+
+            if args.method == "tsdf":
+                mesh, reconstruction = tsdf_mesh_from_observations(frames, args, project_root)
+                support_points_for_quality, _support_colors = build_observation_point_cloud(
+                    frames,
+                    float(args.min_depth),
+                    float(args.max_depth),
+                    int(args.bbox_point_stride or args.point_stride or 1),
+                    project_root=project_root,
+                )
+                if semantic_support_bounds is not None:
+                    support_points_for_quality, _support_colors, semantic_support_filter = filter_points_by_bounds(
+                        support_points_for_quality,
+                        _support_colors,
+                        semantic_support_bounds,
+                        args,
+                        semantic_support_source,
+                    )
+                    reconstruction["semantic_support_filter"] = semantic_support_filter
+            elif args.method == "poisson":
+                points, colors, semantic_support_filter, surface_consistency, surface_bbox_crop = build_filtered_surface_points()
                 support_points_for_quality = points
                 mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
+                reconstruction["semantic_support_filter"] = semantic_support_filter
                 reconstruction["surface_consistency_filter"] = surface_consistency
                 reconstruction["surface_bbox_crop"] = surface_bbox_crop
             else:
                 try:
-                    points, colors, frame_indices = build_observation_point_cloud(
-                        frames,
-                        float(args.min_depth),
-                        float(args.max_depth),
-                        int(args.point_stride),
-                        return_frame_indices=True,
-                        project_root=project_root,
-                    )
-                    surface_consistency = None
-                    if bool(getattr(args, "surface_consistency_filter", True)):
-                        points, colors, surface_consistency = filter_observation_points_by_multiview_depth_consistency(
-                            points,
-                            colors,
-                            frame_indices,
-                            frames,
-                            args,
-                            project_root,
-                        )
-                    surface_bbox_crop = None
-                    points, colors, surface_bbox_crop = filter_points_by_support_quantile_bbox(points, colors, args)
+                    points, colors, semantic_support_filter, surface_consistency, surface_bbox_crop = build_filtered_surface_points()
                     support_points_for_quality = points
                     mesh, reconstruction = mesh_from_observation_point_cloud(points, colors, args)
                     method_used = "poisson"
+                    reconstruction["semantic_support_filter"] = semantic_support_filter
                     reconstruction["surface_consistency_filter"] = surface_consistency
                     reconstruction["surface_bbox_crop"] = surface_bbox_crop
                 except Exception as poisson_exc:
@@ -15349,6 +15479,15 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                         int(args.bbox_point_stride or args.point_stride or 1),
                         project_root=project_root,
                     )
+                    if semantic_support_bounds is not None:
+                        support_points_for_quality, _support_colors, semantic_support_filter = filter_points_by_bounds(
+                            support_points_for_quality,
+                            _support_colors,
+                            semantic_support_bounds,
+                            args,
+                            semantic_support_source,
+                        )
+                        reconstruction["semantic_support_filter"] = semantic_support_filter
             ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
             if not ok:
                 raise RuntimeError(f"Open3D failed to write mesh: {mesh_path}")
@@ -35512,6 +35651,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--surface-bbox-quantile-max", type=float, default=0.98)
     p.add_argument("--surface-bbox-padding-ratio", type=float, default=0.02)
     p.add_argument("--surface-crop-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--semantic-support-filter", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--semantic-support-ply", type=Path, help="Semantic 3DGS PLY used to bound rendered-depth surface points.")
+    p.add_argument("--semantic-support-manifest", type=Path, help="Semantic splat manifest used to map object ids to semantic ids.")
+    p.add_argument("--semantic-support-min-probability", type=float, default=0.5)
+    p.add_argument("--semantic-support-use-gaussian-attributes", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--min-opacity", type=float, default=0.05)
+    p.add_argument("--max-scale", type=float, help="Optional absolute maximum semantic support Gaussian scale.")
+    p.add_argument("--max-scale-quantile", type=float, default=0.90)
+    p.add_argument("--max-anisotropy", type=float, help="Optional absolute maximum ratio between largest and smallest semantic support Gaussian scale.")
+    p.add_argument("--max-anisotropy-quantile", type=float, default=0.95)
+    p.add_argument("--gaussian-attribute-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--semantic-support-bbox-quantile-min", type=float, default=0.20)
+    p.add_argument("--semantic-support-bbox-quantile-max", type=float, default=0.80)
+    p.add_argument("--semantic-support-bbox-padding-ratio", type=float, default=0.12)
+    p.add_argument("--semantic-support-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--voxel-size", type=float, default=0.02)
     p.add_argument("--remove-outliers", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--outlier-nb-neighbors", type=int, default=20)
