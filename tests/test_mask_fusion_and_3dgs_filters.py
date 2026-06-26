@@ -12,6 +12,9 @@ from video2mesh.cli import (
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
     depth_to_normal_map,
+    filter_points_by_dbscan_largest_cluster,
+    filter_points_by_pca_quantiles,
+    filter_points_by_quantile_bbox,
     filter_mask_by_depth_edges,
     export_viewer_plys,
     filter_colmap_points3d_file,
@@ -383,6 +386,49 @@ def test_quantile_bounds_from_points_ignores_outlier_tail():
     assert upper.tolist() == pytest.approx([26.5, 26.5, 26.5])
 
 
+def test_filter_points_by_quantile_bbox_removes_outlier_points():
+    np = pytest.importorskip("numpy")
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 2.0, 2.0],
+            [100.0, 100.0, 100.0],
+        ],
+        dtype=np.float64,
+    )
+    colors = np.ones_like(points)
+
+    filtered, filtered_colors, report = filter_points_by_quantile_bbox(points, colors, 0.0, 0.75, 0.0)
+
+    assert filtered.shape == (3, 3)
+    assert filtered_colors.shape == (3, 3)
+    assert report["removed_points"] == 1
+
+
+def test_filter_points_by_pca_quantiles_removes_axis_tail():
+    np = pytest.importorskip("numpy")
+    points = np.array([[float(i), 0.0, 0.0] for i in range(10)] + [[50.0, 0.0, 0.0]], dtype=np.float64)
+
+    filtered, _colors, report = filter_points_by_pca_quantiles(points, None, 0.0, 0.9, 0.0)
+
+    assert filtered.shape[0] == 10
+    assert report["removed_points"] == 1
+
+
+def test_filter_points_by_dbscan_largest_cluster_keeps_main_cluster():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("open3d")
+    main = np.array([[0.0, 0.0, 0.0], [0.04, 0.0, 0.0], [0.0, 0.04, 0.0], [0.04, 0.04, 0.0]], dtype=np.float64)
+    small = np.array([[1.0, 1.0, 1.0], [1.04, 1.0, 1.0]], dtype=np.float64)
+    points = np.concatenate([main, small], axis=0)
+
+    filtered, _colors, report = filter_points_by_dbscan_largest_cluster(points, None, eps=0.08, min_points=2)
+
+    assert filtered.shape[0] == 4
+    assert report["removed_points"] == 2
+
+
 def test_bbox_proxy_mesh_from_points_returns_box_mesh():
     np = pytest.importorskip("numpy")
     pytest.importorskip("open3d")
@@ -440,8 +486,11 @@ def test_3dgs_mesh_cli_commands_are_registered():
 
     obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
     recon = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj"])
+    semantic_recon = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj"])
     neus = parser.parse_args(["prepare-neus-surface-jobs", "--project-root", "proj"])
 
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
+    assert recon.proxy_mesh == "none"
+    assert semantic_recon.func.__name__ == "cmd_reconstruct_semantic_3dgs_object_meshes"
     assert neus.func.__name__ == "cmd_prepare_neus_surface_jobs"

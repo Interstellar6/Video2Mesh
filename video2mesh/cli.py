@@ -14314,6 +14314,37 @@ def ball_pivoting_mesh_from_pcd(pcd, spacing: float, multipliers: list[float], n
     return clean_triangle_mesh(mesh), {"method": "ball_pivoting", "spacing": float(spacing), "radii": radii}
 
 
+def poisson_mesh_from_pcd(pcd, depth: int, density_quantile: float, normal_radius: float | None, normal_neighbors: int):
+    np = import_numpy()
+    o3d = import_open3d()
+    spacing = estimate_pcd_spacing(pcd, fallback=0.02)
+    radius = float(normal_radius or max(spacing * 4.0, 1e-4))
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max(10, int(normal_neighbors))))
+    try:
+        pcd.orient_normals_consistent_tangent_plane(max(10, int(normal_neighbors)))
+    except Exception:
+        pass
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=int(depth))
+    densities_np = np.asarray(densities, dtype=np.float64)
+    removed = 0
+    if densities_np.size and float(density_quantile) > 0:
+        threshold = float(np.quantile(densities_np, max(0.0, min(1.0, float(density_quantile)))))
+        remove = densities_np < threshold
+        removed = int(remove.sum())
+        mesh.remove_vertices_by_mask(remove)
+    else:
+        threshold = None
+    return clean_triangle_mesh(mesh), {
+        "method": "poisson",
+        "poisson_depth": int(depth),
+        "density_quantile": float(density_quantile),
+        "density_threshold": threshold,
+        "removed_low_density_vertices": removed,
+        "normal_radius": radius,
+        "normal_neighbors": int(normal_neighbors),
+    }
+
+
 def reconstruct_mesh_from_object_points(points, colors, args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
     np = import_numpy()
     points_array = np.asarray(points, dtype=np.float64)
@@ -14336,7 +14367,7 @@ def reconstruct_mesh_from_object_points(points, colors, args: argparse.Namespace
 
     spacing = estimate_pcd_spacing(pcd, fallback=args.min_extent)
     alpha = float(args.alpha) if args.alpha is not None else max(spacing * float(args.alpha_multiplier), 1e-5)
-    method_order = [args.method] if args.method != "auto" else ["alpha_shape", "ball_pivoting", "convex_hull", "bbox"]
+    method_order = [args.method] if args.method != "auto" else ["poisson", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"]
     attempts = []
     last_error = ""
     for method in method_order:
@@ -14349,6 +14380,14 @@ def reconstruct_mesh_from_object_points(points, colors, args: argparse.Namespace
                     spacing,
                     [float(value) for value in args.ball_radius_multipliers],
                     args.normal_radius,
+                )
+            elif method == "poisson":
+                mesh, detail = poisson_mesh_from_pcd(
+                    pcd,
+                    int(getattr(args, "poisson_depth", 8)),
+                    float(getattr(args, "poisson_density_quantile", 0.04)),
+                    getattr(args, "normal_radius", None),
+                    int(getattr(args, "poisson_normal_neighbors", 30)),
                 )
             elif method == "convex_hull":
                 mesh, detail = convex_hull_mesh_from_pcd(pcd)
@@ -14874,7 +14913,6 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
             asset_path = mesh_path
             proxy_metadata = None
             proxy_path = None
-            use_proxy_asset = False
             if str(args.proxy_mesh) != "none":
                 try:
                     points, _colors = build_observation_point_cloud(
@@ -14899,16 +14937,9 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                         "format": args.format,
                         "reconstruction": proxy_reconstruction,
                         "qa": summarize_triangle_mesh(proxy_path),
+                        "role": "collision_proxy",
+                        "visual_asset": False,
                     }
-                    use_proxy_asset = str(args.proxy_mesh) == "always" or (
-                        str(args.proxy_mesh) == "auto"
-                        and (
-                            not bool(mesh_summary.get("is_watertight"))
-                            or float(mesh_summary.get("bbox_diagonal") or 0.0) > float(args.proxy_max_bbox_diagonal)
-                        )
-                    )
-                    if use_proxy_asset:
-                        asset_path = proxy_path
                 except Exception as proxy_exc:
                     proxy_metadata = {"error": str(proxy_exc)}
             if args.copy_to_assets:
@@ -14931,8 +14962,8 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                 "reconstruction": reconstruction,
                 "qa": mesh_summary,
                 "proxy_mesh": proxy_metadata,
-                "asset_source": "proxy_mesh" if use_proxy_asset else "surface_mesh",
-                "notes": "Mesh reconstructed from 3DGS-rendered multi-view depth/normal/mask observations using TSDF fusion and/or Poisson surface extraction.",
+                "asset_source": "surface_mesh",
+                "notes": "Mesh reconstructed from 3DGS-rendered multi-view depth/normal/mask observations. Proxy meshes are diagnostic/collision helpers and are never used as visual assets.",
             }
             write_json(object_mesh_dir / "reconstruction.json", metadata)
             object_json = project_root / manifest["objects_dir"] / object_id / "object.json"
@@ -14974,6 +15005,310 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
     print(f"Reconstructed {len(reconstructed)} 3DGS-derived object mesh(es). Index: {mesh_index_path}")
     if failed:
         print(f"Failed meshes: {', '.join(sorted(failed))}")
+    return 0
+
+
+def semantic_id_for_object_id(semantic_manifest: dict[str, Any] | None, object_id: str) -> int | None:
+    if not isinstance(semantic_manifest, dict):
+        return None
+    mapping = semantic_manifest.get("object_id_to_semantic")
+    if isinstance(mapping, dict) and object_id in mapping:
+        try:
+            return int(mapping[object_id])
+        except Exception:
+            pass
+    for item in semantic_manifest.get("objects", []) if isinstance(semantic_manifest.get("objects"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if slugify(item.get("object_id") or "") == object_id:
+            try:
+                return int(item.get("semantic_id"))
+            except Exception:
+                return None
+    return None
+
+
+def filter_points_by_quantile_bbox(points, colors, q_min: float, q_max: float, padding_ratio: float):
+    np = import_numpy()
+    bounds = quantile_bounds_from_points(points, q_min, q_max, padding_ratio)
+    if bounds is None:
+        return points, colors, None
+    lower, upper = bounds
+    points_np = np.asarray(points, dtype=np.float64)
+    keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+        "kept_points": int(keep.sum()),
+        "removed_points": int(points_np.shape[0] - int(keep.sum())),
+        "q_min": float(q_min),
+        "q_max": float(q_max),
+        "padding_ratio": float(padding_ratio),
+    }
+
+
+def sample_points_and_colors(points, colors, max_points: int, seed: int):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if max_points <= 0 or points_np.shape[0] <= int(max_points):
+        return points_np, colors, None
+    rng = np.random.default_rng(int(seed))
+    indices = np.sort(rng.choice(points_np.shape[0], size=int(max_points), replace=False))
+    sampled_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[indices]
+    return points_np[indices], sampled_colors, {
+        "input_points": int(points_np.shape[0]),
+        "sampled_points": int(indices.shape[0]),
+        "seed": int(seed),
+    }
+
+
+def filter_points_by_pca_quantiles(points, colors, q_min: float, q_max: float, padding_ratio: float):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] < 4:
+        return points_np, colors, None
+    center = points_np.mean(axis=0)
+    centered = points_np - center
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+    except Exception:
+        return points_np, colors, None
+    projected = centered @ vh.T
+    low_q = max(0.0, min(1.0, float(q_min)))
+    high_q = max(low_q, min(1.0, float(q_max)))
+    lower = np.quantile(projected, low_q, axis=0)
+    upper = np.quantile(projected, high_q, axis=0)
+    extent = np.maximum(upper - lower, 1e-8)
+    padding = extent * max(0.0, float(padding_ratio))
+    lower -= padding
+    upper += padding
+    keep = np.all((projected >= lower) & (projected <= upper), axis=1)
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "kept_points": int(keep.sum()),
+        "removed_points": int(points_np.shape[0] - int(keep.sum())),
+        "q_min": low_q,
+        "q_max": high_q,
+        "padding_ratio": float(padding_ratio),
+        "center": [float(value) for value in center.tolist()],
+        "axes": vh.tolist(),
+        "projected_min": [float(value) for value in lower.tolist()],
+        "projected_max": [float(value) for value in upper.tolist()],
+    }
+
+
+def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_points: int):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] < max(1, int(min_points)):
+        return points_np, colors, None
+    if float(eps) <= 0:
+        return points_np, colors, None
+    o3d = import_open3d()
+    pcd = point_cloud_from_arrays(points_np, colors)
+    labels = np.asarray(pcd.cluster_dbscan(eps=float(eps), min_points=max(1, int(min_points)), print_progress=False), dtype=np.int64)
+    valid_labels = labels[labels >= 0]
+    if valid_labels.size == 0:
+        return points_np, colors, {
+            "enabled": True,
+            "eps": float(eps),
+            "min_points": int(min_points),
+            "cluster_count": 0,
+            "kept_points": int(points_np.shape[0]),
+            "removed_points": 0,
+            "reason": "no_clusters",
+        }
+    unique, counts = np.unique(valid_labels, return_counts=True)
+    keep_label = int(unique[int(np.argmax(counts))])
+    keep = labels == keep_label
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "enabled": True,
+        "eps": float(eps),
+        "min_points": int(min_points),
+        "cluster_count": int(unique.shape[0]),
+        "largest_cluster": keep_label,
+        "largest_cluster_points": int(keep.sum()),
+        "noise_points": int((labels < 0).sum()),
+        "kept_points": int(keep.sum()),
+        "removed_points": int(points_np.shape[0] - int(keep.sum())),
+    }
+
+
+def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    import_open3d()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    semantic_ply = resolve_project_cli_path(args.semantic_splats_ply, project_root) if args.semantic_splats_ply else resolve_existing_path(
+        artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+        project_root,
+    )
+    if semantic_ply is None or not semantic_ply.exists():
+        raise FileNotFoundError("Missing semantic 3DGS PLY. Run export-splat-masks/backproject-gaussian-probabilities first or pass --semantic-splats-ply.")
+    semantic_manifest_path = resolve_project_cli_path(args.semantic_manifest, project_root) if args.semantic_manifest else resolve_existing_path(
+        artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"),
+        project_root,
+    )
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
+    output_dir = ensure_dir(resolve_project_relative_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "semantic_3dgs_object_meshes"))
+    sim_objects_dir = ensure_dir(project_root / manifest["simulator_assets_dir"] / "objects")
+    requested = {slugify(value) for value in (args.object_ids or [])}
+    object_table, _object_id_to_semantic, records_by_id = object_table_from_records(project_root, manifest)
+    points, labels, colors = read_semantic_ply(semantic_ply)
+    probabilities_raw = read_ascii_ply_float_property(semantic_ply, "object_probability")
+    probabilities = np.asarray(probabilities_raw if probabilities_raw is not None else np.ones(points.shape[0]), dtype=np.float32)
+
+    reconstructed: dict[str, Any] = {}
+    failed: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+    for item in object_table:
+        object_id = slugify(item.get("object_id") or "")
+        if object_id == "background":
+            continue
+        if requested and object_id not in requested:
+            skipped[object_id] = "not_requested"
+            continue
+        obj = records_by_id.get(object_id, {})
+        if is_background_structure_record(obj) and not args.include_background_structures:
+            skipped[object_id] = "background_structure"
+            continue
+        semantic_id = semantic_id_for_object_id(semantic_manifest, object_id)
+        if semantic_id is None:
+            try:
+                semantic_id = int(item.get("semantic_id"))
+            except Exception:
+                semantic_id = None
+        if semantic_id is None or semantic_id <= 0:
+            skipped[object_id] = "missing_semantic_id"
+            continue
+        selected = (labels == int(semantic_id)) & (probabilities >= float(args.min_probability))
+        selected_points = points[selected]
+        selected_colors = None if colors is None else colors[selected]
+        if selected_points.shape[0] < int(args.min_points):
+            skipped[object_id] = f"too_few_points:{selected_points.shape[0]}"
+            continue
+        object_mesh_dir = ensure_dir(output_dir / object_id)
+        mesh_path = object_mesh_dir / f"{object_id}.{args.format}"
+        try:
+            quantile_crop = None
+            if bool(args.crop_to_quantile_bbox):
+                selected_points, selected_colors, quantile_crop = filter_points_by_quantile_bbox(
+                    selected_points,
+                    selected_colors,
+                    float(args.bbox_quantile_min),
+                    float(args.bbox_quantile_max),
+                    float(args.bbox_padding_ratio),
+                )
+            pca_crop = None
+            if bool(args.crop_to_pca_quantiles):
+                selected_points, selected_colors, pca_crop = filter_points_by_pca_quantiles(
+                    selected_points,
+                    selected_colors,
+                    float(args.pca_quantile_min),
+                    float(args.pca_quantile_max),
+                    float(args.pca_padding_ratio),
+                )
+            dbscan_filter = None
+            if bool(args.keep_largest_dbscan_cluster):
+                selected_points, selected_colors, dbscan_filter = filter_points_by_dbscan_largest_cluster(
+                    selected_points,
+                    selected_colors,
+                    float(args.dbscan_eps),
+                    int(args.dbscan_min_points),
+                )
+            sample_report = None
+            selected_points, selected_colors, sample_report = sample_points_and_colors(
+                selected_points,
+                selected_colors,
+                int(args.max_points),
+                int(args.seed),
+            )
+            mesh, reconstruction = reconstruct_mesh_from_object_points(selected_points, selected_colors, args)
+            if int(args.simplify_triangles or 0) > 0 and len(mesh.triangles) > int(args.simplify_triangles):
+                mesh = mesh.simplify_quadric_decimation(int(args.simplify_triangles))
+                mesh = clean_triangle_mesh(mesh)
+            if int(args.smooth_iterations or 0) > 0 and len(mesh.triangles) > 0:
+                mesh = mesh.filter_smooth_taubin(number_of_iterations=int(args.smooth_iterations))
+                mesh = clean_triangle_mesh(mesh)
+            ok = import_open3d().io.write_triangle_mesh(str(mesh_path), mesh, write_ascii=bool(args.ascii))
+            if not ok:
+                raise RuntimeError(f"Open3D failed to write mesh: {mesh_path}")
+            asset_path = mesh_path
+            if args.copy_to_assets:
+                dst = sim_objects_dir / object_id / mesh_path.name
+                asset_path = copy_or_link(mesh_path, dst, args.mode) if mesh_path.resolve() != dst.resolve() else dst
+            metadata = {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "object_id": object_id,
+                "source": "semantic_3dgs_gaussian_center_reconstruction",
+                "semantic_splats_ply": str(semantic_ply),
+                "semantic_splats_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
+                "semantic_id": int(semantic_id),
+                "source_mesh": str(mesh_path),
+                "asset_path": str(asset_path),
+                "format": args.format,
+                "coordinate_frame": "video2mesh_scene",
+                "method": args.method,
+                "reconstruction": {
+                    **reconstruction,
+                    "selected_semantic_points": int(selected.sum()),
+                    "points_after_quantile_crop": int(selected_points.shape[0]),
+                    "quantile_crop": quantile_crop,
+                    "pca_crop": pca_crop,
+                    "dbscan_filter": dbscan_filter,
+                    "sampling": sample_report,
+                    "min_probability": float(args.min_probability),
+                },
+                "qa": summarize_triangle_mesh(mesh_path),
+                "asset_source": "semantic_3dgs_surface_mesh",
+                "notes": "Visual mesh reconstructed directly from semantic 3DGS Gaussian centers. Collision/box proxies are not used as visual assets.",
+            }
+            write_json(object_mesh_dir / "reconstruction.json", metadata)
+            object_json = project_root / manifest["objects_dir"] / object_id / "object.json"
+            if object_json.exists() and args.update_object_asset:
+                obj_record = read_json(object_json)
+                obj_record["mesh_asset"] = metadata
+                write_json(object_json, obj_record)
+            reconstructed[object_id] = metadata
+        except Exception as exc:
+            failed[object_id] = {"error": str(exc), "selected_points": int(selected_points.shape[0])}
+            if not args.skip_failed:
+                raise
+
+    mesh_index_path = output_dir / "object_meshes.json"
+    write_json(
+        mesh_index_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "semantic_splats_ply": str(semantic_ply),
+            "semantic_splats_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
+            "output_dir": str(output_dir),
+            "method": args.method,
+            "objects": reconstructed,
+            "failed_objects": failed,
+            "skipped_objects": skipped,
+        },
+    )
+    manifest.setdefault("artifacts", {})["semantic_3dgs_object_meshes"] = str(mesh_index_path)
+    manifest["artifacts"]["object_meshes"] = str(mesh_index_path)
+    manifest.setdefault("external_stages", {})["mesh_generation"] = {
+        "status": "semantic_3dgs_object_meshes_reconstructed" if reconstructed and not failed else "semantic_3dgs_object_meshes_partial" if reconstructed else "semantic_3dgs_object_meshes_failed",
+        "method": "semantic_3dgs_gaussian_centers_to_surface_mesh",
+        "semantic_splats_ply": str(semantic_ply),
+        "object_count": len(reconstructed),
+        "failed_objects": sorted(failed),
+        "skipped_objects": skipped,
+    }
+    save_manifest(project_root, manifest)
+    print(f"Reconstructed {len(reconstructed)} semantic 3DGS object mesh(es). Index: {mesh_index_path}")
+    if failed:
+        print(f"Failed meshes: {', '.join(sorted(failed))}")
+    if skipped:
+        print(f"Skipped objects: {len(skipped)}")
     return 0
 
 
@@ -34196,7 +34531,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reconstruct-object-meshes", help="Reconstruct per-object meshes directly from exported 3D mask point clouds.")
     add_common_project_arg(p)
     p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/reconstructed_meshes.")
-    p.add_argument("--method", choices=["auto", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="auto")
+    p.add_argument("--method", choices=["auto", "poisson", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="auto")
     p.add_argument("--format", choices=["obj", "ply", "stl"], default="obj")
     p.add_argument("--min-points", type=int, default=4)
     p.add_argument("--min-extent", type=float, default=0.03, help="Minimum bbox extent for sparse/planar fallback meshes.")
@@ -34209,6 +34544,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--alpha-multiplier", type=float, default=4.0)
     p.add_argument("--ball-radius-multipliers", type=float, nargs="+", default=[1.5, 2.5, 4.0])
     p.add_argument("--normal-radius", type=float, help="Normal estimation radius for ball pivoting. Defaults to spacing * 3.")
+    p.add_argument("--poisson-depth", type=int, default=8)
+    p.add_argument("--poisson-density-quantile", type=float, default=0.04)
+    p.add_argument("--poisson-normal-neighbors", type=int, default=30)
     p.add_argument("--ascii", action=argparse.BooleanOptionalAction, default=False, help="Ask Open3D to write ASCII mesh files when the format supports it.")
     p.add_argument("--copy-to-assets", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
@@ -34247,7 +34585,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bbox-quantile-min", type=float, default=0.01)
     p.add_argument("--bbox-quantile-max", type=float, default=0.99)
     p.add_argument("--bbox-padding-ratio", type=float, default=0.02)
-    p.add_argument("--proxy-mesh", choices=["auto", "always", "none"], default="auto")
+    p.add_argument("--proxy-mesh", choices=["diagnostic", "none"], default="none")
     p.add_argument("--proxy-bbox-quantile-min", type=float, default=0.20)
     p.add_argument("--proxy-bbox-quantile-max", type=float, default=0.80)
     p.add_argument("--proxy-bbox-padding-ratio", type=float, default=0.08)
@@ -34258,6 +34596,51 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--skip-failed", action="store_true")
     p.set_defaults(func=cmd_reconstruct_3dgs_object_meshes)
+
+    p = sub.add_parser("reconstruct-semantic-3dgs-object-meshes", help="Reconstruct visual object meshes directly from semantic 3DGS Gaussian centers.")
+    add_common_project_arg(p)
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic 3DGS PLY with object_id. Defaults to artifacts.semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic manifest with object_id_to_semantic. Defaults to artifacts.semantic_splats_manifest.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_3dgs_object_meshes.")
+    p.add_argument("--object-ids", nargs="+", help="Optional object ids to reconstruct. Defaults to all foreground objects.")
+    p.add_argument("--method", choices=["auto", "poisson", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="poisson")
+    p.add_argument("--format", choices=["obj", "ply", "stl"], default="obj")
+    p.add_argument("--min-probability", type=float, default=0.5)
+    p.add_argument("--min-points", type=int, default=200)
+    p.add_argument("--max-points", type=int, default=0)
+    p.add_argument("--min-extent", type=float, default=0.03)
+    p.add_argument("--bbox-padding-ratio", type=float, default=0.02)
+    p.add_argument("--crop-to-quantile-bbox", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--bbox-quantile-min", type=float, default=0.02)
+    p.add_argument("--bbox-quantile-max", type=float, default=0.98)
+    p.add_argument("--crop-to-pca-quantiles", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--pca-quantile-min", type=float, default=0.10)
+    p.add_argument("--pca-quantile-max", type=float, default=0.90)
+    p.add_argument("--pca-padding-ratio", type=float, default=0.04)
+    p.add_argument("--keep-largest-dbscan-cluster", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--dbscan-eps", type=float, default=0.18)
+    p.add_argument("--dbscan-min-points", type=int, default=20)
+    p.add_argument("--voxel-size", type=float, default=0.035)
+    p.add_argument("--remove-outliers", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--outlier-nb-neighbors", type=int, default=30)
+    p.add_argument("--outlier-std-ratio", type=float, default=1.5)
+    p.add_argument("--alpha", type=float)
+    p.add_argument("--alpha-multiplier", type=float, default=4.0)
+    p.add_argument("--ball-radius-multipliers", type=float, nargs="+", default=[1.5, 2.5, 4.0])
+    p.add_argument("--normal-radius", type=float)
+    p.add_argument("--poisson-depth", type=int, default=8)
+    p.add_argument("--poisson-density-quantile", type=float, default=0.08)
+    p.add_argument("--poisson-normal-neighbors", type=int, default=40)
+    p.add_argument("--simplify-triangles", type=int, default=40000)
+    p.add_argument("--smooth-iterations", type=int, default=3)
+    p.add_argument("--include-background-structures", action="store_true")
+    p.add_argument("--update-object-asset", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--copy-to-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--ascii", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--skip-failed", action="store_true")
+    p.set_defaults(func=cmd_reconstruct_semantic_3dgs_object_meshes)
 
     p = sub.add_parser("prepare-neus-surface-jobs", help="Prepare external NeuS-style SDF surface extraction jobs from 3DGS-rendered RGB/depth/normal/mask observations.")
     add_common_project_arg(p)
