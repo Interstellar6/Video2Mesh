@@ -4513,6 +4513,92 @@ def filter_mask_by_world_bounds(mask, depth, intrinsic: dict[str, Any], world_to
     }
 
 
+def filter_mask_by_projected_support_points(
+    mask,
+    depth,
+    intrinsic: dict[str, Any],
+    world_to_camera,
+    support_points,
+    radius: float = 18.0,
+    depth_tolerance: float = 0.25,
+    min_pixels: int = 64,
+):
+    np = import_numpy()
+    mask_np = np.asarray(mask, dtype=bool)
+    if support_points is None or not mask_np.any():
+        return mask_np, None
+    support_np = np.asarray(support_points, dtype=np.float64)
+    if support_np.ndim != 2 or support_np.shape[1] != 3 or support_np.shape[0] == 0:
+        return mask_np, None
+    depth_np = np.asarray(depth, dtype=np.float32)
+    w2c = np.asarray(world_to_camera, dtype=np.float64)
+    homog = np.concatenate([support_np[:, :3], np.ones((support_np.shape[0], 1), dtype=np.float64)], axis=1)
+    cam = (w2c @ homog.T).T[:, :3]
+    in_front = cam[:, 2] > 1e-6
+    if not bool(in_front.any()):
+        return mask_np, {"enabled": True, "reason": "no_support_points_in_front"}
+    cam = cam[in_front]
+    fx = float(intrinsic["fx"])
+    fy = float(intrinsic.get("fy", fx))
+    cx = float(intrinsic["cx"])
+    cy = float(intrinsic["cy"])
+    px = cam[:, 0] * fx / cam[:, 2] + cx
+    py = cam[:, 1] * fy / cam[:, 2] + cy
+    h, w = mask_np.shape
+    inside = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+    if not bool(inside.any()):
+        return mask_np, {"enabled": True, "reason": "no_projected_support_points_inside_frame", "projected_points": 0}
+    px = px[inside]
+    py = py[inside]
+    pz = cam[inside, 2]
+    ys, xs = np.nonzero(mask_np & np.isfinite(depth_np) & (depth_np > 0))
+    if xs.size == 0:
+        return mask_np, None
+    coords = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    projected = np.stack([px, py], axis=1)
+    best_dist2 = np.full(xs.shape[0], np.inf, dtype=np.float64)
+    best_depth = np.zeros(xs.shape[0], dtype=np.float64)
+    chunk = 256
+    for start in range(0, projected.shape[0], chunk):
+        proj_chunk = projected[start : start + chunk]
+        depth_chunk = pz[start : start + chunk]
+        diff = coords[:, None, :] - proj_chunk[None, :, :]
+        dist2 = np.sum(diff * diff, axis=2)
+        nearest = np.argmin(dist2, axis=1)
+        nearest_dist2 = dist2[np.arange(dist2.shape[0]), nearest]
+        update = nearest_dist2 < best_dist2
+        if bool(update.any()):
+            best_dist2[update] = nearest_dist2[update]
+            best_depth[update] = depth_chunk[nearest[update]]
+    radius2 = max(0.0, float(radius)) ** 2
+    depth_close = np.abs(depth_np[ys, xs].astype(np.float64) - best_depth) <= max(0.0, float(depth_tolerance))
+    keep_values = (best_dist2 <= radius2) & depth_close
+    filtered = np.zeros_like(mask_np, dtype=bool)
+    filtered[ys[keep_values], xs[keep_values]] = True
+    kept = int(filtered.sum())
+    if kept < int(min_pixels):
+        return mask_np, {
+            "enabled": True,
+            "fallback": "too_few_pixels_after_projected_support_filter",
+            "candidate_kept_pixels": kept,
+            "kept_pixels": int(mask_np.sum()),
+            "removed_pixels": 0,
+            "projected_points": int(projected.shape[0]),
+            "radius": float(radius),
+            "depth_tolerance": float(depth_tolerance),
+        }
+    return filtered, {
+        "enabled": True,
+        "input_pixels": int(mask_np.sum()),
+        "valid_depth_pixels": int(xs.size),
+        "kept_pixels": kept,
+        "removed_pixels": int(mask_np.sum() - kept),
+        "projected_points": int(projected.shape[0]),
+        "radius": float(radius),
+        "depth_tolerance": float(depth_tolerance),
+    }
+
+
 def mean_or_none(values: list[float]) -> float | None:
     if not values:
         return None
@@ -4761,6 +4847,13 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                 skipped[object_id] = "missing_2d_masks"
                 continue
             semantic_support_bounds, semantic_support_source = semantic_support_bounds_for_object(project_root, manifest, object_id, args)
+            semantic_support_points = None
+            if isinstance(semantic_support_source, dict):
+                semantic_support_points = semantic_support_source.get("support_points")
+                if "support_points" in semantic_support_source:
+                    semantic_support_source = {
+                        key: value for key, value in semantic_support_source.items() if key != "support_points"
+                    }
             object_dir = ensure_dir(output_dir / object_id)
             frame_reports: list[dict[str, Any]] = []
             for record in object_records:
@@ -4793,6 +4886,7 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                 depth_clip = None
                 depth_mode_band = None
                 depth_edge_filter = None
+                projected_support_filter = None
                 if bool(args.depth_quantile_clip):
                     object_mask, depth_clip = clip_mask_by_depth_quantiles(
                         object_mask,
@@ -4816,11 +4910,28 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                         edge_max=float(args.depth_edge_max),
                     )
                 semantic_support_filter = None
-                if semantic_support_bounds is not None:
+                w2c_np = None
+                if bool(args.projected_semantic_support_filter) and semantic_support_points is not None:
                     w2c_np = world_to_camera_matrix(
                         resolve_extrinsic(camera_info["extrinsic"], record.frame_id),
                         camera_info.get("extrinsic_type") or args.extrinsic_type,
                     )
+                    object_mask, projected_support_filter = filter_mask_by_projected_support_points(
+                        object_mask,
+                        depth_np,
+                        intrinsic,
+                        w2c_np,
+                        semantic_support_points,
+                        radius=float(args.projected_support_radius),
+                        depth_tolerance=float(args.projected_support_depth_tolerance),
+                        min_pixels=int(args.min_component_pixels),
+                    )
+                if semantic_support_bounds is not None:
+                    if w2c_np is None:
+                        w2c_np = world_to_camera_matrix(
+                            resolve_extrinsic(camera_info["extrinsic"], record.frame_id),
+                            camera_info.get("extrinsic_type") or args.extrinsic_type,
+                        )
                     object_mask, semantic_support_filter = filter_mask_by_world_bounds(
                         object_mask,
                         depth_np,
@@ -4884,6 +4995,8 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                             "depth_mode_band": depth_mode_band,
                             "depth_edge_filter": bool(args.depth_edge_filter),
                             "depth_edge": depth_edge_filter,
+                            "projected_semantic_support_filter": bool(args.projected_semantic_support_filter),
+                            "projected_semantic_support": projected_support_filter,
                             "semantic_support_filter": semantic_support_filter,
                         },
                         "alpha_mean": float(alpha_np.mean()),
@@ -15037,6 +15150,7 @@ def semantic_support_bounds_for_object(
         "padding_ratio": float(getattr(args, "semantic_support_bbox_padding_ratio", 0.12)),
         "min": [float(value) for value in lower.tolist()],
         "max": [float(value) for value in upper.tolist()],
+        "support_points": selected_points,
     }
 
 
@@ -35211,6 +35325,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--semantic-support-bbox-quantile-max", type=float, default=0.80)
     p.add_argument("--semantic-support-bbox-padding-ratio", type=float, default=0.12)
     p.add_argument("--semantic-support-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--projected-semantic-support-filter", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--projected-support-radius", type=float, default=18.0)
+    p.add_argument("--projected-support-depth-tolerance", type=float, default=0.25)
     p.add_argument("--include-background-structures", action="store_true")
     p.set_defaults(func=cmd_export_3dgs_mesh_observations)
 

@@ -24,6 +24,7 @@ from video2mesh.cli import (
     filter_observation_points_by_multiview_depth_consistency,
     filter_mask_by_depth_edges,
     filter_mask_by_depth_mode_band,
+    filter_mask_by_projected_support_points,
     filter_mask_by_world_bounds,
     export_viewer_plys,
     filter_colmap_points3d_file,
@@ -835,12 +836,45 @@ def test_filter_mask_by_world_bounds_reprojects_depth_pixels():
     assert report["removed_pixels"] == 24
 
 
+def test_filter_mask_by_projected_support_points_keeps_near_projected_surface():
+    np = pytest.importorskip("numpy")
+    mask = np.ones((5, 5), dtype=bool)
+    depth = np.ones((5, 5), dtype=np.float32) * 8.0
+    depth[2, 2] = 2.0
+    intrinsic = {"fx": 2.0, "fy": 2.0, "cx": 2.0, "cy": 2.0}
+    world_to_camera = np.eye(4)
+    support = np.array([[0.0, 0.0, 2.0]])
+
+    filtered, report = filter_mask_by_projected_support_points(
+        mask,
+        depth,
+        intrinsic,
+        world_to_camera,
+        support,
+        radius=0.5,
+        depth_tolerance=0.1,
+        min_pixels=1,
+    )
+
+    assert int(filtered.sum()) == 1
+    assert filtered[2, 2]
+    assert report["kept_pixels"] == 1
+    assert report["removed_pixels"] == 24
+
+
 def test_3dgs_mesh_cli_commands_are_registered():
     parser = build_parser()
 
     obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
     obs_with_support = parser.parse_args(
-        ["export-3dgs-mesh-observations", "--project-root", "proj", "--semantic-support-filter", "--depth-mode-band-filter"]
+        [
+            "export-3dgs-mesh-observations",
+            "--project-root",
+            "proj",
+            "--semantic-support-filter",
+            "--depth-mode-band-filter",
+            "--projected-semantic-support-filter",
+        ]
     )
     recon = parser.parse_args(["reconstruct-3dgs-object-meshes", "--project-root", "proj"])
     semantic_recon = parser.parse_args(["reconstruct-semantic-3dgs-object-meshes", "--project-root", "proj"])
@@ -849,9 +883,12 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
     assert obs.semantic_support_filter is False
     assert obs.depth_mode_band_filter is False
+    assert obs.projected_semantic_support_filter is False
     assert obs_with_support.semantic_support_filter is True
     assert obs_with_support.depth_mode_band_filter is True
+    assert obs_with_support.projected_semantic_support_filter is True
     assert obs.depth_mode_bins == 48
+    assert obs.projected_support_radius == pytest.approx(18.0)
     assert obs.max_scale_quantile == pytest.approx(0.90)
     assert recon.func.__name__ == "cmd_reconstruct_3dgs_object_meshes"
     assert recon.proxy_mesh == "none"
