@@ -8,12 +8,17 @@ from video2mesh.cli import (
     apply_3dgs_sparse_filter,
     build_observation_point_cloud,
     build_parser,
+    bbox_proxy_mesh_from_points,
+    clean_binary_object_mask,
+    clip_mask_by_depth_quantiles,
     depth_to_normal_map,
+    filter_mask_by_depth_edges,
     export_viewer_plys,
     filter_colmap_points3d_file,
     make_object_masks_exclusive,
     parse_ply_vertex_header,
     prepare_3dgs_colmap_source,
+    quantile_bounds_from_points,
     scaled_intrinsic_for_size,
     select_colmap_sparse_model,
     source_labels_from_object_masks,
@@ -320,6 +325,87 @@ def test_depth_to_normal_map_returns_forward_normals_for_flat_depth():
     assert normals[2, 2, 0] == pytest.approx(0.0)
     assert normals[2, 2, 1] == pytest.approx(0.0)
     assert normals[2, 2, 2] == pytest.approx(1.0)
+
+
+def test_clean_binary_object_mask_keeps_largest_component():
+    np = pytest.importorskip("numpy")
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[2:5, 2:5] = True
+    mask[8:18, 8:18] = True
+
+    cleaned = clean_binary_object_mask(mask, kernel_size=1, keep_largest_component=True, min_component_pixels=1)
+
+    assert int(cleaned.sum()) == 100
+    assert cleaned[10, 10]
+    assert not cleaned[3, 3]
+
+
+def test_clip_mask_by_depth_quantiles_removes_far_tail():
+    np = pytest.importorskip("numpy")
+    depth = np.array([[1.0, 1.1, 1.2, 10.0]], dtype=np.float32)
+    mask = np.ones_like(depth, dtype=bool)
+
+    clipped, info = clip_mask_by_depth_quantiles(mask, depth, 0.0, 0.75)
+
+    assert int(clipped.sum()) == 3
+    assert not clipped[0, 3]
+    assert info["max_depth"] < 10.0
+
+
+def test_filter_mask_by_depth_edges_removes_large_depth_jump():
+    np = pytest.importorskip("numpy")
+    depth = np.ones((5, 5), dtype=np.float32)
+    depth[:, 4] = 8.0
+    mask = np.ones_like(depth, dtype=bool)
+
+    filtered, info = filter_mask_by_depth_edges(mask, depth, edge_quantile=0.8, edge_max=0.5)
+
+    assert int(filtered.sum()) < int(mask.sum())
+    assert not filtered[2, 3]
+    assert info["threshold"] <= 0.5
+
+
+def test_quantile_bounds_from_points_ignores_outlier_tail():
+    np = pytest.importorskip("numpy")
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 2.0, 2.0],
+            [100.0, 100.0, 100.0],
+        ],
+        dtype=np.float64,
+    )
+
+    lower, upper = quantile_bounds_from_points(points, 0.0, 0.75, 0.0)
+
+    assert lower.tolist() == pytest.approx([0.0, 0.0, 0.0])
+    assert upper.tolist() == pytest.approx([26.5, 26.5, 26.5])
+
+
+def test_bbox_proxy_mesh_from_points_returns_box_mesh():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("open3d")
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 0.0, 0.5],
+            [2.0, 0.0, 0.5],
+            [0.0, 1.0, 0.5],
+            [2.0, 1.0, 0.5],
+        ],
+        dtype=np.float64,
+    )
+
+    mesh, report = bbox_proxy_mesh_from_points(points, 0.0, 1.0, 0.0, 0.05)
+
+    assert len(mesh.vertices) == 8
+    assert len(mesh.triangles) == 12
+    assert report["method"] == "quantile_aabb_proxy_from_observation_points"
+    assert report["extent"] == pytest.approx([2.0, 1.0, 0.5])
 
 
 def test_observation_depth_to_point_cloud_uses_mask_and_camera(tmp_path: Path):

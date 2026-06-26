@@ -4244,6 +4244,157 @@ def load_mask_probability_image(mask_path: Path, width: int, height: int, probab
     return clamp_probability_array(mask / max(float(probability_scale), 1e-6))
 
 
+def mask_active_pixel_count(mask_path: Path, min_probability: float, probability_scale: float) -> int:
+    np = import_numpy()
+    Image = import_pil_image()
+    try:
+        with Image.open(mask_path) as image:
+            mask = np.asarray(image.convert("L"), dtype=np.float32)
+    except Exception:
+        return 0
+    probability = clamp_probability_array(mask / max(float(probability_scale), 1e-6))
+    return int((probability >= float(min_probability)).sum())
+
+
+def clean_binary_object_mask(
+    mask,
+    kernel_size: int = 5,
+    keep_largest_component: bool = True,
+    min_component_pixels: int = 64,
+    erode_iterations: int = 0,
+):
+    np = import_numpy()
+    mask_np = np.asarray(mask, dtype=bool)
+    if mask_np.size == 0 or not mask_np.any():
+        return mask_np
+
+    def numpy_component_filter(binary):
+        binary_np = np.asarray(binary, dtype=bool)
+        height, width = binary_np.shape
+        visited = np.zeros_like(binary_np, dtype=bool)
+        components: list[list[tuple[int, int]]] = []
+        for y in range(height):
+            for x in range(width):
+                if not binary_np[y, x] or visited[y, x]:
+                    continue
+                stack = [(y, x)]
+                visited[y, x] = True
+                component: list[tuple[int, int]] = []
+                while stack:
+                    cy, cx = stack.pop()
+                    component.append((cy, cx))
+                    for ny in range(max(0, cy - 1), min(height, cy + 2)):
+                        for nx in range(max(0, cx - 1), min(width, cx + 2)):
+                            if visited[ny, nx] or not binary_np[ny, nx]:
+                                continue
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+                components.append(component)
+        filtered = np.zeros_like(binary_np, dtype=bool)
+        if keep_largest_component and components:
+            largest = max(components, key=len)
+            if len(largest) >= int(min_component_pixels):
+                for y, x in largest:
+                    filtered[y, x] = True
+            return filtered
+        for component in components:
+            if len(component) >= int(min_component_pixels):
+                for y, x in component:
+                    filtered[y, x] = True
+        return filtered
+
+    kernel_size = int(kernel_size or 0)
+    try:
+        cv2 = import_cv2()
+        u8 = (mask_np.astype(np.uint8) * 255)
+        if kernel_size > 1:
+            k = max(1, kernel_size)
+            if k % 2 == 0:
+                k += 1
+            kernel = np.ones((k, k), dtype=np.uint8)
+            u8 = cv2.morphologyEx(u8, cv2.MORPH_OPEN, kernel)
+            u8 = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, kernel)
+        cleaned = u8 > 0
+        if int(erode_iterations or 0) > 0 and cleaned.any():
+            k = max(1, kernel_size)
+            if k % 2 == 0:
+                k += 1
+            kernel = np.ones((k, k), dtype=np.uint8)
+            cleaned = cv2.erode(cleaned.astype(np.uint8), kernel, iterations=int(erode_iterations)) > 0
+        if keep_largest_component and cleaned.any():
+            count, labels, stats, _centroids = cv2.connectedComponentsWithStats(cleaned.astype(np.uint8), connectivity=8)
+            if count > 1:
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                keep = int(areas.argmax()) + 1
+                if int(stats[keep, cv2.CC_STAT_AREA]) >= int(min_component_pixels):
+                    cleaned = labels == keep
+        if int(min_component_pixels) > 0 and cleaned.any() and not keep_largest_component:
+            count, labels, stats, _centroids = cv2.connectedComponentsWithStats(cleaned.astype(np.uint8), connectivity=8)
+            keep_mask = np.zeros_like(cleaned, dtype=bool)
+            for label in range(1, count):
+                if int(stats[label, cv2.CC_STAT_AREA]) >= int(min_component_pixels):
+                    keep_mask |= labels == label
+            cleaned = keep_mask
+        return cleaned
+    except Exception:
+        cleaned = mask_np
+        for _ in range(max(0, int(erode_iterations or 0))):
+            padded = np.pad(cleaned, 1, mode="constant", constant_values=False)
+            eroded = (
+                padded[:-2, :-2]
+                & padded[:-2, 1:-1]
+                & padded[:-2, 2:]
+                & padded[1:-1, :-2]
+                & padded[1:-1, 1:-1]
+                & padded[1:-1, 2:]
+                & padded[2:, :-2]
+                & padded[2:, 1:-1]
+                & padded[2:, 2:]
+            )
+            cleaned = eroded
+        return numpy_component_filter(cleaned)
+
+
+def clip_mask_by_depth_quantiles(mask, depth, q_min: float, q_max: float):
+    np = import_numpy()
+    mask_np = np.asarray(mask, dtype=bool)
+    depth_np = np.asarray(depth, dtype=np.float32)
+    if not mask_np.any():
+        return mask_np, None
+    values = depth_np[mask_np & np.isfinite(depth_np) & (depth_np > 0)]
+    if values.size < 2:
+        return mask_np, None
+    low_q = max(0.0, min(1.0, float(q_min)))
+    high_q = max(low_q, min(1.0, float(q_max)))
+    low = float(np.quantile(values, low_q))
+    high = float(np.quantile(values, high_q))
+    clipped = mask_np & np.isfinite(depth_np) & (depth_np >= low) & (depth_np <= high)
+    return clipped, {"min_depth": low, "max_depth": high, "q_min": low_q, "q_max": high_q}
+
+
+def filter_mask_by_depth_edges(mask, depth, edge_quantile: float = 0.85, edge_max: float = 0.35):
+    np = import_numpy()
+    mask_np = np.asarray(mask, dtype=bool)
+    depth_np = np.asarray(depth, dtype=np.float32)
+    if not mask_np.any():
+        return mask_np, None
+    valid = mask_np & np.isfinite(depth_np) & (depth_np > 0)
+    if int(valid.sum()) < 8:
+        return mask_np, None
+    filled = np.where(np.isfinite(depth_np) & (depth_np > 0), depth_np, 0.0)
+    gy, gx = np.gradient(filled)
+    grad = np.sqrt(gx * gx + gy * gy)
+    values = grad[valid]
+    if values.size < 8:
+        return mask_np, None
+    q_threshold = float(np.quantile(values, max(0.0, min(1.0, float(edge_quantile)))))
+    threshold = q_threshold
+    if float(edge_max or 0) > 0:
+        threshold = min(threshold, float(edge_max))
+    filtered = mask_np & (grad <= threshold)
+    return filtered, {"threshold": threshold, "quantile_threshold": q_threshold, "edge_quantile": float(edge_quantile), "edge_max": float(edge_max)}
+
+
 def mean_or_none(values: list[float]) -> float | None:
     if not values:
         return None
@@ -4418,9 +4569,20 @@ def object_render_frame_records(
     records_by_object: dict[str, list[MaskRecord]],
     frames_by_id: dict[str, Path],
     max_frames: int,
+    min_probability: float = 0.5,
+    probability_scale: float = 255.0,
+    selection: str = "largest_mask",
 ) -> list[MaskRecord]:
     records = [record for record in records_by_object.get(object_id, []) if record.frame_id in frames_by_id]
-    records.sort(key=lambda record: frame_sort_key(Path(record.frame_id)))
+    if selection == "largest_mask":
+        records.sort(
+            key=lambda record: (
+                -mask_active_pixel_count(record.path, min_probability, probability_scale),
+                frame_sort_key(Path(record.frame_id)),
+            )
+        )
+    else:
+        records.sort(key=lambda record: frame_sort_key(Path(record.frame_id)))
     if max_frames and max_frames > 0:
         records = records[: int(max_frames)]
     return records
@@ -4468,7 +4630,15 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
             if requested and object_id not in requested:
                 skipped[object_id] = "not_requested"
                 continue
-            object_records = object_render_frame_records(object_id, records_by_object, frames_by_id, int(args.max_frames_per_object or 0))
+            object_records = object_render_frame_records(
+                object_id,
+                records_by_object,
+                frames_by_id,
+                int(args.max_frames_per_object or 0),
+                float(args.min_probability),
+                float(args.probability_scale),
+                args.frame_selection,
+            )
             if not object_records:
                 skipped[object_id] = "missing_2d_masks"
                 continue
@@ -4493,7 +4663,30 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                 alpha_np = alpha.detach().cpu().numpy().astype(np.float32)
                 mask_prob = load_mask_probability_image(record.path, width, height, args.probability_scale)
                 render_valid = (alpha_np >= float(args.min_alpha)) & (depth_np > 0)
-                object_mask = (mask_prob >= float(args.min_probability)) & render_valid
+                raw_object_mask = (mask_prob >= float(args.min_probability)) & render_valid
+                object_mask = clean_binary_object_mask(
+                    raw_object_mask,
+                    kernel_size=int(args.mask_morph_kernel),
+                    keep_largest_component=bool(args.keep_largest_mask_component),
+                    min_component_pixels=int(args.min_component_pixels),
+                    erode_iterations=int(args.mask_erode_iterations),
+                )
+                depth_clip = None
+                depth_edge_filter = None
+                if bool(args.depth_quantile_clip):
+                    object_mask, depth_clip = clip_mask_by_depth_quantiles(
+                        object_mask,
+                        depth_np,
+                        float(args.depth_quantile_min),
+                        float(args.depth_quantile_max),
+                    )
+                if bool(args.depth_edge_filter):
+                    object_mask, depth_edge_filter = filter_mask_by_depth_edges(
+                        object_mask,
+                        depth_np,
+                        edge_quantile=float(args.depth_edge_quantile),
+                        edge_max=float(args.depth_edge_max),
+                    )
                 normal_np = depth_to_normal_map(depth_np, float(intrinsic["fx"]), float(intrinsic.get("fy", intrinsic["fx"])))
                 frame_dir = ensure_dir(object_dir / record.frame_id)
                 rgb_path = frame_dir / "rgb.png"
@@ -4535,6 +4728,18 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
                         "mask": str(mask_path),
                         "alpha": str(alpha_path),
                         "mask_pixels": int(object_mask.sum()),
+                        "raw_mask_pixels": int(raw_object_mask.sum()),
+                        "mask_cleanup": {
+                            "frame_selection": args.frame_selection,
+                            "mask_morph_kernel": int(args.mask_morph_kernel),
+                            "mask_erode_iterations": int(args.mask_erode_iterations),
+                            "keep_largest_mask_component": bool(args.keep_largest_mask_component),
+                            "min_component_pixels": int(args.min_component_pixels),
+                            "depth_quantile_clip": bool(args.depth_quantile_clip),
+                            "depth_clip": depth_clip,
+                            "depth_edge_filter": bool(args.depth_edge_filter),
+                            "depth_edge": depth_edge_filter,
+                        },
                         "alpha_mean": float(alpha_np.mean()),
                         "depth_min": float(depth_np[object_mask].min()) if object_mask.any() else None,
                         "depth_max": float(depth_np[object_mask].max()) if object_mask.any() else None,
@@ -4573,6 +4778,17 @@ def cmd_export_3dgs_mesh_observations(args: argparse.Namespace) -> int:
             "background": args.background,
             "width": args.width,
             "height": args.height,
+            "frame_selection": args.frame_selection,
+            "mask_morph_kernel": int(args.mask_morph_kernel),
+            "mask_erode_iterations": int(args.mask_erode_iterations),
+            "keep_largest_mask_component": bool(args.keep_largest_mask_component),
+            "min_component_pixels": int(args.min_component_pixels),
+            "depth_quantile_clip": bool(args.depth_quantile_clip),
+            "depth_quantile_min": float(args.depth_quantile_min),
+            "depth_quantile_max": float(args.depth_quantile_max),
+            "depth_edge_filter": bool(args.depth_edge_filter),
+            "depth_edge_quantile": float(args.depth_edge_quantile),
+            "depth_edge_max": float(args.depth_edge_max),
         },
         "notes": "Object-centric observations rendered from 3DGS using registered real camera poses. Depth uses gsplat RGB+ED expected-depth output; normals are derived from the rendered depth map.",
     }
@@ -14372,6 +14588,101 @@ def build_observation_point_cloud(frames: list[dict[str, Any]], min_depth: float
     return np.concatenate(points_list, axis=0), np.concatenate(colors_list, axis=0)
 
 
+def quantile_bounds_from_points(points, q_min: float, q_max: float, padding_ratio: float):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
+        return None
+    low_q = max(0.0, min(1.0, float(q_min)))
+    high_q = max(low_q, min(1.0, float(q_max)))
+    mins = np.quantile(points_np, low_q, axis=0)
+    maxs = np.quantile(points_np, high_q, axis=0)
+    extent = np.maximum(maxs - mins, 1e-8)
+    padding = extent * max(0.0, float(padding_ratio))
+    return mins - padding, maxs + padding
+
+
+def crop_triangle_mesh_to_bounds(mesh, bounds):
+    np = import_numpy()
+    if bounds is None:
+        return mesh, None
+    lower, upper = bounds
+    vertices = np.asarray(mesh.vertices)
+    if vertices.size == 0:
+        return mesh, None
+    outside = np.any((vertices < lower) | (vertices > upper), axis=1)
+    removed = int(outside.sum())
+    if removed > 0:
+        mesh.remove_vertices_by_mask(outside)
+        mesh.remove_unreferenced_vertices()
+    return mesh, {
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+        "removed_vertices": removed,
+    }
+
+
+def bbox_proxy_mesh_from_points(points, q_min: float, q_max: float, padding_ratio: float, min_extent: float):
+    np = import_numpy()
+    o3d = import_open3d()
+    points_np = np.asarray(points, dtype=np.float64)
+    bounds = quantile_bounds_from_points(points_np, q_min, q_max, padding_ratio)
+    if bounds is None:
+        raise ValueError("No observation points available for bbox proxy mesh.")
+    lower, upper = bounds
+    center = (lower + upper) * 0.5
+    extent = np.maximum(upper - lower, float(min_extent))
+    lower = center - extent * 0.5
+    upper = center + extent * 0.5
+    vertices = np.array(
+        [
+            [lower[0], lower[1], lower[2]],
+            [upper[0], lower[1], lower[2]],
+            [lower[0], upper[1], lower[2]],
+            [upper[0], upper[1], lower[2]],
+            [lower[0], lower[1], upper[2]],
+            [upper[0], lower[1], upper[2]],
+            [lower[0], upper[1], upper[2]],
+            [upper[0], upper[1], upper[2]],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array(
+        [
+            [0, 2, 3],
+            [0, 3, 1],
+            [4, 5, 7],
+            [4, 7, 6],
+            [0, 1, 5],
+            [0, 5, 4],
+            [2, 6, 7],
+            [2, 7, 3],
+            [0, 4, 6],
+            [0, 6, 2],
+            [1, 3, 7],
+            [1, 7, 5],
+        ],
+        dtype=np.int32,
+    )
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(triangles),
+    )
+    mesh.compute_vertex_normals()
+    return mesh, {
+        "method": "quantile_aabb_proxy_from_observation_points",
+        "input_point_count": int(points_np.shape[0]),
+        "q_min": float(q_min),
+        "q_max": float(q_max),
+        "padding_ratio": float(padding_ratio),
+        "min_extent": float(min_extent),
+        "center": [float(value) for value in center.tolist()],
+        "extent": [float(value) for value in extent.tolist()],
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+    }
+
+
 def postprocess_triangle_mesh(mesh, args):
     o3d = import_open3d()
     mesh.remove_degenerate_triangles()
@@ -14398,6 +14709,16 @@ def postprocess_triangle_mesh(mesh, args):
         mesh.remove_duplicated_triangles()
         mesh.remove_duplicated_vertices()
         mesh.remove_non_manifold_edges()
+    smooth_iterations = int(getattr(args, "smooth_iterations", 0) or 0)
+    if smooth_iterations > 0 and len(mesh.triangles) > 0:
+        try:
+            mesh = mesh.filter_smooth_taubin(number_of_iterations=smooth_iterations)
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_non_manifold_edges()
+        except Exception:
+            pass
     try:
         mesh.compute_vertex_normals()
     except Exception:
@@ -14478,8 +14799,27 @@ def tsdf_mesh_from_observations(frames: list[dict[str, Any]], args):
     if integrated == 0:
         raise ValueError("No observation frame had enough valid masked depth for TSDF fusion.")
     mesh = volume.extract_triangle_mesh()
+    crop_report = None
+    if bool(getattr(args, "crop_to_observation_bbox", True)):
+        points, _colors = build_observation_point_cloud(
+            frames,
+            float(args.min_depth),
+            float(args.max_depth),
+            int(getattr(args, "bbox_point_stride", args.point_stride) or 1),
+        )
+        bounds = quantile_bounds_from_points(
+            points,
+            float(getattr(args, "bbox_quantile_min", 0.01)),
+            float(getattr(args, "bbox_quantile_max", 0.99)),
+            float(getattr(args, "bbox_padding_ratio", 0.02)),
+        )
+        mesh, crop_report = crop_triangle_mesh_to_bounds(mesh, bounds)
     mesh = postprocess_triangle_mesh(mesh, args)
-    return mesh, {"method": "tsdf_fusion_from_3dgs_rendered_depth_masks", "integrated_frames": integrated}
+    return mesh, {
+        "method": "tsdf_fusion_from_3dgs_rendered_depth_masks",
+        "integrated_frames": integrated,
+        "observation_bbox_crop": crop_report,
+    }
 
 
 def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
@@ -14532,10 +14872,50 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                 raise RuntimeError(f"Open3D failed to write mesh: {mesh_path}")
             mesh_summary = summarize_triangle_mesh(mesh_path)
             asset_path = mesh_path
+            proxy_metadata = None
+            proxy_path = None
+            use_proxy_asset = False
+            if str(args.proxy_mesh) != "none":
+                try:
+                    points, _colors = build_observation_point_cloud(
+                        frames,
+                        float(args.min_depth),
+                        float(args.max_depth),
+                        int(args.bbox_point_stride or 1),
+                    )
+                    proxy_mesh, proxy_reconstruction = bbox_proxy_mesh_from_points(
+                        points,
+                        float(args.proxy_bbox_quantile_min),
+                        float(args.proxy_bbox_quantile_max),
+                        float(args.proxy_bbox_padding_ratio),
+                        float(args.proxy_min_extent),
+                    )
+                    proxy_path = object_mesh_dir / f"{object_id}_proxy.{args.format}"
+                    ok = import_open3d().io.write_triangle_mesh(str(proxy_path), proxy_mesh, write_ascii=bool(args.ascii))
+                    if not ok:
+                        raise RuntimeError(f"Open3D failed to write proxy mesh: {proxy_path}")
+                    proxy_metadata = {
+                        "path": str(proxy_path),
+                        "format": args.format,
+                        "reconstruction": proxy_reconstruction,
+                        "qa": summarize_triangle_mesh(proxy_path),
+                    }
+                    use_proxy_asset = str(args.proxy_mesh) == "always" or (
+                        str(args.proxy_mesh) == "auto"
+                        and (
+                            not bool(mesh_summary.get("is_watertight"))
+                            or float(mesh_summary.get("bbox_diagonal") or 0.0) > float(args.proxy_max_bbox_diagonal)
+                        )
+                    )
+                    if use_proxy_asset:
+                        asset_path = proxy_path
+                except Exception as proxy_exc:
+                    proxy_metadata = {"error": str(proxy_exc)}
             if args.copy_to_assets:
-                dst = sim_objects_dir / object_id / mesh_path.name
-                if mesh_path.resolve() != dst.resolve():
-                    asset_path = copy_or_link(mesh_path, dst, args.mode)
+                src_asset = asset_path
+                dst = sim_objects_dir / object_id / src_asset.name
+                if src_asset.resolve() != dst.resolve():
+                    asset_path = copy_or_link(src_asset, dst, args.mode)
                 else:
                     asset_path = dst
             metadata = {
@@ -14550,6 +14930,8 @@ def cmd_reconstruct_3dgs_object_meshes(args: argparse.Namespace) -> int:
                 "method": method_used,
                 "reconstruction": reconstruction,
                 "qa": mesh_summary,
+                "proxy_mesh": proxy_metadata,
+                "asset_source": "proxy_mesh" if use_proxy_asset else "surface_mesh",
                 "notes": "Mesh reconstructed from 3DGS-rendered multi-view depth/normal/mask observations using TSDF fusion and/or Poisson surface extraction.",
             }
             write_json(object_mesh_dir / "reconstruction.json", metadata)
@@ -33270,9 +33652,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--background", choices=["target_mean", "white", "black", "none"], default="black")
+    p.add_argument("--frame-selection", choices=["largest_mask", "chronological"], default="largest_mask")
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--probability-scale", type=float, default=255.0)
     p.add_argument("--min-alpha", type=float, default=0.02)
+    p.add_argument("--mask-morph-kernel", type=int, default=5)
+    p.add_argument("--mask-erode-iterations", type=int, default=1)
+    p.add_argument("--keep-largest-mask-component", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--min-component-pixels", type=int, default=64)
+    p.add_argument("--depth-quantile-clip", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--depth-quantile-min", type=float, default=0.02)
+    p.add_argument("--depth-quantile-max", type=float, default=0.90)
+    p.add_argument("--depth-edge-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--depth-edge-quantile", type=float, default=0.85)
+    p.add_argument("--depth-edge-max", type=float, default=0.35)
     p.add_argument("--include-background-structures", action="store_true")
     p.set_defaults(func=cmd_export_3dgs_mesh_observations)
 
@@ -33848,6 +34241,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--poisson-normal-neighbors", type=int, default=30)
     p.add_argument("--largest-component", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--simplify-triangles", type=int, default=50000)
+    p.add_argument("--smooth-iterations", type=int, default=3)
+    p.add_argument("--crop-to-observation-bbox", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--bbox-point-stride", type=int, default=2)
+    p.add_argument("--bbox-quantile-min", type=float, default=0.01)
+    p.add_argument("--bbox-quantile-max", type=float, default=0.99)
+    p.add_argument("--bbox-padding-ratio", type=float, default=0.02)
+    p.add_argument("--proxy-mesh", choices=["auto", "always", "none"], default="auto")
+    p.add_argument("--proxy-bbox-quantile-min", type=float, default=0.20)
+    p.add_argument("--proxy-bbox-quantile-max", type=float, default=0.80)
+    p.add_argument("--proxy-bbox-padding-ratio", type=float, default=0.08)
+    p.add_argument("--proxy-min-extent", type=float, default=0.05)
+    p.add_argument("--proxy-max-bbox-diagonal", type=float, default=6.0)
     p.add_argument("--ascii", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--copy-to-assets", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
