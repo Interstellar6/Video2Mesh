@@ -1,6 +1,7 @@
 import json
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from video2mesh.cli import (
     clip_mask_by_depth_quantiles,
     depth_to_normal_map,
     filter_points_by_dbscan_largest_cluster,
+    filter_points_by_multiview_mask_consistency,
     filter_points_by_pca_quantiles,
     filter_points_by_quantile_bbox,
     filter_mask_by_depth_edges,
@@ -427,6 +429,40 @@ def test_filter_points_by_dbscan_largest_cluster_keeps_main_cluster():
 
     assert filtered.shape[0] == 4
     assert report["removed_points"] == 2
+
+
+def test_filter_points_by_multiview_mask_consistency_keeps_mask_hits(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    mask_dir = tmp_path / "masks" / "obj"
+    mask_dir.mkdir(parents=True)
+    mask = np.zeros((10, 10), dtype=np.uint8)
+    mask[4:7, 4:7] = 255
+    Image.fromarray(mask, mode="L").save(mask_dir / "000000.png")
+    records = {"obj": [SimpleNamespace(frame_id="000000", path=mask_dir / "000000.png")]}
+    camera_info = {
+        "extrinsic_type": "world_to_camera",
+        "extrinsic": {"000000": np.eye(4).tolist()},
+        "intrinsic": {"w": 10, "h": 10, "fx": 1.0, "fy": 1.0, "cx": 5.0, "cy": 5.0},
+    }
+    points = np.array([[0.0, 0.0, 1.0], [4.0, 4.0, 1.0]], dtype=np.float64)
+    args = Namespace(
+        consistency_min_probability=0.5,
+        probability_scale=255.0,
+        consistency_max_frames=1,
+        extrinsic_type="world_to_camera",
+        consistency_min_projected=1,
+        consistency_min_hits=1,
+        consistency_min_hit_ratio=1.0,
+        min_points=1,
+        consistency_fallback_keep_original=False,
+    )
+
+    filtered, _colors, report = filter_points_by_multiview_mask_consistency(points, None, "obj", records, camera_info, args)
+
+    assert filtered.shape == (1, 3)
+    assert filtered[0].tolist() == pytest.approx([0.0, 0.0, 1.0])
+    assert report["removed_points"] == 1
 
 
 def test_bbox_proxy_mesh_from_points_returns_box_mesh():

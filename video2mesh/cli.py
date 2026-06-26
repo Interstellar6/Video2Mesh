@@ -15136,6 +15136,107 @@ def filter_points_by_dbscan_largest_cluster(points, colors, eps: float, min_poin
     }
 
 
+def filter_points_by_multiview_mask_consistency(
+    points,
+    colors,
+    object_id: str,
+    records_by_object: dict[str, list[Any]],
+    camera_info: dict[str, Any],
+    args: argparse.Namespace,
+):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
+        return points_np, colors, None
+    records = list(records_by_object.get(object_id, []))
+    if not records:
+        return points_np, colors, {"enabled": True, "reason": "missing_2d_masks", "kept_points": int(points_np.shape[0]), "removed_points": 0}
+    records.sort(
+        key=lambda record: (
+            -mask_active_pixel_count(record.path, float(args.consistency_min_probability), float(args.probability_scale)),
+            frame_sort_key(Path(record.frame_id)),
+        )
+    )
+    max_frames = int(getattr(args, "consistency_max_frames", 0) or 0)
+    if max_frames > 0:
+        records = records[:max_frames]
+
+    projected = np.zeros(points_np.shape[0], dtype=np.int32)
+    hits = np.zeros(points_np.shape[0], dtype=np.int32)
+    frame_reports: list[dict[str, Any]] = []
+    for record in records:
+        extrinsic = resolve_extrinsic(camera_info["extrinsic"], record.frame_id)
+        if extrinsic is None:
+            frame_reports.append({"frame_id": record.frame_id, "mask": str(record.path), "skipped": True, "reason": "missing_extrinsic"})
+            continue
+        intrinsic = intrinsic_for_frame(camera_info, record.frame_id)
+        width = int(intrinsic["w"])
+        height = int(intrinsic["h"])
+        w2c = world_to_camera_matrix(extrinsic, camera_info.get("extrinsic_type") or getattr(args, "extrinsic_type", "world_to_camera"))
+        inside, u_float, v_float, _z = project_points_float(points_np, intrinsic, w2c)
+        indices = np.flatnonzero(inside)
+        if indices.size == 0:
+            frame_reports.append({"frame_id": record.frame_id, "mask": str(record.path), "projected_points": 0, "hit_points": 0})
+            continue
+        mask_prob = load_mask_probability_image(record.path, width, height, float(args.probability_scale))
+        u = np.clip(np.floor(u_float[indices]).astype(np.int64), 0, width - 1)
+        v = np.clip(np.floor(v_float[indices]).astype(np.int64), 0, height - 1)
+        values = mask_prob[v, u]
+        hit_local = values >= float(args.consistency_min_probability)
+        projected[indices] += 1
+        if hit_local.any():
+            hits[indices[hit_local]] += 1
+        frame_reports.append(
+            {
+                "frame_id": record.frame_id,
+                "mask": str(record.path),
+                "projected_points": int(indices.size),
+                "hit_points": int(hit_local.sum()),
+                "hit_ratio": float(hit_local.sum() / max(1, indices.size)),
+            }
+        )
+
+    min_projected = max(1, int(args.consistency_min_projected))
+    min_hits = max(1, int(args.consistency_min_hits))
+    ratios = np.zeros(points_np.shape[0], dtype=np.float32)
+    valid_projected = projected > 0
+    ratios[valid_projected] = hits[valid_projected] / np.maximum(projected[valid_projected], 1)
+    keep = (projected >= min_projected) & (hits >= min_hits) & (ratios >= float(args.consistency_min_hit_ratio))
+    if int(keep.sum()) < int(args.min_points) and bool(args.consistency_fallback_keep_original):
+        return points_np, colors, {
+            "enabled": True,
+            "fallback": "too_few_points_after_consistency",
+            "candidate_kept_points": int(keep.sum()),
+            "kept_points": int(points_np.shape[0]),
+            "removed_points": 0,
+            "frame_count": len(records),
+            "frames": frame_reports,
+            "parameters": {
+                "min_projected": min_projected,
+                "min_hits": min_hits,
+                "min_hit_ratio": float(args.consistency_min_hit_ratio),
+            },
+        }
+    filtered_colors = None if colors is None else np.asarray(colors, dtype=np.float64)[keep]
+    return points_np[keep], filtered_colors, {
+        "enabled": True,
+        "frame_count": len(records),
+        "kept_points": int(keep.sum()),
+        "removed_points": int(points_np.shape[0] - int(keep.sum())),
+        "mean_projected_observations": float(projected.mean()) if projected.size else 0.0,
+        "mean_hit_observations": float(hits.mean()) if hits.size else 0.0,
+        "mean_hit_ratio_kept": float(ratios[keep].mean()) if keep.any() else 0.0,
+        "parameters": {
+            "min_projected": min_projected,
+            "min_hits": min_hits,
+            "min_hit_ratio": float(args.consistency_min_hit_ratio),
+            "min_probability": float(args.consistency_min_probability),
+            "max_frames": max_frames,
+        },
+        "frames": frame_reports,
+    }
+
+
 def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int:
     np = import_numpy()
     import_open3d()
@@ -15155,11 +15256,15 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
     semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
     output_dir = ensure_dir(resolve_project_relative_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "semantic_3dgs_object_meshes"))
     sim_objects_dir = ensure_dir(project_root / manifest["simulator_assets_dir"] / "objects")
+    mask_root = resolve_project_cli_path(args.mask_root, project_root) if args.mask_root else resolve_active_mask_root(project_root, manifest)
+    camera_info_path = resolve_project_cli_path(args.camera_info, project_root) if args.camera_info else (project_root / manifest["scene"]["camera_info"])
     requested = {slugify(value) for value in (args.object_ids or [])}
     object_table, _object_id_to_semantic, records_by_id = object_table_from_records(project_root, manifest)
     points, labels, colors = read_semantic_ply(semantic_ply)
     probabilities_raw = read_ascii_ply_float_property(semantic_ply, "object_probability")
     probabilities = np.asarray(probabilities_raw if probabilities_raw is not None else np.ones(points.shape[0]), dtype=np.float32)
+    records_by_object = mask_records_by_object(mask_root) if bool(args.mask_consistency_filter) else {}
+    camera_info = load_camera_info(camera_info_path) if bool(args.mask_consistency_filter) else {}
 
     reconstructed: dict[str, Any] = {}
     failed: dict[str, Any] = {}
@@ -15193,6 +15298,16 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
         object_mesh_dir = ensure_dir(output_dir / object_id)
         mesh_path = object_mesh_dir / f"{object_id}.{args.format}"
         try:
+            mask_consistency = None
+            if bool(args.mask_consistency_filter):
+                selected_points, selected_colors, mask_consistency = filter_points_by_multiview_mask_consistency(
+                    selected_points,
+                    selected_colors,
+                    object_id,
+                    records_by_object,
+                    camera_info,
+                    args,
+                )
             quantile_crop = None
             if bool(args.crop_to_quantile_bbox):
                 selected_points, selected_colors, quantile_crop = filter_points_by_quantile_bbox(
@@ -15256,6 +15371,7 @@ def cmd_reconstruct_semantic_3dgs_object_meshes(args: argparse.Namespace) -> int
                     **reconstruction,
                     "selected_semantic_points": int(selected.sum()),
                     "points_after_quantile_crop": int(selected_points.shape[0]),
+                    "mask_consistency": mask_consistency,
                     "quantile_crop": quantile_crop,
                     "pca_crop": pca_crop,
                     "dbscan_filter": dbscan_filter,
@@ -34601,6 +34717,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_project_arg(p)
     p.add_argument("--semantic-splats-ply", type=Path, help="Semantic 3DGS PLY with object_id. Defaults to artifacts.semantic_splats_ply.")
     p.add_argument("--semantic-manifest", type=Path, help="Semantic manifest with object_id_to_semantic. Defaults to artifacts.semantic_splats_manifest.")
+    p.add_argument("--camera-info", type=Path, help="Defaults to scene/cameras/camera_info.json when --mask-consistency-filter is enabled.")
+    p.add_argument("--mask-root", type=Path, help="Defaults to the active masks/2d root when --mask-consistency-filter is enabled.")
     p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_3dgs_object_meshes.")
     p.add_argument("--object-ids", nargs="+", help="Optional object ids to reconstruct. Defaults to all foreground objects.")
     p.add_argument("--method", choices=["auto", "poisson", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="poisson")
@@ -34608,6 +34726,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-probability", type=float, default=0.5)
     p.add_argument("--min-points", type=int, default=200)
     p.add_argument("--max-points", type=int, default=0)
+    p.add_argument("--mask-consistency-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--consistency-max-frames", type=int, default=12)
+    p.add_argument("--consistency-min-probability", type=float, default=0.5)
+    p.add_argument("--consistency-min-projected", type=int, default=2)
+    p.add_argument("--consistency-min-hits", type=int, default=2)
+    p.add_argument("--consistency-min-hit-ratio", type=float, default=0.4)
+    p.add_argument("--consistency-fallback-keep-original", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--probability-scale", type=float, default=255.0)
+    p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--min-extent", type=float, default=0.03)
     p.add_argument("--bbox-padding-ratio", type=float, default=0.02)
     p.add_argument("--crop-to-quantile-bbox", action=argparse.BooleanOptionalAction, default=True)
