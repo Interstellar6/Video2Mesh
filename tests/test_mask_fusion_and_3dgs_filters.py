@@ -2,6 +2,8 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from video2mesh.cli import (
     apply_3dgs_sparse_filter,
     export_viewer_plys,
@@ -9,6 +11,7 @@ from video2mesh.cli import (
     make_object_masks_exclusive,
     parse_ply_vertex_header,
     prepare_3dgs_colmap_source,
+    scaled_intrinsic_for_size,
     select_colmap_sparse_model,
     source_labels_from_object_masks,
     write_json,
@@ -282,3 +285,23 @@ def test_export_viewer_plys_keeps_semantic_labels_out_of_supersplat_ply(tmp_path
     payload = json.loads(sidecar.read_text(encoding="utf-8"))
     assert payload["object_id"] == [3, 4]
     assert payload["object_probability"] == [0.8999999761581421, 0.800000011920929]
+
+
+def test_scaled_intrinsic_for_size_scales_focal_length_and_principal_point():
+    intrinsic = {
+        "w": 1280,
+        "h": 720,
+        "fx": 640.0,
+        "fy": 680.0,
+        "cx": 640.0,
+        "cy": 360.0,
+    }
+
+    scaled = scaled_intrinsic_for_size(intrinsic, 432, 768)
+
+    assert scaled["w"] == 432
+    assert scaled["h"] == 768
+    assert scaled["fx"] == 216.0
+    assert scaled["fy"] == pytest.approx(725.3333333333333)
+    assert scaled["cx"] == 216.0
+    assert scaled["cy"] == 384.0

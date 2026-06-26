@@ -3939,9 +3939,28 @@ def load_frame_tensor(path: Path, width: int, height: int, device: str):
         return torch.tensor(image.tolist(), device=device, dtype=torch.float32)
 
 
-def camera_tensors_for_frame(camera_info: dict[str, Any], frame_id: str, extrinsic_type: str, device: str):
+def scaled_intrinsic_for_size(intrinsic: dict[str, Any], width: int | None, height: int | None) -> dict[str, Any]:
+    target_width = int(width or intrinsic["w"])
+    target_height = int(height or intrinsic["h"])
+    source_width = float(intrinsic["w"])
+    source_height = float(intrinsic["h"])
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("Camera intrinsic width/height must be positive.")
+    scale_x = float(target_width) / source_width
+    scale_y = float(target_height) / source_height
+    scaled = dict(intrinsic)
+    scaled["w"] = target_width
+    scaled["h"] = target_height
+    scaled["fx"] = float(intrinsic["fx"]) * scale_x
+    scaled["fy"] = float(intrinsic.get("fy", intrinsic["fx"])) * scale_y
+    scaled["cx"] = float(intrinsic["cx"]) * scale_x
+    scaled["cy"] = float(intrinsic["cy"]) * scale_y
+    return scaled
+
+
+def camera_tensors_for_frame(camera_info: dict[str, Any], frame_id: str, extrinsic_type: str, device: str, width: int | None = None, height: int | None = None):
     torch, _gsplat = import_torch_and_gsplat()
-    intrinsic = intrinsic_for_frame(camera_info, frame_id)
+    intrinsic = scaled_intrinsic_for_size(intrinsic_for_frame(camera_info, frame_id), width, height)
     extrinsic = resolve_extrinsic(camera_info["extrinsic"], frame_id)
     if extrinsic is None:
         raise ValueError(f"Missing camera extrinsic for frame {frame_id}")
@@ -4025,9 +4044,10 @@ def cmd_train_gsplat(args: argparse.Namespace) -> int:
     frame_records = []
     for frame_path in frames:
         frame_id = frame_id_for_path(frame_path)
-        intrinsic, viewmat, K = camera_tensors_for_frame(camera_info, frame_id, args.extrinsic_type, device)
-        target_width = int(args.width or intrinsic["w"])
-        target_height = int(args.height or intrinsic["h"])
+        base_intrinsic = intrinsic_for_frame(camera_info, frame_id)
+        target_width = int(args.width or base_intrinsic["w"])
+        target_height = int(args.height or base_intrinsic["h"])
+        intrinsic, viewmat, K = camera_tensors_for_frame(camera_info, frame_id, args.extrinsic_type, device, target_width, target_height)
         target = load_frame_tensor(frame_path, target_width, target_height, device)
         frame_records.append(
             {
@@ -4212,9 +4232,10 @@ def cmd_render_gsplat_preview(args: argparse.Namespace) -> int:
     with torch.no_grad():
         for frame_path in frames:
             frame_id = frame_id_for_path(frame_path)
-            intrinsic, viewmat, K = camera_tensors_for_frame(camera_info, frame_id, args.extrinsic_type, device)
-            width = int(args.width or intrinsic["w"])
-            height = int(args.height or intrinsic["h"])
+            base_intrinsic = intrinsic_for_frame(camera_info, frame_id)
+            width = int(args.width or base_intrinsic["w"])
+            height = int(args.height or base_intrinsic["h"])
+            intrinsic, viewmat, K = camera_tensors_for_frame(camera_info, frame_id, args.extrinsic_type, device, width, height)
             target = load_frame_tensor(frame_path, width, height, device)
             background = target.reshape(-1, 3).mean(dim=0, keepdim=True) if args.background == "target_mean" else None
             if args.background == "white":
