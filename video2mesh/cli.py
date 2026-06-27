@@ -1250,12 +1250,19 @@ def read_colmap_text_images(path: Path, frame_id_regex: str | None = None) -> di
             line = raw_line.strip()
             if line.startswith("#"):
                 continue
+            if pending_image is not None:
+                if not line:
+                    frame_id = image_name_to_frame_id(pending_image["name"], frame_id_regex)
+                    images[frame_id] = pending_image
+                    pending_image = None
+                    continue
+                frame_id = image_name_to_frame_id(pending_image["name"], frame_id_regex)
+                images[frame_id] = pending_image
+                pending_image = None
+                continue
             parts = line.split()
             is_image_line = len(parts) >= 10 and parts[0].lstrip("-").isdigit()
             if is_image_line:
-                if pending_image is not None:
-                    frame_id = image_name_to_frame_id(pending_image["name"], frame_id_regex)
-                    images[frame_id] = pending_image
                 image_id = parts[0]
                 qvec = [float(value) for value in parts[1:5]]
                 tvec = [float(value) for value in parts[5:8]]
@@ -1268,10 +1275,6 @@ def read_colmap_text_images(path: Path, frame_id_regex: str | None = None) -> di
                     "qvec": qvec,
                     "tvec": tvec,
                 }
-            elif pending_image is not None:
-                frame_id = image_name_to_frame_id(pending_image["name"], frame_id_regex)
-                images[frame_id] = pending_image
-                pending_image = None
         if pending_image is not None:
             frame_id = image_name_to_frame_id(pending_image["name"], frame_id_regex)
             images[frame_id] = pending_image
@@ -2566,6 +2569,26 @@ def command_from_template(template: str, values: dict[str, str]) -> str:
         raise ValueError(f"Unknown run-3dgs template variable {exc}. Available: {available}") from exc
 
 
+def graphdeco_shape_regularizer_args(args: argparse.Namespace, prefix: str = "") -> list[str]:
+    attr_prefix = prefix.replace("-", "_")
+    if not bool(getattr(args, f"{attr_prefix}shape_regularizer", False)):
+        return []
+    items: list[str] = ["--v2m_shape_regularizer"]
+    for name in [
+        "shape_interval",
+        "shape_from_iter",
+        "shape_until_iter",
+        "shape_max_scale",
+        "shape_max_scale_ratio",
+        "shape_max_elongation",
+        "shape_split_children",
+        "shape_max_points_per_interval",
+        "shape_split_scale_divisor",
+    ]:
+        items.extend([f"--v2m_{name}", str(getattr(args, f"{attr_prefix}{name}"))])
+    return items
+
+
 def filter_colmap_points3d_file(
     src: Path,
     dst: Path,
@@ -2645,6 +2668,119 @@ def apply_3dgs_sparse_filter(source_path: Path, args: argparse.Namespace) -> dic
     return report
 
 
+def background_plane_protection_mask(
+    points,
+    *,
+    up_axis: str,
+    max_planes: int,
+    min_points: int,
+    distance_threshold: float,
+    num_iterations: int,
+    refine_iterations: int,
+    max_ransac_points: int,
+    max_fit_points: int,
+    horizontal_alignment: float,
+    wall_up_alignment: float,
+    floor_ceiling_quantile: float,
+    seed: int,
+) -> tuple[Any, dict[str, Any]]:
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    count = int(points_np.shape[0])
+    protected = np.zeros(count, dtype=bool)
+    parameters = {
+        "up_axis": up_axis,
+        "max_planes": int(max_planes),
+        "min_points": int(min_points),
+        "distance_threshold": float(distance_threshold),
+        "num_iterations": int(num_iterations),
+        "refine_iterations": int(refine_iterations),
+        "max_ransac_points": int(max_ransac_points),
+        "max_fit_points": int(max_fit_points),
+        "horizontal_alignment": float(horizontal_alignment),
+        "wall_up_alignment": float(wall_up_alignment),
+        "floor_ceiling_quantile": float(floor_ceiling_quantile),
+        "seed": int(seed),
+    }
+    report: dict[str, Any] = {
+        "enabled": True,
+        "parameters": parameters,
+        "protected_count": 0,
+        "planes": [],
+    }
+    if count < max(3, int(min_points)):
+        report["reason"] = f"{count} Gaussian(s), below --background-plane-min-points {min_points}"
+        return protected, report
+    if int(max_planes) <= 0:
+        report["reason"] = "--background-plane-max-planes <= 0"
+        return protected, report
+    if float(distance_threshold) <= 0:
+        raise ValueError("--background-plane-distance-threshold must be positive")
+
+    up = axis_index(up_axis)
+    rng = np.random.default_rng(int(seed))
+    active = np.ones(count, dtype=bool)
+    ransac_args = argparse.Namespace(
+        distance_threshold=float(distance_threshold),
+        num_iterations=int(num_iterations),
+        refine_iterations=int(refine_iterations),
+        max_ransac_points=int(max_ransac_points),
+        max_fit_points=int(max_fit_points),
+        horizontal_alignment=float(horizontal_alignment),
+        wall_up_alignment=float(wall_up_alignment),
+        floor_ceiling_quantile=float(floor_ceiling_quantile),
+    )
+
+    for plane_index in range(int(max_planes)):
+        candidate_indices = np.flatnonzero(active)
+        if candidate_indices.size < int(min_points):
+            report["planes"].append(
+                {
+                    "plane_index": plane_index,
+                    "status": "stopped",
+                    "reason": f"{candidate_indices.size} active Gaussian(s), below min_points {min_points}",
+                }
+            )
+            break
+        result = ransac_plane_from_indices(points_np, candidate_indices, ransac_args, rng)
+        if result is None:
+            report["planes"].append({"plane_index": plane_index, "status": "stopped", "reason": "no valid plane found"})
+            break
+        indices = np.asarray(result["indices"], dtype=np.int64)
+        if indices.size < int(min_points):
+            report["planes"].append(
+                {
+                    "plane_index": plane_index,
+                    "status": "stopped",
+                    "reason": f"{indices.size} inlier Gaussian(s), below min_points {min_points}",
+                    "candidate_count": int(result["candidate_count"]),
+                }
+            )
+            break
+
+        plane_info = classify_ransac_plane(points_np, indices, result["plane_model"], up, ransac_args)
+        category = str(plane_info["category"])
+        should_protect = category in {"floor", "ceiling", "wall"}
+        if should_protect:
+            protected[indices] = True
+        active[indices] = False
+        report["planes"].append(
+            {
+                "plane_index": plane_index,
+                "status": "protected" if should_protect else "skipped",
+                "category": category,
+                "inlier_count": int(indices.size),
+                "candidate_count": int(result["candidate_count"]),
+                "up_alignment": plane_info["up_alignment"],
+                "mean_abs_distance": result["mean_abs_distance"],
+                "max_abs_distance": result["max_abs_distance"],
+            }
+        )
+
+    report["protected_count"] = int(protected.sum())
+    return protected, report
+
+
 def clean_3dgs_floaters(
     input_ply: Path,
     output_ply: Path,
@@ -2655,6 +2791,19 @@ def clean_3dgs_floaters(
     min_opacity: float,
     low_opacity: float,
     remove_low_opacity: bool,
+    preserve_background_planes: bool = False,
+    background_up_axis: str = "y",
+    background_max_planes: int = 8,
+    background_min_points: int = 300,
+    background_distance_threshold: float = 0.04,
+    background_num_iterations: int = 1500,
+    background_refine_iterations: int = 2,
+    background_max_ransac_points: int = 120000,
+    background_max_fit_points: int = 50000,
+    background_horizontal_alignment: float = 0.82,
+    background_wall_up_alignment: float = 0.35,
+    background_floor_ceiling_quantile: float = 0.18,
+    background_seed: int = 7,
 ) -> dict[str, Any]:
     np = import_numpy()
     o3d = import_open3d()
@@ -2692,6 +2841,27 @@ def clean_3dgs_floaters(
     remove = geometric_outlier | (elongated & weak)
     if remove_low_opacity:
         remove |= transparent
+    candidate_remove = remove.copy()
+    background_plane_report: dict[str, Any] = {"enabled": False}
+    if preserve_background_planes:
+        protected, background_plane_report = background_plane_protection_mask(
+            means,
+            up_axis=background_up_axis,
+            max_planes=int(background_max_planes),
+            min_points=int(background_min_points),
+            distance_threshold=float(background_distance_threshold),
+            num_iterations=int(background_num_iterations),
+            refine_iterations=int(background_refine_iterations),
+            max_ransac_points=int(background_max_ransac_points),
+            max_fit_points=int(background_max_fit_points),
+            horizontal_alignment=float(background_horizontal_alignment),
+            wall_up_alignment=float(background_wall_up_alignment),
+            floor_ceiling_quantile=float(background_floor_ceiling_quantile),
+            seed=int(background_seed),
+        )
+        protected_removed = remove & protected
+        remove = remove & ~protected
+        background_plane_report["suppressed_removal_count"] = int(protected_removed.sum())
     keep = ~remove
     kept = write_filtered_vertex_ply(input_ply, output_ply, keep)
     report = {
@@ -2701,6 +2871,7 @@ def clean_3dgs_floaters(
         "input_count": count,
         "kept_count": int(kept),
         "removed_count": int(remove.sum()),
+        "candidate_removed_count": int(candidate_remove.sum()),
         "removed_ratio": float(remove.sum() / count),
         "parameters": {
             "knn": int(knn),
@@ -2709,7 +2880,9 @@ def clean_3dgs_floaters(
             "min_opacity": float(min_opacity),
             "low_opacity": float(low_opacity),
             "remove_low_opacity": bool(remove_low_opacity),
+            "preserve_background_planes": bool(preserve_background_planes),
         },
+        "background_plane_protection": background_plane_report,
         "geometry_outlier": {
             "removed_count": int(geometric_outlier.sum()),
             "median_mean_neighbor_distance": median_distance,
@@ -2747,6 +2920,19 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
         min_opacity=float(args.min_opacity),
         low_opacity=float(args.low_opacity),
         remove_low_opacity=bool(args.remove_low_opacity),
+        preserve_background_planes=bool(args.preserve_background_planes),
+        background_up_axis=args.background_up_axis,
+        background_max_planes=int(args.background_max_planes),
+        background_min_points=int(args.background_min_points),
+        background_distance_threshold=float(args.background_distance_threshold),
+        background_num_iterations=int(args.background_num_iterations),
+        background_refine_iterations=int(args.background_refine_iterations),
+        background_max_ransac_points=int(args.background_max_ransac_points),
+        background_max_fit_points=int(args.background_max_fit_points),
+        background_horizontal_alignment=float(args.background_horizontal_alignment),
+        background_wall_up_alignment=float(args.background_wall_up_alignment),
+        background_floor_ceiling_quantile=float(args.background_floor_ceiling_quantile),
+        background_seed=int(args.background_seed),
     )
     report_path = resolve_project_relative_path(args.report, project_root) if args.report else output_ply.with_suffix(".clean_report.json")
     write_json(report_path, report)
@@ -2930,10 +3116,17 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
         "status": "prepared",
         "source_report": source_report,
         "sparse_point_filter": sparse_filter_report,
+        "graphdeco_shape_regularizer": {
+            "enabled": bool(getattr(args, "shape_regularizer", False)),
+            "args": graphdeco_shape_regularizer_args(args),
+        },
         "notes": "COLMAP-style source prepared. Provide --command-template to launch an external 3DGS trainer.",
     }
 
     command = command_from_template(args.command_template, command_values) if args.command_template else None
+    regularizer_args = graphdeco_shape_regularizer_args(args)
+    if command and regularizer_args:
+        command = command + " " + " ".join(shlex.quote(value) for value in regularizer_args)
     if command:
         run_manifest["command"] = command
         if args.prepare_only:
@@ -2994,6 +3187,19 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
             min_opacity=float(args.clean_min_opacity),
             low_opacity=float(args.clean_low_opacity),
             remove_low_opacity=bool(args.clean_remove_low_opacity),
+            preserve_background_planes=bool(getattr(args, "clean_preserve_background_planes", False)),
+            background_up_axis=str(getattr(args, "clean_background_up_axis", "y")),
+            background_max_planes=int(getattr(args, "clean_background_max_planes", 8)),
+            background_min_points=int(getattr(args, "clean_background_min_points", 300)),
+            background_distance_threshold=float(getattr(args, "clean_background_distance_threshold", 0.04)),
+            background_num_iterations=int(getattr(args, "clean_background_num_iterations", 1500)),
+            background_refine_iterations=int(getattr(args, "clean_background_refine_iterations", 2)),
+            background_max_ransac_points=int(getattr(args, "clean_background_max_ransac_points", 120000)),
+            background_max_fit_points=int(getattr(args, "clean_background_max_fit_points", 50000)),
+            background_horizontal_alignment=float(getattr(args, "clean_background_horizontal_alignment", 0.82)),
+            background_wall_up_alignment=float(getattr(args, "clean_background_wall_up_alignment", 0.35)),
+            background_floor_ceiling_quantile=float(getattr(args, "clean_background_floor_ceiling_quantile", 0.18)),
+            background_seed=int(getattr(args, "clean_background_seed", 7)),
         )
         write_json(clean_report_path, clean_report)
         run_manifest["clean_3dgs_floaters"] = clean_report
@@ -34607,6 +34813,29 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     clean_min_opacity=args.g3dgs_clean_min_opacity,
                     clean_low_opacity=args.g3dgs_clean_low_opacity,
                     clean_remove_low_opacity=args.g3dgs_clean_remove_low_opacity,
+                    clean_preserve_background_planes=args.g3dgs_clean_preserve_background_planes,
+                    clean_background_up_axis=args.g3dgs_clean_background_up_axis,
+                    clean_background_max_planes=args.g3dgs_clean_background_max_planes,
+                    clean_background_min_points=args.g3dgs_clean_background_min_points,
+                    clean_background_distance_threshold=args.g3dgs_clean_background_distance_threshold,
+                    clean_background_num_iterations=args.g3dgs_clean_background_num_iterations,
+                    clean_background_refine_iterations=args.g3dgs_clean_background_refine_iterations,
+                    clean_background_max_ransac_points=args.g3dgs_clean_background_max_ransac_points,
+                    clean_background_max_fit_points=args.g3dgs_clean_background_max_fit_points,
+                    clean_background_horizontal_alignment=args.g3dgs_clean_background_horizontal_alignment,
+                    clean_background_wall_up_alignment=args.g3dgs_clean_background_wall_up_alignment,
+                    clean_background_floor_ceiling_quantile=args.g3dgs_clean_background_floor_ceiling_quantile,
+                    clean_background_seed=args.g3dgs_clean_background_seed,
+                    shape_regularizer=args.g3dgs_shape_regularizer,
+                    shape_interval=args.g3dgs_shape_interval,
+                    shape_from_iter=args.g3dgs_shape_from_iter,
+                    shape_until_iter=args.g3dgs_shape_until_iter,
+                    shape_max_scale=args.g3dgs_shape_max_scale,
+                    shape_max_scale_ratio=args.g3dgs_shape_max_scale_ratio,
+                    shape_max_elongation=args.g3dgs_shape_max_elongation,
+                    shape_split_children=args.g3dgs_shape_split_children,
+                    shape_max_points_per_interval=args.g3dgs_shape_max_points_per_interval,
+                    shape_split_scale_divisor=args.g3dgs_shape_split_scale_divisor,
                     register_mode=args.mode,
                     no_register=args.no_register_3dgs,
                 )
@@ -35328,6 +35557,20 @@ def add_common_project_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-root", type=Path, required=True, help="Video2Mesh project directory.")
 
 
+def add_graphdeco_shape_regularizer_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:
+    opt = f"--{prefix}" if prefix else "--"
+    parser.add_argument(f"{opt}shape-regularizer", action=argparse.BooleanOptionalAction, default=False, help="Enable Video2Mesh GraphDECO training-time Gaussian scale/elongation splitting.")
+    parser.add_argument(f"{opt}shape-interval", type=int, default=300)
+    parser.add_argument(f"{opt}shape-from-iter", type=int, default=-1)
+    parser.add_argument(f"{opt}shape-until-iter", type=int, default=-1)
+    parser.add_argument(f"{opt}shape-max-scale", type=float, default=0.0)
+    parser.add_argument(f"{opt}shape-max-scale-ratio", type=float, default=0.03)
+    parser.add_argument(f"{opt}shape-max-elongation", type=float, default=18.0)
+    parser.add_argument(f"{opt}shape-split-children", type=int, default=2)
+    parser.add_argument(f"{opt}shape-max-points-per-interval", type=int, default=15000)
+    parser.add_argument(f"{opt}shape-split-scale-divisor", type=float, default=1.6)
+
+
 def add_tracking_flow_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:
     opt = f"--{prefix}" if prefix else "--"
     parser.add_argument(f"{opt}tracking-mode", choices=["template", "flow"], default="template", help="BBox template tracking or dense optical-flow mask propagation.")
@@ -35508,6 +35751,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clean-min-opacity", type=float, default=0.01)
     p.add_argument("--clean-low-opacity", type=float, default=0.08)
     p.add_argument("--clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--clean-background-up-axis", choices=["x", "y", "z"], default="y")
+    p.add_argument("--clean-background-max-planes", type=int, default=8)
+    p.add_argument("--clean-background-min-points", type=int, default=300)
+    p.add_argument("--clean-background-distance-threshold", type=float, default=0.04)
+    p.add_argument("--clean-background-num-iterations", type=int, default=1500)
+    p.add_argument("--clean-background-refine-iterations", type=int, default=2)
+    p.add_argument("--clean-background-max-ransac-points", type=int, default=120000)
+    p.add_argument("--clean-background-max-fit-points", type=int, default=50000)
+    p.add_argument("--clean-background-horizontal-alignment", type=float, default=0.82)
+    p.add_argument("--clean-background-wall-up-alignment", type=float, default=0.35)
+    p.add_argument("--clean-background-floor-ceiling-quantile", type=float, default=0.18)
+    p.add_argument("--clean-background-seed", type=int, default=7)
+    add_graphdeco_shape_regularizer_args(p)
     p.add_argument("--register-mode", choices=["copy", "symlink"], default="copy")
     p.add_argument("--no-register", action="store_true", help="Do not call register-3dgs after a successful command.")
     p.set_defaults(func=cmd_run_3dgs)
@@ -35523,6 +35780,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-opacity", type=float, default=0.01)
     p.add_argument("--low-opacity", type=float, default=0.08)
     p.add_argument("--remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--preserve-background-planes", action=argparse.BooleanOptionalAction, default=False, help="Protect large RANSAC floor/wall/ceiling planes from floater removal.")
+    p.add_argument("--background-up-axis", choices=["x", "y", "z"], default="y")
+    p.add_argument("--background-max-planes", type=int, default=8)
+    p.add_argument("--background-min-points", type=int, default=300)
+    p.add_argument("--background-distance-threshold", type=float, default=0.04)
+    p.add_argument("--background-num-iterations", type=int, default=1500)
+    p.add_argument("--background-refine-iterations", type=int, default=2)
+    p.add_argument("--background-max-ransac-points", type=int, default=120000)
+    p.add_argument("--background-max-fit-points", type=int, default=50000)
+    p.add_argument("--background-horizontal-alignment", type=float, default=0.82)
+    p.add_argument("--background-wall-up-alignment", type=float, default=0.35)
+    p.add_argument("--background-floor-ceiling-quantile", type=float, default=0.18)
+    p.add_argument("--background-seed", type=int, default=7)
     p.add_argument("--register", action=argparse.BooleanOptionalAction, default=False, help="Register the cleaned PLY as artifacts.scene_3dgs_ply.")
     p.set_defaults(func=cmd_clean_3dgs_floaters)
 
@@ -37076,6 +37346,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-clean-min-opacity", type=float, default=0.01)
     p.add_argument("--g3dgs-clean-low-opacity", type=float, default=0.08)
     p.add_argument("--g3dgs-clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--g3dgs-clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--g3dgs-clean-background-up-axis", choices=["x", "y", "z"], default="y")
+    p.add_argument("--g3dgs-clean-background-max-planes", type=int, default=8)
+    p.add_argument("--g3dgs-clean-background-min-points", type=int, default=300)
+    p.add_argument("--g3dgs-clean-background-distance-threshold", type=float, default=0.04)
+    p.add_argument("--g3dgs-clean-background-num-iterations", type=int, default=1500)
+    p.add_argument("--g3dgs-clean-background-refine-iterations", type=int, default=2)
+    p.add_argument("--g3dgs-clean-background-max-ransac-points", type=int, default=120000)
+    p.add_argument("--g3dgs-clean-background-max-fit-points", type=int, default=50000)
+    p.add_argument("--g3dgs-clean-background-horizontal-alignment", type=float, default=0.82)
+    p.add_argument("--g3dgs-clean-background-wall-up-alignment", type=float, default=0.35)
+    p.add_argument("--g3dgs-clean-background-floor-ceiling-quantile", type=float, default=0.18)
+    p.add_argument("--g3dgs-clean-background-seed", type=int, default=7)
+    add_graphdeco_shape_regularizer_args(p, prefix="g3dgs-")
     p.add_argument("--no-register-3dgs", action="store_true")
     p.add_argument("--train-gsplat", action="store_true", help="Run the built-in minimal gsplat trainer and register its output.")
     p.add_argument("--gsplat-point-cloud", type=Path, help="Initialization point cloud for the built-in trainer. Defaults to the original scene/reconstruction/point_cloud.ply, not any downsampled working cloud.")

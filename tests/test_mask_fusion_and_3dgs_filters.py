@@ -30,12 +30,14 @@ from video2mesh.cli import (
     export_viewer_plys,
     filter_colmap_points3d_file,
     gaussian_occupancy_mesh_from_points,
+    graphdeco_shape_regularizer_args,
     make_object_masks_exclusive,
     mesh_support_quality_report,
     parse_ply_vertex_header,
     postprocess_mesh_with_point_support,
     prepare_3dgs_colmap_source,
     quantile_bounds_from_points,
+    read_colmap_text_images,
     resolve_export_record_path,
     scaled_intrinsic_for_size,
     select_colmap_sparse_model,
@@ -129,6 +131,29 @@ def test_filter_colmap_points3d_uses_track_length_and_error(tmp_path: Path):
     assert report["total"] == 3
     assert report["kept"] == 1
     assert report["with_track"] == 3
+
+
+def test_read_colmap_text_images_skips_points2d_rows(tmp_path: Path):
+    images_txt = tmp_path / "images.txt"
+    images_txt.write_text(
+        "\n".join(
+            [
+                "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME",
+                "# POINTS2D[] as (X, Y, POINT3D_ID)",
+                "1 1 0 0 0 0 0 0 1 000000.png",
+                "1122 15.5 -1 750.5 17.5 -1",
+                "2 1 0 0 0 0.1 0 0 1 000001.png",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    images = read_colmap_text_images(images_txt)
+
+    assert sorted(images) == ["000000", "000001"]
+    assert images["000000"]["name"] == "000000.png"
+    assert images["000001"]["name"] == "000001.png"
 
 
 def test_apply_3dgs_sparse_filter_skips_ply_export_without_tracks(tmp_path: Path):
@@ -656,6 +681,74 @@ def test_clean_3dgs_floaters_removes_outliers_and_elongated_low_opacity(tmp_path
     assert report["geometry_outlier"]["removed_count"] >= 1
     assert report["elongated_low_opacity"]["removed_count"] == 1
     assert header["vertex_count"] == 4
+
+
+def test_clean_3dgs_floaters_can_preserve_background_planes(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    source = tmp_path / "splats.ply"
+    output = tmp_path / "splats_background_preserved.ply"
+    plane = np.array([[x * 0.03, 0.0, z * 0.03] for x in range(4) for z in range(4)], dtype=np.float32)
+    means = np.vstack([plane, np.array([[10.0, 10.0, 10.0]], dtype=np.float32)])
+    scales = np.ones((means.shape[0], 3), dtype=np.float32) * 0.02
+    scales[: plane.shape[0]] = np.array([1.0, 0.01, 0.01], dtype=np.float32)
+    opacities = np.ones(means.shape[0], dtype=np.float32) * 0.6
+    opacities[: plane.shape[0]] = 0.02
+    write_supersplat_ply(
+        source,
+        means,
+        np.ones((means.shape[0], 3), dtype=np.float32) * 0.5,
+        opacities,
+        scales,
+        np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (means.shape[0], 1)),
+    )
+
+    report = clean_3dgs_floaters(
+        source,
+        output,
+        knn=2,
+        outlier_mad=2.0,
+        max_elongation=25.0,
+        min_opacity=0.01,
+        low_opacity=0.08,
+        remove_low_opacity=False,
+        preserve_background_planes=True,
+        background_up_axis="y",
+        background_max_planes=1,
+        background_min_points=8,
+        background_distance_threshold=0.001,
+        background_num_iterations=100,
+        background_refine_iterations=1,
+        background_max_ransac_points=0,
+        background_max_fit_points=0,
+    )
+    header = parse_ply_vertex_header(output)
+
+    assert report["candidate_removed_count"] >= plane.shape[0] + 1
+    assert report["background_plane_protection"]["protected_count"] == plane.shape[0]
+    assert report["background_plane_protection"]["suppressed_removal_count"] == plane.shape[0]
+    assert report["removed_count"] == 1
+    assert header["vertex_count"] == plane.shape[0]
+
+
+def test_graphdeco_shape_regularizer_args_supports_cli_prefix():
+    args = Namespace(
+        g3dgs_shape_regularizer=True,
+        g3dgs_shape_interval=300,
+        g3dgs_shape_from_iter=1200,
+        g3dgs_shape_until_iter=5000,
+        g3dgs_shape_max_scale=0.0,
+        g3dgs_shape_max_scale_ratio=0.03,
+        g3dgs_shape_max_elongation=18.0,
+        g3dgs_shape_split_children=2,
+        g3dgs_shape_max_points_per_interval=8000,
+        g3dgs_shape_split_scale_divisor=1.6,
+    )
+
+    items = graphdeco_shape_regularizer_args(args, prefix="g3dgs-")
+
+    assert items[:1] == ["--v2m_shape_regularizer"]
+    assert "--v2m_shape_max_scale_ratio" in items
+    assert "0.03" in items
 
 
 def test_augment_points_from_gaussian_support_adds_oriented_axis_samples():
