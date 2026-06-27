@@ -2584,6 +2584,7 @@ def graphdeco_shape_regularizer_args(args: argparse.Namespace, prefix: str = "")
         "shape_split_children",
         "shape_max_points_per_interval",
         "shape_split_scale_divisor",
+        "shape_opacity_mode",
     ]:
         items.extend([f"--v2m_{name}", str(getattr(args, f"{attr_prefix}{name}"))])
     return items
@@ -34836,6 +34837,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     shape_split_children=args.g3dgs_shape_split_children,
                     shape_max_points_per_interval=args.g3dgs_shape_max_points_per_interval,
                     shape_split_scale_divisor=args.g3dgs_shape_split_scale_divisor,
+                    shape_opacity_mode=args.g3dgs_shape_opacity_mode,
                     register_mode=args.mode,
                     no_register=args.no_register_3dgs,
                 )
@@ -35569,6 +35571,12 @@ def add_graphdeco_shape_regularizer_args(parser: argparse.ArgumentParser, prefix
     parser.add_argument(f"{opt}shape-split-children", type=int, default=2)
     parser.add_argument(f"{opt}shape-max-points-per-interval", type=int, default=15000)
     parser.add_argument(f"{opt}shape-split-scale-divisor", type=float, default=1.6)
+    parser.add_argument(
+        f"{opt}shape-opacity-mode",
+        choices=["preserve_alpha", "divide_alpha", "copy"],
+        default="preserve_alpha",
+        help="How child Gaussian opacity is initialized when splitting oversized/elongated splats.",
+    )
 
 
 def add_tracking_flow_args(parser: argparse.ArgumentParser, prefix: str = "") -> None:

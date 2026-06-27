@@ -742,6 +742,7 @@ def test_graphdeco_shape_regularizer_args_supports_cli_prefix():
         g3dgs_shape_split_children=2,
         g3dgs_shape_max_points_per_interval=8000,
         g3dgs_shape_split_scale_divisor=1.6,
+        g3dgs_shape_opacity_mode="preserve_alpha",
     )
 
     items = graphdeco_shape_regularizer_args(args, prefix="g3dgs-")
@@ -749,6 +750,18 @@ def test_graphdeco_shape_regularizer_args_supports_cli_prefix():
     assert items[:1] == ["--v2m_shape_regularizer"]
     assert "--v2m_shape_max_scale_ratio" in items
     assert "0.03" in items
+    assert "--v2m_shape_opacity_mode" in items
+    assert "preserve_alpha" in items
+
+
+def test_graphdeco_shape_regularizer_patch_preserves_alpha_and_device():
+    patch_text = Path("tools/patch_graphdeco_shape_regularizer.py").read_text(encoding="utf-8")
+
+    assert "regularizer_version" in patch_text
+    assert "preserve_alpha" in patch_text
+    assert "child_alpha = 1.0 - torch.pow(1.0 - selected_alpha" in patch_text
+    assert 'device = self.get_xyz.device' in patch_text
+    assert 'torch.zeros((n_init_points), device=device)' in patch_text
 
 
 def test_augment_points_from_gaussian_support_adds_oriented_axis_samples():

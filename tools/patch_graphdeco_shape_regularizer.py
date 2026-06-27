@@ -44,6 +44,7 @@ def maybe_run_v2m_shape_regularizer(gaussians, opt, scene, iteration):
         split_children=int(getattr(opt, "v2m_shape_split_children", 2) or 2),
         max_points=int(getattr(opt, "v2m_shape_max_points_per_interval", 20000) or 0),
         split_scale_divisor=float(getattr(opt, "v2m_shape_split_scale_divisor", 1.6) or 1.6),
+        opacity_mode=str(getattr(opt, "v2m_shape_opacity_mode", "preserve_alpha") or "preserve_alpha"),
     )
     if int(report.get("selected_count", 0) or 0) <= 0:
         return
@@ -75,10 +76,14 @@ MODEL_METHOD = f'''
         split_children: int = 2,
         max_points: int = 20000,
         split_scale_divisor: float = 1.6,
+        opacity_mode: str = "preserve_alpha",
     ):
         n_init_points = int(self.get_xyz.shape[0])
+        device = self.get_xyz.device
         report = {{
             "enabled": True,
+            "regularizer_version": 2,
+            "strategy": "split_prune_continue_training",
             "initial_count": n_init_points,
             "selected_count": 0,
             "new_count": 0,
@@ -88,6 +93,7 @@ MODEL_METHOD = f'''
             "split_children": int(split_children),
             "max_points": int(max_points),
             "split_scale_divisor": float(split_scale_divisor),
+            "opacity_mode": str(opacity_mode),
         }}
         if n_init_points <= 0 or (float(max_scale) <= 0 and float(max_elongation) <= 0):
             report["reason"] = "disabled_or_empty"
@@ -106,13 +112,15 @@ MODEL_METHOD = f'''
         if float(max_elongation) > 0:
             elongated = elongation > float(max_elongation)
             score = torch.maximum(score, elongation / float(max_elongation))
-        selected_pts_mask = torch.logical_or(oversized, elongated)
+        finite_mask = torch.isfinite(self.get_xyz).all(dim=1) & torch.isfinite(scales).all(dim=1)
+        selected_pts_mask = torch.logical_and(torch.logical_or(oversized, elongated), finite_mask)
         selected_count = int(selected_pts_mask.sum().item())
         report.update(
             {{
                 "candidate_count": selected_count,
                 "oversized_count": int(oversized.sum().item()),
                 "elongated_count": int(elongated.sum().item()),
+                "non_finite_count": int((~finite_mask).sum().item()),
                 "max_scale_observed": float(max_axis.max().item()) if n_init_points else 0.0,
                 "max_elongation_observed": float(elongation.max().item()) if n_init_points else 0.0,
             }}
@@ -134,6 +142,7 @@ MODEL_METHOD = f'''
 
         split_children = max(2, int(split_children))
         split_scale_divisor = max(float(split_scale_divisor), 1e-6)
+        opacity_mode = str(opacity_mode or "preserve_alpha").lower()
         selected_scales = scales[selected_pts_mask]
         selected_xyz = self.get_xyz[selected_pts_mask]
         selected_rotation = self._rotation[selected_pts_mask]
@@ -166,27 +175,44 @@ MODEL_METHOD = f'''
         new_rotation = selected_rotation.repeat_interleave(split_children, dim=0)
         new_features_dc = self._features_dc[selected_pts_mask].repeat_interleave(split_children, dim=0)
         new_features_rest = self._features_rest[selected_pts_mask].repeat_interleave(split_children, dim=0)
-        new_opacity = self._opacity[selected_pts_mask].repeat_interleave(split_children, dim=0)
+        selected_alpha = torch.clamp(self.get_opacity[selected_pts_mask], min=1e-6, max=1.0 - 1e-6)
+        if opacity_mode in ("copy", "duplicate"):
+            child_alpha = selected_alpha
+        elif opacity_mode in ("divide", "divide_alpha", "mean"):
+            child_alpha = torch.clamp(selected_alpha / float(split_children), min=1e-6, max=1.0 - 1e-6)
+        else:
+            opacity_mode = "preserve_alpha"
+            child_alpha = 1.0 - torch.pow(1.0 - selected_alpha, 1.0 / float(split_children))
+            child_alpha = torch.clamp(child_alpha, min=1e-6, max=1.0 - 1e-6)
+        new_opacity = self.inverse_opacity_activation(child_alpha).repeat_interleave(split_children, dim=0)
 
         old_tmp_radii = getattr(self, "tmp_radii", None)
         if old_tmp_radii is None or old_tmp_radii.shape[0] != n_init_points:
-            self.tmp_radii = torch.zeros((n_init_points), device="cuda")
+            self.tmp_radii = torch.zeros((n_init_points), device=device)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat_interleave(split_children)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
         prune_filter = torch.cat(
             (
                 selected_pts_mask,
-                torch.zeros(selected_count * split_children, device="cuda", dtype=torch.bool),
+                torch.zeros(selected_count * split_children, device=device, dtype=torch.bool),
             )
         )
         self.prune_points(prune_filter)
         self.tmp_radii = None
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         report["selected_count"] = selected_count
         report["new_count"] = int(selected_count * split_children)
         report["final_count"] = int(self.get_xyz.shape[0])
+        report["opacity_mode"] = opacity_mode
+        report["target_max_scale_observed"] = float(target_scales.max().item()) if selected_count else 0.0
+        report["target_max_elongation_observed"] = (
+            float((target_scales.max(dim=1).values / torch.clamp(target_scales.min(dim=1).values, min=1e-12)).max().item())
+            if selected_count
+            else 0.0
+        )
         return report
     {MODEL_MARKER.replace("BEGIN", "END")}
 '''
@@ -203,6 +229,7 @@ ARGS_SNIPPET = f'''        {ARGS_MARKER}
         self.v2m_shape_split_children = 2
         self.v2m_shape_max_points_per_interval = 20000
         self.v2m_shape_split_scale_divisor = 1.6
+        self.v2m_shape_opacity_mode = "preserve_alpha"
         {ARGS_MARKER.replace("BEGIN", "END")}
 '''
 
