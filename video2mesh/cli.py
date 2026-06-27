@@ -15235,8 +15235,9 @@ def cmd_reconstruct_object_meshes(args: argparse.Namespace) -> int:
                 points_array = np.asarray(points, dtype=np.float64)
                 if points_array.ndim != 2 or points_array.shape[1] != 3:
                     raise ValueError(f"Expected Nx3 points, got shape {points_array.shape}")
-                if points_array.shape[0] < max(1, int(args.min_points)):
-                    raise ValueError(f"Only {points_array.shape[0]} point(s), below --min-points {args.min_points}")
+                if points_array.shape[0] < 1:
+                    raise ValueError("No points available for bbox mesh fallback.")
+                sparse_bbox_fallback = points_array.shape[0] < max(1, int(args.min_points))
                 mins = points_array.min(axis=0)
                 maxs = points_array.max(axis=0)
                 center = (mins + maxs) / 2.0
@@ -15250,8 +15251,15 @@ def cmd_reconstruct_object_meshes(args: argparse.Namespace) -> int:
                         "filtered_point_count": int(points_array.shape[0]),
                         "spacing_estimate": None,
                         "generator": "light_obj_fallback",
+                        "sparse_bbox_fallback": bool(sparse_bbox_fallback),
+                        "min_points": int(args.min_points),
                     }
                 )
+                if sparse_bbox_fallback:
+                    detail["fallback_reason"] = (
+                        f"Only {points_array.shape[0]} point(s), below --min-points {args.min_points}; "
+                        "wrote minimum-extent bbox mesh."
+                    )
                 reconstruction = {"selected": detail, "attempts": [detail]}
             else:
                 mesh, reconstruction = reconstruct_mesh_from_object_points(points, colors, args)

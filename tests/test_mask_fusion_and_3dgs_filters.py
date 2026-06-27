@@ -14,6 +14,7 @@ from video2mesh.cli import (
     clean_3dgs_floaters,
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
+    cmd_reconstruct_object_meshes,
     depth_to_normal_map,
     filter_points_by_dbscan_largest_cluster,
     filter_points_by_gaussian_attributes,
@@ -43,6 +44,7 @@ from video2mesh.cli import (
     select_colmap_sparse_model,
     source_labels_from_object_masks,
     write_json,
+    write_point_cloud_ascii_ply,
     write_supersplat_ply,
 )
 
@@ -762,6 +764,69 @@ def test_graphdeco_shape_regularizer_patch_preserves_alpha_and_device():
     assert "child_alpha = 1.0 - torch.pow(1.0 - selected_alpha" in patch_text
     assert 'device = self.get_xyz.device' in patch_text
     assert 'torch.zeros((n_init_points), device=device)' in patch_text
+
+
+def test_reconstruct_bbox_mesh_allows_sparse_mask_cloud(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    project_root = tmp_path / "project"
+    object_id = "gdino_object_tiny_lamp"
+    objects_dir = project_root / "objects" / object_id
+    mask_cloud = project_root / "simulator_assets" / "object_masks_3d" / f"{object_id}.ply"
+    write_json(
+        project_root / "manifest.json",
+        {
+            "objects_dir": "objects",
+            "simulator_assets_dir": "simulator_assets",
+            "artifacts": {},
+            "external_stages": {},
+        },
+    )
+    write_json(
+        objects_dir / "object.json",
+        {
+            "object_id": object_id,
+            "category": "lamp",
+            "mask_3d_cloud": {"path": str(mask_cloud), "point_count": 3},
+        },
+    )
+    write_point_cloud_ascii_ply(
+        mask_cloud,
+        np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, 0.01, 0.0]], dtype=np.float64),
+    )
+
+    cmd_reconstruct_object_meshes(
+        Namespace(
+            project_root=project_root,
+            output_dir=None,
+            method="bbox",
+            format="obj",
+            min_points=4,
+            min_extent=0.03,
+            bbox_padding_ratio=0.05,
+            voxel_size=0.0,
+            remove_outliers=False,
+            outlier_nb_neighbors=20,
+            outlier_std_ratio=2.0,
+            alpha=None,
+            alpha_multiplier=4.0,
+            ball_radius_multipliers=[1.5, 2.5, 4.0],
+            normal_radius=None,
+            ascii=False,
+            copy_to_assets=True,
+            mode="copy",
+            skip_missing=False,
+            skip_failed=False,
+        )
+    )
+
+    mesh_index = json.loads((project_root / "simulator_assets" / "object_meshes.json").read_text(encoding="utf-8"))
+    entry = mesh_index["objects"][object_id]
+    assert mesh_index["failed_objects"] == {}
+    assert Path(entry["asset_path"]).exists()
+    selected = entry["reconstruction"]["selected"]
+    assert selected["sparse_bbox_fallback"] is True
+    assert selected["input_point_count"] == 3
+    assert selected["vertex_count"] == 8
 
 
 def test_augment_points_from_gaussian_support_adds_oriented_axis_samples():
