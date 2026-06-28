@@ -24,6 +24,18 @@ tags:
 http://127.0.0.1:8787
 ```
 
+公网和手机远程控制推荐通过 Cloudflare Tunnel 暴露为：
+
+```text
+https://api.relumeow.top
+```
+
+Tunnel 的公开 hostname 指向这台电脑上的本机服务：
+
+```text
+api.relumeow.top -> http://127.0.0.1:8787
+```
+
 第一次启动时会生成 bootstrap token。它只用于首次创建管理员账号：
 
 ```bash
@@ -38,6 +50,8 @@ V2M_API_HOST=127.0.0.1
 V2M_API_PORT=8787
 V2M_SESSION_TTL_SECONDS=604800
 V2M_GITHUB_ALLOWED_LOGINS=Interstellar6
+V2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback
+V2M_ALLOWED_WEB_ORIGINS=https://relumeow.top,http://relumeow.top
 ```
 
 ## 首次创建管理员
@@ -84,7 +98,7 @@ curl -H "Authorization: Bearer $V2M_SESSION_TOKEN" \
 先在 GitHub 创建一个 OAuth App，Authorization callback URL 填：
 
 ```text
-http://127.0.0.1:8787/api/auth/github/callback
+https://api.relumeow.top/api/auth/github/callback
 ```
 
 然后在 `docs-blog/.env` 里配置：
@@ -92,30 +106,37 @@ http://127.0.0.1:8787/api/auth/github/callback
 ```env
 V2M_GITHUB_CLIENT_ID=你的_client_id
 V2M_GITHUB_CLIENT_SECRET=你的_client_secret
-V2M_GITHUB_REDIRECT_URI=http://127.0.0.1:8787/api/auth/github/callback
+V2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback
 V2M_GITHUB_ALLOWED_LOGINS=Interstellar6
+V2M_ALLOWED_WEB_ORIGINS=https://relumeow.top,http://relumeow.top
 ```
 
-重启 API 后，管理员界面 `#/admin` 里的“GitHub 授权登录”会打开 GitHub OAuth。API 会校验 GitHub 登录名必须在 `V2M_GITHUB_ALLOWED_LOGINS` 里，默认只允许 `Interstellar6`。
+重启 API 后，管理员界面 `/admin.html` 里的“GitHub 授权登录”会打开 GitHub OAuth。API 会校验 GitHub 登录名必须在 `V2M_GITHUB_ALLOWED_LOGINS` 里，默认只允许 `Interstellar6`。
 
 ## 管理员界面
 
 公开首页只展示文档，不显示 Mac 控制台。需要远程控制时，打开：
 
 ```text
-#/admin
+/admin.html
 ```
 
 例如本地预览是：
 
 ```text
-http://127.0.0.1:8000/docs-blog/#/admin
+http://127.0.0.1:8000/docs-blog/admin.html
 ```
 
 线上个人主页是：
 
 ```text
-https://interstellar6.github.io/#/admin
+https://relumeow.top/admin.html
+```
+
+管理员界面里的 API 地址填：
+
+```text
+https://api.relumeow.top
 ```
 
 ## 让 Codex 同步一篇文档
@@ -211,23 +232,35 @@ curl -X PATCH \
 python3 docs-blog/codex_queue.py patch task-id --status done --summary "已完成并同步到网站。"
 ```
 
-## 手机怎么连
+## Cloudflare Tunnel 配置
 
-局域网内调试可以临时改成：
-
-```env
-V2M_API_HOST=0.0.0.0
-```
-
-然后手机访问同一个网站的管理员界面 `#/admin`，在 API 地址里填：
+推荐把 `relumeow.top` 接入 Cloudflare，然后创建一个 Tunnel 指向本机 API：
 
 ```text
-http://这台电脑的局域网IP:8787
+Public hostname: api.relumeow.top
+Service: http://127.0.0.1:8787
 ```
 
-公网访问建议走 Cloudflare Tunnel、Tailscale Funnel、ngrok 或自建 HTTPS 反代，并且只暴露给自己使用。
+GitHub OAuth App 填：
 
-如果网站通过 `https://relumeow.top` 打开，浏览器通常会拦截页面调用普通 `http://` API。手机远程控制时，API 地址最好也是 HTTPS 隧道地址，或者在局域网调试时用普通 HTTP 页面打开网站。
+```text
+Homepage URL: https://relumeow.top
+Authorization callback URL: https://api.relumeow.top/api/auth/github/callback
+```
+
+然后手机打开：
+
+```text
+https://relumeow.top/admin.html
+```
+
+API 地址填：
+
+```text
+https://api.relumeow.top
+```
+
+局域网内调试如果想直接连 `http://127.0.0.1:8787` 或 `http://这台电脑的局域网IP:8787`，需要临时把对应网页来源加进 `V2M_ALLOWED_WEB_ORIGINS`，并按需把 `V2M_API_HOST` 改成 `0.0.0.0`。正式远程使用建议只走 HTTPS 隧道。
 
 ## 安全边界
 

@@ -57,7 +57,7 @@ GITHUB_ALLOWED_LOGINS = [item.strip().lower() for item in os.environ.get("V2M_GI
 GITHUB_SCOPE = os.environ.get("V2M_GITHUB_OAUTH_SCOPE", "read:user")
 ALLOWED_WEB_ORIGINS = [item.strip() for item in os.environ.get(
     "V2M_ALLOWED_WEB_ORIGINS",
-    "http://127.0.0.1:8000,http://localhost:8000,http://127.0.0.1:8787,http://localhost:8787,https://relumeow.top,http://relumeow.top",
+    "https://relumeow.top,http://relumeow.top",
 ).split(",") if item.strip()]
 
 
