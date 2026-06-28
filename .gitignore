@@ -26,6 +26,7 @@ conda-meta/
 
 # Node / frontend dependencies and build outputs
 node_modules/
+.wrangler/
 .next/
 dist/
 build/
