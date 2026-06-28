@@ -9,6 +9,19 @@
   </head>
   <body>
     <div class="app-shell">
+      <nav class="site-navbar" aria-label="站点导航">
+        <div class="site-tabs">
+          <a class="site-tab active" href="#/" data-main-tab="docs">文档导航</a>
+          <a class="site-tab" href="https://admin.relumeow.top/#tasks" data-main-tab="codex">Codex 会话管理</a>
+          <a class="site-tab" href="https://admin.relumeow.top/#docs" data-main-tab="sync">Markdown 同步</a>
+          <a class="site-tab" href="https://admin.relumeow.top/#auth" data-main-tab="auth">用户鉴权</a>
+        </div>
+        <a class="user-pill" id="siteUserPill" href="https://admin.relumeow.top/#auth" aria-label="当前用户">
+          <strong id="siteUserRole">访客</strong>
+          <span id="siteUserName">未登录</span>
+        </a>
+      </nav>
+
       <aside class="sidebar" aria-label="文档导航">
         <a class="brand" href="#/" aria-label="Video2Mesh Field Notes">
           <span class="brand-mark">V2M</span>

@@ -1,6 +1,8 @@
 (function () {
   const seed = window.V2M_BLOG_DATA || { docs: [], categories: [], generatedAt: "" };
   const DRAFT_STORAGE_KEY = "v2m-blog-drafts-v1";
+  const API_STORAGE_KEY = "v2m-blog-api-v1";
+  const DEFAULT_API_URL = "https://api.relumeow.top";
   const baseDocs = (seed.docs || []).map(cloneDoc);
   let docs = baseDocs.map(cloneDoc);
   let uploadedDocs = [];
@@ -39,6 +41,9 @@
     editorPreview: $("editorPreview"),
     saveDraft: $("saveDraft"),
     closeEditor: $("closeEditor"),
+    siteUserPill: $("siteUserPill"),
+    siteUserRole: $("siteUserRole"),
+    siteUserName: $("siteUserName"),
   };
 
   const escapeHtml = (value) => String(value ?? "")
@@ -126,6 +131,60 @@
         <div class="doc-tags">${(doc.tags || []).slice(0, 4).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>
       </a>
     `).join("");
+  }
+
+  function readApiSessionState() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(API_STORAGE_KEY) || "{}");
+      return {
+        url: parsed?.url || DEFAULT_API_URL,
+        sessionToken: parsed?.sessionToken || parsed?.token || "",
+        username: parsed?.username || "",
+        role: parsed?.role || "",
+      };
+    } catch (_error) {
+      return { url: DEFAULT_API_URL, sessionToken: "", username: "", role: "" };
+    }
+  }
+
+  function writeApiSessionState(next) {
+    const current = readApiSessionState();
+    try {
+      window.localStorage.setItem(API_STORAGE_KEY, JSON.stringify({ ...current, ...next }));
+    } catch (_error) {
+      // User info is decorative on the public page; ignore blocked storage.
+    }
+  }
+
+  function updateSiteUserInfo(state = readApiSessionState()) {
+    const role = state.role === "admin" ? "管理员" : (state.role || "访客");
+    const name = state.username || (state.sessionToken ? "恢复中" : "未登录");
+    els.siteUserRole.textContent = role;
+    els.siteUserName.textContent = name;
+    els.siteUserPill.dataset.role = state.role === "admin" ? "admin" : "guest";
+    els.siteUserPill.href = state.role === "admin" ? "https://admin.relumeow.top/#tasks" : "https://admin.relumeow.top/#auth";
+  }
+
+  async function restoreSiteUserInfo() {
+    const state = readApiSessionState();
+    updateSiteUserInfo(state);
+    if (!state.sessionToken) return;
+    try {
+      const response = await fetch(`${state.url || DEFAULT_API_URL}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${state.sessionToken}` },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.user) throw new Error(data.error || "session expired");
+      const next = {
+        username: data.user.username || data.user.id || "已登录",
+        role: data.user.role || "admin",
+      };
+      writeApiSessionState(next);
+      updateSiteUserInfo({ ...state, ...next });
+    } catch (_error) {
+      writeApiSessionState({ sessionToken: "", expiresAt: "", username: "", role: "" });
+      updateSiteUserInfo({ url: state.url, sessionToken: "", username: "", role: "" });
+    }
   }
 
   function preprocessMarkdown(markdown) {
@@ -533,8 +592,16 @@
       return;
     }
     els.tocNav.innerHTML = doc.headings.map((heading) => `
-      <a class="toc-level-${escapeHtml(heading.level)}" href="#${escapeHtml(heading.slug)}">${escapeHtml(heading.text)}</a>
+      <button class="toc-link toc-level-${escapeHtml(heading.level)}" data-toc-target="${escapeHtml(heading.slug)}" type="button">${escapeHtml(heading.text)}</button>
     `).join("");
+  }
+
+  function handleTocClick(event) {
+    const button = event.target.closest("[data-toc-target]");
+    if (!(button instanceof HTMLButtonElement)) return;
+    const target = document.getElementById(button.dataset.tocTarget || "");
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function renderRelated(doc) {
@@ -552,11 +619,17 @@
   function route() {
     const match = location.hash.match(/^#\/doc\/(.+)$/);
     if (match) showDoc(decodeURIComponent(match[1]));
+    else if (location.hash && currentDocId) {
+      const target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+      history.replaceState(null, "", `#/doc/${encodeURIComponent(currentDocId)}`);
+    }
     else showHome();
   }
 
   function renderAll() {
     els.buildMeta.textContent = `${docs.length} 篇文档 · 构建时间 ${seed.generatedAt || "本地"} · 支持上传 / 在线编辑 Markdown`;
+    updateSiteUserInfo();
     renderNavigation();
     renderDocGrid();
   }
@@ -660,9 +733,14 @@
   });
   els.articleBody.addEventListener("change", handleRenderedTaskToggle);
   els.editorPreview.addEventListener("change", handleEditorPreviewTaskToggle);
+  els.tocNav.addEventListener("click", handleTocClick);
   window.addEventListener("hashchange", route);
+  window.addEventListener("storage", (event) => {
+    if (event.key === API_STORAGE_KEY) updateSiteUserInfo();
+  });
 
   rebuildDocs();
   renderAll();
   route();
+  restoreSiteUserInfo();
 })();

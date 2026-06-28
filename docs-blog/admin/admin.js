@@ -46,6 +46,8 @@
         url: normalizeApiUrl(parsed?.url),
         sessionToken: parsed?.sessionToken || parsed?.token || "",
         expiresAt: parsed?.expiresAt || "",
+        username: parsed?.username || "",
+        role: parsed?.role || "",
       };
     } catch (_error) {
       return { url: DEFAULT_API_URL, sessionToken: "", expiresAt: "" };
@@ -65,6 +67,8 @@
       url: String(els.apiUrlInput.value || DEFAULT_API_URL).replace(/\/+$/, ""),
       sessionToken: apiConfig.sessionToken || "",
       expiresAt: apiConfig.expiresAt || "",
+      username: apiUser?.username || apiUser?.id || "",
+      role: apiUser?.role || "",
     };
     try {
       window.localStorage.setItem(API_STORAGE_KEY, JSON.stringify(apiConfig));
@@ -88,6 +92,14 @@
     els.panels.forEach((panel) => {
       panel.hidden = panel.dataset.tabPanel !== next;
     });
+    if (!window.location.hash.includes("v2m_session_token") && window.location.hash !== `#${next}`) {
+      history.replaceState(null, "", `#${next}`);
+    }
+  }
+
+  function activeTabFromHash() {
+    const tabName = window.location.hash.replace(/^#/, "");
+    return els.panels.some((panel) => panel.dataset.tabPanel === tabName) ? tabName : "auth";
   }
 
   function updateIdentityBadge() {
@@ -437,7 +449,7 @@
     updateSessionInfo();
     renderApiLists();
     setApiStatus(apiConfig.sessionToken ? "检查登录态..." : "需要登录", apiConfig.sessionToken ? "busy" : "warn");
-    setActiveTab("auth");
+    setActiveTab(activeTabFromHash());
     const consumedHash = consumeAuthHash();
     if (apiConfig.sessionToken && !consumedHash) restoreSession();
   }
@@ -458,6 +470,9 @@
   els.remoteDocForm.addEventListener("submit", syncRemoteDocFromForm);
   els.taskList.addEventListener("change", updateTaskStatus);
   window.addEventListener("message", handleAuthMessage);
+  window.addEventListener("hashchange", () => {
+    if (!window.location.hash.includes("v2m_session_token")) setActiveTab(activeTabFromHash());
+  });
 
   init();
 })();
