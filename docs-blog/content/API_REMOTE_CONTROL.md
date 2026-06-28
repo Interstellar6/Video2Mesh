@@ -52,6 +52,9 @@ V2M_SESSION_TTL_SECONDS=604800
 V2M_GITHUB_ALLOWED_LOGINS=Interstellar6
 V2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback
 V2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top
+V2M_CODEX_WORKSPACE=/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/CodexCloudWorkspace
+V2M_TERMINAL_MAX_TIMEOUT_SECONDS=30
+V2M_TERMINAL_OUTPUT_LIMIT=80000
 ```
 
 ## 首次创建管理员
@@ -232,6 +235,96 @@ curl -X PATCH \
 python3 docs-blog/codex_queue.py patch task-id --status done --summary "已完成并同步到网站。"
 ```
 
+## Codex Cloud Workspace
+
+管理员界面现在有一个 `Codex 会话` 标签。它不是公开首页的一部分，只在：
+
+```text
+https://admin.relumeow.top/#cloud
+```
+
+登录管理员后可用。服务器端会维护：
+
+```text
+CodexCloudWorkspace/
+  project-id/
+    project.json
+    sessions/
+      session-id/
+        session.json
+        messages.json
+        files.json
+        files/
+```
+
+网页端发送消息会同时写入会话记录，并创建一条 Codex 任务队列记录。Codex 完成工作后，可以把回复和产物写回同一个会话。
+
+写入 Codex 回复：
+
+```bash
+curl -H "Authorization: Bearer $V2M_SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"assistant","content":"已完成初稿，输出文件见 outputs/report.md。","enqueue_task":false}' \
+  http://127.0.0.1:8787/api/codex-cloud/projects/video2mesh/sessions/session-id/messages
+```
+
+写入输出文件：
+
+```bash
+curl -H "Authorization: Bearer $V2M_SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"outputs/report.md","summary":"调研报告","content":"# Report\n\n..."}' \
+  http://127.0.0.1:8787/api/codex-cloud/projects/video2mesh/sessions/session-id/files
+```
+
+文件会保存在 `CodexCloudWorkspace/<project>/sessions/<session>/files/`，管理员页面可以直接预览小于 5 MB 的文本/常见文件。
+
+### 工作区文件浏览
+
+管理员页的 `Codex 会话` 标签下方有 `工作区文件` 面板，可以浏览：
+
+```text
+CodexCloudWorkspace/
+```
+
+列目录：
+
+```bash
+curl -H "Authorization: Bearer $V2M_SESSION_TOKEN" \
+  'http://127.0.0.1:8787/api/codex-cloud/fs?path=video2mesh'
+```
+
+预览小文本文件：
+
+```bash
+curl -H "Authorization: Bearer $V2M_SESSION_TOKEN" \
+  'http://127.0.0.1:8787/api/codex-cloud/fs?path=video2mesh/project.json&preview=1'
+```
+
+所有路径都会被限制在 `CodexCloudWorkspace` 内，不能通过 `..` 或绝对路径跳出去。
+
+### 管理员工作区终端
+
+管理员页还有 `终端` 面板。它执行的是一次性命令，不是长期交互 shell；工作目录也限制在 `CodexCloudWorkspace` 内。
+
+```bash
+curl -H "Authorization: Bearer $V2M_SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"cwd":"video2mesh","command":"pwd && find . -maxdepth 2 -type f | sort","timeout_seconds":20}' \
+  http://127.0.0.1:8787/api/codex-cloud/terminal
+```
+
+相关环境变量：
+
+```env
+V2M_CODEX_WORKSPACE=/absolute/path/to/CodexCloudWorkspace
+V2M_TERMINAL_SHELL=/bin/zsh
+V2M_TERMINAL_MAX_TIMEOUT_SECONDS=30
+V2M_TERMINAL_OUTPUT_LIMIT=80000
+```
+
+建议只通过 `https://admin.relumeow.top` 登录后使用，不要把 API 直接裸露成无鉴权公网服务。
+
 ## Cloudflare Tunnel 配置
 
 推荐把 `relumeow.top` 接入 Cloudflare，然后创建一个 Tunnel 指向本机 API：
@@ -287,9 +380,10 @@ https://api.relumeow.top
 
 ## 安全边界
 
-- API 不提供任意 shell 执行接口。
+- 工作区终端只对管理员开放，且工作目录限制在 `CodexCloudWorkspace` 内。
+- 终端命令是一次性执行，带超时和输出截断；它仍然具备在工作区内读写文件的能力，所以管理员密码、GitHub OAuth 和 Cloudflare Tunnel 都必须妥善保护。
 - 远程控制只进入任务队列，由本机 Codex 读取后人工或半自动执行。
 - token 不提交到 git；默认保存在 `docs-blog/runtime/api_token.txt`。
 - GitHub Pages 只能托管静态站，不能直接运行这个 API。
 
-这个边界能让手机远程“派活”，但不把电脑变成一个公网命令执行入口。
+这个边界能让手机远程“派活”，也能在管理员界面检查工作区产物；终端能力只用于受控工作区操作。

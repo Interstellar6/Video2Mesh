@@ -41,6 +41,7 @@ docs-blog/runtime/
 docs-blog/.env
 docs-blog/.env.*
 !docs-blog/.env.example
+CodexCloudWorkspace/
 *.pem
 *.key
 *.crt

@@ -39,6 +39,7 @@
         <nav class="admin-tabs" aria-label="管理标签">
           <button class="admin-tab active" data-admin-tab="auth" type="button" aria-selected="true">用户鉴权</button>
           <button class="admin-tab" data-admin-tab="projects" type="button" aria-selected="false">项目记录</button>
+          <button class="admin-tab" data-admin-tab="cloud" type="button" aria-selected="false">Codex 会话</button>
           <button class="admin-tab" data-admin-tab="tasks" type="button" aria-selected="false">Codex 队列</button>
           <button class="admin-tab" data-admin-tab="docs" type="button" aria-selected="false">Markdown 同步</button>
         </nav>
@@ -90,6 +91,95 @@
             <input name="summary" type="text" placeholder="最近进展 / 备注" />
             <button type="submit">添加项目</button>
           </form>
+        </article>
+      </section>
+
+      <section class="admin-tab-panel" data-tab-panel="cloud" aria-label="Codex 会话管理" hidden>
+        <article class="control-card cloud-workspace-card">
+          <header>
+            <div>
+              <h2>Codex Cloud Workspace</h2>
+              <p class="panel-subtitle">管理员会话、项目目录和 Codex 输出文件都保存在这台 Mac 的工作区。</p>
+            </div>
+            <button id="refreshCloudWorkspace" type="button">刷新</button>
+          </header>
+
+          <div class="cloud-layout">
+            <aside class="cloud-sidebar" aria-label="工作区项目和会话">
+              <form id="cloudProjectForm" class="stack-form cloud-mini-form">
+                <input name="name" type="text" placeholder="新项目名" required />
+                <input name="summary" type="text" placeholder="项目备注，可选" />
+                <button type="submit">新建项目</button>
+              </form>
+              <div id="cloudProjectList" class="record-list compact-list"></div>
+
+              <form id="cloudSessionForm" class="stack-form cloud-mini-form">
+                <input name="title" type="text" placeholder="新会话标题" required />
+                <button type="submit">新建会话</button>
+              </form>
+              <div id="cloudSessionList" class="record-list compact-list"></div>
+            </aside>
+
+            <section class="cloud-main" aria-label="Codex 对话">
+              <div class="cloud-session-header">
+                <div>
+                  <strong id="cloudSessionTitle">未选择会话</strong>
+                  <span id="cloudSessionMeta">选择或新建一个会话开始。</span>
+                </div>
+              </div>
+              <div id="cloudMessageList" class="cloud-message-list"></div>
+              <form id="cloudMessageForm" class="stack-form cloud-message-form">
+                <textarea name="content" rows="5" placeholder="给这台 Mac 上的 Codex 发消息；它会进入会话记录和任务队列。" required></textarea>
+                <button type="submit">发送给 Codex</button>
+              </form>
+            </section>
+
+            <aside class="cloud-files" aria-label="Codex 输出文件">
+              <header>
+                <h3>输出文件</h3>
+              </header>
+              <div id="cloudFileList" class="record-list compact-list"></div>
+              <form id="cloudFileForm" class="stack-form cloud-mini-form">
+                <input name="path" type="text" placeholder="outputs/result.md" required />
+                <input name="summary" type="text" placeholder="文件说明，可选" />
+                <textarea name="content" rows="8" placeholder="Codex 输出内容、Markdown、JSON、代码等。" required></textarea>
+                <button type="submit">写入文件</button>
+              </form>
+              <pre id="cloudFilePreview" class="cloud-file-preview">选择文件后预览。</pre>
+            </aside>
+          </div>
+
+          <div class="workspace-ops-grid">
+            <section class="workspace-browser" aria-label="工作区文件">
+              <header>
+                <div>
+                  <h3>工作区文件</h3>
+                  <span id="workspacePathLabel" class="workspace-path">CodexCloudWorkspace</span>
+                </div>
+                <div class="inline-actions">
+                  <button id="workspaceUpButton" type="button">上级</button>
+                  <button id="refreshWorkspaceFiles" type="button">刷新</button>
+                </div>
+              </header>
+              <div id="workspaceFileList" class="record-list workspace-file-list"></div>
+              <pre id="workspaceFilePreview" class="cloud-file-preview workspace-preview">选择工作区文件后预览。</pre>
+            </section>
+
+            <section class="workspace-terminal" aria-label="工作区终端">
+              <header>
+                <div>
+                  <h3>终端</h3>
+                  <span class="workspace-path">cwd: <span id="terminalCwdLabel">CodexCloudWorkspace</span></span>
+                </div>
+              </header>
+              <form id="terminalForm" class="stack-form terminal-form">
+                <input name="cwd" type="text" placeholder="工作目录，例如 project-id" />
+                <textarea name="command" rows="4" placeholder="pwd && ls -la" required></textarea>
+                <button type="submit">运行命令</button>
+              </form>
+              <pre id="terminalOutput" class="terminal-output">$ </pre>
+            </section>
+          </div>
         </article>
       </section>
 

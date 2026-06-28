@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,10 @@ def print_json(data: dict) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def url_part(value: str) -> str:
+    return quote(str(value), safe="")
+
+
 def cmd_login(args: argparse.Namespace) -> None:
     username = args.username or os.environ.get("V2M_USERNAME") or input("Username: ").strip()
     password = args.password or os.environ.get("V2M_PASSWORD") or getpass.getpass("Password: ")
@@ -111,6 +116,40 @@ def cmd_patch(args: argparse.Namespace) -> None:
     print_json(request_json("PATCH", f"/api/codex-tasks/{args.task_id}", payload, token=token, api_url=args.api_url))
 
 
+def cmd_cloud_session(args: argparse.Namespace) -> None:
+    token = load_session()
+    path = f"/api/codex-cloud/projects/{url_part(args.project)}/sessions/{url_part(args.session)}"
+    print_json(request_json("GET", path, token=token, api_url=args.api_url))
+
+
+def cmd_cloud_reply(args: argparse.Namespace) -> None:
+    token = load_session()
+    content = args.content or sys.stdin.read().strip()
+    if not content:
+        raise CliError("--content or stdin is required")
+    payload = {"role": args.role, "content": content, "enqueue_task": False}
+    path = f"/api/codex-cloud/projects/{url_part(args.project)}/sessions/{url_part(args.session)}/messages"
+    print_json(request_json("POST", path, payload, token=token, api_url=args.api_url))
+
+
+def cmd_cloud_file(args: argparse.Namespace) -> None:
+    token = load_session()
+    if args.file:
+        content = Path(args.file).read_text(encoding="utf-8")
+    else:
+        content = args.content or sys.stdin.read()
+    if content == "":
+        raise CliError("--content, --file, or stdin is required")
+    payload = {
+        "path": args.path,
+        "summary": args.summary or "",
+        "content": content,
+        "source": "codex-cli",
+    }
+    path = f"/api/codex-cloud/projects/{url_part(args.project)}/sessions/{url_part(args.session)}/files"
+    print_json(request_json("POST", path, payload, token=token, api_url=args.api_url))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read and update the Video2Mesh Codex task queue.")
     parser.add_argument("--api-url", default=DEFAULT_API_URL)
@@ -141,6 +180,27 @@ def build_parser() -> argparse.ArgumentParser:
     patch.add_argument("--summary")
     patch.add_argument("--notes")
     patch.set_defaults(func=cmd_patch)
+
+    cloud_session = sub.add_parser("cloud-session")
+    cloud_session.add_argument("--project", required=True)
+    cloud_session.add_argument("--session", required=True)
+    cloud_session.set_defaults(func=cmd_cloud_session)
+
+    cloud_reply = sub.add_parser("cloud-reply")
+    cloud_reply.add_argument("--project", required=True)
+    cloud_reply.add_argument("--session", required=True)
+    cloud_reply.add_argument("--role", default="assistant", choices=["assistant", "system", "tool"])
+    cloud_reply.add_argument("--content")
+    cloud_reply.set_defaults(func=cmd_cloud_reply)
+
+    cloud_file = sub.add_parser("cloud-file")
+    cloud_file.add_argument("--project", required=True)
+    cloud_file.add_argument("--session", required=True)
+    cloud_file.add_argument("--path", required=True)
+    cloud_file.add_argument("--summary")
+    cloud_file.add_argument("--content")
+    cloud_file.add_argument("--file")
+    cloud_file.set_defaults(func=cmd_cloud_file)
     return parser
 
 

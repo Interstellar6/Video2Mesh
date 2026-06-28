@@ -65,6 +65,7 @@
 
 .admin-heading p,
 .auth-card p,
+.panel-subtitle,
 .record-item p,
 .record-item span {
   color: var(--muted);
@@ -318,6 +319,22 @@
   padding: 10px;
 }
 
+button.record-item {
+  width: 100%;
+  color: inherit;
+  text-align: left;
+}
+
+button.record-item:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+button.record-item.active {
+  border-color: #8ecbb5;
+  background: #edf8f2;
+}
+
 .mini-empty {
   color: var(--muted);
   font-size: 13px;
@@ -376,10 +393,244 @@
   flex: 1 1 0;
 }
 
+.panel-subtitle {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+.cloud-workspace-card {
+  gap: 14px;
+}
+
+.cloud-layout {
+  display: grid;
+  grid-template-columns: minmax(210px, 280px) minmax(0, 1fr) minmax(220px, 320px);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.cloud-sidebar,
+.cloud-main,
+.cloud-files {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfa;
+  padding: 10px;
+}
+
+.cloud-sidebar,
+.cloud-files {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.cloud-main {
+  display: grid;
+  grid-template-rows: auto minmax(300px, 1fr) auto;
+  gap: 10px;
+  min-height: 600px;
+}
+
+.cloud-mini-form {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+}
+
+.compact-list {
+  max-height: 240px;
+  min-height: 74px;
+}
+
+.cloud-session-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+}
+
+.cloud-session-header strong,
+.cloud-session-header span {
+  display: block;
+}
+
+.cloud-session-header strong {
+  font-size: 15px;
+}
+
+.cloud-session-header span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.cloud-message-list {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.cloud-message {
+  width: min(88%, 760px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 10px;
+}
+
+.cloud-message.user {
+  justify-self: end;
+  border-color: #efcf9a;
+  background: var(--amber-soft);
+}
+
+.cloud-message.assistant,
+.cloud-message.tool {
+  justify-self: start;
+  border-color: #a8d7c4;
+  background: #eff9f4;
+}
+
+.cloud-message.system {
+  justify-self: center;
+  background: #f5f5f2;
+}
+
+.cloud-message-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.cloud-message pre,
+.cloud-file-preview {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.cloud-message-form textarea {
+  min-height: 112px;
+}
+
+.cloud-files header h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.cloud-file-preview {
+  min-height: 160px;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 10px;
+  color: var(--ink);
+}
+
+.workspace-ops-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.8fr);
+  gap: 12px;
+}
+
+.workspace-browser,
+.workspace-terminal {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfa;
+  padding: 10px;
+}
+
+.workspace-browser,
+.workspace-terminal {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.workspace-browser header,
+.workspace-terminal header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.workspace-browser h3,
+.workspace-terminal h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.workspace-path {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.inline-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.workspace-file-list {
+  max-height: 280px;
+}
+
+.workspace-preview {
+  min-height: 220px;
+  max-height: 340px;
+}
+
+.terminal-form textarea {
+  min-height: 92px;
+}
+
+.terminal-output {
+  min-height: 300px;
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #17211f;
+  color: #e8f8ef;
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 @media (max-width: 980px) {
   .auth-grid,
-  .control-grid {
+  .control-grid,
+  .cloud-layout,
+  .workspace-ops-grid {
     grid-template-columns: 1fr;
+  }
+
+  .cloud-main {
+    min-height: 480px;
   }
 
   .admin-topbar {
@@ -397,9 +648,12 @@
   .admin-heading,
   .admin-userbar,
   .control-card header,
+  .workspace-browser header,
+  .workspace-terminal header,
   .api-connect-grid,
   .record-row,
-  .inline-fields {
+  .inline-fields,
+  .inline-actions {
     display: grid;
     grid-template-columns: 1fr;
   }
@@ -425,6 +679,10 @@
   .stack-form button,
   .admin-link,
   .record-row select {
+    width: 100%;
+  }
+
+  .cloud-message {
     width: 100%;
   }
 }

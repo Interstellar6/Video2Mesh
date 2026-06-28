@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import mimetypes
 import os
 import re
 import secrets
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,10 @@ USERS_FILE = RUNTIME / "users.json"
 SESSIONS_FILE = RUNTIME / "sessions.json"
 GITHUB_STATES_FILE = RUNTIME / "github_oauth_states.json"
 BUILD_SCRIPT = SITE / "build_site.py"
+CODEX_WORKSPACE = Path(os.environ.get("V2M_CODEX_WORKSPACE", ROOT / "CodexCloudWorkspace")).expanduser()
+TERMINAL_SHELL = os.environ.get("V2M_TERMINAL_SHELL", "/bin/zsh")
+TERMINAL_MAX_TIMEOUT_SECONDS = int(os.environ.get("V2M_TERMINAL_MAX_TIMEOUT_SECONDS", "30"))
+TERMINAL_OUTPUT_LIMIT = int(os.environ.get("V2M_TERMINAL_OUTPUT_LIMIT", "80000"))
 
 
 def load_env_file() -> None:
@@ -100,6 +106,277 @@ def extract_title(markdown: str, fallback: str) -> str:
         if match:
             return match.group(1).strip()
     return fallback
+
+
+def safe_workspace_id(value: str, fallback: str = "project") -> str:
+    if "\x00" in value:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "invalid workspace id")
+    text = slugify(value, fallback)
+    if text in {".", ".."}:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "invalid workspace id")
+    return text
+
+
+def decode_url_part(value: str) -> str:
+    return unquote(value)
+
+
+def safe_workspace_path(root: Path, relative: str) -> Path:
+    text = str(relative or "").strip().replace("\\", "/")
+    if not text:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path is required")
+    if text.startswith("/") or "\x00" in text:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "invalid path")
+    parts = [part for part in text.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "invalid path")
+    target = root.joinpath(*parts).resolve()
+    root_resolved = root.resolve()
+    if target != root_resolved and root_resolved not in target.parents:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path escapes workspace")
+    return target
+
+
+def safe_workspace_optional_path(root: Path, relative: str = "") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    root_resolved = root.resolve()
+    text = str(relative or "").strip().replace("\\", "/")
+    if text in {"", "."}:
+        return root_resolved
+    if text.startswith("/") or "\x00" in text:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "invalid path")
+    parts = [part for part in text.split("/") if part and part != "."]
+    if any(part == ".." for part in parts):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "invalid path")
+    target = root_resolved.joinpath(*parts).resolve()
+    if target != root_resolved and root_resolved not in target.parents:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path escapes workspace")
+    return target
+
+
+def workspace_relative_path(path: Path) -> str:
+    root = CODEX_WORKSPACE.resolve()
+    target = path.resolve()
+    if target == root:
+        return ""
+    return str(target.relative_to(root)).replace(os.sep, "/")
+
+
+def workspace_item_meta(path: Path) -> dict[str, Any]:
+    root = CODEX_WORKSPACE.resolve()
+    target = path.resolve()
+    relative = "" if target == root else str(target.relative_to(root)).replace(os.sep, "/")
+    stat_result = path.lstat()
+    mime, _encoding = mimetypes.guess_type(path.name)
+    if path.is_symlink():
+        item_type = "symlink"
+    elif path.is_dir():
+        item_type = "directory"
+    elif path.is_file():
+        item_type = "file"
+    else:
+        item_type = "other"
+    return {
+        "path": relative,
+        "name": path.name or "CodexCloudWorkspace",
+        "type": item_type,
+        "mime": mime or "",
+        "size": stat_result.st_size,
+        "updated_at": datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
+def read_workspace_preview(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "path is not a file")
+    size = path.stat().st_size
+    if size > 1_000_000:
+        return {"preview": "", "preview_error": "file is larger than 1 MB", "truncated": False}
+    raw = path.read_bytes()
+    if b"\x00" in raw[:4096]:
+        return {"preview": "", "preview_error": "binary file preview is not supported", "truncated": False}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+    return {"preview": text, "preview_error": "", "truncated": False}
+
+
+def list_workspace_path(relative: str = "", include_preview: bool = False) -> dict[str, Any]:
+    target = safe_workspace_optional_path(CODEX_WORKSPACE, relative)
+    if not target.exists():
+        raise ApiError(HTTPStatus.NOT_FOUND, "workspace path not found")
+    item = workspace_item_meta(target)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "root": str(CODEX_WORKSPACE.resolve()),
+        "item": item,
+        "children": [],
+    }
+    if target.is_dir():
+        children = []
+        for child in target.iterdir():
+            try:
+                resolved = child.resolve()
+                root = CODEX_WORKSPACE.resolve()
+                if resolved != root and root not in resolved.parents:
+                    continue
+                children.append(workspace_item_meta(child))
+            except OSError:
+                continue
+        children.sort(key=lambda entry: (entry["type"] != "directory", entry["name"].lower()))
+        payload["children"] = children[:500]
+        payload["limited"] = len(children) > 500
+        return payload
+    if include_preview:
+        payload.update(read_workspace_preview(target))
+    return payload
+
+
+def truncate_text(value: str, limit: int) -> tuple[str, bool]:
+    if len(value) <= limit:
+        return value, False
+    return value[-limit:], True
+
+
+def subprocess_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def read_codex_json(path: Path, default: Any) -> Any:
+    return read_json(path, default)
+
+
+def write_codex_json(path: Path, data: Any) -> None:
+    write_json(path, data)
+
+
+def codex_project_dir(project_id: str) -> Path:
+    return CODEX_WORKSPACE / safe_workspace_id(project_id, "project")
+
+
+def codex_session_dir(project_id: str, session_id: str) -> Path:
+    return codex_project_dir(project_id) / "sessions" / safe_workspace_id(session_id, "session")
+
+
+def codex_files_dir(project_id: str, session_id: str) -> Path:
+    return codex_session_dir(project_id, session_id) / "files"
+
+
+def codex_project_meta(project_id: str) -> dict[str, Any]:
+    project_id = safe_workspace_id(project_id, "project")
+    project_dir = codex_project_dir(project_id)
+    meta = read_codex_json(project_dir / "project.json", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    sessions = read_codex_sessions(project_id)
+    meta.setdefault("id", project_id)
+    meta.setdefault("name", project_id)
+    meta.setdefault("summary", "")
+    meta.setdefault("status", "active")
+    meta.setdefault("created_at", now_iso())
+    meta["session_count"] = len(sessions)
+    meta["updated_at"] = str(meta.get("updated_at") or meta.get("created_at") or "")
+    return meta
+
+
+def read_codex_projects() -> list[dict[str, Any]]:
+    CODEX_WORKSPACE.mkdir(parents=True, exist_ok=True)
+    projects = []
+    for path in CODEX_WORKSPACE.iterdir():
+        if path.is_dir() and not path.name.startswith("."):
+            projects.append(codex_project_meta(path.name))
+    projects.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+    return projects
+
+
+def read_codex_sessions(project_id: str) -> list[dict[str, Any]]:
+    sessions_root = codex_project_dir(project_id) / "sessions"
+    if not sessions_root.exists():
+        return []
+    sessions = []
+    for path in sessions_root.iterdir():
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        meta = read_codex_json(path / "session.json", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        messages = read_codex_json(path / "messages.json", [])
+        files = read_codex_json(path / "files.json", [])
+        meta.setdefault("id", path.name)
+        meta.setdefault("project_id", safe_workspace_id(project_id, "project"))
+        meta.setdefault("title", path.name)
+        meta.setdefault("status", "open")
+        meta.setdefault("created_at", "")
+        meta["message_count"] = len(messages) if isinstance(messages, list) else 0
+        meta["file_count"] = len(files) if isinstance(files, list) else 0
+        sessions.append(meta)
+    sessions.sort(key=lambda item: str(item.get("updated_at", "") or item.get("created_at", "")), reverse=True)
+    return sessions
+
+
+def codex_session_detail(project_id: str, session_id: str) -> dict[str, Any]:
+    session_dir = codex_session_dir(project_id, session_id)
+    if not session_dir.exists():
+        raise ApiError(HTTPStatus.NOT_FOUND, "Codex session not found")
+    meta = read_codex_json(session_dir / "session.json", {})
+    messages = read_codex_json(session_dir / "messages.json", [])
+    files = read_codex_json(session_dir / "files.json", [])
+    if not isinstance(meta, dict):
+        meta = {}
+    return {
+        "session": meta,
+        "messages": messages if isinstance(messages, list) else [],
+        "files": files if isinstance(files, list) else [],
+    }
+
+
+def touch_codex_project(project_id: str) -> None:
+    project_path = codex_project_dir(project_id) / "project.json"
+    meta = read_codex_json(project_path, {})
+    if isinstance(meta, dict):
+        meta["updated_at"] = now_iso()
+        write_codex_json(project_path, meta)
+
+
+def enqueue_codex_cloud_task(project_id: str, session_id: str, prompt: str) -> dict[str, Any]:
+    tasks = read_json(TASKS_FILE, [])
+    task = {
+        "id": unique_id("cloud-" + datetime.now().strftime("%Y%m%d%H%M%S"), tasks),
+        "project": project_id,
+        "prompt": prompt,
+        "status": "queued",
+        "priority": "normal",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "notes": "Created from Codex Cloud Workspace conversation.",
+        "workspace_project": project_id,
+        "workspace_session": session_id,
+    }
+    tasks.insert(0, task)
+    write_json(TASKS_FILE, tasks)
+    return task
+
+
+def file_meta_for(path: Path, files_root: Path, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    relative = str(path.relative_to(files_root)).replace(os.sep, "/")
+    mime, _encoding = mimetypes.guess_type(path.name)
+    stat_result = path.stat()
+    meta = {
+        "id": slugify(relative, "file"),
+        "path": relative,
+        "name": path.name,
+        "mime": mime or "application/octet-stream",
+        "size": stat_result.st_size,
+        "updated_at": datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    if extra:
+        meta.update(extra)
+    return meta
 
 
 def ensure_bootstrap_token() -> str:
@@ -374,6 +651,52 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "POST":
                     self.create_task(self.read_body())
                     return
+            if parsed.path == "/api/codex-cloud/projects":
+                self.require_admin()
+                if method == "GET":
+                    self.reply({"projects": read_codex_projects(), "workspace": str(CODEX_WORKSPACE)})
+                    return
+                if method == "POST":
+                    self.create_codex_project(self.read_body())
+                    return
+            if parsed.path == "/api/codex-cloud/fs" and method == "GET":
+                self.require_admin()
+                self.get_workspace_fs(parse_qs(parsed.query))
+                return
+            if parsed.path == "/api/codex-cloud/terminal" and method == "POST":
+                self.require_admin()
+                self.run_workspace_terminal(self.read_body())
+                return
+            codex_session_collection = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions", parsed.path)
+            if codex_session_collection:
+                self.require_admin()
+                project_id = decode_url_part(codex_session_collection.group(1))
+                if method == "GET":
+                    self.reply({"sessions": read_codex_sessions(project_id)})
+                    return
+                if method == "POST":
+                    self.create_codex_session(project_id, self.read_body())
+                    return
+            codex_session_item = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions/([^/]+)", parsed.path)
+            if codex_session_item and method == "GET":
+                self.require_admin()
+                self.reply(codex_session_detail(decode_url_part(codex_session_item.group(1)), decode_url_part(codex_session_item.group(2))))
+                return
+            codex_messages = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions/([^/]+)/messages", parsed.path)
+            if codex_messages and method == "POST":
+                self.require_admin()
+                self.add_codex_message(decode_url_part(codex_messages.group(1)), decode_url_part(codex_messages.group(2)), self.read_body())
+                return
+            codex_files = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions/([^/]+)/files", parsed.path)
+            if codex_files and method == "POST":
+                self.require_admin()
+                self.add_codex_file(decode_url_part(codex_files.group(1)), decode_url_part(codex_files.group(2)), self.read_body())
+                return
+            codex_file_item = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions/([^/]+)/files/(.+)", parsed.path)
+            if codex_file_item and method == "GET":
+                self.require_admin()
+                self.get_codex_file(decode_url_part(codex_file_item.group(1)), decode_url_part(codex_file_item.group(2)), decode_url_part(codex_file_item.group(3)))
+                return
             task_match = re.fullmatch(r"/api/codex-tasks/([^/]+)", parsed.path)
             if task_match and method == "PATCH":
                 self.require_auth()
@@ -459,6 +782,12 @@ class Handler(BaseHTTPRequestHandler):
         user = next((item for item in users if str(item.get("id", "")) == str(session.get("user_id", ""))), None)
         if not user:
             raise ApiError(HTTPStatus.UNAUTHORIZED, "Session user not found")
+        return user
+
+    def require_admin(self) -> dict[str, Any]:
+        user = self.require_auth()
+        if str(user.get("role", "admin")).lower() != "admin":
+            raise ApiError(HTTPStatus.FORBIDDEN, "Admin role required")
         return user
 
     def setup_user(self, data: dict[str, Any]) -> None:
@@ -639,6 +968,196 @@ class Handler(BaseHTTPRequestHandler):
             self.reply({"ok": True, "task": task})
             return
         raise ApiError(HTTPStatus.NOT_FOUND, "Task not found")
+
+    def create_codex_project(self, data: dict[str, Any]) -> None:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "name is required")
+        project_id = safe_workspace_id(str(data.get("id") or name), "project")
+        project_dir = codex_project_dir(project_id)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = project_dir / "project.json"
+        existing = read_codex_json(meta_path, {})
+        created_at = str(existing.get("created_at") or now_iso()) if isinstance(existing, dict) else now_iso()
+        project = {
+            "id": project_id,
+            "name": name,
+            "summary": str(data.get("summary") or ""),
+            "status": str(data.get("status") or "active"),
+            "created_at": created_at,
+            "updated_at": now_iso(),
+        }
+        write_codex_json(meta_path, project)
+        (project_dir / "sessions").mkdir(exist_ok=True)
+        self.reply({"ok": True, "project": codex_project_meta(project_id)}, HTTPStatus.CREATED)
+
+    def create_codex_session(self, project_id: str, data: dict[str, Any]) -> None:
+        project_id = safe_workspace_id(project_id, "project")
+        title = str(data.get("title") or "New Codex Session").strip()
+        session_id = safe_workspace_id(str(data.get("id") or title or datetime.now().strftime("%Y%m%d%H%M%S")), "session")
+        session_dir = codex_session_dir(project_id, session_id)
+        if session_dir.exists():
+            session_id = unique_id(session_id, [{"id": item.get("id")} for item in read_codex_sessions(project_id)])
+            session_dir = codex_session_dir(project_id, session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "files").mkdir(exist_ok=True)
+        session = {
+            "id": session_id,
+            "project_id": project_id,
+            "title": title,
+            "status": str(data.get("status") or "open"),
+            "summary": str(data.get("summary") or ""),
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        write_codex_json(session_dir / "session.json", session)
+        write_codex_json(session_dir / "messages.json", [])
+        write_codex_json(session_dir / "files.json", [])
+        touch_codex_project(project_id)
+        self.reply({"ok": True, "session": session}, HTTPStatus.CREATED)
+
+    def add_codex_message(self, project_id: str, session_id: str, data: dict[str, Any]) -> None:
+        project_id = safe_workspace_id(project_id, "project")
+        session_id = safe_workspace_id(session_id, "session")
+        session_dir = codex_session_dir(project_id, session_id)
+        if not session_dir.exists():
+            raise ApiError(HTTPStatus.NOT_FOUND, "Codex session not found")
+        role = str(data.get("role") or "user").strip().lower()
+        if role not in {"user", "assistant", "system", "tool"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "role must be user, assistant, system, or tool")
+        content = str(data.get("content") or data.get("message") or "").strip()
+        if not content:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "content is required")
+        messages = read_codex_json(session_dir / "messages.json", [])
+        if not isinstance(messages, list):
+            messages = []
+        message = {
+            "id": unique_id("msg-" + datetime.now().strftime("%Y%m%d%H%M%S"), messages),
+            "role": role,
+            "content": content,
+            "created_at": now_iso(),
+        }
+        if isinstance(data.get("files"), list):
+            message["files"] = data.get("files")
+        messages.append(message)
+        write_codex_json(session_dir / "messages.json", messages)
+        meta = read_codex_json(session_dir / "session.json", {})
+        if isinstance(meta, dict):
+            meta["updated_at"] = now_iso()
+            meta["last_role"] = role
+            meta["last_message"] = content[:240]
+            write_codex_json(session_dir / "session.json", meta)
+        touch_codex_project(project_id)
+        task = None
+        if role == "user" and data.get("enqueue_task", True):
+            task = enqueue_codex_cloud_task(project_id, session_id, content)
+        self.reply({"ok": True, "message": message, "task": task}, HTTPStatus.CREATED)
+
+    def add_codex_file(self, project_id: str, session_id: str, data: dict[str, Any]) -> None:
+        project_id = safe_workspace_id(project_id, "project")
+        session_id = safe_workspace_id(session_id, "session")
+        session_dir = codex_session_dir(project_id, session_id)
+        if not session_dir.exists():
+            raise ApiError(HTTPStatus.NOT_FOUND, "Codex session not found")
+        path_value = str(data.get("path") or data.get("name") or "").strip()
+        content = str(data.get("content") or "")
+        if not path_value:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "path is required")
+        files_root = codex_files_dir(project_id, session_id)
+        target = safe_workspace_path(files_root, path_value)
+        if len(content.encode("utf-8")) > 5_000_000:
+            raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "file content too large")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        files = read_codex_json(session_dir / "files.json", [])
+        if not isinstance(files, list):
+            files = []
+        file_meta = file_meta_for(target, files_root, {
+            "summary": str(data.get("summary") or ""),
+            "source": str(data.get("source") or "codex"),
+        })
+        files = [item for item in files if str(item.get("path")) != file_meta["path"]]
+        files.insert(0, file_meta)
+        write_codex_json(session_dir / "files.json", files)
+        meta = read_codex_json(session_dir / "session.json", {})
+        if isinstance(meta, dict):
+            meta["updated_at"] = now_iso()
+            write_codex_json(session_dir / "session.json", meta)
+        touch_codex_project(project_id)
+        self.reply({"ok": True, "file": file_meta}, HTTPStatus.CREATED)
+
+    def get_codex_file(self, project_id: str, session_id: str, relative_path: str) -> None:
+        files_root = codex_files_dir(project_id, session_id)
+        target = safe_workspace_path(files_root, relative_path)
+        if not target.exists() or not target.is_file():
+            raise ApiError(HTTPStatus.NOT_FOUND, "Codex file not found")
+        size = target.stat().st_size
+        if size > 5_000_000:
+            raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "file is too large to preview")
+        mime, _encoding = mimetypes.guess_type(target.name)
+        raw = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.add_common_headers()
+        self.send_header("Content-Type", mime or "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def get_workspace_fs(self, query: dict[str, list[str]]) -> None:
+        relative = (query.get("path") or [""])[0]
+        include_preview = (query.get("preview") or [""])[0].lower() in {"1", "true", "yes"}
+        self.reply(list_workspace_path(relative, include_preview=include_preview))
+
+    def run_workspace_terminal(self, data: dict[str, Any]) -> None:
+        command = str(data.get("command") or "").strip()
+        if not command:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "command is required")
+        cwd = safe_workspace_optional_path(CODEX_WORKSPACE, str(data.get("cwd") or ""))
+        if not cwd.exists() or not cwd.is_dir():
+            raise ApiError(HTTPStatus.BAD_REQUEST, "cwd must be an existing workspace directory")
+        try:
+            timeout = int(data.get("timeout_seconds") or 12)
+        except (TypeError, ValueError):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "timeout_seconds must be an integer")
+        timeout = max(1, min(timeout, TERMINAL_MAX_TIMEOUT_SECONDS))
+        started = time.monotonic()
+        timed_out = False
+        try:
+            completed = subprocess.run(
+                [TERMINAL_SHELL, "-lc", command],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "PWD": str(cwd)},
+                check=False,
+            )
+            returncode = completed.returncode
+            stdout = subprocess_text(completed.stdout)
+            stderr = subprocess_text(completed.stderr)
+        except subprocess.TimeoutExpired as error:
+            timed_out = True
+            returncode = 124
+            stdout = subprocess_text(error.stdout)
+            stderr = subprocess_text(error.stderr)
+            stderr = (stderr + f"\nCommand timed out after {timeout} seconds.").strip()
+        output = stdout + (("\n" + stderr) if stderr else "")
+        output, truncated = truncate_text(output, TERMINAL_OUTPUT_LIMIT)
+        stdout, stdout_truncated = truncate_text(stdout, TERMINAL_OUTPUT_LIMIT)
+        stderr, stderr_truncated = truncate_text(stderr, TERMINAL_OUTPUT_LIMIT)
+        self.reply({
+            "ok": True,
+            "command": command,
+            "cwd": workspace_relative_path(cwd),
+            "cwd_abs": str(cwd),
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "stdout": stdout,
+            "stderr": stderr,
+            "output": output,
+            "truncated": truncated or stdout_truncated or stderr_truncated,
+        })
 
 
 def unique_path(path: Path) -> Path:
