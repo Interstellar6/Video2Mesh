@@ -29,6 +29,14 @@
   margin-bottom: 0;
 }
 
+.admin-userbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
 .admin-panel,
 .auth-card,
 .control-card {
@@ -82,6 +90,80 @@
   font-size: 13px;
 }
 
+.admin-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.admin-tab {
+  min-height: 38px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  padding: 0 13px;
+  font-size: 13px;
+}
+
+.admin-tab:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: var(--accent-soft);
+}
+
+.admin-tab.active {
+  border-color: #efcf9a;
+  background: var(--amber-soft);
+  color: var(--ink);
+}
+
+.admin-tab-panel {
+  margin-bottom: 14px;
+}
+
+.identity-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  max-width: min(42vw, 360px);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+
+.identity-pill strong,
+.identity-pill em {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.identity-pill strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.identity-pill em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.identity-pill[data-role="admin"] {
+  border-color: #a8d7c4;
+  background: #e8f8ef;
+}
+
+.identity-pill[data-role="admin"] strong {
+  color: #1f6a43;
+}
+
 .status-pill {
   flex: 0 0 auto;
   min-height: 30px;
@@ -104,6 +186,7 @@
   grid-template-columns: minmax(220px, 1fr) auto;
   gap: 10px;
   align-items: end;
+  margin-bottom: 12px;
 }
 
 .api-connect-grid label,
@@ -298,6 +381,10 @@
   .control-grid {
     grid-template-columns: 1fr;
   }
+
+  .admin-topbar {
+    align-items: flex-start;
+  }
 }
 
 @media (max-width: 680px) {
@@ -308,12 +395,27 @@
 
   .admin-topbar,
   .admin-heading,
+  .admin-userbar,
   .control-card header,
   .api-connect-grid,
   .record-row,
   .inline-fields {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .admin-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .admin-tab {
+    width: 100%;
+  }
+
+  .identity-pill {
+    max-width: 100%;
+    justify-content: center;
   }
 
   .status-pill,

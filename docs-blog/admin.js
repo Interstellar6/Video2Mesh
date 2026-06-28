@@ -9,6 +9,9 @@
 
   const $ = (id) => document.getElementById(id);
   const els = {
+    identityBadge: $("identityBadge"),
+    identityRole: $("identityRole"),
+    identityName: $("identityName"),
     apiStatus: $("apiStatus"),
     apiUrlInput: $("apiUrlInput"),
     apiHealthCheck: $("apiHealthCheck"),
@@ -24,6 +27,8 @@
     taskForm: $("taskForm"),
     refreshTasks: $("refreshTasks"),
     remoteDocForm: $("remoteDocForm"),
+    tabs: Array.from(document.querySelectorAll("[data-admin-tab]")),
+    panels: Array.from(document.querySelectorAll("[data-tab-panel]")),
   };
 
   const escapeHtml = (value) => String(value ?? "")
@@ -71,6 +76,32 @@
   function setApiStatus(message, state = "idle") {
     els.apiStatus.textContent = message;
     els.apiStatus.dataset.state = state;
+  }
+
+  function setActiveTab(tabName) {
+    const next = els.panels.some((panel) => panel.dataset.tabPanel === tabName) ? tabName : "auth";
+    els.tabs.forEach((tab) => {
+      const active = tab.dataset.adminTab === next;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    els.panels.forEach((panel) => {
+      panel.hidden = panel.dataset.tabPanel !== next;
+    });
+  }
+
+  function updateIdentityBadge() {
+    if (!apiUser) {
+      els.identityBadge.dataset.role = "guest";
+      els.identityRole.textContent = "访客";
+      els.identityName.textContent = apiConfig.sessionToken ? "恢复中" : "未登录";
+      return;
+    }
+    const role = String(apiUser.role || "admin");
+    const name = String(apiUser.username || apiUser.id || "已登录");
+    els.identityBadge.dataset.role = role.toLowerCase() === "admin" ? "admin" : "user";
+    els.identityRole.textContent = role === "admin" ? "管理员" : role;
+    els.identityName.textContent = name;
   }
 
   function apiBaseUrl() {
@@ -225,6 +256,7 @@
     updateSessionInfo();
     renderApiLists();
     setApiStatus("已退出登录", "warn");
+    setActiveTab("auth");
   }
 
   function applyLoginResult(result) {
@@ -234,9 +266,11 @@
     persistApiConfig();
     updateSessionInfo();
     setApiStatus(apiUser ? "已登录" : "登录成功", "ok");
+    setActiveTab("projects");
   }
 
   function updateSessionInfo() {
+    updateIdentityBadge();
     if (!apiUser) {
       els.sessionInfo.textContent = apiConfig.sessionToken ? "正在恢复登录态..." : "尚未登录。只有登录后才能访问 Mac 控制接口。";
       return;
@@ -403,10 +437,14 @@
     updateSessionInfo();
     renderApiLists();
     setApiStatus(apiConfig.sessionToken ? "检查登录态..." : "需要登录", apiConfig.sessionToken ? "busy" : "warn");
+    setActiveTab("auth");
     const consumedHash = consumeAuthHash();
     if (apiConfig.sessionToken && !consumedHash) restoreSession();
   }
 
+  els.tabs.forEach((tab) => {
+    tab.addEventListener("click", () => setActiveTab(tab.dataset.adminTab || "auth"));
+  });
   els.apiUrlInput.addEventListener("change", persistApiConfig);
   els.apiHealthCheck.addEventListener("click", checkApiHealth);
   els.setupForm.addEventListener("submit", setupAdminFromForm);

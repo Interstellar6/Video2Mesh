@@ -1,5 +1,5 @@
 window.V2M_BLOG_DATA = {
-  "generatedAt": "2026-06-28 23:25",
+  "generatedAt": "2026-06-29 00:30",
   "docs": [
     {
       "id": "readme",

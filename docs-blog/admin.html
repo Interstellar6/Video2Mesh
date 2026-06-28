@@ -19,10 +19,16 @@
             <em>Admin</em>
           </span>
         </a>
-        <span id="apiStatus" class="status-pill">未连接</span>
+        <div class="admin-userbar" aria-label="当前用户">
+          <span id="identityBadge" class="identity-pill" data-role="guest">
+            <strong id="identityRole">访客</strong>
+            <em id="identityName">未登录</em>
+          </span>
+          <span id="apiStatus" class="status-pill">未连接</span>
+        </div>
       </header>
 
-      <section class="admin-panel" aria-label="本机 API 连接">
+      <section class="admin-panel" aria-label="管理入口">
         <div class="admin-heading">
           <div>
             <h1>Local Control</h1>
@@ -30,6 +36,15 @@
           </div>
           <a class="admin-link" href="./">公开首页</a>
         </div>
+        <nav class="admin-tabs" aria-label="管理标签">
+          <button class="admin-tab active" data-admin-tab="auth" type="button" aria-selected="true">用户鉴权</button>
+          <button class="admin-tab" data-admin-tab="projects" type="button" aria-selected="false">项目记录</button>
+          <button class="admin-tab" data-admin-tab="tasks" type="button" aria-selected="false">Codex 队列</button>
+          <button class="admin-tab" data-admin-tab="docs" type="button" aria-selected="false">Markdown 同步</button>
+        </nav>
+      </section>
+
+      <section class="admin-tab-panel" data-tab-panel="auth" aria-label="用户鉴权">
         <div class="api-connect-grid">
           <label>
             <span>API 地址</span>
@@ -37,33 +52,32 @@
           </label>
           <button id="apiHealthCheck" type="button">连接</button>
         </div>
+        <div class="auth-grid">
+          <form id="loginForm" class="stack-form auth-card">
+            <h2>登录 Mac 会话</h2>
+            <input name="username" type="text" placeholder="用户名" autocomplete="username" required />
+            <input name="password" type="password" placeholder="密码" autocomplete="current-password" required />
+            <button type="submit">登录</button>
+            <button id="githubLoginButton" class="github-button" type="button">GitHub 授权登录</button>
+          </form>
+
+          <form id="setupForm" class="stack-form auth-card">
+            <h2>首次创建管理员</h2>
+            <input name="bootstrap_token" type="password" placeholder="Bootstrap token" autocomplete="off" required />
+            <input name="username" type="text" placeholder="用户名" autocomplete="username" required />
+            <input name="password" type="password" placeholder="至少 10 位密码" autocomplete="new-password" required />
+            <button type="submit">创建并登录</button>
+          </form>
+
+          <section class="auth-card session-card" aria-label="当前会话">
+            <h2>当前会话</h2>
+            <p id="sessionInfo">尚未登录。只有登录后才能访问 Mac 控制接口。</p>
+            <button id="logoutButton" type="button">退出登录</button>
+          </section>
+        </div>
       </section>
 
-      <section class="auth-grid" aria-label="登录与会话">
-        <form id="loginForm" class="stack-form auth-card">
-          <h2>登录 Mac 会话</h2>
-          <input name="username" type="text" placeholder="用户名" autocomplete="username" required />
-          <input name="password" type="password" placeholder="密码" autocomplete="current-password" required />
-          <button type="submit">登录</button>
-          <button id="githubLoginButton" class="github-button" type="button">GitHub 授权登录</button>
-        </form>
-
-        <form id="setupForm" class="stack-form auth-card">
-          <h2>首次创建管理员</h2>
-          <input name="bootstrap_token" type="password" placeholder="Bootstrap token" autocomplete="off" required />
-          <input name="username" type="text" placeholder="用户名" autocomplete="username" required />
-          <input name="password" type="password" placeholder="至少 10 位密码" autocomplete="new-password" required />
-          <button type="submit">创建并登录</button>
-        </form>
-
-        <section class="auth-card session-card" aria-label="当前会话">
-          <h2>当前会话</h2>
-          <p id="sessionInfo">尚未登录。只有登录后才能访问 Mac 控制接口。</p>
-          <button id="logoutButton" type="button">退出登录</button>
-        </section>
-      </section>
-
-      <section class="control-grid" aria-label="管理功能">
+      <section class="admin-tab-panel" data-tab-panel="projects" aria-label="项目记录" hidden>
         <article class="control-card">
           <header>
             <h2>项目记录</h2>
@@ -77,7 +91,9 @@
             <button type="submit">添加项目</button>
           </form>
         </article>
+      </section>
 
+      <section class="admin-tab-panel" data-tab-panel="tasks" aria-label="Codex 任务队列" hidden>
         <article class="control-card">
           <header>
             <h2>Codex 任务队列</h2>
@@ -95,7 +111,9 @@
             <button type="submit">加入队列</button>
           </form>
         </article>
+      </section>
 
+      <section class="admin-tab-panel" data-tab-panel="docs" aria-label="远程同步 Markdown" hidden>
         <article class="control-card md-sync-card">
           <header>
             <h2>远程同步 Markdown</h2>
