@@ -35,6 +35,10 @@ coverage/
 .env
 .env.*
 !.env.example
+docs-blog/runtime/
+docs-blog/.env
+docs-blog/.env.*
+!docs-blog/.env.example
 *.pem
 *.key
 *.crt
