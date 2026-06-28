@@ -265,12 +265,17 @@ def write_placeholder_asset() -> None:
     )
 
 
+def write_custom_domain() -> None:
+    (SITE / "CNAME").write_text("relumeow.top\n", encoding="utf-8")
+
+
 def main() -> int:
     ASSETS.mkdir(parents=True, exist_ok=True)
     CONTENT.mkdir(parents=True, exist_ok=True)
     docs = collect_docs()
     write_site_data(docs)
     write_placeholder_asset()
+    write_custom_domain()
     print(f"Built docs-blog with {len(docs)} document(s).")
     for doc in docs:
         print(f"- [{doc.category}] {doc.title} ({doc.source_path})")
