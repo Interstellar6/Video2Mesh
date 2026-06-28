@@ -30,6 +30,7 @@ node_modules/
 dist/
 build/
 coverage/
+docs-blog/_public/
 
 # Secrets and local runtime configuration
 .env

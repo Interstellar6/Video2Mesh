@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "docs-blog"
 ASSETS = SITE / "assets"
 CONTENT = SITE / "content"
+PUBLIC_BUILD = SITE / "_public"
 
 BUILTIN_DOCS = [
     "README.md",
@@ -269,6 +270,26 @@ def write_custom_domain() -> None:
     (SITE / "CNAME").write_text("relumeow.top\n", encoding="utf-8")
 
 
+def build_public_site() -> None:
+    if PUBLIC_BUILD.exists():
+        shutil.rmtree(PUBLIC_BUILD)
+    ignore = shutil.ignore_patterns(
+        ".env",
+        ".env.*",
+        "_public",
+        "admin",
+        "admin-domain-worker.js",
+        "api_server.py",
+        "build_site.py",
+        "codex_queue.py",
+        "run_api.sh",
+        "runtime",
+        "wrangler.admin.toml",
+    )
+    shutil.copytree(SITE, PUBLIC_BUILD, ignore=ignore)
+    (PUBLIC_BUILD / "CNAME").write_text("relumeow.top\n", encoding="utf-8")
+
+
 def main() -> int:
     ASSETS.mkdir(parents=True, exist_ok=True)
     CONTENT.mkdir(parents=True, exist_ok=True)
@@ -276,6 +297,7 @@ def main() -> int:
     write_site_data(docs)
     write_placeholder_asset()
     write_custom_domain()
+    build_public_site()
     print(f"Built docs-blog with {len(docs)} document(s).")
     for doc in docs:
         print(f"- [{doc.category}] {doc.title} ({doc.source_path})")

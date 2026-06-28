@@ -1,0 +1,7 @@
+name = "video2mesh-admin"
+main = "admin-domain-worker.js"
+compatibility_date = "2025-12-01"
+
+routes = [
+  { pattern = "admin.relumeow.top", custom_domain = true },
+]

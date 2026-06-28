@@ -57,7 +57,7 @@ GITHUB_ALLOWED_LOGINS = [item.strip().lower() for item in os.environ.get("V2M_GI
 GITHUB_SCOPE = os.environ.get("V2M_GITHUB_OAUTH_SCOPE", "read:user")
 ALLOWED_WEB_ORIGINS = [item.strip() for item in os.environ.get(
     "V2M_ALLOWED_WEB_ORIGINS",
-    "https://relumeow.top,http://relumeow.top",
+    "https://relumeow.top,http://relumeow.top,https://admin.relumeow.top",
 ).split(",") if item.strip()]
 
 
@@ -197,7 +197,7 @@ def github_redirect_uri() -> str:
 
 def safe_return_url(value: str) -> str:
     if not value:
-        return "http://127.0.0.1:8000/docs-blog/"
+        return "http://127.0.0.1:8000/docs-blog/admin/"
     parsed = urlparse(value)
     origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
     if origin in ALLOWED_WEB_ORIGINS:

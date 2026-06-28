@@ -43,7 +43,7 @@ jobs:
       - name: Upload static site
         uses: actions/upload-pages-artifact@v4
         with:
-          path: docs-blog
+          path: docs-blog/_public
 
   deploy:
     environment:

@@ -51,7 +51,7 @@ V2M_API_PORT=8787
 V2M_SESSION_TTL_SECONDS=604800
 V2M_GITHUB_ALLOWED_LOGINS=Interstellar6
 V2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback
-V2M_ALLOWED_WEB_ORIGINS=https://relumeow.top,http://relumeow.top
+V2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top
 ```
 
 ## 首次创建管理员
@@ -108,29 +108,29 @@ V2M_GITHUB_CLIENT_ID=你的_client_id
 V2M_GITHUB_CLIENT_SECRET=你的_client_secret
 V2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback
 V2M_GITHUB_ALLOWED_LOGINS=Interstellar6
-V2M_ALLOWED_WEB_ORIGINS=https://relumeow.top,http://relumeow.top
+V2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top
 ```
 
-重启 API 后，管理员界面 `/admin.html` 里的“GitHub 授权登录”会打开 GitHub OAuth。API 会校验 GitHub 登录名必须在 `V2M_GITHUB_ALLOWED_LOGINS` 里，默认只允许 `Interstellar6`。
+重启 API 后，管理员界面里的“GitHub 授权登录”会打开 GitHub OAuth。API 会校验 GitHub 登录名必须在 `V2M_GITHUB_ALLOWED_LOGINS` 里，默认只允许 `Interstellar6`。
 
 ## 管理员界面
 
 公开首页只展示文档，不显示 Mac 控制台。需要远程控制时，打开：
 
 ```text
-/admin.html
+https://admin.relumeow.top/
 ```
 
 例如本地预览是：
 
 ```text
-http://127.0.0.1:8000/docs-blog/admin.html
+http://127.0.0.1:8000/docs-blog/admin/
 ```
 
-线上个人主页是：
+线上管理域名是：
 
 ```text
-https://relumeow.top/admin.html
+https://admin.relumeow.top/
 ```
 
 管理员界面里的 API 地址填：
@@ -244,14 +244,37 @@ Service: http://127.0.0.1:8787
 GitHub OAuth App 填：
 
 ```text
-Homepage URL: https://relumeow.top
+Homepage URL: https://admin.relumeow.top
 Authorization callback URL: https://api.relumeow.top/api/auth/github/callback
 ```
 
-然后手机打开：
+管理静态页使用 Cloudflare Worker 挂到独立子域名：
 
 ```text
-https://relumeow.top/admin.html
+Worker source: docs-blog/admin-domain-worker.js
+Custom Domain: admin.relumeow.top
+```
+
+Cloudflare Dashboard 操作：
+
+1. Workers & Pages 里创建一个 Worker。
+2. 粘贴 `docs-blog/admin-domain-worker.js`。
+3. 在 Worker 的 Settings -> Domains & Routes 里添加 Custom Domain：
+
+```text
+admin.relumeow.top
+```
+
+4. 打开：
+
+```text
+https://admin.relumeow.top/
+```
+
+也可以用 Wrangler 部署：
+
+```bash
+npx wrangler deploy --config docs-blog/wrangler.admin.toml
 ```
 
 API 地址填：
