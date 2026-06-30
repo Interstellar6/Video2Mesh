@@ -1,5 +1,5 @@
 window.V2M_BLOG_DATA = {
-  "generatedAt": "2026-06-29 05:08",
+  "generatedAt": "2026-07-01 02:28",
   "docs": [
     {
       "id": "readme",
@@ -947,6 +947,279 @@ window.V2M_BLOG_DATA = {
       "reading_minutes": 1
     },
     {
+      "id": "mesh-reconstruction-methods-survey",
+      "title": "3DGS / 点云到 Mesh 重建方法调研报告",
+      "category": "Surveys",
+      "summary": "调研日期：2026-06-30 面向项目：Video2Mesh 核心问题：从 3DGS、COLMAP 点云、语义点云或多视角深度中生成可用于 Web / Unity / 仿真的 Mesh，尤其是轻量 collision mesh，并兼容后续语义资产。 我们不应该只选一种“3DGS 转 Mesh”方法，而应该把 Mesh 产物拆成三类：",
+      "source_path": "MESH_RECONSTRUCTION_METHODS_SURVEY.md",
+      "source_kind": "builtin",
+      "updated": "2026-06-30",
+      "tags": [
+        "3DGS",
+        "Surveys"
+      ],
+      "body": "# 3DGS / 点云到 Mesh 重建方法调研报告\n\n调研日期：2026-06-30  \n面向项目：Video2Mesh  \n核心问题：从 3DGS、COLMAP 点云、语义点云或多视角深度中生成可用于 Web / Unity / 仿真的 Mesh，尤其是轻量 collision mesh，并兼容后续语义资产。\n\n## 0. 结论先行\n\n我们不应该只选一种“3DGS 转 Mesh”方法，而应该把 Mesh 产物拆成三类：\n\n```text\nvisual mesh       用于展示、贴图、编辑，追求几何和外观质量\ncollision mesh    用于碰撞、阻挡、角色行走，追求轻量、闭合、稳定\nsemantic mesh     用于语义查询、交互区域、对象归属，追求 label 可追溯\n```\n\n对 Video2Mesh 最合适的路线是：\n\n1. **短期 P0：COLMAP dense fused PLY + Poisson / Delaunay / Open3D，生成 scene-level collision mesh**  \n   这条路和 Azureovo 报告中的 CloudCompare PoissonRecon 思路一致，也是我们最容易自动化接入的 baseline。它适合做静态环境 collider，不适合作最终视觉模型。\n\n2. **短期 P0：语义继续保留在 point / Gaussian 层，不强行塞进 collider**  \n   `semantic_splats.ply`、`semantic_gaussian_probabilities.ply`、`masks/3d/*` 继续作为语义主数据。碰撞 Mesh 只做物理代理。\n\n3. **中期 P1：对最终 Mesh 做语义回灌**  \n   Mesh 建好、减面、清理之后，再用 KDTree / 半径投票把语义点云或语义 Gaussian 的 `object_id / probability` 转移到 Mesh 顶点或三角面，输出 `scene_collision_semantics.json`。\n\n4. **中期 P1：物体 visual mesh 走 3DGS render depth/normal/mask -> TSDF fusion -> marching cubes / Poisson**  \n   这比直接对 sparse object mask cloud 做三角化稳定，也和我们 README 里现有生产方向一致。\n\n5. **长期 P2：引入 SuGaR / 2DGS / GOF / GS2Mesh 类 3DGS-aware surface 方法**  \n   这些方法更适合提高 visual mesh 质量，但训练、依赖和数据约束更重，不应阻塞我们先把 collider 和语义层跑通。\n\n最重要的架构判断：\n\n```text\n3DGS / semantic splat = 视觉与语义层\nPoisson / TSDF / convex proxy mesh = 物理与导航层\nscene_graph / sidecar JSON = 交互逻辑层\n```\n\n## 1. 当前 Video2Mesh 的约束\n\n当前仓库已经具备几个关键接口：\n\n- `run-colmap` 可以生成 COLMAP sparse model，并在 dense 模式下生成 `external/colmap/dense/fused.ply`。\n- `scene/reconstruction/point_cloud.ply` 是默认训练和语义源。\n- `fuse-masks` 把 2D masks 投影到点云，输出 `masks/3d/<object_id>/point_indices.json` 和概率文件。\n- `export-splat-masks` 可以把 `object_id` 写入 PLY / splat 表示。\n- `backproject-gaussian-probabilities` 可以把 2D mask 概率回投到 Gaussian。\n- `reconstruct-object-meshes` 和 `reconstruct-3dgs-object-meshes` 已经有 object 级 mesh baseline。\n- `export-simulator-assets` 已经有 `collider`、`collision-proxy`、Unity / MuJoCo / Isaac adapter 的概念。\n\n还缺的是一个明确的 **scene-level collision mesh stage**：\n\n```text\nexternal/colmap/dense/fused.ply\n  -> scene_collision_raw.ply\n  -> scene_collision_clean.glb\n  -> scene_collision_semantics.json 可选\n  -> simulator_assets/collision/scene_collision.glb\n  -> Unity MeshCollider / Web BVH / navmesh source\n```\n\n## 2. 方法横评\n\n| 方法 | 输入 | 输出 | 优点 | 风险 | 语义兼容 | Video2Mesh 定位 |\n|---|---|---|---|---|---|---|\n| CloudCompare PoissonRecon | oriented point cloud | watertight triangle mesh | Azureovo 已验证，GUI 成熟，适合大点云 | GUI/插件自动化弱，Poisson 会补洞和“糊面” | 后处理回灌语义 | collision baseline，可作为人工验证工具 |\n| COLMAP poisson_mesher / delaunay_mesher | COLMAP dense fused point cloud | mesh PLY | 和现有 COLMAP dense 直接衔接，CLI 自动化好 | 质量取决于 fused.ply 和照片覆盖 | 后处理回灌语义 | P0 自动化首选 |\n| Open3D Alpha / BPA / Poisson | point cloud + normals | mesh | Python 可控，易接入现有 CLI | 参数敏感，稀疏点云会碎 | 可按 object_id 分组或后投影 | P0/P1 编程化 baseline |\n| OpenMVS | camera poses + images + sparse cloud | dense cloud, refined textured mesh | 完整 photogrammetry mesh/texturing | 依赖重，AGPL，资源消耗高 | 可从相机和点云回灌 | P1 视觉 mesh 对照组 |\n| TSDF fusion / Marching Cubes | posed depth maps / RGB-D / 3DGS rendered depth | smooth mesh | 多视角融合抗噪，适合 object mesh | 需要可靠 depth、尺度、mask | 天然可做 masked semantic fusion | P1 物体 visual mesh 主路线 |\n| SuGaR | trained 3DGS | editable mesh + refined GS | 3DGS-aware，几分钟提 mesh | 需要额外训练/优化，集成成本中等 | 可用 semantic splat 约束或回灌 | P2 visual mesh 升级 |\n| 2DGS | multi-view images / COLMAP | surface-aligned Gaussians + mesh | 几何比原始 3DGS 更稳 | 替换训练后端，工程改动大 | 需要重新做 semantic transfer | P2 研究后端 |\n| GOF | 3DGS-style optimization | level-set mesh | 针对 3DGS surface reconstruction | 新方法，依赖和鲁棒性待验证 | 后处理回灌 | P2 高质量 surface 方向 |\n| GS2Mesh | trained 3DGS render stereo pairs | TSDF fused mesh | 不直接相信 Gaussian 几何，用 stereo depth 正则 | 需要 stereo model 和渲染管线 | 可用 semantic mask 渲染做筛选 | P2 适合 in-the-wild 场景 |\n| NeuS / VolSDF / Neuralangelo | posed images | neural SDF mesh | 高质量 surface，适合视觉资产 | 训练重，调参重，不适合快速 collider | 可 mask / object-wise 训练 | P3 高质量离线资产 |\n| RealityCapture / Metashape | photos / video frames / LiDAR | textured mesh, simplified mesh | 工业成熟，贴图和简化强 | 商业闭源，不好嵌入开源 pipeline | 可外部回灌 | 对照组 / 人工 benchmark |\n| V-HACD / CoACD | existing mesh | convex parts | 物理引擎友好，适合动态物体 collider | 不生成视觉表面，只做碰撞近似 | 继承 object 级语义 | P1 dynamic object collider |\n\n## 3. 经典点云建面路线\n\n### 3.1 CloudCompare PoissonRecon\n\nAzureovo 报告中的路线是：\n\n```text\n3DGS / splat / PLY\n  -> 导出 Gaussian center point cloud\n  -> CloudCompare Poisson Surface Reconstruction\n  -> Blender / MeshLab 减面\n  -> Unity Mesh Collider\n```\n\n它的价值是已经被 Web/Unity demo 验证过：视觉层用 3DGS，碰撞层用单独的 GLB mesh。我们本地抓到的 Azureovo public snapshot 也显示 demo 不是动态生成 mesh，而是直接加载：\n\n```text\n3dscene/game/3DGS/3DGS.sog\n3dscene/game/glb/3dgsCollider.glb\n3dscene/game/3DGS/outdoor4.sog\n3dscene/game/glb/outdoor4.collision.glb\n```\n\nCloudCompare 的 qPoissonRecon 是 Kazhdan Poisson Surface Reconstruction 的界面封装，适合点云到闭合网格。CloudCompare 本身也强调它能处理大型点云和 triangle mesh。\n\n落地判断：\n\n- 适合做人工验证和论文式 baseline。\n- 自动化接入时不建议依赖 CloudCompare GUI。\n- 如果要自动化，可以优先考虑 COLMAP 自带 `poisson_mesher`、Open3D Poisson，或 CloudComPy 的 PoissonRecon wrapper。\n- Poisson 会补洞，可能生成“封口”和虚假表面，所以作为 collider 可以接受，作为 visual mesh 要谨慎。\n\n语义兼容：\n\n- 不要依赖原始点索引，因为 Poisson 会重建新拓扑。\n- 建成并减面后，再从 semantic point cloud / semantic splat 向 mesh face center 做 nearest-neighbor / radius vote。\n\n### 3.2 COLMAP dense fused PLY + poisson_mesher / delaunay_mesher\n\nCOLMAP 官方 CLI 覆盖了完整的 classic pipeline：\n\n```text\nfeature_extractor\nmatcher\nmapper\nimage_undistorter\npatch_match_stereo\nstereo_fusion\npoisson_mesher / delaunay_mesher\nmesh_simplifier / mesh_texturer\n```\n\n这和我们仓库最契合，因为 `cmd_run_colmap` 已经能跑 dense reconstruction，并把 `colmap_dense_fused_ply` 写进 manifest。也就是说我们不需要重新找数据源，直接从已有 `external/colmap/dense/fused.ply` 往后接就行。\n\n推荐命令形态：\n\n```bash\npython -m video2mesh.cli reconstruct-scene-collision-mesh \\\n  --project-root exports/<run> \\\n  --source exports/<run>/external/colmap/dense/fused.ply \\\n  --method poisson \\\n  --target-triangles 50000 \\\n  --output exports/<run>/simulator_assets/collision/scene_collision.glb\n```\n\n内部可以先封装为：\n\n```text\nfused.ply\n  -> normal estimation\n  -> Poisson / Delaunay\n  -> remove low-density vertices\n  -> largest components / floor-wall filter 可选\n  -> simplify\n  -> export PLY/OBJ/GLB\n  -> write QA report\n```\n\n适用范围：\n\n- 场景级静态 collider。\n- 地面、墙体、大型背景结构。\n- Web 端 BVH collision mesh。\n- Unity static MeshCollider。\n\n不适合：\n\n- 细节展示 mesh。\n- 动态刚体 collider。\n- 直接承载可靠 object semantic label。\n\n### 3.3 Open3D point-cloud reconstruction\n\nOpen3D 官方 surface reconstruction 教程覆盖三类经典方法：\n\n- Alpha shapes\n- Ball Pivoting Algorithm\n- Poisson surface reconstruction\n\n对我们有两个优点：\n\n1. Python 集成简单，适合直接写进 `video2mesh/cli.py`。\n2. 能和语义点云一起工作，比如按 `object_id` 分组重建，或在建面前过滤点云。\n\n方法选择：\n\n| 方法 | 适合 | 不适合 |\n|---|---|---|\n| Alpha shape | 稀疏、小物体、快速 hull-like baseline | 大场景、噪声多、参数泛化 |\n| Ball Pivoting | 点密度均匀、有 normals 的扫描表面 | 点云不均匀、孔洞多 |\n| Poisson | 需要闭合/平滑 surface，场景 collider | 开放结构、薄片、真实边界 |\n\n推荐先用 Open3D 做第一个自动化版本，因为现有 object mesh baseline 已经有类似依赖和参数结构。\n\n## 4. 多视角 / 深度融合路线\n\n### 4.1 OpenMVS\n\nOpenMVS 官方 README 明确它补的是 SfM 后半段：输入相机位姿和 sparse point cloud，输出完整 surface，包含：\n\n- dense point-cloud reconstruction\n- mesh reconstruction\n- mesh refinement\n- mesh texturing\n\n典型链路：\n\n```text\nCOLMAP / OpenMVG sparse model\n  -> InterfaceCOLMAP / InterfaceOpenMVG\n  -> DensifyPointCloud\n  -> ReconstructMesh\n  -> RefineMesh\n  -> TextureMesh\n```\n\n对 Video2Mesh 的价值：\n\n- 可以作为 photogrammetry visual mesh 对照组。\n- 比单纯 Poisson collider 更接近 textured visual mesh。\n- 可用于评估我们 3DGS-to-mesh 的表面质量。\n\n风险：\n\n- 工程依赖重。\n- AGPL 许可证需要谨慎，建议先作为外部 CLI 可选工具，而不是直接链接进核心库。\n- 对图片质量、内参、位姿仍然敏感。\n- 输出 mesh 未必适合直接做 collider，仍需 decimate / convex decomposition / QA。\n\n### 4.2 TSDF fusion / Marching Cubes\n\nTSDF 是更适合我们“语义 object mesh”的中期路线。\n\n输入可以来自：\n\n```text\n真实 RGB-D / LiDAR depth\n估计深度\n3DGS rendered depth\n3DGS rendered normal\nobject mask / semantic mask\nregistered camera poses\n```\n\n输出：\n\n```text\nobject_tsdf_volume\nobject_mesh_raw.ply\nobject_mesh_clean.glb\nobject_collider_proxy.glb\n```\n\n为什么适合我们：\n\n- 能把多视角 noisy depth 融成一个平滑表面。\n- 可以在 integration 前用 object mask 裁剪，只融合目标物体。\n- 可以在 integration 时保存 semantic_id / object probability。\n- Open3D 和 VDBFusion 都提供可参考的实现路径。\n\n推荐 object mesh 主路线：\n\n```text\ntrained GraphDECO 3DGS\n  + registered cameras\n  + 2D/3D object masks\n  -> render RGB/depth/normal/mask from selected views\n  -> masked TSDF fusion\n  -> marching cubes\n  -> cleanup / simplify / texture bake\n  -> visual mesh + simplified collider\n```\n\n对 scene-level collider 也可以用 TSDF，但前提是我们有可靠 depth。纯 RGB + COLMAP dense fused PLY 的情况下，Poisson 更快落地。\n\n## 5. 3DGS-aware surface 方法\n\n### 5.1 SuGaR\n\nSuGaR 的目标是从 3D Gaussian Splatting 表示中快速提取 editable mesh。它通过 surface-aligned regularization 让 Gaussian 更贴近真实表面，再进行 mesh extraction。\n\n优点：\n\n- 比原始 3DGS Gaussian centers 直接建面更合理。\n- 项目和代码较成熟。\n- 输出 mesh 可以编辑、动画、组合。\n\n风险：\n\n- 需要额外训练/优化，不是从现有 splat 文件一键出稳定 collider。\n- 对我们来说更偏 visual mesh，不是 P0 collider。\n\n推荐定位：\n\n- P2：作为 `reconstruct-3dgs-object-meshes` 的高级后端。\n- 可以先对小场景或单物体试验，不影响 P0 collider 工程。\n\n### 5.2 2D Gaussian Splatting\n\n2DGS 把 3D Gaussian 体表示压成 2D oriented disks / surfels，并加入几何正则以改善表面一致性。官方实现也强调它设计了 Gaussian splatting 的 meshing approaches。\n\n优点：\n\n- 从表示层减少 3DGS 多视角几何不一致。\n- 更适合 surface extraction。\n\n风险：\n\n- 相当于替换/新增训练后端。\n- 我们现有 GraphDECO 资产、semantic transfer、viewer PLY 都要适配。\n\n推荐定位：\n\n- P2/P3：研究型后端。\n- 如果未来目标是“视觉 mesh 质量优先”，可以和 GraphDECO 并行比较。\n\n### 5.3 GOF\n\nGaussian Opacity Fields 试图直接从 3D Gaussians 构建 opacity field，并通过 level-set / Marching Tetrahedra 进行自适应紧凑 mesh extraction。\n\n优点：\n\n- 明确针对 3DGS surface reconstruction 的难点。\n- 更适合 unbounded scenes。\n\n风险：\n\n- 工程成熟度和鲁棒性需要实测。\n- 和我们的语义 pipeline 需要额外桥接。\n\n推荐定位：\n\n- P2：作为 3DGS visual mesh 高质量候选。\n- 不作为第一版 collider 路线。\n\n### 5.4 GS2Mesh\n\nGS2Mesh 的核心思想很适合我们：不要直接相信 Gaussian 属性里的几何，而是用 3DGS 渲染能力生成 stereo-aligned novel views，再用预训练 stereo model 得深度，最后 TSDF 融合成 mesh。\n\n这和我们现有方向高度一致：\n\n```text\n3DGS render\n  -> depth / stereo depth\n  -> TSDF fusion\n  -> mesh\n```\n\n优点：\n\n- 对 in-the-wild 手机扫描友好。\n- 把 3DGS 当作多视角渲染器，而不是直接把 Gaussian centers 连面。\n- 可以自然接 object mask 和 semantic mask。\n\n风险：\n\n- 需要 stereo model 和渲染/视角采样工程。\n- 成本高于 P0 Poisson collider。\n\n推荐定位：\n\n- P1/P2：object visual mesh 的强候选。\n- 如果我们已经能从 3DGS 渲染 RGB/depth/mask，GS2Mesh-style stereo depth 可以作为质量增强。\n\n## 6. Neural SDF / NeRF mesh 路线\n\nNeuS、VolSDF、Neuralangelo 都属于 neural implicit surface reconstruction。共同点是用 SDF 或类似隐式场表达表面，再通过体渲染监督从多视角图像中优化几何。\n\n优点：\n\n- 表面质量潜力高。\n- 适合复杂物体和高质量离线资产。\n- Neuralangelo 对 RGB 视频大场景有代表性。\n\n风险：\n\n- 训练成本高。\n- 对相机位姿、曝光、mask、动态物体很敏感。\n- 输出到游戏/仿真仍要 decimate、UV、texture bake、collider proxy。\n\n推荐定位：\n\n- P3：高质量离线 visual mesh。\n- 不作为当前 collider 主线。\n- 可以作为特定 object 的 repair/refinement 后端。\n\n## 7. 工业 Photogrammetry 路线\n\n### 7.1 RealityCapture / RealityScan\n\nRealityCapture / RealityScan 的工业链路通常是：\n\n```text\nalign images\nreconstruct high-poly model\ntexture\nsimplify\nexport\n```\n\n官方 CLI 支持 `simplify`、`smooth`、`exportSparsePointCloud`、texture reprojection 等命令。Simplify 工具的目标是降低 triangle count，例如把近似平面的密集三角面合并为更少的面。\n\n对我们有两种价值：\n\n- 作为商业 photogrammetry benchmark，比较我们的 COLMAP/OpenMVS/3DGS-to-mesh 结果。\n- 作为人工生产流程参考：高质量视觉 mesh 和轻量 collider 是两套产物。\n\n### 7.2 Agisoft Metashape\n\nMetashape Python API 支持 align photos、build dense cloud、build mesh、texture、decimate model、export results。它适合批处理 photogrammetry，但同样是商业闭源路线。\n\n对我们：\n\n- 不适合作为核心开源依赖。\n- 可以用于 benchmark 和对外展示对比。\n- 其“模型构建 + decimate + export”的产物组织方式值得参考。\n\n## 8. Collision proxy 和物理约束\n\nMesh reconstruction 只是第一步。进 Unity / Web / 仿真后，还要把 mesh 变成物理友好的 collider。\n\n### 8.1 Unity MeshCollider 限制\n\nUnity 官方文档强调，concave MeshCollider 有限制：通常只能用于 static 或 kinematic 场景，concave colliders 之间不会直接碰撞。动态刚体更应该使用 convex collider 或 primitive / compound colliders。\n\n所以策略应是：\n\n| 对象 | 推荐 collider |\n|---|---|\n| 大场景地面/墙体 | simplified static MeshCollider |\n| 桌椅柜等静态家具 | box / convex hull / compound collider |\n| 动态可交互物体 | primitive / convex decomposition |\n| 楼梯/斜坡 | ramp proxy + navmesh |\n| 视觉细节复杂物体 | visual mesh 和 physics mesh 分离 |\n\n### 8.2 Blender Decimate\n\nBlender Decimate modifier 用于降低 mesh 顶点/面数，同时尽量保留形状。它适合人工/批处理做 collider 简化，但自动 pipeline 里也可以用 Open3D / trimesh / meshoptimizer 做类似处理。\n\n### 8.3 V-HACD / CoACD\n\nV-HACD 和 CoACD 都是 approximate convex decomposition。它们不是 mesh 重建算法，而是把已有复杂 mesh 拆成多个近似凸部件，方便物理引擎高效碰撞。\n\n对我们：\n\n- scene-level static collider：不一定需要 convex decomposition，简化 mesh 即可。\n- dynamic object collider：建议加 CoACD/V-HACD 作为 P1。\n- 语义 object 已经分好时，可以按 object mesh 单独做 convex decomposition。\n\n## 9. 语义兼容方案\n\n语义点云和 mesh 重建可以兼容，但要遵守一个原则：\n\n```text\n语义不要绑定到 Poisson 前的点索引上，\n而要绑定到最终发布的 mesh / object / face group 上。\n```\n\n### 9.1 推荐数据流\n\n```text\nsemantic_splats.ply / semantic_point_cloud.ply\n  object_id\n  object_probability\n  semantic_id\n  category\n          |\n          | KDTree / radius vote / top-k weighted vote\n          v\nscene_collision.glb\nscene_collision_semantics.json\n```\n\n### 9.2 Face-level sidecar 格式草案\n\n```json\n{\n  \"schema_version\": \"0.1\",\n  \"mesh\": \"scene_collision.glb\",\n  \"source_semantics\": \"semantic_splats.ply\",\n  \"label_transfer\": {\n    \"method\": \"face_center_knn_vote\",\n    \"k\": 8,\n    \"max_distance\": 0.08,\n    \"min_probability\": 0.5\n  },\n  \"face_groups\": [\n    {\n      \"object_id\": \"floor\",\n      \"semantic_id\": 1,\n      \"category\": \"floor\",\n      \"face_indices\": [0, 1, 2],\n      \"mean_probability\": 0.92\n    }\n  ]\n}\n```\n\n### 9.3 语义回灌算法\n\n1. 读取最终发布的 mesh，而不是 raw Poisson mesh。\n2. 对每个 triangle 计算 face center 和 normal。\n3. 对 semantic point cloud / Gaussian centers 建 KDTree。\n4. 查 top-k 邻居，按距离、概率、可见次数加权投票。\n5. 设置 `unknown` 阈值，避免强行标注远离语义点云的补洞区域。\n6. 对 face graph 做连通域平滑，去掉小碎片标签。\n7. 输出 sidecar JSON 和可视化 QA PLY/GLB。\n\n### 9.4 两种语义 mesh 策略\n\n| 策略 | 做法 | 适合 |\n|---|---|---|\n| 先分割再建面 | 按 object_id 切点云，每个 object 单独建 mesh | 物体 visual mesh、对象级编辑 |\n| 先建面再贴语义 | 先生成全场景 collider，再把语义投到 face | 场景 collider、navmesh、floor/wall trigger |\n\n对我们建议两条都保留：\n\n- scene collision mesh：先建面再贴语义。\n- object visual mesh：先分割再建面 / TSDF。\n\n## 10. 推荐落地路线图\n\n### P0：自动生成 scene collision mesh\n\n新增 CLI：\n\n```bash\npython -m video2mesh.cli reconstruct-scene-collision-mesh \\\n  --project-root exports/<run> \\\n  --source auto \\\n  --method poisson \\\n  --target-triangles 50000 \\\n  --output-format glb \\\n  --write-qa\n```\n\n默认 source 查找顺序：\n\n```text\nmanifest.artifacts.colmap_dense_fused_ply\nexternal/colmap/dense/fused.ply\nscene/reconstruction/point_cloud.ply\n```\n\n默认输出：\n\n```text\nsimulator_assets/collision/scene_collision_raw.ply\nsimulator_assets/collision/scene_collision.glb\nsimulator_assets/collision/scene_collision_report.json\n```\n\n最小 QA：\n\n- vertex / triangle count\n- bbox extent\n- connected component count\n- non-manifold edge count\n- watertight flag\n- simplification ratio\n- source point to mesh distance\n\n### P1：语义回灌到 collider mesh\n\n新增 CLI：\n\n```bash\npython -m video2mesh.cli transfer-semantics-to-mesh \\\n  --project-root exports/<run> \\\n  --mesh simulator_assets/collision/scene_collision.glb \\\n  --semantic-ply simulator_assets/semantic_splats.ply \\\n  --output simulator_assets/collision/scene_collision_semantics.json \\\n  --method face_center_knn_vote\n```\n\n输出还可以包括：\n\n```text\nsimulator_assets/collision/scene_collision_semantic_preview.glb\nsimulator_assets/collision/scene_collision_semantic_report.json\n```\n\n### P1：object mesh 继续走 TSDF / 3DGS render\n\n我们已有 `reconstruct-3dgs-object-meshes`，应该继续加强：\n\n- view selection\n- semantic-support filter\n- masked TSDF\n- mesh cleanup\n- texture bake\n- collider simplification\n\n不要把 sparse mask cloud OBJ 当最终物体 mesh。\n\n### P1：dynamic object collider\n\n在 object visual mesh 出来后：\n\n```text\nobject_mesh.glb\n  -> CoACD / V-HACD\n  -> object_collider_compound.glb\n  -> export-simulator-assets\n```\n\n### P2：3DGS-aware mesh 后端试验\n\n候选顺序：\n\n1. SuGaR：最直接的 3DGS-to-editable-mesh 实验。\n2. GS2Mesh-style：最符合我们“render views -> TSDF”方向。\n3. 2DGS / GOF：适合评估替换训练后端或高质量 surface extraction。\n\n## 11. 和 Azureovo / Icare 案例的关系\n\nAzureovo 报告验证的是一种很实用的架构：\n\n```text\n3DGS visual layer\n  + invisible collision mesh\n  + player controller / interaction logic\n```\n\n它没有公开 3DGS-to-mesh 生成脚本，只公开了生成后的 `.sog` 和 `.glb` 资产，以及 Web demo 的加载逻辑。因此我们不能直接“拿它的转换代码”，但可以复用它的架构判断：\n\n- 3DGS 不负责碰撞。\n- Mesh collider 不必和视觉 3DGS 一样精细。\n- 交互逻辑跑在传统 mesh / physics / controller 上。\n- semantic layer 应独立保存，必要时投到 collider 或 trigger 上。\n\nIcare / World Labs 类项目也符合这个分层：Spark/3DGS 做 visual runtime，角色、碰撞、任务、NPC 和 authoring collision helpers 是传统游戏架构。\n\n## 12. 最终推荐\n\n对我们项目，方法优先级如下：\n\n| 优先级 | 要做什么 | 用什么方法 | 原因 |\n|---|---|---|---|\n| P0 | scene-level static collider | COLMAP dense fused PLY + Open3D/COLMAP Poisson + simplify | 最快补上 Web/Unity 交互闭环 |\n| P0 | 保留语义点云主数据 | semantic_splats / gaussian probabilities | 不被 mesh 重建破坏语义 |\n| P1 | mesh semantic sidecar | face center KDTree vote | 让 floor/wall/object trigger 可查语义 |\n| P1 | object visual mesh | 3DGS rendered depth/mask + TSDF | 比 sparse point cloud mesh 稳 |\n| P1 | dynamic collider | CoACD / V-HACD / primitive compound | 符合 Unity/物理引擎要求 |\n| P2 | 高质量 3DGS-to-mesh | SuGaR / GS2Mesh / GOF / 2DGS | 提升展示 mesh，不阻塞 collider |\n| P3 | neural SDF asset refinement | NeuS / VolSDF / Neuralangelo | 离线高质量，成本高 |\n\n一句话版本：\n\n```text\n先用 COLMAP dense fused PLY + Poisson 把场景 collider 做出来；\n语义点云继续独立保存；\n再把语义回灌到最终 collider face；\n物体 mesh 继续走 3DGS render + TSDF；\n高质量 3DGS-aware mesh 方法作为后续增强。\n```\n\n## 参考资料\n\n### 当前项目和已抓取案例\n\n- Azureovo 3DGS report: <https://azureovo.github.io/3dscene/research/>\n- Local public snapshot inventory: `external_code_snapshots/2026-06-30/README.md`\n- Video2Mesh pipeline: `README.md`, `VIDEO2MESH_PIPELINE.md`\n\n### Classic SfM / MVS / point-cloud meshing\n\n- COLMAP documentation: <https://colmap.github.io/>\n- COLMAP command-line interface: <https://colmap.github.io/cli.html>\n- COLMAP tutorial: <https://colmap.github.io/tutorial.html>\n- OpenMVS GitHub: <https://github.com/cdcseacave/openMVS>\n- OpenMVG OpenMVS docs: <https://openmvg.readthedocs.io/en/latest/software/MVS/OpenMVS/>\n- Open3D surface reconstruction: <https://www.open3d.org/docs/latest/tutorial/Advanced/surface_reconstruction.html>\n- Open3D RGB-D integration: <https://www.open3d.org/docs/latest/tutorial/pipelines/rgbd_integration.html>\n- Open3D TSDF integration: <https://www.open3d.org/docs/release/tutorial/t_reconstruction_system/integration.html>\n- VDBFusion GitHub: <https://github.com/PRBonn/vdbfusion>\n\n### CloudCompare / Poisson\n\n- CloudCompare Poisson Surface Reconstruction plugin: <https://www.cloudcompare.org/doc/wiki/index.php/Poisson_Surface_Reconstruction_%28plugin%29>\n- CloudCompare GitHub: <https://github.com/cloudcompare/cloudcompare>\n- CloudComPy PoissonRecon wrapper: <https://www.simulation.openfields.fr/documentation/CloudComPy/html/PoissonRecon.html>\n\n### 3DGS-aware mesh\n\n- SuGaR paper: <https://arxiv.org/abs/2311.12775>\n- SuGaR project: <https://imagine.enpc.fr/~guedona/sugar/>\n- SuGaR GitHub: <https://github.com/Anttwo/SuGaR>\n- 2D Gaussian Splatting project: <https://surfsplatting.github.io/>\n- 2D Gaussian Splatting GitHub: <https://github.com/hbb1/2d-gaussian-splatting>\n- GOF paper: <https://arxiv.org/abs/2404.10772>\n- GOF GitHub: <https://github.com/autonomousvision/gaussian-opacity-fields>\n- GS2Mesh paper: <https://arxiv.org/abs/2404.01810>\n- GS2Mesh project: <https://gs2mesh.github.io/>\n- GS2Mesh GitHub: <https://github.com/yanivw12/gs2mesh>\n\n### Neural implicit / NeRF mesh\n\n- Neuralangelo project: <https://research.nvidia.com/labs/cosmos-lab/neuralangelo/>\n- Neuralangelo GitHub: <https://github.com/nvlabs/neuralangelo>\n- NeuS paper: <https://arxiv.org/abs/2106.10689>\n- NeuS project: <https://lingjie0206.github.io/papers/NeuS/>\n- VolSDF paper: <https://arxiv.org/abs/2106.12052>\n- VolSDF project: <https://lioryariv.github.io/volsdf/>\n- Nerfstudio export geometry: <https://docs.nerf.studio/quickstart/export_geometry.html>\n- Nerfstudio `ns-export`: <https://docs.nerf.studio/reference/cli/ns_export.html>\n\n### Industry / DCC / physics\n\n- Unity Mesh Collider manual: <https://docs.unity3d.com/6000.2/Documentation/Manual/mesh-colliders-introduction.html>\n- Blender Decimate modifier: <https://docs.blender.org/manual/en/latest/modeling/modifiers/generate/decimate.html>\n- RealityScan CLI commands: <https://rshelp.capturingreality.com/en-US/appbasics/allcommands.htm>\n- RealityScan Simplify tool: <https://rshelp.capturingreality.com/en-US/tools/simplify.htm>\n- Agisoft Metashape Python API: <https://www.agisoft.com/pdf/metashape_python_api_2_2_0.pdf>\n- V-HACD GitHub: <https://github.com/kmammou/v-hacd>\n- Unity V-HACD fork: <https://github.com/Unity-Technologies/VHACD>\n- CoACD GitHub: <https://github.com/SarahWeiii/CoACD>\n- CoACD project: <https://colin97.github.io/CoACD/>\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "0. 结论先行",
+          "slug": "0.-结论先行"
+        },
+        {
+          "level": "2",
+          "text": "1. 当前 Video2Mesh 的约束",
+          "slug": "1.-当前-video2mesh-的约束"
+        },
+        {
+          "level": "2",
+          "text": "2. 方法横评",
+          "slug": "2.-方法横评"
+        },
+        {
+          "level": "2",
+          "text": "3. 经典点云建面路线",
+          "slug": "3.-经典点云建面路线"
+        },
+        {
+          "level": "3",
+          "text": "3.1 CloudCompare PoissonRecon",
+          "slug": "3.1-cloudcompare-poissonrecon"
+        },
+        {
+          "level": "3",
+          "text": "3.2 COLMAP dense fused PLY + poisson_mesher / delaunay_mesher",
+          "slug": "3.2-colmap-dense-fused-ply--poisson-mesher-delaunay-mesher"
+        },
+        {
+          "level": "3",
+          "text": "3.3 Open3D point-cloud reconstruction",
+          "slug": "3.3-open3d-point-cloud-reconstruction"
+        },
+        {
+          "level": "2",
+          "text": "4. 多视角 / 深度融合路线",
+          "slug": "4.-多视角-深度融合路线"
+        },
+        {
+          "level": "3",
+          "text": "4.1 OpenMVS",
+          "slug": "4.1-openmvs"
+        },
+        {
+          "level": "3",
+          "text": "4.2 TSDF fusion / Marching Cubes",
+          "slug": "4.2-tsdf-fusion-marching-cubes"
+        },
+        {
+          "level": "2",
+          "text": "5. 3DGS-aware surface 方法",
+          "slug": "5.-3dgs-aware-surface-方法"
+        },
+        {
+          "level": "3",
+          "text": "5.1 SuGaR",
+          "slug": "5.1-sugar"
+        },
+        {
+          "level": "3",
+          "text": "5.2 2D Gaussian Splatting",
+          "slug": "5.2-2d-gaussian-splatting"
+        },
+        {
+          "level": "3",
+          "text": "5.3 GOF",
+          "slug": "5.3-gof"
+        },
+        {
+          "level": "3",
+          "text": "5.4 GS2Mesh",
+          "slug": "5.4-gs2mesh"
+        },
+        {
+          "level": "2",
+          "text": "6. Neural SDF / NeRF mesh 路线",
+          "slug": "6.-neural-sdf-nerf-mesh-路线"
+        },
+        {
+          "level": "2",
+          "text": "7. 工业 Photogrammetry 路线",
+          "slug": "7.-工业-photogrammetry-路线"
+        },
+        {
+          "level": "3",
+          "text": "7.1 RealityCapture / RealityScan",
+          "slug": "7.1-realitycapture-realityscan"
+        },
+        {
+          "level": "3",
+          "text": "7.2 Agisoft Metashape",
+          "slug": "7.2-agisoft-metashape"
+        },
+        {
+          "level": "2",
+          "text": "8. Collision proxy 和物理约束",
+          "slug": "8.-collision-proxy-和物理约束"
+        },
+        {
+          "level": "3",
+          "text": "8.1 Unity MeshCollider 限制",
+          "slug": "8.1-unity-meshcollider-限制"
+        },
+        {
+          "level": "3",
+          "text": "8.2 Blender Decimate",
+          "slug": "8.2-blender-decimate"
+        },
+        {
+          "level": "3",
+          "text": "8.3 V-HACD / CoACD",
+          "slug": "8.3-v-hacd-coacd"
+        },
+        {
+          "level": "2",
+          "text": "9. 语义兼容方案",
+          "slug": "9.-语义兼容方案"
+        }
+      ],
+      "reading_minutes": 6
+    },
+    {
+      "id": "sim-anything-phys-splat-survey",
+      "title": "Sim Anything / PhysSplat 论文调研：对 Video2Mesh 仿真资产线的启发",
+      "category": "Surveys",
+      "summary": "调研日期：2026-06-30 面向项目：Video2Mesh 当前流水线 用户提到的 Sim Anything 对应的公开项目/论文线索目前主要指向 PhysSplat: Efficient Physics Simulation for 3D Scenes via MLLM-Guided Gaussian Splatting。",
+      "source_path": "SIM_ANYTHING_PHYS_SPLAT_SURVEY.md",
+      "source_kind": "builtin",
+      "updated": "2026-06-30",
+      "tags": [
+        "Surveys"
+      ],
+      "body": "# Sim Anything / PhysSplat 论文调研：对 Video2Mesh 仿真资产线的启发\n\n调研日期：2026-06-30  \n面向项目：Video2Mesh 当前流水线\n\n## 0. 结论先行\n\n用户提到的 **Sim Anything** 对应的公开项目/论文线索目前主要指向\n**PhysSplat: Efficient Physics Simulation for 3D Scenes via MLLM-Guided Gaussian Splatting**。\n论文 arXiv 编号为 `2411.12789`，项目页早期使用 `sim-gs.github.io`，\nGitHub 链接为 `Maxwell-Zhao/PhysSplat`。arXiv v3 标注为 ICCV 2025。\n\n这篇论文不是从视频重建 3D 场景或 mesh 的方法；它假设已经有一个静态\n3DGS 场景，然后自动找出可动对象、估计物理属性，并把 3DGS 变成可物理仿真的\n动态粒子/高斯表示。它对 Video2Mesh 最有价值的部分是：\n\n1. **把仿真问题拆成 semantic + physics + deformation + rendering 四层**，而不是只导出一个 mesh。\n2. **用 MLLM/VLM 自动判断对象物理属性**，可补强 Video2Mesh 当前的 `prepare-simulator-physics-jobs` 和 `import-simulator-physics`。\n3. **用可动对象 mask 驱动局部动态**，与 Video2Mesh 的 2D/3D mask、semantic splats、simulator bundle 很贴。\n4. **用 Gaussian/particle 级表示做动态仿真**，适合做软体、液体、可形变物体展示；但它不能直接替代 Video2Mesh 的 mesh、collider、MuJoCo/Unity/Isaac 导出。\n\n建议把它作为 Video2Mesh 的 **动态仿真增强方向**，而不是替代当前\n`video -> COLMAP -> 3DGS -> masks -> object mesh -> simulator assets` 主链路。\n\n## 1. 论文要解决的问题\n\n传统 3DGS 主要擅长新视角渲染：给定一组图片和相机位姿，训练出静态高斯场景。\n但是静态 3DGS 不知道哪些东西能动、是什么材质、受到外力后怎么变形，也没有\n仿真器里的质量、刚体/软体、碰撞体等属性。\n\nPhysSplat 的问题定义可以概括为：\n\n```text\n静态 3DGS 场景\n  -> 自动识别可操作/可动对象\n  -> 估计物理属性\n  -> 把对象高斯转换为可仿真的粒子/高斯状态\n  -> 用物理模拟更新对象形变和运动\n  -> 仍然用 Gaussian splatting 渲染动态结果\n```\n\n它关心的是“让已有 3DGS 场景动起来”，而不是“从视频把场景建出来”。\n\n## 2. 方法链路\n\n### 2.1 场景理解与对象定位\n\n论文使用多模态大模型辅助理解场景和物体。核心作用不是训练一个新的 open-vocabulary\nsegmenter，而是让模型根据渲染视图、语言提示和场景上下文判断：\n\n- 哪些对象是目标对象。\n- 哪些区域属于该对象。\n- 对象更像刚体、软体、颗粒、液体或其他物理类别。\n- 对象应采用哪些物理参数或交互规则。\n\n这和 Video2Mesh 当前的 `auto-prompts`、`track-masks`、`fuse-masks` 分工不同：\nVideo2Mesh 更偏“先得到稳定 2D/3D mask”，PhysSplat 更强调“mask 之后的物理解释”。\n\n### 2.2 3DGS 到物理表示\n\n论文把 3DGS 中目标对象对应的高斯抽出来，并转成适合仿真的物理实体。\n这一步的关键是：Gaussian 原本只是渲染 primitive，不天然等于物理粒子。\n因此需要给每个对象或每个高斯/粒子附加：\n\n- 位置、速度、质量。\n- 材质参数。\n- 刚度、阻尼、塑性或流体相关参数。\n- 是否固定、是否受重力、是否可碰撞。\n- 和场景背景/其他对象的碰撞关系。\n\nVideo2Mesh 当前已经有 `semantic_splats.ply`、`semantic_gaussian_probabilities.ply`\n和 `simulator_asset_bundle.json`，但语义高斯和仿真 bundle 之间还不是同一个\n物理粒子系统。PhysSplat 的价值就在这个连接处。\n\n### 2.3 物理模拟\n\n论文使用物理模拟更新对象状态，使高斯/粒子随时间运动或形变。它的重点是\n高效地产生可视化动态效果，尤其适合：\n\n- 软体/可变形物体。\n- 颗粒或散落物。\n- 受力后会形变的局部对象。\n- 需要保持 3DGS 渲染外观的动态场景。\n\n这和 MuJoCo/Isaac/Unity 的标准刚体资产导出不是同一个目标。MuJoCo/Isaac/Unity\n更需要稳定 mesh、collider、joint、rigid body、body type 和可解释的物理参数；\nPhysSplat 更像是在 Gaussian 表示上直接做动态视觉仿真。\n\n### 2.4 动态渲染\n\n仿真后，目标对象的 Gaussian/particle 状态发生变化，系统再用 splatting 渲染每个时间步。\n因此最终结果更像动态 3DGS 视频或交互式 dynamic splat，而不是标准游戏引擎资产包。\n\n## 3. 和 Video2Mesh 当前流水线对照\n\n| 阶段 | Video2Mesh 当前做法 | PhysSplat / Sim Anything 做法 | 关系 |\n|---|---|---|---|\n| 输入 | 空间扫描视频 | 已训练静态 3DGS 场景 | Video2Mesh 更前置 |\n| 位姿/重建 | COLMAP + GraphDECO 3DGS | 依赖已有 3DGS | PhysSplat 不替代重建 |\n| 2D mask | SAM prompt + SAM2 tracking | MLLM/VLM 辅助对象理解 | 可互补 |\n| 2D-to-3D | 点云/高斯语义融合 | 从 3DGS 中抽目标对象 | Video2Mesh 可提供对象高斯 |\n| 物体 mesh | 3DGS rendered depth/normal/mask -> TSDF/Poisson | 不以 mesh 为核心 | 不能替代 mesh 导出 |\n| 物理属性 | 默认估计 + 外部/manual physics jobs | MLLM-guided physics property inference | 可借鉴 |\n| 仿真表示 | simulator bundle + collider + adapters | Gaussian/particle dynamics | 两条输出线 |\n| 输出 | MuJoCo/Unity/Isaac + review pack | dynamic 3DGS simulation | 目标不同 |\n\n最重要的边界：PhysSplat 不能帮 Video2Mesh 解决 COLMAP 失败、3DGS 几何质量差、\n2D mask 漂移、object mesh 破碎这些上游问题。它主要帮的是“已经有语义对象之后，\n如何让它们具备动态物理行为”。\n\n## 4. Video2Mesh 可以怎么借\n\n### 4.1 增加 `dynamic_gaussian_assets` 输出线\n\n当前 Video2Mesh 的 simulator 输出可以继续保持：\n\n```text\nsimulator_assets/simulator_asset_bundle.json\nsimulator_assets/adapters/mujoco/scene.xml\nsimulator_assets/adapters/unity/unity_adapter.json\nsimulator_assets/adapters/isaac/...\n```\n\n在旁边新增一条 Gaussian 动态仿真线：\n\n```text\nsimulator_assets/dynamic_gaussian_assets/\n  scene_dynamic_config.json\n  objects/<object_id>/gaussians.ply\n  objects/<object_id>/physics.json\n  objects/<object_id>/constraints.json\n  simulations/<sim_id>/trajectory.npz\n  simulations/<sim_id>/frames/\n```\n\n这条线服务于 dynamic splat 展示和局部物理实验，不强行塞进 MuJoCo/Unity\n标准 mesh/collider 合同。\n\n### 4.2 用 VLM/MLLM 生成物理属性草稿\n\nVideo2Mesh 已经有：\n\n```bash\npython -m video2mesh.cli prepare-simulator-physics-jobs\npython -m video2mesh.cli import-simulator-physics\npython -m video2mesh.cli simulator-physics-quality-report\n```\n\n可以新增一个 provider，例如：\n\n```text\nprovider = \"mllm_physics\"\n```\n\n输入给 VLM/MLLM：\n\n- object crop / selected frames。\n- object mask。\n- object category / label。\n- world bbox size。\n- support plane。\n- 当前 mesh 或 object splat preview。\n\n输出：\n\n```json\n{\n  \"object_id\": \"chair_01\",\n  \"body_type\": \"dynamic\",\n  \"material\": \"wood\",\n  \"mass_kg\": 5.0,\n  \"friction\": 0.55,\n  \"restitution\": 0.1,\n  \"rigidity\": \"rigid\",\n  \"deformable\": false,\n  \"confidence\": 0.72,\n  \"rationale\": \"wooden dining chair with rigid frame\"\n}\n```\n\n这样可以先补齐仿真 bundle 的物理字段，再由人工或真实测量校准。\n\n### 4.3 把对象分成刚体输出和可形变输出\n\n推荐在 `object_asset.json` 或 `simulator_asset_bundle.json` 中增加动态类型：\n\n```json\n{\n  \"simulation_role\": \"rigid_body\",\n  \"dynamic_gaussian_candidate\": false\n}\n```\n\n或：\n\n```json\n{\n  \"simulation_role\": \"deformable_gaussian\",\n  \"dynamic_gaussian_candidate\": true\n}\n```\n\n分类规则可以先简单做：\n\n- chair/table/cabinet/book：默认 rigid body。\n- cloth/pillow/blanket/plant/liquid/food/sand：候选 deformable/particle。\n- floor/wall/ceiling/background：static collider。\n\nPhysSplat 更适合第二类，不适合把所有物体都 Gaussian 化仿真。\n\n### 4.4 对 semantic Gaussian 做物理属性扩展\n\nVideo2Mesh 当前语义高斯更偏：\n\n```text\nobject_id\nsemantic_id\nobject_probability\n```\n\n可借鉴 PhysSplat 增加物理相关 sidecar，而不是直接污染 viewer PLY：\n\n```text\nsimulator_assets/gaussian_physics/\n  gaussian_physics_manifest.json\n  object_<id>_gaussian_indices.npy\n  object_<id>_particle_state.npz\n```\n\n字段示例：\n\n```json\n{\n  \"object_id\": \"pillow_01\",\n  \"semantic_id\": 3,\n  \"particle_source\": \"semantic_gaussian_probabilities.ply\",\n  \"gaussian_count\": 12843,\n  \"physics_model\": \"deformable\",\n  \"material\": {\n    \"density\": 35.0,\n    \"youngs_modulus\": 20000.0,\n    \"poisson_ratio\": 0.35,\n    \"friction\": 0.6\n  }\n}\n```\n\n### 4.5 对背景和对象做不同处理\n\nPhysSplat 的动态对象需要和静态背景碰撞。Video2Mesh 已经把 background structure\n作为 `asset_role=background_structure` 的一等记录，这一点很适合承接：\n\n```text\nfloor/wall/table surface\n  -> static collider / boundary condition\n\nforeground deformable object\n  -> dynamic gaussian/particle object\n```\n\n不要把背景也当成可动高斯对象。背景更应该导出为静态 collider 或 layout plane。\n\n## 5. 不建议直接照搬的地方\n\n### 5.1 不要用 PhysSplat 替代 object mesh\n\nVideo2Mesh 的目标包括 MuJoCo/Unity/Isaac asset export。标准仿真器仍然更吃：\n\n- watertight 或近似 watertight visual mesh。\n- 简化 collision proxy。\n- 明确尺度、坐标系、body type。\n- joint/constraint/contact material。\n\nPhysSplat 输出的 dynamic Gaussian simulation 对展示很好，但不能直接等价于\nUnity/MuJoCo 可复用资产。\n\n### 5.2 不要让 MLLM 决定所有物理参数而不做 QA\n\nMLLM 可以给材料和参数初值，但物理字段需要质量报告：\n\n- 是否缺 mass。\n- mass 是否和 bbox 尺寸/类别严重不符。\n- friction/restitution 是否超范围。\n- rigid/deformable 是否和类别冲突。\n- static background 是否被误标成 dynamic object。\n\n这些可以接入现有 `simulator-physics-quality-report`。\n\n### 5.3 不要忽略上游 mask 质量\n\n动态仿真对 mask 质量非常敏感。对象 Gaussian 混入背景后，仿真会出现：\n\n- 墙/地板跟着物体动。\n- 物体边缘飞散。\n- 软体对象粘连到桌面。\n- 碰撞体和视觉对象错位。\n\n因此在接 PhysSplat-style 动态之前，应先保证：\n\n- object 3D mask 有足够 visibility support。\n- semantic Gaussian probability 足够高。\n- 3D 连通域干净。\n- 支撑平面和对象 bbox 合理。\n\n## 6. 推荐落地路线\n\n### 6.1 短期：先做物理属性自动草稿\n\n优先级最高的是补强现有 simulator bundle，而不是先做完整 Gaussian 动力学：\n\n```text\nselected object frames + masks + bbox\n  -> VLM/MLLM physics annotation\n  -> import-simulator-physics\n  -> simulator-physics-quality-report\n```\n\n收益：\n\n- 最贴近现有 CLI 和 QA。\n- 对导师展示有直接价值。\n- 即使不做 dynamic Gaussian，也能改善 Unity/MuJoCo/Isaac bundle。\n\n### 6.2 中期：导出动态 Gaussian 候选对象\n\n新增命令可以设计为：\n\n```bash\npython -m video2mesh.cli export-dynamic-gaussian-assets \\\n  --project-root exports/<run> \\\n  --semantic-splats-ply exports/<run>/simulator_assets/semantic_gaussian_probabilities.ply \\\n  --min-probability 0.6 \\\n  --roles deformable_gaussian particle\n```\n\n输出每个候选对象的 Gaussian 子集、物理属性草稿和背景 collider 引用。\n\n### 6.3 长期：接入 MPM / differentiable physics 后端\n\n长期才考虑类似 PhysSplat 的完整闭环：\n\n```text\nsemantic object gaussians\n  -> particle initialization\n  -> MPM / deformable simulation\n  -> per-timestep gaussian update\n  -> dynamic splat viewer\n  -> optional rendered video / interaction demo\n```\n\n这部分建议作为独立 backend，避免把 Video2Mesh 主 CLI 变成重型物理引擎。\n\n## 7. 对当前项目的具体判断\n\nVideo2Mesh 和 PhysSplat 的关系可以一句话概括：\n\n```text\nVideo2Mesh 负责从真实扫描视频生成有语义、几何和仿真合同的资产；\nPhysSplat 启发我们把其中一部分语义 Gaussian 对象升级成可动态仿真的物理对象。\n```\n\n最值得借的不是它的最终 demo，而是三个设计：\n\n1. **semantic Gaussian -> physical object** 的转换层。\n2. **MLLM/VLM -> physics property draft** 的自动标注层。\n3. **dynamic Gaussian object** 和 **static background collider** 的分层。\n\n如果要和当前代码对接，最自然的插入点是：\n\n```text\nbackproject-gaussian-probabilities\n  -> gaussian-probability-quality-report\n  -> export-dynamic-gaussian-assets\n  -> prepare/import simulator physics\n  -> simulator-physics-quality-report\n```\n\n而不是替换 `reconstruct-3dgs-object-meshes` 或 `export-simulator-assets`。\n\n## 8. 参考资料\n\n- PhysSplat arXiv: <https://arxiv.org/abs/2411.12789>\n- PhysSplat arXiv HTML: <https://arxiv.org/html/2411.12789>\n- Project page: <https://sim-gs.github.io/>\n- GitHub: <https://github.com/Maxwell-Zhao/PhysSplat>\n- Video2Mesh current pipeline: `VIDEO2MESH_PIPELINE.md`\n- Video2Mesh scene scanning survey: `SCENE_SCANNING_SOLUTIONS_SURVEY.md`\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "0. 结论先行",
+          "slug": "0.-结论先行"
+        },
+        {
+          "level": "2",
+          "text": "1. 论文要解决的问题",
+          "slug": "1.-论文要解决的问题"
+        },
+        {
+          "level": "2",
+          "text": "2. 方法链路",
+          "slug": "2.-方法链路"
+        },
+        {
+          "level": "3",
+          "text": "2.1 场景理解与对象定位",
+          "slug": "2.1-场景理解与对象定位"
+        },
+        {
+          "level": "3",
+          "text": "2.2 3DGS 到物理表示",
+          "slug": "2.2-3dgs-到物理表示"
+        },
+        {
+          "level": "3",
+          "text": "2.3 物理模拟",
+          "slug": "2.3-物理模拟"
+        },
+        {
+          "level": "3",
+          "text": "2.4 动态渲染",
+          "slug": "2.4-动态渲染"
+        },
+        {
+          "level": "2",
+          "text": "3. 和 Video2Mesh 当前流水线对照",
+          "slug": "3.-和-video2mesh-当前流水线对照"
+        },
+        {
+          "level": "2",
+          "text": "4. Video2Mesh 可以怎么借",
+          "slug": "4.-video2mesh-可以怎么借"
+        },
+        {
+          "level": "3",
+          "text": "4.1 增加 dynamic_gaussian_assets 输出线",
+          "slug": "4.1-增加-dynamic-gaussian-assets-输出线"
+        },
+        {
+          "level": "3",
+          "text": "4.2 用 VLM/MLLM 生成物理属性草稿",
+          "slug": "4.2-用-vlm-mllm-生成物理属性草稿"
+        },
+        {
+          "level": "3",
+          "text": "4.3 把对象分成刚体输出和可形变输出",
+          "slug": "4.3-把对象分成刚体输出和可形变输出"
+        },
+        {
+          "level": "3",
+          "text": "4.4 对 semantic Gaussian 做物理属性扩展",
+          "slug": "4.4-对-semantic-gaussian-做物理属性扩展"
+        },
+        {
+          "level": "3",
+          "text": "4.5 对背景和对象做不同处理",
+          "slug": "4.5-对背景和对象做不同处理"
+        },
+        {
+          "level": "2",
+          "text": "5. 不建议直接照搬的地方",
+          "slug": "5.-不建议直接照搬的地方"
+        },
+        {
+          "level": "3",
+          "text": "5.1 不要用 PhysSplat 替代 object mesh",
+          "slug": "5.1-不要用-physsplat-替代-object-mesh"
+        },
+        {
+          "level": "3",
+          "text": "5.2 不要让 MLLM 决定所有物理参数而不做 QA",
+          "slug": "5.2-不要让-mllm-决定所有物理参数而不做-qa"
+        },
+        {
+          "level": "3",
+          "text": "5.3 不要忽略上游 mask 质量",
+          "slug": "5.3-不要忽略上游-mask-质量"
+        },
+        {
+          "level": "2",
+          "text": "6. 推荐落地路线",
+          "slug": "6.-推荐落地路线"
+        },
+        {
+          "level": "3",
+          "text": "6.1 短期：先做物理属性自动草稿",
+          "slug": "6.1-短期先做物理属性自动草稿"
+        },
+        {
+          "level": "3",
+          "text": "6.2 中期：导出动态 Gaussian 候选对象",
+          "slug": "6.2-中期导出动态-gaussian-候选对象"
+        },
+        {
+          "level": "3",
+          "text": "6.3 长期：接入 MPM / differentiable physics 后端",
+          "slug": "6.3-长期接入-mpm-differentiable-physics-后端"
+        },
+        {
+          "level": "2",
+          "text": "7. 对当前项目的具体判断",
+          "slug": "7.-对当前项目的具体判断"
+        },
+        {
+          "level": "2",
+          "text": "8. 参考资料",
+          "slug": "8.-参考资料"
+        }
+      ],
+      "reading_minutes": 3
+    },
+    {
       "id": "api-remote-control",
       "title": "本机 API、用户登录与手机远程控制",
       "category": "Guide",
@@ -960,7 +1233,7 @@ window.V2M_BLOG_DATA = {
         "Remote",
         "Guide"
       ],
-      "body": "\n# 本机 API、用户登录与手机远程控制\n\n这个网站本身仍然是 GitHub Pages 静态站。动态能力由本机侧边 API 提供：它运行在这台电脑上，负责登录鉴权、写入 Markdown、记录多个项目、接收 Codex 任务队列。\n\n## 启动 API\n\n```bash\n./docs-blog/run_api.sh\n```\n\n默认监听：\n\n```text\nhttp://127.0.0.1:8787\n```\n\n公网和手机远程控制推荐通过 Cloudflare Tunnel 暴露为：\n\n```text\nhttps://api.relumeow.top\n```\n\nTunnel 的公开 hostname 指向这台电脑上的本机服务：\n\n```text\napi.relumeow.top -> http://127.0.0.1:8787\n```\n\n第一次启动时会生成 bootstrap token。它只用于首次创建管理员账号：\n\n```bash\ncat docs-blog/runtime/api_token.txt\n```\n\n如果想固定配置，可以创建 `docs-blog/.env`：\n\n```env\nV2M_API_TOKEN=change-this-long-random-token\nV2M_API_HOST=127.0.0.1\nV2M_API_PORT=8787\nV2M_SESSION_TTL_SECONDS=604800\nV2M_GITHUB_ALLOWED_LOGINS=Interstellar6\nV2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback\nV2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top\nV2M_CODEX_WORKSPACE=/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/CodexCloudWorkspace\nV2M_TERMINAL_MAX_TIMEOUT_SECONDS=30\nV2M_TERMINAL_OUTPUT_LIMIT=80000\n```\n\n## 首次创建管理员\n\n账号建议使用：\n\n```text\nInterstellar6\n```\n\n创建管理员：\n\n```bash\nexport V2M_BOOTSTRAP_TOKEN=\"$(cat docs-blog/runtime/api_token.txt)\"\n\ncurl -H \"Authorization: Bearer $V2M_BOOTSTRAP_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"username\":\"Interstellar6\",\"password\":\"替换成强密码\"}' \\\n  http://127.0.0.1:8787/api/auth/setup\n```\n\n返回里的 `session_token` 是登录会话 token。以后访问 Mac 控制接口都用这个会话 token，而不是 bootstrap token。\n\n## 普通登录\n\n```bash\nexport V2M_SESSION_TOKEN=\"$(\n  curl -s -H \"Content-Type: application/json\" \\\n    -d '{\"username\":\"Interstellar6\",\"password\":\"替换成强密码\"}' \\\n    http://127.0.0.1:8787/api/auth/login \\\n  | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"session_token\"])'\n)\"\n```\n\n检查当前登录用户：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  http://127.0.0.1:8787/api/auth/me\n```\n\n## GitHub 授权登录\n\n先在 GitHub 创建一个 OAuth App，Authorization callback URL 填：\n\n```text\nhttps://api.relumeow.top/api/auth/github/callback\n```\n\n然后在 `docs-blog/.env` 里配置：\n\n```env\nV2M_GITHUB_CLIENT_ID=你的_client_id\nV2M_GITHUB_CLIENT_SECRET=你的_client_secret\nV2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback\nV2M_GITHUB_ALLOWED_LOGINS=Interstellar6\nV2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top\n```\n\n重启 API 后，管理员界面里的“GitHub 授权登录”会打开 GitHub OAuth。API 会校验 GitHub 登录名必须在 `V2M_GITHUB_ALLOWED_LOGINS` 里，默认只允许 `Interstellar6`。\n\n## 管理员界面\n\n公开首页只展示文档，不显示 Mac 控制台。需要远程控制时，打开：\n\n```text\nhttps://admin.relumeow.top/\n```\n\n例如本地预览是：\n\n```text\nhttp://127.0.0.1:8000/docs-blog/admin/\n```\n\n线上管理域名是：\n\n```text\nhttps://admin.relumeow.top/\n```\n\n管理员界面里的 API 地址填：\n\n```text\nhttps://api.relumeow.top\n```\n\n## 让 Codex 同步一篇文档\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"title\": \"Codex Remote Note\",\n    \"category\": \"Remote\",\n    \"tags\": [\"Codex\", \"Remote\"],\n    \"markdown\": \"# Codex Remote Note\\n\\n这篇文档来自本机 API。\"\n  }' \\\n  http://127.0.0.1:8787/api/docs\n```\n\nAPI 会把文件写入：\n\n```text\ndocs-blog/content/remote/\n```\n\n然后自动运行：\n\n```bash\npython3 docs-blog/build_site.py\n```\n\n## 多项目记录\n\n添加项目：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"name\": \"Video2Mesh\",\n    \"repo\": \"/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh\",\n    \"summary\": \"文档站、远程 API 和任务队列\"\n  }' \\\n  http://127.0.0.1:8787/api/projects\n```\n\n读取项目：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  http://127.0.0.1:8787/api/projects\n```\n\n## Codex 任务队列\n\n手机端或网页端可以把工作请求写入队列：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"project\": \"Video2Mesh\",\n    \"prompt\": \"请 Codex 调研如何把 3DGS 场景转成可交互游戏关卡。\"\n  }' \\\n  http://127.0.0.1:8787/api/codex-tasks\n```\n\n本机 Codex 可以读取：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  http://127.0.0.1:8787/api/codex-tasks\n```\n\n也可以用本机辅助脚本登录并读取队列：\n\n```bash\npython3 docs-blog/codex_queue.py login --username Interstellar6\npython3 docs-blog/codex_queue.py next\npython3 docs-blog/codex_queue.py list --status queued\n```\n\n执行后更新状态：\n\n```bash\ncurl -X PATCH \\\n  -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"status\":\"done\",\"result_summary\":\"已完成并同步到网站。\"}' \\\n  http://127.0.0.1:8787/api/codex-tasks/task-id\n```\n\n或者：\n\n```bash\npython3 docs-blog/codex_queue.py patch task-id --status done --summary \"已完成并同步到网站。\"\n```\n\n## Codex Cloud Workspace\n\n管理员界面现在有一个 `Codex 会话` 标签。它不是公开首页的一部分，只在：\n\n```text\nhttps://admin.relumeow.top/#cloud\n```\n\n登录管理员后可用。服务器端会维护：\n\n```text\nCodexCloudWorkspace/\n  project-id/\n    project.json\n    sessions/\n      session-id/\n        session.json\n        messages.json\n        files.json\n        files/\n```\n\n网页端发送消息会同时写入会话记录，并创建一条 Codex 任务队列记录。Codex 完成工作后，可以把回复和产物写回同一个会话。\n\n写入 Codex 回复：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"role\":\"assistant\",\"content\":\"已完成初稿，输出文件见 outputs/report.md。\",\"enqueue_task\":false}' \\\n  http://127.0.0.1:8787/api/codex-cloud/projects/video2mesh/sessions/session-id/messages\n```\n\n写入输出文件：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"path\":\"outputs/report.md\",\"summary\":\"调研报告\",\"content\":\"# Report\\n\\n...\"}' \\\n  http://127.0.0.1:8787/api/codex-cloud/projects/video2mesh/sessions/session-id/files\n```\n\n文件会保存在 `CodexCloudWorkspace/<project>/sessions/<session>/files/`，管理员页面可以直接预览小于 5 MB 的文本/常见文件。\n\n### 工作区文件浏览\n\n管理员页的 `Codex 会话` 标签下方有 `工作区文件` 面板，可以浏览：\n\n```text\nCodexCloudWorkspace/\n```\n\n列目录：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  'http://127.0.0.1:8787/api/codex-cloud/fs?path=video2mesh'\n```\n\n预览小文本文件：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  'http://127.0.0.1:8787/api/codex-cloud/fs?path=video2mesh/project.json&preview=1'\n```\n\n所有路径都会被限制在 `CodexCloudWorkspace` 内，不能通过 `..` 或绝对路径跳出去。\n\n### 管理员工作区终端\n\n管理员页还有 `终端` 面板。它执行的是一次性命令，不是长期交互 shell；工作目录也限制在 `CodexCloudWorkspace` 内。\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"cwd\":\"video2mesh\",\"command\":\"pwd && find . -maxdepth 2 -type f | sort\",\"timeout_seconds\":20}' \\\n  http://127.0.0.1:8787/api/codex-cloud/terminal\n```\n\n相关环境变量：\n\n```env\nV2M_CODEX_WORKSPACE=/absolute/path/to/CodexCloudWorkspace\nV2M_TERMINAL_SHELL=/bin/zsh\nV2M_TERMINAL_MAX_TIMEOUT_SECONDS=30\nV2M_TERMINAL_OUTPUT_LIMIT=80000\n```\n\n建议只通过 `https://admin.relumeow.top` 登录后使用，不要把 API 直接裸露成无鉴权公网服务。\n\n## Cloudflare Tunnel 配置\n\n推荐把 `relumeow.top` 接入 Cloudflare，然后创建一个 Tunnel 指向本机 API：\n\n```text\nPublic hostname: api.relumeow.top\nService: http://127.0.0.1:8787\n```\n\nGitHub OAuth App 填：\n\n```text\nHomepage URL: https://admin.relumeow.top\nAuthorization callback URL: https://api.relumeow.top/api/auth/github/callback\n```\n\n管理静态页使用 Cloudflare Worker 挂到独立子域名：\n\n```text\nWorker source: docs-blog/admin-domain-worker.js\nCustom Domain: admin.relumeow.top\n```\n\nCloudflare Dashboard 操作：\n\n1. Workers & Pages 里创建一个 Worker。\n2. 粘贴 `docs-blog/admin-domain-worker.js`。\n3. 在 Worker 的 Settings -> Domains & Routes 里添加 Custom Domain：\n\n```text\nadmin.relumeow.top\n```\n\n4. 打开：\n\n```text\nhttps://admin.relumeow.top/\n```\n\n也可以用 Wrangler 部署：\n\n```bash\nnpx wrangler deploy --config docs-blog/wrangler.admin.toml\n```\n\nAPI 地址填：\n\n```text\nhttps://api.relumeow.top\n```\n\n局域网内调试如果想直接连 `http://127.0.0.1:8787` 或 `http://这台电脑的局域网IP:8787`，需要临时把对应网页来源加进 `V2M_ALLOWED_WEB_ORIGINS`，并按需把 `V2M_API_HOST` 改成 `0.0.0.0`。正式远程使用建议只走 HTTPS 隧道。\n\n## 安全边界\n\n- 工作区终端只对管理员开放，且工作目录限制在 `CodexCloudWorkspace` 内。\n- 终端命令是一次性执行，带超时和输出截断；它仍然具备在工作区内读写文件的能力，所以管理员密码、GitHub OAuth 和 Cloudflare Tunnel 都必须妥善保护。\n- 远程控制只进入任务队列，由本机 Codex 读取后人工或半自动执行。\n- token 不提交到 git；默认保存在 `docs-blog/runtime/api_token.txt`。\n- GitHub Pages 只能托管静态站，不能直接运行这个 API。\n\n这个边界能让手机远程“派活”，也能在管理员界面检查工作区产物；终端能力只用于受控工作区操作。\n",
+      "body": "\n# 本机 API、用户登录与手机远程控制\n\n这个网站本身仍然是 GitHub Pages 静态站。动态能力由本机侧边 API 提供：它运行在这台电脑上，负责登录鉴权、写入 Markdown、记录多个项目、接收 Codex 任务队列。\n\n## 启动 API\n\n```bash\n./docs-blog/run_api.sh\n```\n\n默认监听：\n\n```text\nhttp://127.0.0.1:8787\n```\n\n公网和手机远程控制推荐通过 Cloudflare Tunnel 暴露为：\n\n```text\nhttps://api.relumeow.top\n```\n\nTunnel 的公开 hostname 指向这台电脑上的本机服务：\n\n```text\napi.relumeow.top -> http://127.0.0.1:8787\n```\n\n第一次启动时会生成 bootstrap token。它只用于首次创建管理员账号：\n\n```bash\ncat docs-blog/runtime/api_token.txt\n```\n\n如果想固定配置，可以创建 `docs-blog/.env`：\n\n```env\nV2M_API_TOKEN=change-this-long-random-token\nV2M_API_HOST=127.0.0.1\nV2M_API_PORT=8787\nV2M_SESSION_TTL_SECONDS=604800\nV2M_GITHUB_ALLOWED_LOGINS=Interstellar6\nV2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback\nV2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top,http://127.0.0.1:8000,http://localhost:8000\nV2M_CODEX_WORKSPACE=/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/CodexCloudWorkspace\nV2M_TERMINAL_MAX_TIMEOUT_SECONDS=30\nV2M_TERMINAL_OUTPUT_LIMIT=80000\n```\n\n## 首次创建管理员\n\n账号建议使用：\n\n```text\nInterstellar6\n```\n\n创建管理员：\n\n```bash\nexport V2M_BOOTSTRAP_TOKEN=\"$(cat docs-blog/runtime/api_token.txt)\"\n\ncurl -H \"Authorization: Bearer $V2M_BOOTSTRAP_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"username\":\"Interstellar6\",\"password\":\"替换成强密码\"}' \\\n  http://127.0.0.1:8787/api/auth/setup\n```\n\n返回里的 `session_token` 是登录会话 token。以后访问 Mac 控制接口都用这个会话 token，而不是 bootstrap token。\n\n## 普通登录\n\n```bash\nexport V2M_SESSION_TOKEN=\"$(\n  curl -s -H \"Content-Type: application/json\" \\\n    -d '{\"username\":\"Interstellar6\",\"password\":\"替换成强密码\"}' \\\n    http://127.0.0.1:8787/api/auth/login \\\n  | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"session_token\"])'\n)\"\n```\n\n检查当前登录用户：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  http://127.0.0.1:8787/api/auth/me\n```\n\n## GitHub 授权登录\n\n先在 GitHub 创建一个 OAuth App，Authorization callback URL 填：\n\n```text\nhttps://api.relumeow.top/api/auth/github/callback\n```\n\n然后在 `docs-blog/.env` 里配置：\n\n```env\nV2M_GITHUB_CLIENT_ID=你的_client_id\nV2M_GITHUB_CLIENT_SECRET=你的_client_secret\nV2M_GITHUB_REDIRECT_URI=https://api.relumeow.top/api/auth/github/callback\nV2M_GITHUB_ALLOWED_LOGINS=Interstellar6\nV2M_ALLOWED_WEB_ORIGINS=https://admin.relumeow.top,https://relumeow.top,http://relumeow.top,http://127.0.0.1:8000,http://localhost:8000\n```\n\n重启 API 后，管理员界面里的“GitHub 授权登录”会打开 GitHub OAuth。API 会校验 GitHub 登录名必须在 `V2M_GITHUB_ALLOWED_LOGINS` 里，默认只允许 `Interstellar6`。\n\n## 管理员界面\n\n公开首页只展示文档，不显示 Mac 控制台。需要远程控制时，打开：\n\n```text\nhttps://admin.relumeow.top/\n```\n\n例如本地预览是：\n\n```text\nhttp://127.0.0.1:8000/docs-blog/admin/\n```\n\n线上管理域名是：\n\n```text\nhttps://admin.relumeow.top/\n```\n\n管理员界面里的 API 地址填：\n\n```text\nhttps://api.relumeow.top\n```\n\n## 让 Codex 同步一篇文档\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"title\": \"Codex Remote Note\",\n    \"category\": \"Remote\",\n    \"tags\": [\"Codex\", \"Remote\"],\n    \"markdown\": \"# Codex Remote Note\\n\\n这篇文档来自本机 API。\"\n  }' \\\n  http://127.0.0.1:8787/api/docs\n```\n\nAPI 会把文件写入：\n\n```text\ndocs-blog/content/remote/\n```\n\n然后自动运行：\n\n```bash\npython3 docs-blog/build_site.py\n```\n\n## 多项目记录\n\n添加项目：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"name\": \"Video2Mesh\",\n    \"repo\": \"/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh\",\n    \"summary\": \"文档站、远程 API 和任务队列\"\n  }' \\\n  http://127.0.0.1:8787/api/projects\n```\n\n读取项目：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  http://127.0.0.1:8787/api/projects\n```\n\n## Codex 任务队列\n\n手机端或网页端可以把工作请求写入队列：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"project\": \"Video2Mesh\",\n    \"prompt\": \"请 Codex 调研如何把 3DGS 场景转成可交互游戏关卡。\"\n  }' \\\n  http://127.0.0.1:8787/api/codex-tasks\n```\n\n本机 Codex 可以读取：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  http://127.0.0.1:8787/api/codex-tasks\n```\n\n也可以用本机辅助脚本登录并读取队列：\n\n```bash\npython3 docs-blog/codex_queue.py login --username Interstellar6\npython3 docs-blog/codex_queue.py next\npython3 docs-blog/codex_queue.py list --status queued\n```\n\n执行后更新状态：\n\n```bash\ncurl -X PATCH \\\n  -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"status\":\"done\",\"result_summary\":\"已完成并同步到网站。\"}' \\\n  http://127.0.0.1:8787/api/codex-tasks/task-id\n```\n\n或者：\n\n```bash\npython3 docs-blog/codex_queue.py patch task-id --status done --summary \"已完成并同步到网站。\"\n```\n\n## Codex Cloud Workspace\n\n管理员界面现在有一个 `Codex 会话` 标签。它不是公开首页的一部分，只在：\n\n```text\nhttps://admin.relumeow.top/#cloud\n```\n\n登录管理员后可用。服务器端会维护：\n\n```text\nCodexCloudWorkspace/\n  project-id/\n    project.json\n    sessions/\n      session-id/\n        session.json\n        messages.json\n        files.json\n        files/\n```\n\n网页端发送消息会同时写入会话记录，并创建一条 Codex 任务队列记录。Codex 完成工作后，可以把回复和产物写回同一个会话。\n\nGitHub 授权或 token 回调会尽量保留当前标签；如果你从 `#cloud` 发起登录，登录完成后会回到 Codex 会话工作台。\n\n写入 Codex 回复：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"role\":\"assistant\",\"content\":\"已完成初稿，输出文件见 outputs/report.md。\",\"enqueue_task\":false}' \\\n  http://127.0.0.1:8787/api/codex-cloud/projects/video2mesh/sessions/session-id/messages\n```\n\n写入输出文件：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"path\":\"outputs/report.md\",\"summary\":\"调研报告\",\"content\":\"# Report\\n\\n...\"}' \\\n  http://127.0.0.1:8787/api/codex-cloud/projects/video2mesh/sessions/session-id/files\n```\n\n文件会保存在 `CodexCloudWorkspace/<project>/sessions/<session>/files/`，管理员页面可以直接预览小于 5 MB 的文本/常见文件。\n\n### 工作区文件浏览\n\n管理员页的 `Codex 会话` 标签下方有 `工作区文件` 面板，可以浏览：\n\n```text\nCodexCloudWorkspace/\n```\n\n列目录：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  'http://127.0.0.1:8787/api/codex-cloud/fs?path=video2mesh'\n```\n\n预览小文本文件：\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  'http://127.0.0.1:8787/api/codex-cloud/fs?path=video2mesh/project.json&preview=1'\n```\n\n所有路径都会被限制在 `CodexCloudWorkspace` 内，不能通过 `..` 或绝对路径跳出去。\n\n### 管理员工作区终端\n\n管理员页还有 `终端` 面板。它执行的是一次性命令，不是长期交互 shell；工作目录也限制在 `CodexCloudWorkspace` 内。\n\n```bash\ncurl -H \"Authorization: Bearer $V2M_SESSION_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"cwd\":\"video2mesh\",\"command\":\"pwd && find . -maxdepth 2 -type f | sort\",\"timeout_seconds\":20}' \\\n  http://127.0.0.1:8787/api/codex-cloud/terminal\n```\n\n相关环境变量：\n\n```env\nV2M_CODEX_WORKSPACE=/absolute/path/to/CodexCloudWorkspace\nV2M_TERMINAL_SHELL=/bin/zsh\nV2M_TERMINAL_MAX_TIMEOUT_SECONDS=30\nV2M_TERMINAL_OUTPUT_LIMIT=80000\n```\n\n建议只通过 `https://admin.relumeow.top` 登录后使用，不要把 API 直接裸露成无鉴权公网服务。\n\n## Cloudflare Tunnel 配置\n\n推荐把 `relumeow.top` 接入 Cloudflare，然后创建一个 Tunnel 指向本机 API：\n\n```text\nPublic hostname: api.relumeow.top\nService: http://127.0.0.1:8787\n```\n\nGitHub OAuth App 填：\n\n```text\nHomepage URL: https://admin.relumeow.top\nAuthorization callback URL: https://api.relumeow.top/api/auth/github/callback\n```\n\n管理静态页使用 Cloudflare Worker 挂到独立子域名：\n\n```text\nWorker source: docs-blog/admin-domain-worker.js\nCustom Domain: admin.relumeow.top\n```\n\nCloudflare Dashboard 操作：\n\n1. Workers & Pages 里创建一个 Worker。\n2. 粘贴 `docs-blog/admin-domain-worker.js`。\n3. 在 Worker 的 Settings -> Domains & Routes 里添加 Custom Domain：\n\n```text\nadmin.relumeow.top\n```\n\n4. 打开：\n\n```text\nhttps://admin.relumeow.top/\n```\n\n也可以用 Wrangler 部署：\n\n```bash\nnpx wrangler deploy --config docs-blog/wrangler.admin.toml\n```\n\nAPI 地址填：\n\n```text\nhttps://api.relumeow.top\n```\n\n局域网内调试如果想直接连 `http://127.0.0.1:8787` 或 `http://这台电脑的局域网IP:8787`，需要临时把对应网页来源加进 `V2M_ALLOWED_WEB_ORIGINS`，并按需把 `V2M_API_HOST` 改成 `0.0.0.0`。正式远程使用建议只走 HTTPS 隧道。\n\n## 安全边界\n\n- 工作区终端只对管理员开放，且工作目录限制在 `CodexCloudWorkspace` 内。\n- 终端命令是一次性执行，带超时和输出截断；它仍然具备在工作区内读写文件的能力，所以管理员密码、GitHub OAuth 和 Cloudflare Tunnel 都必须妥善保护。\n- 远程控制只进入任务队列，由本机 Codex 读取后人工或半自动执行。\n- token 不提交到 git；默认保存在 `docs-blog/runtime/api_token.txt`。\n- GitHub Pages 只能托管静态站，不能直接运行这个 API。\n\n这个边界能让手机远程“派活”，也能在管理员界面检查工作区产物；终端能力只用于受控工作区操作。\n",
       "headings": [
         {
           "level": "2",

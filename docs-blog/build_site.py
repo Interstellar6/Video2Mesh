@@ -20,7 +20,7 @@ ASSETS = SITE / "assets"
 CONTENT = SITE / "content"
 PUBLIC_BUILD = SITE / "_public"
 
-BUILTIN_DOCS = [
+PINNED_ROOT_DOCS = [
     "README.md",
     "Video2Mesh_PROJECT_README.md",
     "VIDEO2MESH_PIPELINE.md",
@@ -34,6 +34,8 @@ BUILTIN_DOCS = [
     "Video2Mesh_milscene2_showcase.md",
     "Video2Mesh_milscene3_showcase.md",
 ]
+
+ROOT_DOC_EXCLUDE = set()
 
 CATEGORY_RULES = [
     ("Game Scenes", ["game", "interactive", "游戏", "交互"]),
@@ -226,10 +228,16 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str]) -> Doc:
 def collect_docs() -> list[Doc]:
     used_ids: set[str] = set()
     docs: list[Doc] = []
-    for name in BUILTIN_DOCS:
+    seen_root_docs: set[Path] = set()
+    for name in PINNED_ROOT_DOCS:
         path = ROOT / name
         if path.exists():
+            seen_root_docs.add(path.resolve())
             docs.append(load_doc(path, "builtin", used_ids))
+    for path in sorted(ROOT.glob("*.md")):
+        if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_root_docs:
+            continue
+        docs.append(load_doc(path, "builtin", used_ids))
     for path in sorted(CONTENT.rglob("*.md")):
         docs.append(load_doc(path, "content", used_ids))
     return docs
