@@ -20,19 +20,15 @@ ASSETS = SITE / "assets"
 CONTENT = SITE / "content"
 PUBLIC_BUILD = SITE / "_public"
 
-PINNED_ROOT_DOCS = [
+PINNED_DOCS = [
     "README.md",
-    "Video2Mesh_PROJECT_README.md",
-    "VIDEO2MESH_PIPELINE.md",
-    "SCENE_SCANNING_SOLUTIONS_SURVEY.md",
-    "FEED_FORWARD_GAUSSIAN_SCENE_GRAPH_SURVEY.md",
-    "INTERACTIVE_GAME_SCENE_FROM_3DGS_SURVEY.md",
-    "Video2Mesh_technical_survey_draft.md",
-    "SVLGaussian_frame_matching_notes.md",
-    "Video2Mesh_real_demo_runbook.md",
-    "REMOTE_SETUP_STATUS.md",
-    "Video2Mesh_milscene2_showcase.md",
-    "Video2Mesh_milscene3_showcase.md",
+    "docs/README.md",
+    "docs/01-project-overview.md",
+    "docs/02-pipeline-and-commands.md",
+    "docs/03-research-roadmap.md",
+    "docs/04-mesh-interaction-and-completion.md",
+    "docs/05-operations-and-showcase.md",
+    "docs/06-site-and-remote-control.md",
 ]
 
 ROOT_DOC_EXCLUDE = set()
@@ -228,14 +224,18 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str]) -> Doc:
 def collect_docs() -> list[Doc]:
     used_ids: set[str] = set()
     docs: list[Doc] = []
-    seen_root_docs: set[Path] = set()
-    for name in PINNED_ROOT_DOCS:
+    seen_docs: set[Path] = set()
+    for name in PINNED_DOCS:
         path = ROOT / name
         if path.exists():
-            seen_root_docs.add(path.resolve())
+            seen_docs.add(path.resolve())
             docs.append(load_doc(path, "builtin", used_ids))
     for path in sorted(ROOT.glob("*.md")):
-        if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_root_docs:
+        if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_docs:
+            continue
+        docs.append(load_doc(path, "builtin", used_ids))
+    for path in sorted((ROOT / "docs").glob("*.md")):
+        if path.resolve() in seen_docs:
             continue
         docs.append(load_doc(path, "builtin", used_ids))
     for path in sorted(CONTENT.rglob("*.md")):
