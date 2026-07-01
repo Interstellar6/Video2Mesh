@@ -6,6 +6,7 @@
     <meta name="robots" content="noindex,nofollow" />
     <title>Video2Mesh Admin</title>
     <meta name="description" content="Video2Mesh 管理员界面。" />
+    <script src="../theme.js"></script>
     <link rel="stylesheet" href="../styles.css" />
     <link rel="stylesheet" href="./admin.css" />
   </head>
@@ -24,6 +25,10 @@
             <strong id="identityRole">访客</strong>
             <em id="identityName">未登录</em>
           </span>
+          <button class="theme-toggle" type="button" data-theme-toggle>
+            <span class="theme-toggle-icon" aria-hidden="true"></span>
+            <span data-theme-label>白天</span>
+          </button>
           <span id="apiStatus" class="status-pill">未连接</span>
         </div>
       </header>
@@ -95,90 +100,208 @@
       </section>
 
       <section class="admin-tab-panel" data-tab-panel="cloud" aria-label="Codex 会话管理" hidden>
-        <article class="control-card cloud-workspace-card">
-          <header>
+        <article class="control-card cloud-workspace-card codex-web-card">
+          <header class="codex-workspace-top">
             <div>
-              <h2>Codex Cloud Workspace</h2>
-              <p class="panel-subtitle">管理员会话、项目目录和 Codex 输出文件都保存在这台 Mac 的工作区。</p>
+              <h2>Codex Cloud</h2>
+              <p class="panel-subtitle">会话、运行日志和输出文件保存在 CodexCloudWorkspace；后续可替换成云服务器挂载目录。</p>
             </div>
-            <button id="refreshCloudWorkspace" type="button">刷新</button>
+            <div class="codex-top-actions">
+              <span id="codexRunnerPill" class="runner-pill" data-state="idle">idle</span>
+              <button id="refreshCloudWorkspace" type="button">刷新</button>
+            </div>
           </header>
 
-          <div class="cloud-layout">
-            <aside class="cloud-sidebar" aria-label="工作区项目和会话">
-              <form id="cloudProjectForm" class="stack-form cloud-mini-form">
-                <input name="name" type="text" placeholder="新项目名" required />
-                <input name="summary" type="text" placeholder="项目备注，可选" />
-                <button type="submit">新建项目</button>
-              </form>
-              <div id="cloudProjectList" class="record-list compact-list"></div>
+          <div class="codex-web-shell">
+            <aside class="codex-sidebar" aria-label="工作区项目和会话">
+              <div class="codex-sidebar-head">
+                <div>
+                  <strong>Codex</strong>
+                  <span>CodexCloudWorkspace</span>
+                </div>
+                <span id="cloudWorkspaceStatus" class="workspace-status">local</span>
+              </div>
+              <nav class="codex-main-nav" aria-label="Codex 主导航">
+                <button id="railNewChat" type="button">
+                  <span aria-hidden="true">+</span>
+                  <strong>New chat</strong>
+                </button>
+                <button id="railSearchFocus" type="button">
+                  <span aria-hidden="true">⌕</span>
+                  <strong>Search</strong>
+                </button>
+                <button id="railRunFocus" type="button">
+                  <span aria-hidden="true">◷</span>
+                  <strong>Runs</strong>
+                </button>
+              </nav>
+              <label class="codex-search" aria-label="搜索 Codex 会话">
+                <svg aria-hidden="true" viewBox="0 0 24 24">
+                  <circle cx="11" cy="11" r="7"></circle>
+                  <path d="m16.5 16.5 4 4"></path>
+                </svg>
+                <input id="cloudSearchInput" type="search" placeholder="Search tasks" autocomplete="off" />
+                <button id="clearCloudSearch" type="button" aria-label="清除搜索">&times;</button>
+              </label>
+              <button id="primaryNewSession" class="new-task-button" type="button">New task</button>
+              <div class="codex-sidebar-section">
+                <div class="codex-section-title">
+                  <span class="codex-rail-label">Workspace</span>
+                </div>
+                <div id="cloudProjectList" class="record-list compact-list codex-project-list"></div>
+              </div>
 
-              <form id="cloudSessionForm" class="stack-form cloud-mini-form">
-                <input name="title" type="text" placeholder="新会话标题" required />
-                <button type="submit">新建会话</button>
-              </form>
-              <div id="cloudSessionList" class="record-list compact-list"></div>
+              <div class="codex-sidebar-section">
+                <div class="codex-section-title">
+                  <span class="codex-rail-label">Sessions</span>
+                  <button id="newSessionShortcut" class="icon-action" type="button" title="新建会话" aria-label="新建会话">+</button>
+                </div>
+                <div id="cloudSessionList" class="record-list compact-list codex-session-list"></div>
+              </div>
+
+              <details class="codex-create-drawer workspace-drawer">
+                <summary>New workspace</summary>
+                <form id="cloudProjectForm" class="stack-form cloud-mini-form codex-create-form">
+                  <input name="name" type="text" placeholder="新项目名" required />
+                  <input name="summary" type="text" placeholder="项目备注，可选" />
+                  <button type="submit">创建 workspace</button>
+                </form>
+              </details>
+
+              <details class="codex-create-drawer session-drawer">
+                <summary>Session details</summary>
+                <form id="cloudSessionForm" class="stack-form cloud-mini-form codex-create-form">
+                  <input name="title" type="text" placeholder="新会话标题" required />
+                  <button type="submit">Create task</button>
+                </form>
+              </details>
             </aside>
 
-            <section class="cloud-main" aria-label="Codex 对话">
+            <section class="codex-chat" aria-label="Codex 对话">
               <div class="cloud-session-header">
                 <div>
                   <strong id="cloudSessionTitle">未选择会话</strong>
                   <span id="cloudSessionMeta">选择或新建一个会话开始。</span>
                 </div>
+                <div class="session-header-actions">
+                  <button id="threadNewTask" class="ghost-action" type="button">New task</button>
+                  <span id="cloudWorkspaceChip" class="session-chip">workspace</span>
+                  <span id="cloudMessageCount" class="session-chip">0 messages</span>
+                  <span id="cloudFileCount" class="session-chip">0 files</span>
+                </div>
+              </div>
+              <div id="codexRunStrip" class="codex-run-strip" data-state="idle">
+                <span class="run-dot" aria-hidden="true"></span>
+                <strong>idle</strong>
+                <span>等待下一条任务。</span>
               </div>
               <div id="cloudMessageList" class="cloud-message-list"></div>
-              <form id="cloudMessageForm" class="stack-form cloud-message-form">
-                <textarea name="content" rows="5" placeholder="给这台 Mac 上的 Codex 发消息；它会进入会话记录和任务队列。" required></textarea>
-                <button type="submit">发送给 Codex</button>
+              <section id="codexActivityCard" class="codex-activity-card" aria-label="Codex 运行摘要">
+                <button id="activityToggle" class="activity-toggle" type="button">
+                  <span id="activitySummary">Worked just now</span>
+                  <span aria-hidden="true">›</span>
+                </button>
+                <div class="activity-body">
+                  <div class="activity-link-card">
+                    <span class="activity-icon" aria-hidden="true">Web</span>
+                    <div>
+                      <strong>Video2Mesh Admin</strong>
+                      <span>Website</span>
+                    </div>
+                    <button id="activityOpenWorkspace" type="button">Open in</button>
+                  </div>
+                  <div class="activity-diff-card">
+                    <div>
+                      <strong id="activityChangeTitle">Session artifacts</strong>
+                      <span id="activityChangeMeta">No files changed yet</span>
+                    </div>
+                    <button id="activityReview" type="button">Review</button>
+                  </div>
+                </div>
+              </section>
+              <div class="prompt-suggestions" id="promptSuggestions" aria-label="快捷提示">
+                <button type="button" data-prompt="请总结当前工作区的文件结构，并列出下一步建议。">总结工作区</button>
+                <button type="button" data-prompt="请创建一份 Markdown 计划文档，保存到 outputs/plan.md。">生成计划文档</button>
+                <button type="button" data-prompt="请检查最近一次运行日志，指出失败原因和修复建议。">检查运行日志</button>
+              </div>
+              <form id="cloudMessageForm" class="cloud-message-form codex-composer">
+                <div class="composer-toolbar">
+                  <button id="attachWorkspaceButton" type="button">Workspace</button>
+                  <span id="composerContext">运行在当前项目工作区</span>
+                </div>
+                <textarea name="content" rows="4" placeholder="发送给 Codex" required></textarea>
+                <div class="composer-actions">
+                  <span id="composerMode">Cmd/Ctrl+Enter 发送</span>
+                  <div class="composer-buttons">
+                    <button id="clearComposer" type="button">清空</button>
+                    <button type="submit">发送</button>
+                  </div>
+                </div>
               </form>
             </section>
 
-            <aside class="cloud-files" aria-label="Codex 输出文件">
-              <header>
-                <h3>输出文件</h3>
-              </header>
-              <div id="cloudFileList" class="record-list compact-list"></div>
-              <form id="cloudFileForm" class="stack-form cloud-mini-form">
-                <input name="path" type="text" placeholder="outputs/result.md" required />
-                <input name="summary" type="text" placeholder="文件说明，可选" />
-                <textarea name="content" rows="8" placeholder="Codex 输出内容、Markdown、JSON、代码等。" required></textarea>
-                <button type="submit">写入文件</button>
-              </form>
-              <pre id="cloudFilePreview" class="cloud-file-preview">选择文件后预览。</pre>
+            <aside class="codex-inspector" aria-label="Codex 输出与工作区">
+              <nav class="inspector-tabs" aria-label="Codex 检查器标签">
+                <button class="active" data-inspector-tab="workspace" type="button">Workspace</button>
+                <button data-inspector-tab="artifacts" type="button">Artifacts</button>
+                <button data-inspector-tab="run" type="button">Run</button>
+              </nav>
+
+              <section class="inspector-panel active" data-inspector-panel="workspace" aria-label="工作区文件">
+                <header class="inspector-header">
+                  <div>
+                    <h3>Files</h3>
+                    <span id="workspacePathLabel" class="workspace-path">CodexCloudWorkspace</span>
+                  </div>
+                  <div class="inline-actions">
+                    <button id="workspaceUpButton" type="button">Up</button>
+                    <button id="refreshWorkspaceFiles" type="button">Refresh</button>
+                  </div>
+                </header>
+                <div id="workspaceFileList" class="record-list workspace-file-list"></div>
+                <pre id="workspaceFilePreview" class="cloud-file-preview workspace-preview">选择工作区文件后预览。</pre>
+              </section>
+
+              <section class="inspector-panel" data-inspector-panel="artifacts" aria-label="输出文件" hidden>
+                <header class="inspector-header">
+                  <div>
+                    <h3>Artifacts</h3>
+                    <span class="workspace-path">session outputs</span>
+                  </div>
+                </header>
+                <div id="cloudFileList" class="record-list compact-list"></div>
+                <form id="cloudFileForm" class="stack-form cloud-mini-form">
+                  <input name="path" type="text" placeholder="outputs/result.md" required />
+                  <input name="summary" type="text" placeholder="文件说明，可选" />
+                  <textarea name="content" rows="7" placeholder="Markdown、JSON、代码等输出内容。" required></textarea>
+                  <button type="submit">写入文件</button>
+                </form>
+                <pre id="cloudFilePreview" class="cloud-file-preview">选择文件后预览。</pre>
+              </section>
+
+              <section class="inspector-panel" data-inspector-panel="run" aria-label="运行状态和终端" hidden>
+                <header class="inspector-header">
+                  <div>
+                    <h3>运行</h3>
+                    <span class="workspace-path">cwd: <span id="terminalCwdLabel">CodexCloudWorkspace</span></span>
+                  </div>
+                  <div class="run-header-actions">
+                    <span id="codexRunMeta" class="run-meta">未运行</span>
+                    <button id="runCodexNow" type="button">运行 Codex</button>
+                  </div>
+                </header>
+                <div id="codexRunCard" class="run-card">
+                  <strong>Codex runner</strong>
+                  <span>等待消息。</span>
+                </div>
+                <form id="terminalForm" class="stack-form terminal-form">
+                  <input name="cwd" type="text" placeholder="工作目录，例如 project-id" />
+                  <textarea name="command" rows="4" placeholder="pwd && ls -la" required></textarea>
+                  <button type="submit">运行命令</button>
+                </form>
+                <pre id="terminalOutput" class="terminal-output">$ </pre>
+              </section>
             </aside>
-          </div>
-
-          <div class="workspace-ops-grid">
-            <section class="workspace-browser" aria-label="工作区文件">
-              <header>
-                <div>
-                  <h3>工作区文件</h3>
-                  <span id="workspacePathLabel" class="workspace-path">CodexCloudWorkspace</span>
-                </div>
-                <div class="inline-actions">
-                  <button id="workspaceUpButton" type="button">上级</button>
-                  <button id="refreshWorkspaceFiles" type="button">刷新</button>
-                </div>
-              </header>
-              <div id="workspaceFileList" class="record-list workspace-file-list"></div>
-              <pre id="workspaceFilePreview" class="cloud-file-preview workspace-preview">选择工作区文件后预览。</pre>
-            </section>
-
-            <section class="workspace-terminal" aria-label="工作区终端">
-              <header>
-                <div>
-                  <h3>终端</h3>
-                  <span class="workspace-path">cwd: <span id="terminalCwdLabel">CodexCloudWorkspace</span></span>
-                </div>
-              </header>
-              <form id="terminalForm" class="stack-form terminal-form">
-                <input name="cwd" type="text" placeholder="工作目录，例如 project-id" />
-                <textarea name="command" rows="4" placeholder="pwd && ls -la" required></textarea>
-                <button type="submit">运行命令</button>
-              </form>
-              <pre id="terminalOutput" class="terminal-output">$ </pre>
-            </section>
           </div>
         </article>
       </section>

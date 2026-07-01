@@ -5,14 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Video2Mesh Field Notes</title>
     <meta name="description" content="Video2Mesh 项目文档、调研和运行手册的静态博客网站。" />
-    <link rel="stylesheet" href="./styles.css" />
+    <script src="./theme.js?v=20260701"></script>
+    <link rel="stylesheet" href="./styles.css?v=20260701" />
   </head>
   <body>
     <div class="app-shell">
+      <div class="reading-progress" aria-hidden="true"><span id="readingProgressBar"></span></div>
       <nav class="site-navbar" aria-label="站点导航">
         <div class="site-tabs">
           <a class="site-tab active" href="#/" data-main-tab="docs">文档导航</a>
-          <a class="site-tab" href="https://admin.relumeow.top/#tasks" data-main-tab="codex">Codex 会话管理</a>
+          <a class="site-tab" href="https://admin.relumeow.top/#cloud" data-main-tab="codex">Codex 会话管理</a>
           <a class="site-tab" href="https://admin.relumeow.top/#docs" data-main-tab="sync">Markdown 同步</a>
           <a class="site-tab" href="https://admin.relumeow.top/#auth" data-main-tab="auth">用户鉴权</a>
         </div>
@@ -20,6 +22,10 @@
           <strong id="siteUserRole">访客</strong>
           <span id="siteUserName">未登录</span>
         </a>
+        <button class="theme-toggle" type="button" data-theme-toggle>
+          <span class="theme-toggle-icon" aria-hidden="true"></span>
+          <span data-theme-label>白天</span>
+        </button>
       </nav>
 
       <aside class="sidebar" aria-label="文档导航">
@@ -43,6 +49,20 @@
         <section class="draft-panel" aria-label="在线编辑 Markdown">
           <h2>在线编辑</h2>
           <button id="newDraft" class="secondary-button" type="button">新建 Markdown</button>
+        </section>
+        <section class="library-panel" aria-label="个人阅读库">
+          <div class="panel-heading">
+            <h2>阅读库</h2>
+            <button id="clearReadingState" type="button">清空</button>
+          </div>
+          <div class="mini-library">
+            <strong>收藏</strong>
+            <div id="favoriteList" class="mini-list"></div>
+          </div>
+          <div class="mini-library">
+            <strong>最近阅读</strong>
+            <div id="recentList" class="mini-list"></div>
+          </div>
         </section>
       </aside>
 
@@ -76,13 +96,44 @@
               </ol>
             </article>
           </section>
+          <section class="insight-panel" aria-label="知识库概览">
+            <div class="stats-strip">
+              <article>
+                <strong id="docCountStat">0</strong>
+                <span>文档</span>
+              </article>
+              <article>
+                <strong id="categoryCountStat">0</strong>
+                <span>分类</span>
+              </article>
+              <article>
+                <strong id="tagCountStat">0</strong>
+                <span>标签</span>
+              </article>
+              <article>
+                <strong id="readingTimeStat">0m</strong>
+                <span>阅读量</span>
+              </article>
+            </div>
+            <div class="path-panel">
+              <header>
+                <h2>阅读路径</h2>
+                <span>按主题串起关键文档</span>
+              </header>
+              <div id="readingPaths" class="path-grid"></div>
+            </div>
+          </section>
           <section class="toolbar">
-            <div id="categoryChips" class="chip-row"></div>
+            <div class="filter-stack">
+              <div id="categoryChips" class="chip-row"></div>
+              <div id="tagChips" class="tag-row"></div>
+            </div>
             <div class="view-actions">
               <button id="sortRecent" type="button">最新</button>
               <button id="sortTitle" type="button">标题</button>
             </div>
           </section>
+          <div id="resultSummary" class="result-summary"></div>
           <section id="docGrid" class="doc-grid" aria-live="polite"></section>
         </section>
 
@@ -93,6 +144,8 @@
               <div id="articleMeta" class="article-meta"></div>
               <div class="article-actions">
                 <div class="action-group">
+                  <button id="favoriteDoc" type="button">收藏</button>
+                  <button id="copyDocLink" type="button">复制链接</button>
                   <button id="editDoc" type="button">编辑 Markdown</button>
                   <button id="downloadDoc" type="button">下载 md</button>
                   <button id="discardDraft" type="button" hidden>撤销草稿</button>
@@ -126,7 +179,7 @@
         </article>
       </main>
     </div>
-    <script src="./site-data.js"></script>
-    <script src="./app.js"></script>
+    <script src="./site-data.js?v=20260701"></script>
+    <script src="./app.js?v=20260701"></script>
   </body>
 </html>

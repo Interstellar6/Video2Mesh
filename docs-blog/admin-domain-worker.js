@@ -8,6 +8,7 @@ const ROUTES = {
   "/admin.css": { path: "/admin/admin.css", type: "text/css; charset=utf-8" },
   "/admin.js": { path: "/admin/admin.js", type: "application/javascript; charset=utf-8" },
   "/styles.css": { path: "/styles.css", type: "text/css; charset=utf-8" },
+  "/theme.js": { path: "/theme.js", type: "application/javascript; charset=utf-8" },
 };
 
 function upstreamUrl(pathname) {

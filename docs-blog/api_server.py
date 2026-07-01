@@ -6,9 +6,11 @@ import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -31,10 +33,6 @@ USERS_FILE = RUNTIME / "users.json"
 SESSIONS_FILE = RUNTIME / "sessions.json"
 GITHUB_STATES_FILE = RUNTIME / "github_oauth_states.json"
 BUILD_SCRIPT = SITE / "build_site.py"
-CODEX_WORKSPACE = Path(os.environ.get("V2M_CODEX_WORKSPACE", ROOT / "CodexCloudWorkspace")).expanduser()
-TERMINAL_SHELL = os.environ.get("V2M_TERMINAL_SHELL", "/bin/zsh")
-TERMINAL_MAX_TIMEOUT_SECONDS = int(os.environ.get("V2M_TERMINAL_MAX_TIMEOUT_SECONDS", "30"))
-TERMINAL_OUTPUT_LIMIT = int(os.environ.get("V2M_TERMINAL_OUTPUT_LIMIT", "80000"))
 
 
 def load_env_file() -> None:
@@ -65,6 +63,17 @@ ALLOWED_WEB_ORIGINS = [item.strip() for item in os.environ.get(
     "V2M_ALLOWED_WEB_ORIGINS",
     "https://relumeow.top,http://relumeow.top,https://admin.relumeow.top",
 ).split(",") if item.strip()]
+CODEX_WORKSPACE = Path(os.environ.get("V2M_CODEX_WORKSPACE", ROOT / "CodexCloudWorkspace")).expanduser()
+TERMINAL_SHELL = os.environ.get("V2M_TERMINAL_SHELL", "/bin/zsh")
+TERMINAL_MAX_TIMEOUT_SECONDS = int(os.environ.get("V2M_TERMINAL_MAX_TIMEOUT_SECONDS", "30"))
+TERMINAL_OUTPUT_LIMIT = int(os.environ.get("V2M_TERMINAL_OUTPUT_LIMIT", "80000"))
+CODEX_BIN = os.environ.get("V2M_CODEX_BIN", "codex")
+CODEX_RUNNER_ENABLED = os.environ.get("V2M_CODEX_RUNNER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+CODEX_RUN_TIMEOUT_SECONDS = int(os.environ.get("V2M_CODEX_RUN_TIMEOUT_SECONDS", "300"))
+CODEX_RUN_OUTPUT_LIMIT = int(os.environ.get("V2M_CODEX_RUN_OUTPUT_LIMIT", "80000"))
+CODEX_MODEL = os.environ.get("V2M_CODEX_MODEL", "").strip()
+CODEX_EFFORT = os.environ.get("V2M_CODEX_EFFORT", "").strip()
+CODEX_DATA_LOCK = threading.RLock()
 
 
 def now_iso() -> str:
@@ -247,6 +256,19 @@ def subprocess_text(value: str | bytes | None) -> str:
     return value
 
 
+def boolean_flag(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "y", "on"}
+
+
 def read_codex_json(path: Path, default: Any) -> Any:
     return read_json(path, default)
 
@@ -343,23 +365,83 @@ def touch_codex_project(project_id: str) -> None:
         write_codex_json(project_path, meta)
 
 
+def append_codex_message(
+    project_id: str,
+    session_id: str,
+    role: str,
+    content: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    project_id = safe_workspace_id(project_id, "project")
+    session_id = safe_workspace_id(session_id, "session")
+    session_dir = codex_session_dir(project_id, session_id)
+    if not session_dir.exists():
+        raise ApiError(HTTPStatus.NOT_FOUND, "Codex session not found")
+    if role not in {"user", "assistant", "system", "tool"}:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "role must be user, assistant, system, or tool")
+    if not content.strip():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "content is required")
+    with CODEX_DATA_LOCK:
+        messages = read_codex_json(session_dir / "messages.json", [])
+        if not isinstance(messages, list):
+            messages = []
+        message = {
+            "id": unique_id("msg-" + datetime.now().strftime("%Y%m%d%H%M%S"), messages),
+            "role": role,
+            "content": content,
+            "created_at": now_iso(),
+        }
+        if extra:
+            message.update(extra)
+        messages.append(message)
+        write_codex_json(session_dir / "messages.json", messages)
+        meta = read_codex_json(session_dir / "session.json", {})
+        if isinstance(meta, dict):
+            meta["updated_at"] = now_iso()
+            meta["last_role"] = role
+            meta["last_message"] = content[:240]
+            write_codex_json(session_dir / "session.json", meta)
+        touch_codex_project(project_id)
+    return message
+
+
 def enqueue_codex_cloud_task(project_id: str, session_id: str, prompt: str) -> dict[str, Any]:
-    tasks = read_json(TASKS_FILE, [])
-    task = {
-        "id": unique_id("cloud-" + datetime.now().strftime("%Y%m%d%H%M%S"), tasks),
-        "project": project_id,
-        "prompt": prompt,
-        "status": "queued",
-        "priority": "normal",
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "notes": "Created from Codex Cloud Workspace conversation.",
-        "workspace_project": project_id,
-        "workspace_session": session_id,
-    }
-    tasks.insert(0, task)
-    write_json(TASKS_FILE, tasks)
+    with CODEX_DATA_LOCK:
+        tasks = read_json(TASKS_FILE, [])
+        task = {
+            "id": unique_id("cloud-" + datetime.now().strftime("%Y%m%d%H%M%S"), tasks),
+            "project": project_id,
+            "prompt": prompt,
+            "status": "queued",
+            "priority": "normal",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "notes": "Created from Codex Cloud Workspace conversation.",
+            "workspace_project": project_id,
+            "workspace_session": session_id,
+        }
+        tasks.insert(0, task)
+        write_json(TASKS_FILE, tasks)
     return task
+
+
+def update_codex_cloud_task(task_id: str, status: str, summary: str = "") -> None:
+    if not task_id:
+        return
+    with CODEX_DATA_LOCK:
+        tasks = read_json(TASKS_FILE, [])
+        changed = False
+        for task in tasks:
+            if task.get("id") != task_id:
+                continue
+            task["status"] = status
+            task["updated_at"] = now_iso()
+            if summary:
+                task["result_summary"] = summary[:500]
+            changed = True
+            break
+        if changed:
+            write_json(TASKS_FILE, tasks)
 
 
 def file_meta_for(path: Path, files_root: Path, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -377,6 +459,305 @@ def file_meta_for(path: Path, files_root: Path, extra: dict[str, Any] | None = N
     if extra:
         meta.update(extra)
     return meta
+
+
+def refresh_codex_session_files(project_id: str, session_id: str) -> list[dict[str, Any]]:
+    session_dir = codex_session_dir(project_id, session_id)
+    files_root = codex_files_dir(project_id, session_id)
+    if not session_dir.exists():
+        raise ApiError(HTTPStatus.NOT_FOUND, "Codex session not found")
+    files_root.mkdir(parents=True, exist_ok=True)
+    with CODEX_DATA_LOCK:
+        previous = read_codex_json(session_dir / "files.json", [])
+        previous_by_path = {
+            str(item.get("path")): item
+            for item in previous
+            if isinstance(item, dict) and item.get("path")
+        } if isinstance(previous, list) else {}
+        files: list[dict[str, Any]] = []
+        for path in files_root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                meta = file_meta_for(path, files_root, {"source": "codex"})
+            except OSError:
+                continue
+            old = previous_by_path.get(meta["path"], {})
+            if isinstance(old, dict):
+                if old.get("summary"):
+                    meta["summary"] = str(old.get("summary"))
+                if old.get("source"):
+                    meta["source"] = str(old.get("source"))
+            files.append(meta)
+        files.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        write_codex_json(session_dir / "files.json", files[:500])
+        return files[:500]
+
+
+def set_codex_runner_state(project_id: str, session_id: str, runner: dict[str, Any]) -> dict[str, Any]:
+    session_dir = codex_session_dir(project_id, session_id)
+    with CODEX_DATA_LOCK:
+        meta = read_codex_json(session_dir / "session.json", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        current = meta.get("codex_runner") if isinstance(meta.get("codex_runner"), dict) else {}
+        next_runner = {**current, **runner, "updated_at": now_iso()}
+        meta["codex_runner"] = next_runner
+        meta["updated_at"] = now_iso()
+        runner_status = str(runner.get("status") or "")
+        if runner_status == "running":
+            meta["status"] = "running"
+        elif runner_status in {"done", "failed", "disabled"} and str(meta.get("status") or "") == "running":
+            meta["status"] = "open"
+        write_codex_json(session_dir / "session.json", meta)
+        touch_codex_project(project_id)
+    return next_runner
+
+
+def codex_runner_state(project_id: str, session_id: str) -> dict[str, Any]:
+    meta = read_codex_json(codex_session_dir(project_id, session_id) / "session.json", {})
+    runner = meta.get("codex_runner") if isinstance(meta, dict) and isinstance(meta.get("codex_runner"), dict) else {}
+    return dict(runner)
+
+
+def clip_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit // 2] + "\n...[内容过长，已截断]...\n" + value[-limit // 2 :]
+
+
+def build_codex_runner_prompt(project_id: str, session_id: str, latest_user_content: str) -> str:
+    project_dir = codex_project_dir(project_id).resolve()
+    session_rel = f"sessions/{safe_workspace_id(session_id, 'session')}"
+    files_rel = f"{session_rel}/files"
+    messages = read_codex_json(codex_session_dir(project_id, session_id) / "messages.json", [])
+    if not isinstance(messages, list):
+        messages = []
+    transcript_parts = []
+    for message in messages[-14:]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user")
+        content = clip_text(str(message.get("content") or ""), 3000)
+        transcript_parts.append(f"{role}:\n{content}")
+    transcript = clip_text("\n\n---\n\n".join(transcript_parts), 18000)
+    return f"""你是 Video2Mesh 管理员网页背后的本机 Codex。
+
+当前工作目录是：
+{project_dir}
+
+请把这个目录当作一个云端项目工作区。你可以在其中创建、修改和读取本项目需要的文件。
+如果需要输出 Markdown、代码、JSON、报告或其他产物，优先写入：
+{files_rel}/
+
+完成后用中文回复用户，简洁说明你做了什么，并列出重要输出文件的相对路径。
+不要读取、打印或复制密钥、token、OAuth secret、session 文件、.env 中的敏感值，除非用户明确要求且确有必要。
+不要修改这个项目工作区之外的文件。
+
+下面是网页会话最近的上下文：
+
+{transcript}
+
+用户这次的新消息是：
+{latest_user_content}
+"""
+
+
+def find_codex_session_id(stdout: str) -> str:
+    uuid_pattern = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+    def walk(value: Any) -> str:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_text = str(key).lower()
+                if "session" in key_text and isinstance(nested, str) and uuid_pattern.fullmatch(nested):
+                    return nested
+                found = walk(nested)
+                if found:
+                    return found
+        if isinstance(value, list):
+            for nested in value:
+                found = walk(nested)
+                if found:
+                    return found
+        return ""
+
+    for line in stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        found = walk(payload)
+        if found:
+            return found
+    match = re.search(r'"(?:session_id|sessionId|conversation_id|conversationId)"\s*:\s*"([^"]+)"', stdout)
+    if match and uuid_pattern.fullmatch(match.group(1)):
+        return match.group(1)
+    return ""
+
+
+def codex_binary_path() -> str:
+    if os.sep in CODEX_BIN or CODEX_BIN.startswith("."):
+        path = Path(CODEX_BIN).expanduser()
+        if path.exists():
+            return str(path)
+        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Codex binary not found: {CODEX_BIN}")
+    path = shutil.which(CODEX_BIN)
+    if not path:
+        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Codex binary not found in PATH: {CODEX_BIN}")
+    return path
+
+
+def start_codex_runner(project_id: str, session_id: str, message: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not CODEX_RUNNER_ENABLED:
+        return {"status": "disabled", "enabled": False}
+    running = codex_runner_state(project_id, session_id)
+    if running.get("status") == "running":
+        return {"status": "already_running", "run_id": running.get("run_id", "")}
+    codex_binary_path()
+    run_id = "run-" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(3)
+    runner = set_codex_runner_state(project_id, session_id, {
+        "status": "running",
+        "enabled": True,
+        "run_id": run_id,
+        "started_at": now_iso(),
+        "trigger_message_id": message.get("id", ""),
+        "task_id": task.get("id", "") if isinstance(task, dict) else "",
+        "finished_at": "",
+        "duration_ms": 0,
+        "returncode": "",
+        "timed_out": False,
+        "log_path": "",
+        "last_message_path": "",
+        "codex_session_id": "",
+        "error": "",
+    })
+    thread = threading.Thread(
+        target=run_codex_for_session,
+        args=(project_id, session_id, str(message.get("content") or ""), run_id, str(runner.get("task_id") or "")),
+        daemon=True,
+    )
+    thread.start()
+    return runner
+
+
+def run_codex_for_session(project_id: str, session_id: str, latest_user_content: str, run_id: str, task_id: str = "") -> None:
+    project_id = safe_workspace_id(project_id, "project")
+    session_id = safe_workspace_id(session_id, "session")
+    session_dir = codex_session_dir(project_id, session_id)
+    run_dir = session_dir / "codex_runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / f"{run_id}.log"
+    last_message_path = run_dir / f"{run_id}.last.md"
+    started = time.monotonic()
+    returncode = 1
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    assistant_content = ""
+    status = "failed"
+    error_message = ""
+    task_summary = ""
+    try:
+        update_codex_cloud_task(task_id, "running", "Codex runner 已启动。")
+        prompt = build_codex_runner_prompt(project_id, session_id, latest_user_content)
+        cmd = [
+            codex_binary_path(),
+            "exec",
+            "-C",
+            str(codex_project_dir(project_id).resolve()),
+            "--skip-git-repo-check",
+            "-s",
+            "workspace-write",
+            "--json",
+            "--output-last-message",
+            str(last_message_path),
+        ]
+        if CODEX_MODEL:
+            cmd.extend(["-m", CODEX_MODEL])
+        cmd.append("-")
+        completed = subprocess.run(
+            cmd,
+            input=prompt,
+            cwd=codex_project_dir(project_id),
+            capture_output=True,
+            text=True,
+            timeout=CODEX_RUN_TIMEOUT_SECONDS,
+            env={**os.environ, "PWD": str(codex_project_dir(project_id).resolve())},
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout = subprocess_text(completed.stdout)
+        stderr = subprocess_text(completed.stderr)
+        if last_message_path.exists():
+            assistant_content = last_message_path.read_text(encoding="utf-8", errors="replace").strip()
+        if returncode == 0:
+            status = "done"
+            if not assistant_content:
+                assistant_content = "Codex 已完成运行，但没有返回最终文本。请查看运行日志。"
+            task_summary = assistant_content[:500]
+        else:
+            status = "failed"
+            error_tail, _truncated = truncate_text((stderr or stdout).strip(), 4000)
+            assistant_content = f"Codex 运行失败，退出码 {returncode}。运行日志已保存。"
+            if error_tail:
+                assistant_content += f"\n\n```text\n{error_tail}\n```"
+            task_summary = f"Codex 运行失败，退出码 {returncode}。"
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        returncode = 124
+        status = "failed"
+        stdout = subprocess_text(exc.stdout)
+        stderr = subprocess_text(exc.stderr)
+        assistant_content = f"Codex 运行超过 {CODEX_RUN_TIMEOUT_SECONDS} 秒，已超时停止。运行日志已保存。"
+        task_summary = assistant_content
+    except Exception as exc:
+        status = "failed"
+        error_message = str(exc)
+        assistant_content = f"Codex runner 启动失败：{error_message}"
+        task_summary = assistant_content
+    finally:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        stdout_trimmed, stdout_truncated = truncate_text(stdout, CODEX_RUN_OUTPUT_LIMIT)
+        stderr_trimmed, stderr_truncated = truncate_text(stderr, CODEX_RUN_OUTPUT_LIMIT)
+        log_payload = {
+            "run_id": run_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "started_at": now_iso(),
+            "duration_ms": duration_ms,
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "stdout": stdout_trimmed,
+            "stderr": stderr_trimmed,
+            "error": error_message,
+        }
+        log_path.write_text(json.dumps(log_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        refresh_codex_session_files(project_id, session_id)
+        codex_session_id = find_codex_session_id(stdout)
+        log_rel = workspace_relative_path(log_path)
+        last_rel = workspace_relative_path(last_message_path) if last_message_path.exists() else ""
+        append_codex_message(project_id, session_id, "assistant", assistant_content, {
+            "run_id": run_id,
+            "run_status": status,
+            "run_log": log_rel,
+            "codex_returncode": returncode,
+            "codex_timed_out": timed_out,
+        })
+        set_codex_runner_state(project_id, session_id, {
+            "status": status,
+            "finished_at": now_iso(),
+            "duration_ms": duration_ms,
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "log_path": log_rel,
+            "last_message_path": last_rel,
+            "codex_session_id": codex_session_id,
+            "error": error_message,
+        })
+        update_codex_cloud_task(task_id, "done" if status == "done" else "blocked", task_summary)
 
 
 def ensure_bootstrap_token() -> str:
@@ -686,6 +1067,11 @@ class Handler(BaseHTTPRequestHandler):
             if codex_messages and method == "POST":
                 self.require_admin()
                 self.add_codex_message(decode_url_part(codex_messages.group(1)), decode_url_part(codex_messages.group(2)), self.read_body())
+                return
+            codex_run = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions/([^/]+)/run", parsed.path)
+            if codex_run and method == "POST":
+                self.require_admin()
+                self.run_codex_session(decode_url_part(codex_run.group(1)), decode_url_part(codex_run.group(2)), self.read_body())
                 return
             codex_files = re.fullmatch(r"/api/codex-cloud/projects/([^/]+)/sessions/([^/]+)/files", parsed.path)
             if codex_files and method == "POST":
@@ -1028,30 +1414,40 @@ class Handler(BaseHTTPRequestHandler):
         content = str(data.get("content") or data.get("message") or "").strip()
         if not content:
             raise ApiError(HTTPStatus.BAD_REQUEST, "content is required")
+        extra: dict[str, Any] = {}
+        if isinstance(data.get("files"), list):
+            extra["files"] = data.get("files")
+        message = append_codex_message(project_id, session_id, role, content, extra)
+        task = None
+        runner = None
+        if role == "user" and data.get("enqueue_task", True):
+            task = enqueue_codex_cloud_task(project_id, session_id, content)
+        if role == "user" and boolean_flag(data.get("run_codex"), True):
+            runner = start_codex_runner(project_id, session_id, message, task)
+        self.reply({"ok": True, "message": message, "task": task, "runner": runner}, HTTPStatus.CREATED)
+
+    def run_codex_session(self, project_id: str, session_id: str, data: dict[str, Any]) -> None:
+        project_id = safe_workspace_id(project_id, "project")
+        session_id = safe_workspace_id(session_id, "session")
+        session_dir = codex_session_dir(project_id, session_id)
+        if not session_dir.exists():
+            raise ApiError(HTTPStatus.NOT_FOUND, "Codex session not found")
         messages = read_codex_json(session_dir / "messages.json", [])
         if not isinstance(messages, list):
             messages = []
-        message = {
-            "id": unique_id("msg-" + datetime.now().strftime("%Y%m%d%H%M%S"), messages),
-            "role": role,
-            "content": content,
-            "created_at": now_iso(),
-        }
-        if isinstance(data.get("files"), list):
-            message["files"] = data.get("files")
-        messages.append(message)
-        write_codex_json(session_dir / "messages.json", messages)
-        meta = read_codex_json(session_dir / "session.json", {})
-        if isinstance(meta, dict):
-            meta["updated_at"] = now_iso()
-            meta["last_role"] = role
-            meta["last_message"] = content[:240]
-            write_codex_json(session_dir / "session.json", meta)
-        touch_codex_project(project_id)
-        task = None
-        if role == "user" and data.get("enqueue_task", True):
-            task = enqueue_codex_cloud_task(project_id, session_id, content)
-        self.reply({"ok": True, "message": message, "task": task}, HTTPStatus.CREATED)
+        message_id = str(data.get("message_id") or "").strip()
+        user_messages = [item for item in messages if isinstance(item, dict) and str(item.get("role") or "").lower() == "user"]
+        message = next((item for item in user_messages if str(item.get("id") or "") == message_id), None) if message_id else None
+        if message is None and user_messages:
+            message = user_messages[-1]
+        if not message:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "No user message to run")
+        content = str(message.get("content") or "").strip()
+        if not content:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Selected user message is empty")
+        task = enqueue_codex_cloud_task(project_id, session_id, content)
+        runner = start_codex_runner(project_id, session_id, message, task)
+        self.reply({"ok": True, "message": message, "task": task, "runner": runner}, HTTPStatus.CREATED)
 
     def add_codex_file(self, project_id: str, session_id: str, data: dict[str, Any]) -> None:
         project_id = safe_workspace_id(project_id, "project")

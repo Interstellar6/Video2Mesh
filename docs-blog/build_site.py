@@ -25,6 +25,7 @@ PINNED_DOCS = [
     "docs/README.md",
     "docs/01-project-overview.md",
     "docs/02-pipeline-and-commands.md",
+    "docs/07-pipeline-route-matrix.md",
     "docs/03-research-roadmap.md",
     "docs/04-mesh-interaction-and-completion.md",
     "docs/05-operations-and-showcase.md",
@@ -159,8 +160,14 @@ def normalize_tags(meta: dict[str, Any], title: str, category: str) -> list[str]
 
 
 def copy_local_assets(doc_path: Path, doc_id: str, body: str) -> str:
+    def split_image_target(raw_url: str) -> tuple[str, str]:
+        match = re.match(r'^(\S+)(\s+"[^"]*")\s*$', raw_url.strip())
+        if match:
+            return match.group(1), match.group(2)
+        return raw_url.strip(), ""
+
     def copy_one(raw_url: str) -> str | None:
-        url = raw_url.strip()
+        url, _title = split_image_target(raw_url)
         if re.match(r"^(https?:|data:|#)", url):
             return None
         url_path = url.split("#", 1)[0].split("?", 1)[0]
@@ -175,9 +182,10 @@ def copy_local_assets(doc_path: Path, doc_id: str, body: str) -> str:
         return f"assets/uploaded/{doc_id}/{src.name}"
 
     def replace(match: re.Match[str]) -> str:
-        alt, url = match.group(1), match.group(2).strip()
-        copied = copy_one(url)
-        return f"![{alt}]({copied})" if copied else match.group(0)
+        alt, raw_url = match.group(1), match.group(2).strip()
+        _url, title = split_image_target(raw_url)
+        copied = copy_one(raw_url)
+        return f"![{alt}]({copied}{title})" if copied else match.group(0)
 
     def replace_obsidian(match: re.Match[str]) -> str:
         raw = match.group(1).strip()

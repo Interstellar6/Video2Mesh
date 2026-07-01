@@ -2,12 +2,15 @@
   const seed = window.V2M_BLOG_DATA || { docs: [], categories: [], generatedAt: "" };
   const DRAFT_STORAGE_KEY = "v2m-blog-drafts-v1";
   const API_STORAGE_KEY = "v2m-blog-api-v1";
+  const READING_STORAGE_KEY = "v2m-blog-reading-v1";
   const DEFAULT_API_URL = "https://api.relumeow.top";
   const baseDocs = (seed.docs || []).map(cloneDoc);
   let docs = baseDocs.map(cloneDoc);
   let uploadedDocs = [];
   let draftStore = loadDraftStore();
+  let readingStore = loadReadingStore();
   let activeCategory = "All";
+  let activeTag = "All";
   let sortMode = "recent";
   let currentDocId = "";
   let pendingEditorDocId = "";
@@ -16,7 +19,9 @@
   const els = {
     categoryNav: $("categoryNav"),
     categoryChips: $("categoryChips"),
+    tagChips: $("tagChips"),
     docGrid: $("docGrid"),
+    resultSummary: $("resultSummary"),
     searchInput: $("searchInput"),
     clearSearch: $("clearSearch"),
     buildMeta: $("buildMeta"),
@@ -32,6 +37,8 @@
     sortRecent: $("sortRecent"),
     sortTitle: $("sortTitle"),
     newDraft: $("newDraft"),
+    favoriteDoc: $("favoriteDoc"),
+    copyDocLink: $("copyDocLink"),
     editDoc: $("editDoc"),
     downloadDoc: $("downloadDoc"),
     discardDraft: $("discardDraft"),
@@ -44,6 +51,15 @@
     siteUserPill: $("siteUserPill"),
     siteUserRole: $("siteUserRole"),
     siteUserName: $("siteUserName"),
+    docCountStat: $("docCountStat"),
+    categoryCountStat: $("categoryCountStat"),
+    tagCountStat: $("tagCountStat"),
+    readingTimeStat: $("readingTimeStat"),
+    readingPaths: $("readingPaths"),
+    favoriteList: $("favoriteList"),
+    recentList: $("recentList"),
+    clearReadingState: $("clearReadingState"),
+    readingProgressBar: $("readingProgressBar"),
   };
 
   const escapeHtml = (value) => String(value ?? "")
@@ -77,15 +93,44 @@
     return list;
   }
 
+  function allTags() {
+    const counts = new Map();
+    docs.forEach((doc) => (doc.tags || []).forEach((tag) => {
+      const clean = String(tag || "").trim();
+      if (!clean) return;
+      counts.set(clean, (counts.get(clean) || 0) + 1);
+    }));
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans-CN"))
+      .slice(0, 14);
+  }
+
   function countFor(category) {
     return category === "All" ? docs.length : docs.filter((doc) => doc.category === category).length;
   }
 
+  function docsForCategory(category) {
+    return docs
+      .filter((doc) => category === "All" || doc.category === category)
+      .slice()
+      .sort((a, b) => String(a.source_path || "").localeCompare(String(b.source_path || ""), "zh-Hans-CN") || a.title.localeCompare(b.title, "zh-Hans-CN"));
+  }
+
   function renderNavigation() {
     const nav = categories().map((category) => `
-      <button class="nav-item ${category === activeCategory ? "active" : ""}" data-category="${escapeHtml(category)}" type="button">
-        <span>${escapeHtml(category)}</span><span>${countFor(category)}</span>
-      </button>
+      <div class="nav-group ${category === activeCategory ? "open" : ""}">
+        <button class="nav-item ${category === activeCategory ? "active" : ""}" data-category="${escapeHtml(category)}" type="button" aria-expanded="${category === activeCategory ? "true" : "false"}">
+          <span>${escapeHtml(category)}</span><span>${countFor(category)}</span>
+        </button>
+        <div class="nav-doc-list">
+          ${docsForCategory(category).map((doc) => `
+            <a class="nav-doc-link ${doc.id === currentDocId ? "active" : ""}" href="#/doc/${encodeURIComponent(doc.id)}">
+              <span>${escapeHtml(doc.title)}</span>
+              <small>${escapeHtml(doc.category)}</small>
+            </a>
+          `).join("")}
+        </div>
+      </div>
     `).join("");
     els.categoryNav.innerHTML = nav;
     els.categoryChips.innerHTML = categories().map((category) => `
@@ -93,9 +138,26 @@
         ${escapeHtml(category)} · ${countFor(category)}
       </button>
     `).join("");
+    const tagChips = allTags();
+    els.tagChips.innerHTML = [
+      `<button class="tag-chip ${activeTag === "All" ? "active" : ""}" data-tag="All" type="button">全部标签</button>`,
+      ...tagChips.map(([tag, count]) => `
+        <button class="tag-chip ${tag === activeTag ? "active" : ""}" data-tag="${escapeHtml(tag)}" type="button">
+          #${escapeHtml(tag)} <span>${count}</span>
+        </button>
+      `),
+    ].join("");
     document.querySelectorAll("[data-category]").forEach((button) => {
       button.addEventListener("click", () => {
         activeCategory = button.dataset.category || "All";
+        activeTag = "All";
+        if (location.hash && location.hash !== "#/" && location.hash !== "#") location.hash = "#/";
+        else renderAll();
+      });
+    });
+    document.querySelectorAll("[data-tag]").forEach((button) => {
+      button.addEventListener("click", () => {
+        activeTag = button.dataset.tag || "All";
         renderAll();
       });
     });
@@ -104,6 +166,9 @@
   function filteredDocs() {
     const query = els.searchInput.value.trim().toLowerCase();
     let list = docs.filter((doc) => activeCategory === "All" || doc.category === activeCategory);
+    if (activeTag !== "All") {
+      list = list.filter((doc) => (doc.tags || []).includes(activeTag));
+    }
     if (query) {
       list = list.filter((doc) => {
         const haystack = [doc.title, doc.summary, doc.category, (doc.tags || []).join(" "), stripMarkdown(doc.body)].join(" ").toLowerCase();
@@ -119,18 +184,30 @@
 
   function renderDocGrid() {
     const list = filteredDocs();
+    renderResultSummary(list);
     if (!list.length) {
       els.docGrid.innerHTML = `<div class="empty-state">没有匹配的文档。换个关键词，或者上传一个新的 Markdown 试试。</div>`;
       return;
     }
     els.docGrid.innerHTML = list.map((doc) => `
-      <a class="doc-card" href="#/doc/${encodeURIComponent(doc.id)}">
+      <a class="doc-card ${isFavorite(doc.id) ? "favorite" : ""}" href="#/doc/${encodeURIComponent(doc.id)}">
         <header><span>${escapeHtml(doc.category)}</span><span>${escapeHtml(doc.updated)} · ${doc.reading_minutes || 1} min</span></header>
         <h2>${escapeHtml(doc.title)}</h2>
         <p>${escapeHtml(doc.summary || "暂无摘要。")}</p>
         <div class="doc-tags">${(doc.tags || []).slice(0, 4).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>
+        <footer><span>${isFavorite(doc.id) ? "已收藏" : doc.source_kind || "doc"}</span><span>打开 →</span></footer>
       </a>
     `).join("");
+  }
+
+  function renderResultSummary(list) {
+    const totalMinutes = list.reduce((sum, doc) => sum + (Number(doc.reading_minutes) || 1), 0);
+    const filters = [
+      activeCategory !== "All" ? activeCategory : "",
+      activeTag !== "All" ? `#${activeTag}` : "",
+      els.searchInput.value.trim() ? `搜索「${els.searchInput.value.trim()}」` : "",
+    ].filter(Boolean);
+    els.resultSummary.textContent = `${list.length} 篇匹配文档 · 约 ${totalMinutes || 0} min${filters.length ? ` · ${filters.join(" / ")}` : ""}`;
   }
 
   function readApiSessionState() {
@@ -259,6 +336,12 @@
       }
       flushTable();
       if (!line.trim()) { flushParagraph(); closeLists(); return; }
+      const imageOnly = /^!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]+)")?\)\s*$/.exec(line.trim());
+      if (imageOnly) {
+        flushParagraph(); closeLists();
+        html += renderFigure(imageOnly[2], imageOnly[1], imageOnly[3] || "");
+        return;
+      }
       if (/^<details>|^<\/details>|^<summary>/.test(line.trim())) {
         flushParagraph(); closeLists(); html += line; return;
       }
@@ -310,6 +393,28 @@
     return html;
   }
 
+  function renderFigure(src, alt, title) {
+    const cleanSrc = String(src || "").trim();
+    const cleanAlt = String(alt || "").trim();
+    const caption = String(title || cleanAlt || "").trim();
+    const isExternal = /^https?:\/\//i.test(cleanSrc);
+    const sourceLabel = (() => {
+      if (!isExternal) return "";
+      try {
+        return new URL(cleanSrc).hostname.replace(/^www\./, "");
+      } catch (_error) {
+        return "external image";
+      }
+    })();
+    const image = `<img src="${escapeHtml(cleanSrc)}" alt="${escapeHtml(cleanAlt)}" loading="lazy" decoding="async">`;
+    return `
+      <figure class="doc-figure">
+        ${isExternal ? `<a href="${escapeHtml(cleanSrc)}" target="_blank" rel="noreferrer">${image}</a>` : image}
+        ${caption || sourceLabel ? `<figcaption>${caption ? escapeHtml(caption) : ""}${sourceLabel ? `<span>${escapeHtml(sourceLabel)}</span>` : ""}</figcaption>` : ""}
+      </figure>
+    `;
+  }
+
   function inline(value) {
     let text = escapeHtml(value);
     const stash = [];
@@ -343,6 +448,46 @@
     } catch (_error) {
       return {};
     }
+  }
+
+  function loadReadingStore() {
+    try {
+      const raw = window.localStorage.getItem(READING_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return {
+        favorites: Array.isArray(parsed.favorites) ? parsed.favorites : [],
+        recent: Array.isArray(parsed.recent) ? parsed.recent : [],
+      };
+    } catch (_error) {
+      return { favorites: [], recent: [] };
+    }
+  }
+
+  function persistReadingStore() {
+    try {
+      window.localStorage.setItem(READING_STORAGE_KEY, JSON.stringify(readingStore));
+    } catch (_error) {
+      setStatus("浏览器阻止了阅读状态保存。");
+    }
+  }
+
+  function isFavorite(id) {
+    return readingStore.favorites.includes(id);
+  }
+
+  function markRecent(id) {
+    readingStore.recent = [id, ...readingStore.recent.filter((item) => item !== id)].slice(0, 8);
+    persistReadingStore();
+  }
+
+  function toggleFavorite(id) {
+    if (!id) return;
+    if (isFavorite(id)) readingStore.favorites = readingStore.favorites.filter((item) => item !== id);
+    else readingStore.favorites = [id, ...readingStore.favorites].slice(0, 20);
+    persistReadingStore();
+    renderReadingLibrary();
+    updateFavoriteButton();
+    renderDocGrid();
   }
 
   function persistDraftStore() {
@@ -423,6 +568,18 @@
     els.discardDraft.hidden = !draft;
     if (draft) setStatus(`本地草稿 · ${draft.draft_updated_at || doc.updated || "已保存"}`);
     else setStatus("可在线编辑，保存后只存到当前浏览器。");
+  }
+
+  function updateFavoriteButton() {
+    const doc = currentDoc();
+    if (!doc) {
+      els.favoriteDoc.textContent = "收藏";
+      els.favoriteDoc.dataset.active = "false";
+      return;
+    }
+    const active = isFavorite(doc.id);
+    els.favoriteDoc.textContent = active ? "已收藏" : "收藏";
+    els.favoriteDoc.dataset.active = active ? "true" : "false";
   }
 
   function openEditor() {
@@ -557,13 +714,23 @@
     closeEditor();
     els.homeView.hidden = false;
     els.articleView.hidden = true;
+    renderNavigation();
+    updateReadingProgress();
     renderDocGrid();
   }
 
   function showDoc(id, options = {}) {
-    const doc = docs.find((item) => item.id === id) || docs[0];
-    if (!doc) return showHome();
+    const doc = docs.find((item) => item.id === id);
+    if (!doc) {
+      currentDocId = "";
+      if (location.hash !== "#/") location.hash = "#/";
+      else showHome();
+      return;
+    }
     currentDocId = doc.id;
+    if (doc.category) activeCategory = doc.category;
+    renderNavigation();
+    markRecent(doc.id);
     els.homeView.hidden = true;
     els.articleView.hidden = false;
     if (!options.keepEditor) closeEditor();
@@ -578,12 +745,15 @@
     if (options.keepEditor) els.editorPreview.innerHTML = renderMarkdown(els.markdownEditor.value);
     renderToc(doc);
     renderRelated(doc);
+    renderReadingLibrary();
     updateDraftControls(doc);
+    updateFavoriteButton();
     if (pendingEditorDocId === doc.id) {
       pendingEditorDocId = "";
       openEditor();
     }
     if (!options.preserveScroll) window.scrollTo({ top: 0, behavior: "instant" });
+    updateReadingProgress();
   }
 
   function renderToc(doc) {
@@ -616,9 +786,87 @@
     `).join("") || `<span style="color: var(--muted); font-size: 13px;">暂无相关文档</span>`;
   }
 
+  function renderStats() {
+    const tags = new Set();
+    docs.forEach((doc) => (doc.tags || []).forEach((tag) => tags.add(tag)));
+    const totalMinutes = docs.reduce((sum, doc) => sum + (Number(doc.reading_minutes) || 1), 0);
+    els.docCountStat.textContent = String(docs.length);
+    els.categoryCountStat.textContent = String(categories().length - 1);
+    els.tagCountStat.textContent = String(tags.size);
+    els.readingTimeStat.textContent = `${totalMinutes}m`;
+  }
+
+  function renderReadingPaths() {
+    const pathDefs = [
+      { title: "从视频到资产", tags: ["Pipeline", "Simulation"], query: "pipeline" },
+      { title: "3DGS 与场景理解", tags: ["3DGS", "Scene Graph", "Surveys"], query: "3dgs" },
+      { title: "游戏/交互场景", tags: ["Game Scenes", "Unity", "Game"], query: "game" },
+    ];
+    els.readingPaths.innerHTML = pathDefs.map((path) => {
+      const matches = docs
+        .filter((doc) => path.tags.includes(doc.category) || (doc.tags || []).some((tag) => path.tags.includes(tag)) || doc.title.toLowerCase().includes(path.query))
+        .slice(0, 3);
+      return `
+        <article class="path-card">
+          <h3>${escapeHtml(path.title)}</h3>
+          <div>
+            ${matches.map((doc) => `<a href="#/doc/${encodeURIComponent(doc.id)}">${escapeHtml(doc.title)}</a>`).join("") || "<span>暂无匹配文档</span>"}
+          </div>
+        </article>
+      `;
+    }).join("");
+  }
+
+  function renderReadingLibrary() {
+    const renderList = (ids, emptyText) => {
+      const items = ids.map((id) => docs.find((doc) => doc.id === id)).filter(Boolean).slice(0, 5);
+      if (!items.length) return `<span>${escapeHtml(emptyText)}</span>`;
+      return items.map((doc) => `<a href="#/doc/${encodeURIComponent(doc.id)}">${escapeHtml(doc.title)}</a>`).join("");
+    };
+    els.favoriteList.innerHTML = renderList(readingStore.favorites, "还没有收藏。");
+    els.recentList.innerHTML = renderList(readingStore.recent, "阅读后会显示在这里。");
+  }
+
+  function clearReadingState() {
+    readingStore = { favorites: [], recent: [] };
+    persistReadingStore();
+    renderReadingLibrary();
+    updateFavoriteButton();
+    renderDocGrid();
+  }
+
+  function updateReadingProgress() {
+    if (!els.readingProgressBar) return;
+    if (!currentDocId || els.articleView.hidden) {
+      els.readingProgressBar.style.width = "0%";
+      return;
+    }
+    const article = els.articleBody;
+    const rect = article.getBoundingClientRect();
+    const articleTop = window.scrollY + rect.top;
+    const scrollable = Math.max(1, article.offsetHeight - window.innerHeight * 0.65);
+    const progress = Math.max(0, Math.min(1, (window.scrollY - articleTop + 90) / scrollable));
+    els.readingProgressBar.style.width = `${Math.round(progress * 100)}%`;
+  }
+
+  async function copyCurrentDocLink() {
+    const doc = currentDoc();
+    if (!doc) return;
+    const url = `${location.origin}${location.pathname}#/doc/${encodeURIComponent(doc.id)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setStatus("已复制当前文档链接。");
+    } catch (_error) {
+      setStatus(url);
+    }
+  }
+
   function route() {
     const match = location.hash.match(/^#\/doc\/(.+)$/);
     if (match) showDoc(decodeURIComponent(match[1]));
+    else if (!location.hash || location.hash === "#/" || location.hash === "#") {
+      showHome();
+    }
     else if (location.hash && currentDocId) {
       const target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
       if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -631,6 +879,9 @@
     els.buildMeta.textContent = `${docs.length} 篇文档 · 构建时间 ${seed.generatedAt || "本地"} · 支持上传 / 在线编辑 Markdown`;
     updateSiteUserInfo();
     renderNavigation();
+    renderStats();
+    renderReadingPaths();
+    renderReadingLibrary();
     renderDocGrid();
   }
 
@@ -722,6 +973,8 @@
   els.sortRecent.addEventListener("click", () => { sortMode = "recent"; renderDocGrid(); });
   els.sortTitle.addEventListener("click", () => { sortMode = "title"; renderDocGrid(); });
   els.newDraft.addEventListener("click", createNewDraft);
+  els.favoriteDoc.addEventListener("click", () => toggleFavorite(currentDocId));
+  els.copyDocLink.addEventListener("click", copyCurrentDocLink);
   els.editDoc.addEventListener("click", openEditor);
   els.closeEditor.addEventListener("click", closeEditor);
   els.saveDraft.addEventListener("click", saveDraftFromEditor);
@@ -734,6 +987,9 @@
   els.articleBody.addEventListener("change", handleRenderedTaskToggle);
   els.editorPreview.addEventListener("change", handleEditorPreviewTaskToggle);
   els.tocNav.addEventListener("click", handleTocClick);
+  els.clearReadingState.addEventListener("click", clearReadingState);
+  window.addEventListener("scroll", updateReadingProgress, { passive: true });
+  window.addEventListener("resize", updateReadingProgress);
   window.addEventListener("hashchange", route);
   window.addEventListener("storage", (event) => {
     if (event.key === API_STORAGE_KEY) updateSiteUserInfo();
