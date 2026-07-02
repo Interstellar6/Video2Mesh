@@ -109,6 +109,8 @@ gaussian-splatting/
 !docs-blog/demos/visual-physics-proxy/assets/azureovo_3dgs_collider.glb
 !docs-blog/demos/visual-physics-proxy/assets/azureovo_outdoor.splat
 !docs-blog/demos/visual-physics-proxy/assets/azureovo_outdoor_collider.glb
+!docs-blog/demos/visual-physics-proxy/assets/bedroom_4_scene_3dgs_repaired_point_cloud.ply
+!docs-blog/demos/visual-physics-proxy/assets/bedroom_4_colmap_delaunay_collider.glb
 !configs/**
 !tools/**
 !video2mesh/**

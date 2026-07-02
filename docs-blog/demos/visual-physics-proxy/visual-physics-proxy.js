@@ -14,9 +14,22 @@ const assetMetric = document.querySelector("#assetMetric");
 const modeChip = document.querySelector("#modeChip");
 const toast = document.querySelector("#toast");
 
-const DEMO_ASSET_VERSION = "spark-splat-20260702";
+const DEMO_ASSET_VERSION = "bedroom4-20260703";
+const PLY_VISUAL_ASSETS = [
+  {
+    id: "bedroom_4_dense100",
+    label: "Bedroom 4 3DGS PLY",
+    format: "ply",
+    visualUrl: `./assets/bedroom_4_scene_3dgs_repaired_point_cloud.ply?v=${DEMO_ASSET_VERSION}`,
+    colliderUrl: `./assets/bedroom_4_colmap_delaunay_collider.glb?v=${DEMO_ASSET_VERSION}`,
+    pointCount: 874472,
+    pointSize: 0.016,
+    colliderLabel: "bedroom-4-colmap-delaunay-collider",
+  },
+];
 const SPARK_VISUAL_ASSETS = [
   {
+    id: "azureovo_outdoor_splat",
     label: "Spark .splat",
     format: "splat",
     visualUrl: `./assets/azureovo_outdoor.splat?v=${DEMO_ASSET_VERSION}`,
@@ -28,6 +41,7 @@ const SPARK_VISUAL_ASSETS = [
     colliderLabel: "outdoor-splat-collider-mesh",
   },
   {
+    id: "azureovo_sog",
     label: "Spark .sog",
     format: "sog",
     visualUrl: `./assets/azureovo_3dgs.sog?v=${DEMO_ASSET_VERSION}`,
@@ -153,12 +167,13 @@ const obstacles = [];
 let floorCollider;
 let realColliderRoot = null;
 let sparkSplatMesh = null;
-let activeSparkAsset = null;
-let realVisualSource = "Spark .splat";
-let realVisualFormat = "splat";
+let activeVisualAsset = null;
+let realVisualSource = "Bedroom 4 3DGS PLY";
+let realVisualFormat = "ply";
 let realVisualUrl = "";
 let realColliderUrl = "";
 let realVisualUsesSpark = false;
+let realVisualAssetId = "";
 let realPointCount = 0;
 let realTriangleCount = 0;
 let realBounds = null;
@@ -284,7 +299,7 @@ function clearRealAssetLayers({ dispose = false } = {}) {
   realColliderLayer.clear();
   realColliderRoot = null;
   sparkSplatMesh = null;
-  activeSparkAsset = null;
+  activeVisualAsset = null;
   realColliderObjects.length = 0;
   for (let i = colliderObjects.length - 1; i >= 0; i -= 1) {
     if (!proceduralColliderObjects.includes(colliderObjects[i])) colliderObjects.splice(i, 1);
@@ -312,6 +327,7 @@ function syncDemoState() {
     visualSource: realVisualSource,
     visualFormat: realVisualFormat,
     visualUrl: realVisualUrl,
+    visualAssetId: realVisualAssetId,
     visualUsesSpark: realVisualUsesSpark,
     visualCount: realPointCount,
     colliderUrl: realColliderUrl,
@@ -602,12 +618,29 @@ function buildScene() {
   buildActor();
 }
 
-async function loadRealPointCloud() {
+async function loadRealPointCloud(asset = {
+  id: "legacy_ply_fallback",
+  label: "PLY fallback",
+  format: "ply",
+  visualUrl: REAL_ASSETS.plyFallbackUrl,
+  colliderUrl: REAL_ASSETS.poissonFallbackUrl,
+  pointSize: 0.018,
+}) {
+  activeVisualAsset = asset;
+  realVisualSource = asset.label;
+  realVisualFormat = asset.format;
+  realVisualUrl = asset.visualUrl;
+  realColliderUrl = asset.colliderUrl || realColliderUrl;
+  realVisualAssetId = asset.id || asset.label;
   const loader = new PLYLoader();
-  const geometry = await loader.loadAsync(REAL_ASSETS.plyFallbackUrl);
+  const geometry = await withTimeout(
+    loader.loadAsync(asset.visualUrl),
+    asset.timeoutMs || 45000,
+    `${asset.label} PLY load`
+  );
   geometry.computeBoundingBox();
   const sourceBox = geometry.boundingBox.clone();
-  realPointCount = geometry.getAttribute("position")?.count || 0;
+  realPointCount = asset.pointCount || geometry.getAttribute("position")?.count || 0;
 
   if (!geometry.getAttribute("color")) {
     const count = geometry.getAttribute("position").count;
@@ -622,21 +655,18 @@ async function loadRealPointCloud() {
   }
 
   const material = new THREE.PointsMaterial({
-    size: 0.018,
+    size: asset.pointSize || 0.018,
     vertexColors: true,
     transparent: true,
     opacity: 0.92,
     depthWrite: false,
   });
   const points = new THREE.Points(geometry, material);
-  points.name = "real 3dgs centers from PLY";
+  points.name = `real ${asset.label} centers from PLY`;
   points.userData.semantic = "real-ply";
   points.userData.preserveVertexColors = true;
   points.raycast = () => {};
   realVisualLayer.add(points);
-  realVisualSource = "PLY fallback";
-  realVisualFormat = "ply";
-  realVisualUrl = REAL_ASSETS.plyFallbackUrl;
   realVisualUsesSpark = false;
   fitRealLayersToDemoSpace(sourceBox);
   state.realVisualReady = true;
@@ -644,10 +674,11 @@ async function loadRealPointCloud() {
 }
 
 async function loadSparkSplat(asset) {
-  activeSparkAsset = asset;
+  activeVisualAsset = asset;
   realVisualSource = asset.label;
   realVisualFormat = asset.format;
   realVisualUrl = asset.visualUrl;
+  realVisualAssetId = asset.id || asset.label;
   const splat = new SplatMesh({
     url: asset.visualUrl,
     lod: asset.lod,
@@ -683,7 +714,7 @@ async function loadSparkSplat(asset) {
   setLayerVisibility();
 }
 
-async function loadRealCollider(colliderUrl = activeSparkAsset?.colliderUrl || REAL_ASSETS.poissonFallbackUrl, colliderLabel = activeSparkAsset?.colliderLabel || "true-3dgs-poisson-mesh") {
+async function loadRealCollider(colliderUrl = activeVisualAsset?.colliderUrl || REAL_ASSETS.poissonFallbackUrl, colliderLabel = activeVisualAsset?.colliderLabel || "true-3dgs-poisson-mesh") {
   realColliderUrl = colliderUrl;
   const loader = new GLTFLoader();
   loader.setDRACOLoader(dracoLoader);
@@ -749,9 +780,45 @@ async function loadSparkAssetPair(asset) {
   setLayerVisibility();
 }
 
+async function loadPlyAssetPair(asset) {
+  clearRealAssetLayers({ dispose: true });
+  state.realVisualReady = false;
+  state.realColliderReady = false;
+  state.realAssetError = "";
+  realPointCount = 0;
+  realTriangleCount = 0;
+  realVisualUsesSpark = false;
+  realVisualSource = asset.label;
+  realVisualFormat = asset.format;
+  realVisualUrl = asset.visualUrl;
+  realColliderUrl = asset.colliderUrl;
+  realVisualAssetId = asset.id || asset.label;
+  updateDebugPanel();
+  await loadRealPointCloud(asset);
+  await loadRealCollider(asset.colliderUrl, asset.colliderLabel);
+  setLayerVisibility();
+}
+
 async function loadRealAssets() {
   updateDebugPanel();
-  const sparkErrors = [];
+  const assetErrors = [];
+  for (const asset of PLY_VISUAL_ASSETS) {
+    try {
+      await loadPlyAssetPair(asset);
+      showToast(`Loaded ${asset.label} visual + GLB collider mesh.`);
+      return;
+    } catch (error) {
+      console.warn(`${asset.label} visual/collider path failed; trying next asset.`, error);
+      assetErrors.push(`${asset.label}: ${error?.message || String(error)}`);
+      clearRealAssetLayers({ dispose: true });
+      state.realVisualReady = false;
+      state.realColliderReady = false;
+      realPointCount = 0;
+      realTriangleCount = 0;
+      realVisualUsesSpark = false;
+    }
+  }
+
   for (const asset of SPARK_VISUAL_ASSETS) {
     try {
       await loadSparkAssetPair(asset);
@@ -759,7 +826,7 @@ async function loadRealAssets() {
       return;
     } catch (error) {
       console.warn(`${asset.label} visual/collider path failed; trying next asset.`, error);
-      sparkErrors.push(`${asset.label}: ${error?.message || String(error)}`);
+      assetErrors.push(`${asset.label}: ${error?.message || String(error)}`);
       clearRealAssetLayers({ dispose: true });
       state.realVisualReady = false;
       state.realColliderReady = false;
@@ -770,7 +837,7 @@ async function loadRealAssets() {
   }
 
   try {
-    activeSparkAsset = null;
+    activeVisualAsset = null;
     realVisualSource = "PLY fallback";
     realVisualFormat = "ply";
     realVisualUrl = REAL_ASSETS.plyFallbackUrl;
@@ -781,7 +848,7 @@ async function loadRealAssets() {
     showToast("Spark 资产加载失败，已加载 PLY/Poisson fallback。");
   } catch (fallbackError) {
     const message = [
-      ...sparkErrors,
+      ...assetErrors,
       `PLY/Poisson fallback: ${fallbackError?.message || String(fallbackError)}`,
     ].join(" | ");
     setRealAssetError(new Error(message));

@@ -422,7 +422,7 @@
       <div class="panel status-card">
         <h1>视觉代理 3DGS + 碰撞代理 Mesh</h1>
         <p>
-          视觉层用 Spark 优先加载真实 3DGS .splat，并保留 .sog 兜底；移动、射线和落点检测只依赖真实 GLB collider mesh。
+          视觉层默认加载 bedroom_4 真实生成的 3DGS PLY，并保留 Spark .splat / .sog 兜底；移动、射线和落点检测只依赖真实 GLB collider mesh。
           点击画面会命中碰撞代理，而不是命中视觉点云。
         </p>
         <div class="metrics">
@@ -450,14 +450,14 @@
             <button type="button" data-drive="right" aria-label="Right">▶</button>
           </div>
           <div class="legend">
-            <span><i class="swatch"></i> Spark .splat/.sog 真实 3DGS：只负责显示</span>
-            <span><i class="swatch mesh"></i> 真实 GLB collider mesh：负责地面、边界和射线</span>
+            <span><i class="swatch"></i> bedroom_4 真实 3DGS PLY：只负责显示</span>
+            <span><i class="swatch mesh"></i> bedroom_4 GLB collider mesh：负责地面、边界和射线</span>
             <span><i class="swatch ray"></i> 红色标记：射线命中的 collider face</span>
           </div>
         </div>
       </div>
     </section>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="./visual-physics-proxy.js?v=spark-splat-20260702"></script>
+    <script type="module" src="./visual-physics-proxy.js?v=bedroom4-20260703"></script>
   </body>
 </html>
