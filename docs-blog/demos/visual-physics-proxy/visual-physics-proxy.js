@@ -13,8 +13,8 @@ const modeChip = document.querySelector("#modeChip");
 const toast = document.querySelector("#toast");
 
 const REAL_ASSETS = {
-  pointCloudUrl: "./assets/3dgs_iter30000_clean_filtered_xyzrgb.ply",
-  colliderUrl: "./assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb",
+  pointCloudUrl: "./assets/3dgs_iter30000_clean_filtered_xyzrgb.ply?v=real-assets-20260702",
+  colliderUrl: "./assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb?v=real-assets-20260702",
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
