@@ -14,10 +14,32 @@ const assetMetric = document.querySelector("#assetMetric");
 const modeChip = document.querySelector("#modeChip");
 const toast = document.querySelector("#toast");
 
+const DEMO_ASSET_VERSION = "spark-splat-20260702";
+const SPARK_VISUAL_ASSETS = [
+  {
+    label: "Spark .splat",
+    format: "splat",
+    visualUrl: `./assets/azureovo_outdoor.splat?v=${DEMO_ASSET_VERSION}`,
+    colliderUrl: `./assets/azureovo_outdoor_collider.glb?v=${DEMO_ASSET_VERSION}`,
+    splatCount: 1200000,
+    rotation: { x: 0, y: 0, z: Math.PI },
+    lod: false,
+    timeoutMs: 45000,
+    colliderLabel: "outdoor-splat-collider-mesh",
+  },
+  {
+    label: "Spark .sog",
+    format: "sog",
+    visualUrl: `./assets/azureovo_3dgs.sog?v=${DEMO_ASSET_VERSION}`,
+    colliderUrl: `./assets/azureovo_3dgs_collider.glb?v=${DEMO_ASSET_VERSION}`,
+    splatCount: 688687,
+    rotation: { x: -Math.PI / 2, y: 0, z: 0 },
+    lod: true,
+    timeoutMs: 60000,
+    colliderLabel: "sog-3dgs-collider-mesh",
+  },
+];
 const REAL_ASSETS = {
-  splatUrl: "./assets/azureovo_3dgs.sog?v=spark-sog-20260702",
-  splatCount: 688687,
-  colliderUrl: "./assets/azureovo_3dgs_collider.glb?v=spark-sog-20260702",
   plyFallbackUrl: "./assets/3dgs_iter30000_clean_filtered_xyzrgb.ply?v=real-assets-20260702",
   poissonFallbackUrl: "./assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb?v=real-assets-20260702",
 };
@@ -131,7 +153,11 @@ const obstacles = [];
 let floorCollider;
 let realColliderRoot = null;
 let sparkSplatMesh = null;
-let realVisualSource = "Spark .sog";
+let activeSparkAsset = null;
+let realVisualSource = "Spark .splat";
+let realVisualFormat = "splat";
+let realVisualUrl = "";
+let realColliderUrl = "";
 let realVisualUsesSpark = false;
 let realPointCount = 0;
 let realTriangleCount = 0;
@@ -173,11 +199,11 @@ function formatCount(value) {
 }
 
 function setRealAssetError(error) {
-  console.warn("Real Spark visual/collider asset failed to load.", error);
+  console.warn("Real Spark visual/collider assets failed to load.", error);
   state.realAssetError = error?.message || String(error);
   state.useRealAssets = false;
   setLayerVisibility();
-  showToast("真实 Spark 3DGS / GLB 加载失败，已切回 procedural fallback。");
+  showToast("真实 Spark 3DGS / GLB 全部加载失败，已切回 procedural fallback。");
 }
 
 function applyRealLayerTransform() {
@@ -224,10 +250,45 @@ function transformedBox(box, matrix) {
   return new THREE.Box3().setFromPoints(points);
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
+}
+
 function registerCollider(mesh, label, collection = colliderObjects) {
   mesh.userData.colliderLabel = label;
   collection.push(mesh);
   if (!colliderObjects.includes(mesh)) colliderObjects.push(mesh);
+}
+
+function clearRealAssetLayers({ dispose = false } = {}) {
+  if (dispose) {
+    realVisualLayer.traverse((child) => {
+      if (child !== sparkSplatMesh) {
+        child.geometry?.dispose?.();
+        if (Array.isArray(child.material)) child.material.forEach((material) => material?.dispose?.());
+        else child.material?.dispose?.();
+      }
+      child.dispose?.();
+    });
+    realColliderLayer.traverse((child) => {
+      child.geometry?.dispose?.();
+      if (Array.isArray(child.material)) child.material.forEach((material) => material?.dispose?.());
+      else child.material?.dispose?.();
+    });
+  }
+  realVisualLayer.clear();
+  realColliderLayer.clear();
+  realColliderRoot = null;
+  sparkSplatMesh = null;
+  activeSparkAsset = null;
+  realColliderObjects.length = 0;
+  for (let i = colliderObjects.length - 1; i >= 0; i -= 1) {
+    if (!proceduralColliderObjects.includes(colliderObjects[i])) colliderObjects.splice(i, 1);
+  }
 }
 
 function activeColliderObjects() {
@@ -245,9 +306,14 @@ function syncDemoState() {
   const snapshot = {
     mode: activeModeName(),
     visualSource: realVisualSource,
+    visualFormat: realVisualFormat,
+    visualUrl: realVisualUrl,
     visualUsesSpark: realVisualUsesSpark,
     visualCount: realPointCount,
+    colliderUrl: realColliderUrl,
     colliderTriangles: Math.round(realTriangleCount),
+    realVisualReady: state.realVisualReady,
+    realColliderReady: state.realColliderReady,
     lastHit: state.lastHit,
     realAssetError: state.realAssetError,
   };
@@ -560,42 +626,47 @@ async function loadRealPointCloud() {
   points.raycast = () => {};
   realVisualLayer.add(points);
   realVisualSource = "PLY fallback";
+  realVisualFormat = "ply";
+  realVisualUrl = REAL_ASSETS.plyFallbackUrl;
   realVisualUsesSpark = false;
   fitRealLayersToDemoSpace(sourceBox);
   state.realVisualReady = true;
   setLayerVisibility();
 }
 
-async function loadSparkSplat() {
+async function loadSparkSplat(asset) {
+  activeSparkAsset = asset;
+  realVisualSource = asset.label;
+  realVisualFormat = asset.format;
+  realVisualUrl = asset.visualUrl;
   const splat = new SplatMesh({
-    url: REAL_ASSETS.splatUrl,
-    lod: true,
+    url: asset.visualUrl,
+    lod: asset.lod,
     lodAbove: 100000,
     raycastable: false,
     onProgress: (event) => {
       if (!event.total) return;
       const pct = Math.round((event.loaded / event.total) * 100);
-      assetMetric.textContent = `splat ${pct}%`;
+      assetMetric.textContent = `${asset.format} ${pct}%`;
     },
   });
-  splat.name = "real Spark 3DGS visual splat";
+  splat.name = `real ${asset.label} visual splat`;
   splat.raycast = () => {};
   realVisualLayer.add(splat);
-  await splat.initialized;
-  splat.rotateX(-Math.PI / 2);
+  await withTimeout(splat.initialized, asset.timeoutMs || 60000, `${asset.label} initialization`);
+  splat.rotation.set(asset.rotation?.x || 0, asset.rotation?.y || 0, asset.rotation?.z || 0);
   splat.updateMatrixWorld(true);
 
   const sourceBox = transformedBox(splat.getBoundingBox(true), splat.matrix);
   if (sourceBox.isEmpty()) {
     throw new Error("Spark splat bounding box is empty.");
   }
-  realPointCount = REAL_ASSETS.splatCount
+  realPointCount = asset.splatCount
     || splat.packedSplats?.numSplats
     || splat.extSplats?.numSplats
     || splat.splats?.numSplats
     || splat.numSplats
     || 0;
-  realVisualSource = "Spark .sog";
   realVisualUsesSpark = true;
   sparkSplatMesh = splat;
   fitRealLayersToDemoSpace(sourceBox);
@@ -603,7 +674,8 @@ async function loadSparkSplat() {
   setLayerVisibility();
 }
 
-async function loadRealCollider(colliderUrl = REAL_ASSETS.colliderUrl) {
+async function loadRealCollider(colliderUrl = activeSparkAsset?.colliderUrl || REAL_ASSETS.poissonFallbackUrl, colliderLabel = activeSparkAsset?.colliderLabel || "true-3dgs-poisson-mesh") {
+  realColliderUrl = colliderUrl;
   const loader = new GLTFLoader();
   loader.setDRACOLoader(dracoLoader);
   const gltf = await loader.loadAsync(colliderUrl);
@@ -627,7 +699,7 @@ async function loadRealCollider(colliderUrl = REAL_ASSETS.colliderUrl) {
     child.material = shadedMaterial;
     child.castShadow = false;
     child.receiveShadow = true;
-    child.userData.colliderLabel = realVisualUsesSpark ? "spark-3dgs-collider-mesh" : "true-3dgs-poisson-mesh";
+    child.userData.colliderLabel = colliderLabel;
     child.visible = state.showCollider;
     registerCollider(child, child.userData.colliderLabel, realColliderObjects);
     const positionCount = child.geometry.getAttribute("position")?.count || 0;
@@ -650,29 +722,60 @@ async function loadRealCollider(colliderUrl = REAL_ASSETS.colliderUrl) {
   setLayerVisibility();
 }
 
+async function loadSparkAssetPair(asset) {
+  clearRealAssetLayers({ dispose: true });
+  state.realVisualReady = false;
+  state.realColliderReady = false;
+  state.realAssetError = "";
+  realPointCount = 0;
+  realTriangleCount = 0;
+  realVisualUsesSpark = false;
+  realVisualSource = asset.label;
+  realVisualFormat = asset.format;
+  realVisualUrl = asset.visualUrl;
+  realColliderUrl = asset.colliderUrl;
+  updateDebugPanel();
+  await loadSparkSplat(asset);
+  await loadRealCollider(asset.colliderUrl, asset.colliderLabel);
+  setLayerVisibility();
+}
+
 async function loadRealAssets() {
   updateDebugPanel();
-  try {
-    await loadSparkSplat();
-    await loadRealCollider();
-    setLayerVisibility();
-    showToast("Loaded Spark 3DGS visual layer + GLB collider mesh.");
-  } catch (error) {
-    console.warn("Spark 3DGS path failed; trying PLY/Poisson fallback.", error);
+  const sparkErrors = [];
+  for (const asset of SPARK_VISUAL_ASSETS) {
     try {
-      realVisualLayer.clear();
-      realColliderLayer.clear();
-      realColliderObjects.length = 0;
+      await loadSparkAssetPair(asset);
+      showToast(`Loaded ${asset.label} visual + GLB collider mesh.`);
+      return;
+    } catch (error) {
+      console.warn(`${asset.label} visual/collider path failed; trying next asset.`, error);
+      sparkErrors.push(`${asset.label}: ${error?.message || String(error)}`);
+      clearRealAssetLayers({ dispose: true });
+      state.realVisualReady = false;
+      state.realColliderReady = false;
       realPointCount = 0;
       realTriangleCount = 0;
       realVisualUsesSpark = false;
-      await loadRealPointCloud();
-      await loadRealCollider(REAL_ASSETS.poissonFallbackUrl);
-      setLayerVisibility();
-      showToast("Spark 加载失败，已加载 PLY/Poisson fallback。");
-    } catch (fallbackError) {
-      setRealAssetError(fallbackError);
     }
+  }
+
+  try {
+    activeSparkAsset = null;
+    realVisualSource = "PLY fallback";
+    realVisualFormat = "ply";
+    realVisualUrl = REAL_ASSETS.plyFallbackUrl;
+    realColliderUrl = REAL_ASSETS.poissonFallbackUrl;
+    await loadRealPointCloud();
+    await loadRealCollider(REAL_ASSETS.poissonFallbackUrl, "true-3dgs-poisson-mesh");
+    setLayerVisibility();
+    showToast("Spark 资产加载失败，已加载 PLY/Poisson fallback。");
+  } catch (fallbackError) {
+    const message = [
+      ...sparkErrors,
+      `PLY/Poisson fallback: ${fallbackError?.message || String(fallbackError)}`,
+    ].join(" | ");
+    setRealAssetError(new Error(message));
   }
 }
 

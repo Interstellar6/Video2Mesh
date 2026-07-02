@@ -36,13 +36,13 @@ real lightweight GLB collider mesh
 |---|---|---|
 | World Labs / Marble | 环境视觉资产和 collider 资产分开输出 | 视觉点云和 collider mesh 分成两个 layer |
 | image-blaster | `SparkRenderer` / `SplatMesh` + Rapier/mesh collider + object layer | Spark 负责 3DGS 视觉，Three.js mesh 负责射线和碰撞 |
-| 学长 TriSplat 网页 | `3DGS.sog` + `3dgsCollider.glb` + player controller | 直接复用同源 `.sog` 视觉资产和 GLB collider mesh |
+| 学长 TriSplat 网页 | `Outdoor.splat` / `outdoor4.sog` + `outdoor4.collision.glb`，以及 `3DGS.sog` + `3dgsCollider.glb` player controller | 主路径复用真实 `.splat` 视觉资产和同源 GLB collider，旧 `.sog` 资产作为兜底 |
 | Icare / SparkJS | splat 视觉资源与 walkable / characterCollision mesh 分离 | Splat 禁用 raycast，GLB mesh 独立承担交互 |
 
 ## 当前能力
 
-- 视觉层：默认用本地 vendored Spark runtime 加载真实 `azureovo_3dgs.sog`，源文件 `meta.json` 记录 688,687 个 splats；页面 HUD 会显示 Spark 运行时实际加载计数，只负责显示，默认不参与 raycast。
-- 碰撞层：默认加载同源 `azureovo_3dgs_collider.glb`，作为静态 mesh collider proxy；如果 Spark 路径失败，会退回我们自己的 PLY + Poisson GLB fallback。
+- 视觉层：默认用本地 vendored Spark runtime 优先加载真实 `azureovo_outdoor.splat`，约 1,200,000 个 splats；若失败再加载 `azureovo_3dgs.sog`，最后才退回 PLY debug visual。视觉层只负责显示，默认不参与 raycast。
+- 碰撞层：主路径加载同源 `azureovo_outdoor_collider.glb`，作为静态 mesh collider proxy；`.sog` 兜底会加载 `azureovo_3dgs_collider.glb`；Spark 路径都失败时才退回我们自己的 PLY + Poisson GLB fallback。
 - Actor：WASD / 方向键 / 屏幕按钮移动；Real Assets 模式下用 GLB mesh 做向下地面探测和前向阻挡探测。
 - Raycast：点击画面只命中 collider mesh，并显示红色命中点和法线。
 - Debug：可切换 Real Assets / Procedural fallback、Visual 3DGS、Collider Mesh、Semantic Tint。
@@ -51,12 +51,14 @@ real lightweight GLB collider mesh
 
 | 层 | 文件 | 体积 | 用途 |
 |---|---:|---:|---|
-| 视觉代理 | `docs-blog/demos/visual-physics-proxy/assets/azureovo_3dgs.sog` | 11MB | Spark `SplatMesh` 加载 PC-SOGS 3DGS，禁用 raycast |
-| 碰撞代理 | `docs-blog/demos/visual-physics-proxy/assets/azureovo_3dgs_collider.glb` | 3.4MB | Three.js `GLTFLoader` + `DRACOLoader` 加载 mesh collider，负责 raycast / ground probe |
+| 主视觉代理 | `docs-blog/demos/visual-physics-proxy/assets/azureovo_outdoor.splat` | 37MB | Spark `SplatMesh` 加载真实 `.splat` 3DGS，禁用 raycast |
+| 主碰撞代理 | `docs-blog/demos/visual-physics-proxy/assets/azureovo_outdoor_collider.glb` | 1.1MB | Three.js `GLTFLoader` + `DRACOLoader` 加载 outdoor collider，负责 raycast / ground probe |
+| 兜底视觉代理 | `docs-blog/demos/visual-physics-proxy/assets/azureovo_3dgs.sog` | 11MB | Spark `SplatMesh` 加载 PC-SOGS 3DGS，禁用 raycast |
+| 兜底碰撞代理 | `docs-blog/demos/visual-physics-proxy/assets/azureovo_3dgs_collider.glb` | 3.4MB | `.sog` 路径失败前的同源 GLB collider |
 | fallback 视觉 | `docs-blog/demos/visual-physics-proxy/assets/3dgs_iter30000_clean_filtered_xyzrgb.ply` | 7.4MB | Spark 失败时加载为 `THREE.Points` debug visual |
 | fallback 碰撞 | `docs-blog/demos/visual-physics-proxy/assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb` | 1.8MB | 我们自己的 CloudCompare/Poisson collider fallback |
 
-页面中的资产计数默认显示为 `3DGS / mesh`：当前预期为 `688,687 / 883,159`，分别对应 `.sog` 源文件 splat 数量和碰撞 mesh 三角面数量。`Collider Mesh` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
+页面中的资产计数默认显示为 `3DGS / mesh`：主路径预期为约 `1.2M / outdoor GLB triangle count`。页面会把当前 `visualFormat`、`visualUrl`、`colliderUrl` 写入 `document.documentElement.dataset.visualPhysicsState`，方便确认线上实际命中的资产。`Collider Mesh` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
 
 ## 后续替换方向
 
@@ -64,7 +66,7 @@ real lightweight GLB collider mesh
 
 | 当前 demo | 后续增强 |
 |---|---|
-| Spark PC-SOGS `.sog` visual layer | 接入我们自己的 GraphDECO `.ply` / `.splat` / `.spz` 导出 |
+| Spark `.splat` / PC-SOGS `.sog` visual layer | 接入我们自己的 GraphDECO `.ply` / `.splat` / `.spz` 导出 |
 | 真实 Poisson GLB collider | object-level mesh / convex hull / V-HACD / CoACD |
 | 轻量 kinematic collision | Rapier / Unity CharacterController / robot controller |
 | mock semantic tint | Video2Mesh semantic/probability splats 或 semantic sidecar |
