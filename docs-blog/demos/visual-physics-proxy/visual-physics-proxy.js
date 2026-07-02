@@ -137,7 +137,7 @@ const actor = {
 
 const state = {
   showVisual: true,
-  showCollider: false,
+  showCollider: true,
   semanticTint: false,
   useRealAssets: true,
   realVisualReady: false,
@@ -303,6 +303,10 @@ function activeModeName() {
 }
 
 function syncDemoState() {
+  let visibleColliderMeshes = 0;
+  realColliderLayer.traverse((child) => {
+    if (child instanceof THREE.Mesh && child.visible) visibleColliderMeshes += 1;
+  });
   const snapshot = {
     mode: activeModeName(),
     visualSource: realVisualSource,
@@ -314,6 +318,11 @@ function syncDemoState() {
     colliderTriangles: Math.round(realTriangleCount),
     realVisualReady: state.realVisualReady,
     realColliderReady: state.realColliderReady,
+    showVisual: state.showVisual,
+    showCollider: state.showCollider,
+    sparkRendererVisible: sparkRenderer.visible,
+    realVisualLayerVisible: realVisualLayer.visible,
+    visibleColliderMeshes,
     lastHit: state.lastHit,
     realAssetError: state.realAssetError,
   };

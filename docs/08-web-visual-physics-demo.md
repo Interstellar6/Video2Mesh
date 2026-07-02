@@ -45,7 +45,7 @@ real lightweight GLB collider mesh
 - 碰撞层：主路径加载同源 `azureovo_outdoor_collider.glb`，作为静态 mesh collider proxy；`.sog` 兜底会加载 `azureovo_3dgs_collider.glb`；Spark 路径都失败时才退回我们自己的 PLY + Poisson GLB fallback。
 - Actor：WASD / 方向键 / 屏幕按钮移动；Real Assets 模式下用 GLB mesh 做向下地面探测和前向阻挡探测。
 - Raycast：点击画面只命中 collider mesh，并显示红色命中点和法线。
-- Debug：可切换 Real Assets / Procedural fallback、Visual 3DGS、Collider Mesh、Semantic Tint。
+- Debug：默认同时显示 Visual 3DGS 和 Collider Mesh overlay；可切换 Real Assets / Procedural fallback、Visual 3DGS、Collider Mesh、Semantic Tint。
 
 ## 当前资产
 
@@ -58,7 +58,7 @@ real lightweight GLB collider mesh
 | fallback 视觉 | `docs-blog/demos/visual-physics-proxy/assets/3dgs_iter30000_clean_filtered_xyzrgb.ply` | 7.4MB | Spark 失败时加载为 `THREE.Points` debug visual |
 | fallback 碰撞 | `docs-blog/demos/visual-physics-proxy/assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb` | 1.8MB | 我们自己的 CloudCompare/Poisson collider fallback |
 
-页面中的资产计数默认显示为 `3DGS / mesh`：主路径预期为约 `1.2M / outdoor GLB triangle count`。页面会把当前 `visualFormat`、`visualUrl`、`colliderUrl` 写入 `document.documentElement.dataset.visualPhysicsState`，方便确认线上实际命中的资产。`Collider Mesh` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
+页面中的资产计数默认显示为 `3DGS / mesh`：主路径预期为约 `1.2M / outdoor GLB triangle count`。页面会把当前 `visualFormat`、`visualUrl`、`colliderUrl`、`sparkRendererVisible`、`visibleColliderMeshes` 写入 `document.documentElement.dataset.visualPhysicsState`，方便确认线上实际命中的资产和显示状态。`Collider Mesh` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
 
 ## 后续替换方向
 
