@@ -6,13 +6,14 @@
     <title>3DGS Visual + Mesh Collider Proxy Demo</title>
     <meta
       name="description"
-      content="Video2Mesh web demo: a splat-like visual layer is separated from a lightweight mesh collider proxy."
+      content="Video2Mesh web demo: a Spark 3DGS visual layer is separated from a lightweight mesh collider proxy."
     />
     <script type="importmap">
       {
         "imports": {
           "three": "https://esm.sh/three@0.180.0",
-          "three/addons/": "https://esm.sh/three@0.180.0/examples/jsm/"
+          "three/addons/": "https://esm.sh/three@0.180.0/examples/jsm/",
+          "@sparkjsdev/spark": "./vendor/spark.module.js"
         }
       }
     </script>
@@ -421,14 +422,14 @@
       <div class="panel status-card">
         <h1>视觉代理 3DGS + 碰撞代理 Mesh</h1>
         <p>
-          视觉层加载真实 PLY 高斯中心点，只负责显示；移动、射线和落点检测只依赖真实 GLB collider mesh。
+          视觉层用 Spark 加载真实 3DGS .sog，只负责显示；移动、射线和落点检测只依赖真实 GLB collider mesh。
           点击画面会命中碰撞代理，而不是命中视觉点云。
         </p>
         <div class="metrics">
           <div class="metric"><strong id="speedMetric">0.0</strong><span>actor m/s</span></div>
           <div class="metric"><strong id="heightMetric">1.6</strong><span>ground height</span></div>
           <div class="metric"><strong id="hitMetric">none</strong><span>ray hit</span></div>
-          <div class="metric"><strong id="assetMetric">loading</strong><span>real assets</span></div>
+          <div class="metric"><strong id="assetMetric">loading</strong><span>3DGS / mesh</span></div>
         </div>
       </div>
       <div class="panel controls">
@@ -449,7 +450,7 @@
             <button type="button" data-drive="right" aria-label="Right">▶</button>
           </div>
           <div class="legend">
-            <span><i class="swatch"></i> 真实 PLY / 高斯中心点：只负责显示</span>
+            <span><i class="swatch"></i> Spark .sog / 真实 3DGS：只负责显示</span>
             <span><i class="swatch mesh"></i> 真实 GLB collider mesh：负责地面、边界和射线</span>
             <span><i class="swatch ray"></i> 红色标记：射线命中的 collider face</span>
           </div>
@@ -457,6 +458,6 @@
       </div>
     </section>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="./visual-physics-proxy.js?v=real-assets-20260702"></script>
+    <script type="module" src="./visual-physics-proxy.js?v=spark-sog-20260702"></script>
   </body>
 </html>

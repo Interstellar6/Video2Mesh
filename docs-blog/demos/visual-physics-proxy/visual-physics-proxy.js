@@ -1,5 +1,7 @@
 import * as THREE from "three";
+import { SplatMesh, SparkRenderer } from "@sparkjsdev/spark";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
@@ -13,8 +15,11 @@ const modeChip = document.querySelector("#modeChip");
 const toast = document.querySelector("#toast");
 
 const REAL_ASSETS = {
-  pointCloudUrl: "./assets/3dgs_iter30000_clean_filtered_xyzrgb.ply?v=real-assets-20260702",
-  colliderUrl: "./assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb?v=real-assets-20260702",
+  splatUrl: "./assets/azureovo_3dgs.sog?v=spark-sog-20260702",
+  splatCount: 688687,
+  colliderUrl: "./assets/azureovo_3dgs_collider.glb?v=spark-sog-20260702",
+  plyFallbackUrl: "./assets/3dgs_iter30000_clean_filtered_xyzrgb.ply?v=real-assets-20260702",
+  poissonFallbackUrl: "./assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb?v=real-assets-20260702",
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -25,12 +30,19 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
+const sparkRenderer = new SparkRenderer({
+  renderer,
+  enableLod: true,
+});
+
 const fpvRenderer = new THREE.WebGLRenderer({ canvas: fpvCanvas, antialias: true, alpha: true });
 fpvRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 fpvRenderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0x070a0d, 14, 44);
+sparkRenderer.name = "spark-3dgs-renderer";
+scene.add(sparkRenderer);
 
 const camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.05, 120);
 camera.position.set(8.5, 7.2, 9.5);
@@ -89,6 +101,8 @@ const pointer = new THREE.Vector2();
 const keys = new Set();
 const heldDrive = new Set();
 const clock = new THREE.Clock();
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.7/");
 
 const actor = {
   radius: 0.24,
@@ -116,6 +130,9 @@ const proceduralColliderObjects = [];
 const obstacles = [];
 let floorCollider;
 let realColliderRoot = null;
+let sparkSplatMesh = null;
+let realVisualSource = "Spark .sog";
+let realVisualUsesSpark = false;
 let realPointCount = 0;
 let realTriangleCount = 0;
 let realBounds = null;
@@ -156,36 +173,55 @@ function formatCount(value) {
 }
 
 function setRealAssetError(error) {
-  console.warn("Real visual/collider asset failed to load.", error);
+  console.warn("Real Spark visual/collider asset failed to load.", error);
   state.realAssetError = error?.message || String(error);
   state.useRealAssets = false;
   setLayerVisibility();
-  showToast("真实 PLY/GLB 加载失败，已切回 procedural fallback。");
+  showToast("真实 Spark 3DGS / GLB 加载失败，已切回 procedural fallback。");
 }
 
-function fitObjectToDemoSpace(object, sourceBox) {
+function applyRealLayerTransform() {
+  for (const layer of [realVisualLayer, realColliderLayer]) {
+    layer.position.set(
+      -realTransform.center.x * realTransform.scale,
+      -realTransform.center.y * realTransform.scale,
+      -realTransform.center.z * realTransform.scale
+    );
+    layer.scale.setScalar(realTransform.scale);
+    layer.updateMatrixWorld(true);
+  }
+}
+
+function fitRealLayersToDemoSpace(sourceBox) {
   const box = sourceBox.clone();
   const size = new THREE.Vector3();
   const center = new THREE.Vector3();
   box.getSize(size);
   box.getCenter(center);
   const scale = 8.8 / Math.max(size.x, size.y, size.z);
-  object.position.set(-center.x * scale, -center.y * scale, -center.z * scale);
-  object.scale.setScalar(scale);
-  object.updateMatrixWorld(true);
   realTransform = { center, scale };
-  realBounds = new THREE.Box3().setFromObject(object);
+  applyRealLayerTransform();
+  realBounds = new THREE.Box3().setFromObject(realColliderLayer);
 }
 
 function applyRealTransform(object) {
-  object.position.set(
-    -realTransform.center.x * realTransform.scale,
-    -realTransform.center.y * realTransform.scale,
-    -realTransform.center.z * realTransform.scale
-  );
-  object.scale.setScalar(realTransform.scale);
+  object.position.set(0, 0, 0);
+  object.scale.setScalar(1);
   object.updateMatrixWorld(true);
-  realBounds = new THREE.Box3().setFromObject(object);
+  applyRealLayerTransform();
+  realBounds = new THREE.Box3().setFromObject(realColliderLayer);
+}
+
+function transformedBox(box, matrix) {
+  const points = [];
+  for (const x of [box.min.x, box.max.x]) {
+    for (const y of [box.min.y, box.max.y]) {
+      for (const z of [box.min.z, box.max.z]) {
+        points.push(new THREE.Vector3(x, y, z).applyMatrix4(matrix));
+      }
+    }
+  }
+  return new THREE.Box3().setFromPoints(points);
 }
 
 function registerCollider(mesh, label, collection = colliderObjects) {
@@ -199,17 +235,35 @@ function activeColliderObjects() {
 }
 
 function activeModeName() {
-  return state.useRealAssets && state.realVisualReady && state.realColliderReady ? "Real PLY + GLB"
+  return state.useRealAssets && state.realVisualReady && state.realColliderReady
+    ? `${realVisualSource} + GLB`
     : state.useRealAssets && !state.realAssetError ? "Loading real assets"
     : "Procedural fallback";
+}
+
+function syncDemoState() {
+  const snapshot = {
+    mode: activeModeName(),
+    visualSource: realVisualSource,
+    visualUsesSpark: realVisualUsesSpark,
+    visualCount: realPointCount,
+    colliderTriangles: Math.round(realTriangleCount),
+    lastHit: state.lastHit,
+    realAssetError: state.realAssetError,
+  };
+  window.__visualPhysicsDemoState = snapshot;
+  document.documentElement.dataset.visualPhysicsState = JSON.stringify(snapshot);
+  return snapshot;
 }
 
 function updateAssetMetric() {
   if (state.realVisualReady && state.realColliderReady) {
     assetMetric.textContent = `${formatCount(realPointCount)} / ${formatCount(realTriangleCount)}`;
+    syncDemoState();
     return;
   }
   assetMetric.textContent = state.realAssetError ? "fallback" : "loading";
+  syncDemoState();
 }
 
 function updateDebugPanel() {
@@ -475,7 +529,7 @@ function buildScene() {
 
 async function loadRealPointCloud() {
   const loader = new PLYLoader();
-  const geometry = await loader.loadAsync(REAL_ASSETS.pointCloudUrl);
+  const geometry = await loader.loadAsync(REAL_ASSETS.plyFallbackUrl);
   geometry.computeBoundingBox();
   const sourceBox = geometry.boundingBox.clone();
   realPointCount = geometry.getAttribute("position")?.count || 0;
@@ -504,18 +558,57 @@ async function loadRealPointCloud() {
   points.userData.semantic = "real-ply";
   points.userData.preserveVertexColors = true;
   points.raycast = () => {};
-  fitObjectToDemoSpace(points, sourceBox);
   realVisualLayer.add(points);
+  realVisualSource = "PLY fallback";
+  realVisualUsesSpark = false;
+  fitRealLayersToDemoSpace(sourceBox);
   state.realVisualReady = true;
   setLayerVisibility();
 }
 
-async function loadRealCollider() {
+async function loadSparkSplat() {
+  const splat = new SplatMesh({
+    url: REAL_ASSETS.splatUrl,
+    lod: true,
+    lodAbove: 100000,
+    raycastable: false,
+    onProgress: (event) => {
+      if (!event.total) return;
+      const pct = Math.round((event.loaded / event.total) * 100);
+      assetMetric.textContent = `splat ${pct}%`;
+    },
+  });
+  splat.name = "real Spark 3DGS visual splat";
+  splat.raycast = () => {};
+  realVisualLayer.add(splat);
+  await splat.initialized;
+  splat.rotateX(-Math.PI / 2);
+  splat.updateMatrixWorld(true);
+
+  const sourceBox = transformedBox(splat.getBoundingBox(true), splat.matrix);
+  if (sourceBox.isEmpty()) {
+    throw new Error("Spark splat bounding box is empty.");
+  }
+  realPointCount = REAL_ASSETS.splatCount
+    || splat.packedSplats?.numSplats
+    || splat.extSplats?.numSplats
+    || splat.splats?.numSplats
+    || splat.numSplats
+    || 0;
+  realVisualSource = "Spark .sog";
+  realVisualUsesSpark = true;
+  sparkSplatMesh = splat;
+  fitRealLayersToDemoSpace(sourceBox);
+  state.realVisualReady = true;
+  setLayerVisibility();
+}
+
+async function loadRealCollider(colliderUrl = REAL_ASSETS.colliderUrl) {
   const loader = new GLTFLoader();
-  const gltf = await loader.loadAsync(REAL_ASSETS.colliderUrl);
+  loader.setDRACOLoader(dracoLoader);
+  const gltf = await loader.loadAsync(colliderUrl);
   const root = gltf.scene;
-  root.name = "real 3dgs poisson mesh collider";
-  applyRealTransform(root);
+  root.name = "real 3dgs mesh collider";
   realColliderRoot = root;
   realTriangleCount = 0;
 
@@ -534,9 +627,9 @@ async function loadRealCollider() {
     child.material = shadedMaterial;
     child.castShadow = false;
     child.receiveShadow = true;
-    child.userData.colliderLabel = "true-3dgs-poisson-mesh";
+    child.userData.colliderLabel = realVisualUsesSpark ? "spark-3dgs-collider-mesh" : "true-3dgs-poisson-mesh";
     child.visible = state.showCollider;
-    registerCollider(child, "true-3dgs-poisson-mesh", realColliderObjects);
+    registerCollider(child, child.userData.colliderLabel, realColliderObjects);
     const positionCount = child.geometry.getAttribute("position")?.count || 0;
     realTriangleCount += child.geometry.index ? child.geometry.index.count / 3 : positionCount / 3;
 
@@ -551,6 +644,7 @@ async function loadRealCollider() {
   });
 
   realColliderLayer.add(root);
+  applyRealTransform(root);
   state.realColliderReady = true;
   resetActorOnRealMesh();
   setLayerVisibility();
@@ -559,16 +653,34 @@ async function loadRealCollider() {
 async function loadRealAssets() {
   updateDebugPanel();
   try {
-    await loadRealPointCloud();
+    await loadSparkSplat();
     await loadRealCollider();
     setLayerVisibility();
-    showToast("Loaded real PLY visual layer + GLB collider mesh.");
+    showToast("Loaded Spark 3DGS visual layer + GLB collider mesh.");
   } catch (error) {
-    setRealAssetError(error);
+    console.warn("Spark 3DGS path failed; trying PLY/Poisson fallback.", error);
+    try {
+      realVisualLayer.clear();
+      realColliderLayer.clear();
+      realColliderObjects.length = 0;
+      realPointCount = 0;
+      realTriangleCount = 0;
+      realVisualUsesSpark = false;
+      await loadRealPointCloud();
+      await loadRealCollider(REAL_ASSETS.poissonFallbackUrl);
+      setLayerVisibility();
+      showToast("Spark 加载失败，已加载 PLY/Poisson fallback。");
+    } catch (fallbackError) {
+      setRealAssetError(fallbackError);
+    }
   }
 }
 
 function updateVisualColors() {
+  if (sparkSplatMesh) {
+    sparkSplatMesh.recolor.set(state.semanticTint ? 0.58 : 1, state.semanticTint ? 0.95 : 1, state.semanticTint ? 0.9 : 1);
+    sparkSplatMesh.opacity = state.showCollider ? 0.58 : 1;
+  }
   visualLayer.traverse((child) => {
     if (!(child instanceof THREE.Points)) return;
     if (child.userData.preserveVertexColors) return;
@@ -693,9 +805,11 @@ function setLayerVisibility() {
   visualLayer.visible = state.showVisual;
   realVisualLayer.visible = state.showVisual && state.useRealAssets && state.realVisualReady;
   proceduralLayer.visible = state.showVisual && (!state.useRealAssets || !state.realVisualReady);
+  sparkRenderer.visible = state.showVisual && state.useRealAssets && state.realVisualReady && realVisualUsesSpark;
   realVisualLayer.traverse((child) => {
     if (child instanceof THREE.Points) child.material.opacity = state.showCollider ? 0.46 : baseVisualOpacity;
   });
+  if (sparkSplatMesh) sparkSplatMesh.opacity = state.showCollider ? 0.58 : 1;
   realColliderLayer.traverse((child) => {
     if (child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
       child.visible = state.showCollider && state.useRealAssets && state.realColliderReady;
@@ -735,6 +849,7 @@ function onPointerDown(event) {
   if (!hits.length) {
     state.lastHit = "none";
     hitMetric.textContent = "none";
+    syncDemoState();
     showToast("No collider hit. Visual splats are ignored by raycast.");
     return;
   }
@@ -745,6 +860,7 @@ function onPointerDown(event) {
   markHit(hit.point, normal);
   state.lastHit = label;
   hitMetric.textContent = label;
+  syncDemoState();
   showToast(`Ray hit mesh collider: ${label}`);
 }
 
@@ -758,7 +874,9 @@ function showToast(message) {
 function resetActor() {
   placeActorAtCurrentSpawn();
   markerLayer.clear();
+  state.lastHit = "none";
   hitMetric.textContent = "none";
+  syncDemoState();
   showToast("Actor reset on the collider mesh floor.");
 }
 
@@ -773,8 +891,11 @@ function animate() {
     if (child instanceof THREE.Points) child.material.opacity = pulse;
   });
 
-  renderer.render(scene, camera);
+  sparkRenderer.render(scene, camera);
+  const mainSparkVisible = sparkRenderer.visible;
+  sparkRenderer.visible = false;
   fpvRenderer.render(scene, fpvCamera);
+  sparkRenderer.visible = mainSparkVisible;
   requestAnimationFrame(animate);
 }
 
@@ -793,7 +914,7 @@ function bindEvents() {
   });
   document.querySelector("#toggleAssets").addEventListener("click", () => {
     if (!state.realVisualReady || !state.realColliderReady) {
-      showToast("Real PLY/GLB assets are still loading; using fallback until ready.");
+      showToast("Real Spark 3DGS / GLB assets are still loading; using fallback until ready.");
       return;
     }
     state.useRealAssets = !state.useRealAssets;
@@ -801,7 +922,7 @@ function bindEvents() {
     hitMetric.textContent = "none";
     placeActorAtCurrentSpawn();
     setLayerVisibility();
-    showToast(state.useRealAssets ? "Using real PLY visual + GLB collider." : "Using procedural fallback scene.");
+    showToast(state.useRealAssets ? `Using ${realVisualSource} visual + GLB collider.` : "Using procedural fallback scene.");
   });
   document.querySelector("#toggleCollider").addEventListener("click", () => {
     state.showCollider = !state.showCollider;
@@ -828,5 +949,5 @@ bindEvents();
 resize();
 setLayerVisibility();
 loadRealAssets();
-showToast("Loading real PLY visual layer + GLB collider mesh...");
+showToast("Loading real Spark 3DGS visual layer + GLB collider mesh...");
 animate();

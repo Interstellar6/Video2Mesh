@@ -106,6 +106,7 @@ gaussian-splatting/
 !docs-blog/demos/visual-physics-proxy/assets/
 !docs-blog/demos/visual-physics-proxy/assets/3dgs_iter30000_clean_filtered_xyzrgb.ply
 !docs-blog/demos/visual-physics-proxy/assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb
+!docs-blog/demos/visual-physics-proxy/assets/azureovo_3dgs_collider.glb
 !configs/**
 !tools/**
 !video2mesh/**
