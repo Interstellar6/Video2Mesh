@@ -28,6 +28,7 @@ PINNED_DOCS = [
     "docs/07-pipeline-route-matrix.md",
     "docs/03-research-roadmap.md",
     "docs/04-mesh-interaction-and-completion.md",
+    "docs/08-web-visual-physics-demo.md",
     "docs/05-operations-and-showcase.md",
     "docs/06-site-and-remote-control.md",
 ]

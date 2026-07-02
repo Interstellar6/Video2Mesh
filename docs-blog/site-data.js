@@ -1,5 +1,5 @@
 window.V2M_BLOG_DATA = {
-  "generatedAt": "2026-07-01 18:12",
+  "generatedAt": "2026-07-02 16:59",
   "docs": [
     {
       "id": "readme",
@@ -29,13 +29,13 @@ window.V2M_BLOG_DATA = {
       "summary": "Video2Mesh 精简后的唯一主文档入口，按项目总览、流水线、研究路线、交互仿真、运行展示和网站运维分类。",
       "source_path": "docs/README.md",
       "source_kind": "builtin",
-      "updated": "2026-07-01",
+      "updated": "2026-07-02",
       "tags": [
         "Video2Mesh",
         "Docs",
         "Overview"
       ],
-      "body": "\n# Video2Mesh 文档中心\n\n这个目录是 Video2Mesh 的精简文档入口。旧的根目录长报告已经合并到这里，不再作为主文档维护。\n\n## 文档结构\n\n| 文档 | 读者问题 | 内容 |\n|---|---|---|\n| [01-project-overview.md](01-project-overview.md) | 这个项目到底做什么？ | 项目目标、资产分层、当前边界、参考项目角色 |\n| [02-pipeline-and-commands.md](02-pipeline-and-commands.md) | 怎么跑？产物在哪里？ | 端到端流水线、远端命令、关键输出、QA |\n| [07-pipeline-route-matrix.md](07-pipeline-route-matrix.md) | 每个流程阶段该选哪条路线？ | 当前选型、备选方法、适用场景和风险对比 |\n| [03-research-roadmap.md](03-research-roadmap.md) | 学术和业界路线怎么选？ | 场景扫描、3DGS、mesh、Scene Graph、方法优先级 |\n| [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) | 怎么让场景可交互？遮挡怎么补？ | 3DGS-to-mesh、collider、补全、语义、SimAnything 动态线 |\n| [05-operations-and-showcase.md](05-operations-and-showcase.md) | 展示和排错怎么做？ | 远端环境、历史 run、展示清单、常见失败处理 |\n| [06-site-and-remote-control.md](06-site-and-remote-control.md) | relumeow.top 怎么更新？ | Markdown 网站、API、登录、远程控制边界 |\n\n## 当前结论\n\nVideo2Mesh 的核心路线不是“从视频直接生成一个完美 mesh”，而是把真实扫描视频拆成多层资产：\n\n```text\nvideo\n  -> COLMAP / learned pose fallback\n  -> GraphDECO 3DGS visual scene\n  -> 2D/3D object masks\n  -> semantic / probability splats\n  -> object visual mesh\n  -> collider / physics proxy\n  -> simulator adapters and review pack\n```\n\n最重要的工程判断：\n\n- 3DGS 负责高质量视觉层，不直接负责碰撞。\n- mesh/collider 是物理和交互代理，不要求和视觉 3DGS 一样精细。\n- semantic layer 独立保存，必要时投到 mesh face、collider 或 trigger。\n- 遮挡补全要分成 object visual completion、background clean plate、physics proxy completion 三件事。\n- SimAnything / PhysSplat 应作为 dynamic Gaussian 和物理属性增强线，不替代 mesh/collider 主链路。\n\n## 优先级\n\n| 优先级 | 目标 | 当前推荐 |\n|---|---|---|\n| P0 | 跑通可展示闭环 | COLMAP + GraphDECO + SAM2 + 3D masks + simulator bundle |\n| P0 | 场景级碰撞 | dense point cloud / Poisson / simplified static collider |\n| P1 | 物体 visual mesh | 3DGS rendered RGB/depth/normal/mask -> TSDF / Poisson |\n| P1 | 动态物体 collider | primitive compound / convex hull / CoACD or V-HACD |\n| P1 | 遮挡补全 | Hunyuan3D / Meshy / TRELLIS / image-blaster 生成完整视觉 mesh，再按 bbox 对齐 |\n| P2 | 高质量 3DGS-to-mesh | GS2Mesh-style stereo depth fusion、SuGaR、2DGS、GOF |\n| P2 | 动态 Gaussian | SimAnything / PhysSplat-style semantic Gaussian -> physics object |\n\n## 旧文档合并说明\n\n| 旧主题 | 新位置 |\n|---|---|\n| `Video2Mesh_PROJECT_README.md`、`README.md` | [01-project-overview.md](01-project-overview.md) |\n| `VIDEO2MESH_PIPELINE.md`、`SVLGaussian_frame_matching_notes.md` | [02-pipeline-and-commands.md](02-pipeline-and-commands.md) |\n| `SCENE_SCANNING_SOLUTIONS_SURVEY.md`、`FEED_FORWARD_GAUSSIAN_SCENE_GRAPH_SURVEY.md` | [03-research-roadmap.md](03-research-roadmap.md) |\n| `MESH_RECONSTRUCTION_METHODS_SURVEY.md`、`INTERACTIVE_GAME_SCENE_FROM_3DGS_SURVEY.md`、`SIM_ANYTHING_PHYS_SPLAT_SURVEY.md` | [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) |\n| `REMOTE_SETUP_STATUS.md`、`Video2Mesh_real_demo_runbook.md`、`Video2Mesh_milscene*.md` | [05-operations-and-showcase.md](05-operations-and-showcase.md) |\n| `docs-blog/content/*.md` | [06-site-and-remote-control.md](06-site-and-remote-control.md) |\n",
+      "body": "\n# Video2Mesh 文档中心\n\n这个目录是 Video2Mesh 的精简文档入口。旧的根目录长报告已经合并到这里，不再作为主文档维护。\n\n## 文档结构\n\n| 文档 | 读者问题 | 内容 |\n|---|---|---|\n| [01-project-overview.md](01-project-overview.md) | 这个项目到底做什么？ | 项目目标、资产分层、当前边界、参考项目角色 |\n| [02-pipeline-and-commands.md](02-pipeline-and-commands.md) | 怎么跑？产物在哪里？ | 端到端流水线、远端命令、关键输出、QA |\n| [07-pipeline-route-matrix.md](07-pipeline-route-matrix.md) | 每个流程阶段该选哪条路线？ | 当前选型、备选方法、适用场景和风险对比 |\n| [03-research-roadmap.md](03-research-roadmap.md) | 学术和业界路线怎么选？ | 场景扫描、3DGS、mesh、Scene Graph、方法优先级 |\n| [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) | 怎么让场景可交互？遮挡怎么补？ | 3DGS-to-mesh、collider、补全、语义、SimAnything 动态线 |\n| [08-web-visual-physics-demo.md](08-web-visual-physics-demo.md) | Web 端能不能先演示视逻分离？ | 视觉代理 3DGS + 碰撞代理 mesh 的静态 Web demo |\n| [05-operations-and-showcase.md](05-operations-and-showcase.md) | 展示和排错怎么做？ | 远端环境、历史 run、展示清单、常见失败处理 |\n| [06-site-and-remote-control.md](06-site-and-remote-control.md) | relumeow.top 怎么更新？ | Markdown 网站、API、登录、远程控制边界 |\n\n## 当前结论\n\nVideo2Mesh 的核心路线不是“从视频直接生成一个完美 mesh”，而是把真实扫描视频拆成多层资产：\n\n```text\nvideo\n  -> COLMAP / learned pose fallback\n  -> GraphDECO 3DGS visual scene\n  -> 2D/3D object masks\n  -> semantic / probability splats\n  -> object visual mesh\n  -> collider / physics proxy\n  -> simulator adapters and review pack\n```\n\n最重要的工程判断：\n\n- 3DGS 负责高质量视觉层，不直接负责碰撞。\n- mesh/collider 是物理和交互代理，不要求和视觉 3DGS 一样精细。\n- semantic layer 独立保存，必要时投到 mesh face、collider 或 trigger。\n- 遮挡补全要分成 object visual completion、background clean plate、physics proxy completion 三件事。\n- SimAnything / PhysSplat 应作为 dynamic Gaussian 和物理属性增强线，不替代 mesh/collider 主链路。\n\n## 优先级\n\n| 优先级 | 目标 | 当前推荐 |\n|---|---|---|\n| P0 | 跑通可展示闭环 | COLMAP + GraphDECO + SAM2 + 3D masks + simulator bundle |\n| P0 | 场景级碰撞 | dense point cloud / Poisson / simplified static collider |\n| P1 | 物体 visual mesh | 3DGS rendered RGB/depth/normal/mask -> TSDF / Poisson |\n| P1 | 动态物体 collider | primitive compound / convex hull / CoACD or V-HACD |\n| P1 | 遮挡补全 | Hunyuan3D / Meshy / TRELLIS / image-blaster 生成完整视觉 mesh，再按 bbox 对齐 |\n| P2 | 高质量 3DGS-to-mesh | GS2Mesh-style stereo depth fusion、SuGaR、2DGS、GOF |\n| P2 | 动态 Gaussian | SimAnything / PhysSplat-style semantic Gaussian -> physics object |\n\n## 旧文档合并说明\n\n| 旧主题 | 新位置 |\n|---|---|\n| `Video2Mesh_PROJECT_README.md`、`README.md` | [01-project-overview.md](01-project-overview.md) |\n| `VIDEO2MESH_PIPELINE.md`、`SVLGaussian_frame_matching_notes.md` | [02-pipeline-and-commands.md](02-pipeline-and-commands.md) |\n| `SCENE_SCANNING_SOLUTIONS_SURVEY.md`、`FEED_FORWARD_GAUSSIAN_SCENE_GRAPH_SURVEY.md` | [03-research-roadmap.md](03-research-roadmap.md) |\n| `MESH_RECONSTRUCTION_METHODS_SURVEY.md`、`INTERACTIVE_GAME_SCENE_FROM_3DGS_SURVEY.md`、`SIM_ANYTHING_PHYS_SPLAT_SURVEY.md` | [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) |\n| `REMOTE_SETUP_STATUS.md`、`Video2Mesh_real_demo_runbook.md`、`Video2Mesh_milscene*.md` | [05-operations-and-showcase.md](05-operations-and-showcase.md) |\n| `docs-blog/content/*.md` | [06-site-and-remote-control.md](06-site-and-remote-control.md) |\n",
       "headings": [
         {
           "level": "2",
@@ -500,6 +500,56 @@ window.V2M_BLOG_DATA = {
         }
       ],
       "reading_minutes": 2
+    },
+    {
+      "id": "08-web-visual-physics-demo",
+      "title": "Web 视觉代理与碰撞代理演示",
+      "category": "Simulation",
+      "summary": "一个参考 World Labs、image-blaster 和学长 TriSplat 演示结构的 Web demo：视觉层近似 3DGS，碰撞层使用独立 mesh proxy。",
+      "source_path": "docs/08-web-visual-physics-demo.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-02",
+      "tags": [
+        "Web Demo",
+        "3DGS",
+        "Mesh Collider",
+        "World Labs",
+        "Simulation"
+      ],
+      "body": "\n# Web 视觉代理与碰撞代理演示\n\n在线演示入口：[Visual Proxy Demo](/demos/visual-physics-proxy/)\n\n## 目标\n\n这个 demo 验证的是架构，而不是画质：\n\n```text\nsplat-like visual layer\n  -> only for rendering\n\nlightweight mesh collider layer\n  -> movement\n  -> raycast hit test\n  -> floor / obstacle blocking\n  -> future Unity / Web physics proxy\n```\n\n它对应我们项目里的核心判断：3DGS 负责视觉真实感，mesh/collider 负责物理、导航、点击、交互和 runtime 逻辑。\n\n## 参考对象\n\n| 来源 | 借鉴点 | demo 中的实现 |\n|---|---|---|\n| World Labs / Marble | 环境视觉资产和 collider 资产分开输出 | 视觉点云和 collider mesh 分成两个 layer |\n| image-blaster | Spark splat + Rapier/mesh collider + object layer | Three.js 场景中显式区分 visual layer 与 collider layer |\n| 学长 TriSplat 网页 | 全屏 canvas、HUD、FPV 小窗、agent 控制 | 保留全屏 canvas、Live FPV、移动控制、射线命中反馈 |\n\n## 当前能力\n\n- 视觉层：用 splat-like `THREE.Points` 近似 3DGS 高斯点云，默认不参与 raycast。\n- 碰撞层：用 floor shape 和 box collider proxy 表示地面、墙、桌、椅、柜子、沙发。\n- Actor：WASD / 方向键 / 屏幕按钮移动，只根据 collider proxy 阻挡。\n- Raycast：点击画面只命中 collider mesh，并显示红色命中点和法线。\n- Debug：可切换显示 Visual 3DGS、Collider Mesh、Semantic Tint。\n\n## 下一步替换真实资产\n\n这个 demo 的接口可以逐步替换：\n\n| 当前 demo | 后续真实数据 |\n|---|---|\n| `THREE.Points` splat-like visual layer | GraphDECO / Spark `.ply`, `.splat`, `.spz` |\n| 手写 floor shape | COLMAP dense fused PLY -> Poisson -> decimated mesh |\n| 手写 box colliders | object mesh / convex hull / V-HACD / CoACD |\n| 手写 semantic tint | Video2Mesh semantic/probability splats |\n| 简单 kinematic actor | Rapier / Unity CharacterController / robot controller |\n\n## 和 Video2Mesh 的接入位置\n\n```text\nexports/<run>/\n  semantic_supersplat.ply          # visual / semantic layer\n  simulator_assets/\n    background/collider_mesh.glb   # static collider proxy\n    objects/*/visual_mesh.glb      # object visual mesh\n    objects/*/collider.glb         # object collider proxy\n    simulator_asset_bundle.json    # pose / scale / semantic / physics sidecar\n```\n\n最终 Web viewer 可以从 `simulator_asset_bundle.json` 加载每个资产：\n\n- visual assets 放在可见层。\n- collider assets 放进 physics/raycast 层。\n- semantic sidecar 决定 hover label、可抓取性、affordance、材质参数。\n\n## 当前限制\n\n- 还不是 Spark 真实 3DGS renderer。\n- 没有接入 Rapier rigid body，只做了轻量 kinematic collision。\n- 碰撞 mesh 是演示用低模代理，不来自真实点云重建。\n- 没有加载真实 World Labs Marble `.spz` 或 `collider_mesh_url`。\n\n但它已经验证了我们要的最小闭环：视觉代理和碰撞代理可以完全分层，交互逻辑不依赖 3DGS 本身产生 collider。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "目标",
+          "slug": "目标"
+        },
+        {
+          "level": "2",
+          "text": "参考对象",
+          "slug": "参考对象"
+        },
+        {
+          "level": "2",
+          "text": "当前能力",
+          "slug": "当前能力"
+        },
+        {
+          "level": "2",
+          "text": "下一步替换真实资产",
+          "slug": "下一步替换真实资产"
+        },
+        {
+          "level": "2",
+          "text": "和 Video2Mesh 的接入位置",
+          "slug": "和-video2mesh-的接入位置"
+        },
+        {
+          "level": "2",
+          "text": "当前限制",
+          "slug": "当前限制"
+        }
+      ],
+      "reading_minutes": 1
     },
     {
       "id": "05-operations-and-showcase",

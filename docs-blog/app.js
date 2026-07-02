@@ -426,7 +426,7 @@
     text = text
       .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, `<img src="$2" alt="$1">`)
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, href) => {
-        const target = href.startsWith("#") ? "_self" : "_blank";
+        const target = href.startsWith("#") || href.startsWith("/") ? "_self" : "_blank";
         return `<a href="${href}" target="${target}" rel="noreferrer">${label}</a>`;
       })
       .replace(/`([^`]+)`/g, "<code>$1</code>")
