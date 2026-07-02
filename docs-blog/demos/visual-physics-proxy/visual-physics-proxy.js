@@ -1,19 +1,29 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
 const canvas = document.querySelector("#sceneCanvas");
 const fpvCanvas = document.querySelector("#fpvCanvas");
 const speedMetric = document.querySelector("#speedMetric");
 const heightMetric = document.querySelector("#heightMetric");
 const hitMetric = document.querySelector("#hitMetric");
+const assetMetric = document.querySelector("#assetMetric");
 const modeChip = document.querySelector("#modeChip");
 const toast = document.querySelector("#toast");
+
+const REAL_ASSETS = {
+  pointCloudUrl: "./assets/3dgs_iter30000_clean_filtered_xyzrgb.ply",
+  colliderUrl: "./assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb",
+};
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x070a0d, 1);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const fpvRenderer = new THREE.WebGLRenderer({ canvas: fpvCanvas, antialias: true, alpha: true });
 fpvRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -51,9 +61,25 @@ const visualLayer = new THREE.Group();
 visualLayer.name = "visual-splat-layer";
 scene.add(visualLayer);
 
+const proceduralLayer = new THREE.Group();
+proceduralLayer.name = "procedural-fallback-layer";
+visualLayer.add(proceduralLayer);
+
+const realVisualLayer = new THREE.Group();
+realVisualLayer.name = "real-3dgs-point-cloud-layer";
+visualLayer.add(realVisualLayer);
+
 const colliderLayer = new THREE.Group();
 colliderLayer.name = "mesh-collider-proxy-layer";
 scene.add(colliderLayer);
+
+const proceduralColliderLayer = new THREE.Group();
+proceduralColliderLayer.name = "procedural-collider-layer";
+colliderLayer.add(proceduralColliderLayer);
+
+const realColliderLayer = new THREE.Group();
+realColliderLayer.name = "real-mesh-collider-layer";
+colliderLayer.add(realColliderLayer);
 
 const markerLayer = new THREE.Group();
 scene.add(markerLayer);
@@ -77,12 +103,27 @@ const state = {
   showVisual: true,
   showCollider: false,
   semanticTint: false,
+  useRealAssets: true,
+  realVisualReady: false,
+  realColliderReady: false,
+  realAssetError: "",
   lastHit: "none",
 };
 
 const colliderObjects = [];
+const realColliderObjects = [];
+const proceduralColliderObjects = [];
 const obstacles = [];
 let floorCollider;
+let realColliderRoot = null;
+let realPointCount = 0;
+let realTriangleCount = 0;
+let realBounds = null;
+let realTransform = {
+  center: new THREE.Vector3(1.6495707035064697, 3.6022610664367676, 6.305891513824463),
+  scale: 0.5044801873791451,
+};
+const baseVisualOpacity = 0.92;
 
 const roomBounds = {
   minX: -5.2,
@@ -110,6 +151,140 @@ function makeWireMat(color, opacity = 0.34) {
   });
 }
 
+function formatCount(value) {
+  return Intl.NumberFormat("en-US", { notation: value > 999999 ? "compact" : "standard" }).format(value);
+}
+
+function setRealAssetError(error) {
+  console.warn("Real visual/collider asset failed to load.", error);
+  state.realAssetError = error?.message || String(error);
+  state.useRealAssets = false;
+  setLayerVisibility();
+  showToast("真实 PLY/GLB 加载失败，已切回 procedural fallback。");
+}
+
+function fitObjectToDemoSpace(object, sourceBox) {
+  const box = sourceBox.clone();
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+  const scale = 8.8 / Math.max(size.x, size.y, size.z);
+  object.position.set(-center.x * scale, -center.y * scale, -center.z * scale);
+  object.scale.setScalar(scale);
+  object.updateMatrixWorld(true);
+  realTransform = { center, scale };
+  realBounds = new THREE.Box3().setFromObject(object);
+}
+
+function applyRealTransform(object) {
+  object.position.set(
+    -realTransform.center.x * realTransform.scale,
+    -realTransform.center.y * realTransform.scale,
+    -realTransform.center.z * realTransform.scale
+  );
+  object.scale.setScalar(realTransform.scale);
+  object.updateMatrixWorld(true);
+  realBounds = new THREE.Box3().setFromObject(object);
+}
+
+function registerCollider(mesh, label, collection = colliderObjects) {
+  mesh.userData.colliderLabel = label;
+  collection.push(mesh);
+  if (!colliderObjects.includes(mesh)) colliderObjects.push(mesh);
+}
+
+function activeColliderObjects() {
+  return state.useRealAssets && state.realColliderReady ? realColliderObjects : proceduralColliderObjects;
+}
+
+function activeModeName() {
+  return state.useRealAssets && state.realVisualReady && state.realColliderReady ? "Real PLY + GLB"
+    : state.useRealAssets && !state.realAssetError ? "Loading real assets"
+    : "Procedural fallback";
+}
+
+function updateAssetMetric() {
+  if (state.realVisualReady && state.realColliderReady) {
+    assetMetric.textContent = `${formatCount(realPointCount)} / ${formatCount(realTriangleCount)}`;
+    return;
+  }
+  assetMetric.textContent = state.realAssetError ? "fallback" : "loading";
+}
+
+function updateDebugPanel() {
+  updateAssetMetric();
+  const mode = activeModeName();
+  modeChip.textContent = `${mode} · ${state.showCollider ? "collider visible" : "collider hidden but active"} · raycast ignores visual points`;
+}
+
+function realGroundProbe(pos) {
+  if (!state.realColliderReady || !realBounds) return null;
+  const origin = new THREE.Vector3(pos.x, realBounds.max.y + 2, pos.z);
+  raycaster.set(origin, new THREE.Vector3(0, -1, 0));
+  raycaster.far = Math.max(16, realBounds.max.y - realBounds.min.y + 4);
+  const hits = raycaster.intersectObjects(realColliderObjects, false);
+  raycaster.far = Infinity;
+  return hits.find((hit) => {
+    const normal = hit.face?.normal.clone() || new THREE.Vector3(0, 1, 0);
+    normal.transformDirection(hit.object.matrixWorld);
+    return normal.y > 0.18;
+  }) || null;
+}
+
+function realForwardBlock(delta) {
+  if (!state.realColliderReady || delta.lengthSq() === 0) return null;
+  const dir = delta.clone().setY(0);
+  if (dir.lengthSq() === 0) return null;
+  dir.normalize();
+  const probeDistance = actor.radius + delta.length() + 0.12;
+  const heights = [0.38, 0.72, 1.05];
+  for (const height of heights) {
+    raycaster.set(actor.position.clone().add(new THREE.Vector3(0, height, 0)), dir);
+    raycaster.far = probeDistance;
+    const hits = raycaster.intersectObjects(realColliderObjects, false);
+    for (const hit of hits) {
+      const normal = hit.face?.normal.clone() || new THREE.Vector3(0, 1, 0);
+      normal.transformDirection(hit.object.matrixWorld);
+      if (normal.y < 0.45) {
+        raycaster.far = Infinity;
+        return hit;
+      }
+    }
+  }
+  raycaster.far = Infinity;
+  return null;
+}
+
+function resetActorOnRealMesh() {
+  const candidates = [
+    new THREE.Vector3(-2.8, 0, 2.6),
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(-1.8, 0, 1.1),
+    new THREE.Vector3(1.4, 0, -0.8),
+    new THREE.Vector3(2.6, 0, 1.8),
+    new THREE.Vector3(-3.2, 0, -1.6),
+  ];
+  for (const candidate of candidates) {
+    const hit = realGroundProbe(candidate);
+    if (hit) {
+      actor.position.set(candidate.x, hit.point.y + 0.05, candidate.z);
+      actor.velocity.set(0, 0, 0);
+      actor.yaw = -0.6;
+      return true;
+    }
+  }
+  return false;
+}
+
+function placeActorAtCurrentSpawn() {
+  if (!(state.useRealAssets && state.realColliderReady && resetActorOnRealMesh())) {
+    actor.position.set(-2.8, 0.35, 2.6);
+  }
+  actor.velocity.set(0, 0, 0);
+  actor.yaw = -0.6;
+}
+
 const floorShape = [
   new THREE.Vector2(-5.4, -4.7),
   new THREE.Vector2(5.4, -4.7),
@@ -129,10 +304,9 @@ function buildFloorCollider() {
   const material = makeWireMat(0xefb35f, 0.42);
   const mesh = new THREE.Mesh(geometry, material);
   mesh.name = "floor collider mesh";
-  mesh.userData.colliderLabel = "floor";
   mesh.visible = state.showCollider;
-  colliderLayer.add(mesh);
-  colliderObjects.push(mesh);
+  proceduralColliderLayer.add(mesh);
+  registerCollider(mesh, "floor", proceduralColliderObjects);
   floorCollider = mesh;
 
   const visualFloor = new THREE.Mesh(
@@ -141,7 +315,7 @@ function buildFloorCollider() {
   );
   visualFloor.name = "visual shadow floor";
   visualFloor.position.y = -0.012;
-  visualLayer.add(visualFloor);
+  proceduralLayer.add(visualFloor);
 }
 
 function addObstacle({ name, position, size, color, semantic }) {
@@ -149,11 +323,10 @@ function addObstacle({ name, position, size, color, semantic }) {
   const colliderMesh = new THREE.Mesh(colliderGeo, makeWireMat(0xefb35f, 0.48));
   colliderMesh.position.copy(position);
   colliderMesh.name = `${name} collider`;
-  colliderMesh.userData.colliderLabel = name;
   colliderMesh.userData.semantic = semantic;
   colliderMesh.visible = state.showCollider;
-  colliderLayer.add(colliderMesh);
-  colliderObjects.push(colliderMesh);
+  proceduralColliderLayer.add(colliderMesh);
+  registerCollider(colliderMesh, name, proceduralColliderObjects);
 
   const obstacle = {
     name,
@@ -168,7 +341,7 @@ function addObstacle({ name, position, size, color, semantic }) {
   const visualMesh = new THREE.Mesh(visualGeo, visualMat);
   visualMesh.position.copy(position);
   visualMesh.name = `${name} translucent visual proxy`;
-  visualLayer.add(visualMesh);
+  proceduralLayer.add(visualMesh);
 
   addSplatCluster(position, size, color, semantic);
 }
@@ -222,7 +395,7 @@ function addSplatCluster(center, size, color, semantic) {
   points.userData.baseColor = color;
   points.userData.semantic = semantic;
   points.raycast = () => {};
-  visualLayer.add(points);
+  proceduralLayer.add(points);
 }
 
 function addWallVisuals() {
@@ -300,9 +473,105 @@ function buildScene() {
   buildActor();
 }
 
+async function loadRealPointCloud() {
+  const loader = new PLYLoader();
+  const geometry = await loader.loadAsync(REAL_ASSETS.pointCloudUrl);
+  geometry.computeBoundingBox();
+  const sourceBox = geometry.boundingBox.clone();
+  realPointCount = geometry.getAttribute("position")?.count || 0;
+
+  if (!geometry.getAttribute("color")) {
+    const count = geometry.getAttribute("position").count;
+    const colors = new Float32Array(count * 3);
+    const color = new THREE.Color(0x58d7c9);
+    for (let i = 0; i < count; i += 1) {
+      colors[i * 3] = color.r;
+      colors[i * 3 + 1] = color.g;
+      colors[i * 3 + 2] = color.b;
+    }
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  }
+
+  const material = new THREE.PointsMaterial({
+    size: 0.018,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.92,
+    depthWrite: false,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.name = "real 3dgs centers from PLY";
+  points.userData.semantic = "real-ply";
+  points.userData.preserveVertexColors = true;
+  points.raycast = () => {};
+  fitObjectToDemoSpace(points, sourceBox);
+  realVisualLayer.add(points);
+  state.realVisualReady = true;
+  setLayerVisibility();
+}
+
+async function loadRealCollider() {
+  const loader = new GLTFLoader();
+  const gltf = await loader.loadAsync(REAL_ASSETS.colliderUrl);
+  const root = gltf.scene;
+  root.name = "real 3dgs poisson mesh collider";
+  applyRealTransform(root);
+  realColliderRoot = root;
+  realTriangleCount = 0;
+
+  const shadedMaterial = makeMat(0x31423d, {
+    transparent: true,
+    opacity: 0.24,
+    side: THREE.DoubleSide,
+  });
+  const wireMaterial = makeWireMat(0xefb35f, 0.5);
+  root.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return;
+    const sourceMaterial = child.material;
+    if (Array.isArray(sourceMaterial)) sourceMaterial.forEach((material) => material?.dispose?.());
+    else sourceMaterial?.dispose?.();
+    child.geometry.computeVertexNormals();
+    child.material = shadedMaterial;
+    child.castShadow = false;
+    child.receiveShadow = true;
+    child.userData.colliderLabel = "true-3dgs-poisson-mesh";
+    child.visible = state.showCollider;
+    registerCollider(child, "true-3dgs-poisson-mesh", realColliderObjects);
+    const positionCount = child.geometry.getAttribute("position")?.count || 0;
+    realTriangleCount += child.geometry.index ? child.geometry.index.count / 3 : positionCount / 3;
+
+    const wire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(child.geometry),
+      wireMaterial.clone()
+    );
+    wire.name = `${child.name || "mesh"} collider wire overlay`;
+    wire.visible = state.showCollider;
+    wire.raycast = () => {};
+    child.add(wire);
+  });
+
+  realColliderLayer.add(root);
+  state.realColliderReady = true;
+  resetActorOnRealMesh();
+  setLayerVisibility();
+}
+
+async function loadRealAssets() {
+  updateDebugPanel();
+  try {
+    await loadRealPointCloud();
+    await loadRealCollider();
+    setLayerVisibility();
+    showToast("Loaded real PLY visual layer + GLB collider mesh.");
+  } catch (error) {
+    setRealAssetError(error);
+  }
+}
+
 function updateVisualColors() {
   visualLayer.traverse((child) => {
     if (!(child instanceof THREE.Points)) return;
+    if (child.userData.preserveVertexColors) return;
     const colors = child.geometry.getAttribute("color");
     const base = new THREE.Color(child.userData.baseColor || 0xffffff);
     const semantic = child.userData.semantic;
@@ -345,6 +614,22 @@ function groundHeightAt(pos) {
 
 function tryMove(delta) {
   const next = actor.position.clone().add(delta);
+  if (state.useRealAssets && state.realColliderReady) {
+    const block = realForwardBlock(delta);
+    if (block) {
+      showToast("Blocked by real GLB collider mesh.");
+      return false;
+    }
+    const ground = realGroundProbe(next);
+    if (!ground) {
+      showToast("No walkable face under actor in real collider mesh.");
+      return false;
+    }
+    next.y = ground.point.y + 0.05;
+    actor.position.copy(next);
+    return true;
+  }
+
   const hit = intersectsObstacle(next, actor.radius);
   if (!isInsideFloor(next) || hit) {
     if (hit) showToast(`Blocked by mesh collider: ${hit}`);
@@ -406,13 +691,26 @@ function resize() {
 
 function setLayerVisibility() {
   visualLayer.visible = state.showVisual;
-  colliderLayer.traverse((child) => {
-    if (child instanceof THREE.Mesh) child.visible = state.showCollider;
+  realVisualLayer.visible = state.showVisual && state.useRealAssets && state.realVisualReady;
+  proceduralLayer.visible = state.showVisual && (!state.useRealAssets || !state.realVisualReady);
+  realVisualLayer.traverse((child) => {
+    if (child instanceof THREE.Points) child.material.opacity = state.showCollider ? 0.46 : baseVisualOpacity;
   });
+  realColliderLayer.traverse((child) => {
+    if (child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
+      child.visible = state.showCollider && state.useRealAssets && state.realColliderReady;
+    }
+  });
+  proceduralColliderLayer.traverse((child) => {
+    if (child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
+      child.visible = state.showCollider && (!state.useRealAssets || !state.realColliderReady);
+    }
+  });
+  document.querySelector("#toggleAssets").classList.toggle("is-active", state.useRealAssets);
   document.querySelector("#toggleVisual").classList.toggle("is-active", state.showVisual);
   document.querySelector("#toggleCollider").classList.toggle("is-active", state.showCollider);
   document.querySelector("#toggleSemantic").classList.toggle("is-active", state.semanticTint);
-  modeChip.textContent = `${state.showVisual ? "Visual: splat-like 3DGS" : "Visual hidden"} · ${state.showCollider ? "Collider mesh visible" : "Collider mesh hidden but active"}`;
+  updateDebugPanel();
 }
 
 function markHit(point, normal) {
@@ -433,7 +731,7 @@ function onPointerDown(event) {
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects(colliderObjects, true);
+  const hits = raycaster.intersectObjects(activeColliderObjects(), false);
   if (!hits.length) {
     state.lastHit = "none";
     hitMetric.textContent = "none";
@@ -458,9 +756,7 @@ function showToast(message) {
 }
 
 function resetActor() {
-  actor.position.set(-2.8, 0.35, 2.6);
-  actor.velocity.set(0, 0, 0);
-  actor.yaw = -0.6;
+  placeActorAtCurrentSpawn();
   markerLayer.clear();
   hitMetric.textContent = "none";
   showToast("Actor reset on the collider mesh floor.");
@@ -473,7 +769,7 @@ function animate() {
   controls.update();
 
   const pulse = 0.78 + Math.sin(clock.elapsedTime * 2.2) * 0.08;
-  visualLayer.traverse((child) => {
+  proceduralLayer.traverse((child) => {
     if (child instanceof THREE.Points) child.material.opacity = pulse;
   });
 
@@ -494,6 +790,18 @@ function bindEvents() {
   document.querySelector("#toggleVisual").addEventListener("click", () => {
     state.showVisual = !state.showVisual;
     setLayerVisibility();
+  });
+  document.querySelector("#toggleAssets").addEventListener("click", () => {
+    if (!state.realVisualReady || !state.realColliderReady) {
+      showToast("Real PLY/GLB assets are still loading; using fallback until ready.");
+      return;
+    }
+    state.useRealAssets = !state.useRealAssets;
+    markerLayer.clear();
+    hitMetric.textContent = "none";
+    placeActorAtCurrentSpawn();
+    setLayerVisibility();
+    showToast(state.useRealAssets ? "Using real PLY visual + GLB collider." : "Using procedural fallback scene.");
   });
   document.querySelector("#toggleCollider").addEventListener("click", () => {
     state.showCollider = !state.showCollider;
@@ -519,5 +827,6 @@ buildScene();
 bindEvents();
 resize();
 setLayerVisibility();
-showToast("WASD / arrow keys move on mesh collider. Click scene to raycast collider.");
+loadRealAssets();
+showToast("Loading real PLY visual layer + GLB collider mesh...");
 animate();
