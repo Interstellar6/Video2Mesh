@@ -40,14 +40,16 @@ docs-blog/CNAME
 
 `docs-blog/_public/` 是静态发布目录，已被 Git 忽略。
 
-`docs-blog/demos/visual-physics-proxy/` 里有超过 100MB 的本地 raw PLY 时，不要把 raw PLY 直接放进 Pages 发布产物。当前构建脚本会排除：
+当前构建脚本会排除整个 `docs-blog/demos/` 目录，只把文档站发布到 GitHub Pages。这样 `relumeow.top` 可以先稳定更新文档，不受本地 3DGS 演示资产大小影响。
+
+`docs-blog/demos/visual-physics-proxy/` 仍保留为本地验证源目录。里面有超过 100MB 的本地 raw PLY 时，不要把 raw PLY 直接放进 Pages 发布产物。后续如果恢复线上演示，至少需要排除：
 
 ```text
 bedroom_4_cli30k_graphdeco_clean_iteration30000.ply
 bedroom_4_scene_3dgs_repaired_supersplat.ply
 ```
 
-线上 Pages artifact 只发布 `assets/large-asset-manifest.json`。分片文件保存在 GitHub repo 的 `docs-blog/demos/visual-physics-proxy/assets/chunks/*.partNN`，manifest 中使用 `https://raw.githubusercontent.com/...` 绝对 URL 让浏览器跨域拉取。更新这些大资产时，先重新生成分片和 manifest，再运行 `python3 docs-blog/build_site.py`，确认 `_public` 中没有 `assets/chunks/`，否则 Pages deploy 可能因为 artifact 太大失败。
+线上 demo 重新启用时，Pages artifact 应只发布小型脚本、GLB collider 和 `assets/large-asset-manifest.json`。分片文件可以保存在 GitHub repo 的 `docs-blog/demos/visual-physics-proxy/assets/chunks/*.partNN`，manifest 中使用 `https://raw.githubusercontent.com/...` 绝对 URL 让浏览器跨域拉取。更新这些大资产时，先重新生成分片和 manifest，再运行 `python3 docs-blog/build_site.py`，确认 `_public` 中没有 raw PLY 或 `assets/chunks/`，否则 Pages deploy 可能因为 artifact 太大失败。
 
 ## 新增文档
 

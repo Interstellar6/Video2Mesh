@@ -11,7 +11,9 @@ tags:
 
 # Web 视觉代理与碰撞代理演示
 
-在线演示入口：[Visual Proxy Demo](/demos/visual-physics-proxy/)
+本地演示入口：`http://127.0.0.1:4173/demos/visual-physics-proxy/`。
+
+当前 `relumeow.top` 先只发布文档站，演示界面和大资产暂不放进 GitHub Pages artifact。`docs-blog/demos/visual-physics-proxy/` 仍作为本地验证和后续线上化的源目录保留。
 
 ## 目标
 
@@ -66,18 +68,20 @@ real lightweight GLB collider mesh
 | fallback 视觉 | `docs-blog/demos/visual-physics-proxy/assets/3dgs_iter30000_clean_filtered_xyzrgb.ply` | 7.4MB | Spark 失败时加载为 `THREE.Points` debug visual |
 | fallback 碰撞 | `docs-blog/demos/visual-physics-proxy/assets/true_3dgs_cloudcompare_poisson_depth8_trim8_mesh_faces40000.glb` | 1.8MB | 我们自己的 CloudCompare/Poisson collider fallback |
 
-## 线上发布形态
+## 当前发布形态
 
-`relumeow.top` 的公开站仍由 GitHub Pages 构建 `docs-blog/_public/`。为了避开 GitHub 普通仓库和 Pages 对 100MB 以上单文件的限制，两个 GraphDECO 大 PLY 在线上不直接发布 raw 文件，也不放进 Pages artifact：
+`relumeow.top` 的公开站仍由 GitHub Pages 构建 `docs-blog/_public/`，但当前只发布文档，不发布演示界面。构建脚本会排除整个 `docs-blog/demos/` 目录，避免 3DGS / PLY / splat 大资产拖住 Pages 部署。
+
+如果后续恢复线上演示，两个 GraphDECO 大 PLY 不应直接放进 Pages artifact。当前本地方案已经保留了 manifest + raw GitHub 分片的形态：
 
 ```text
 assets/large-asset-manifest.json
 https://raw.githubusercontent.com/Interstellar6/Video2Mesh/main/docs-blog/demos/visual-physics-proxy/assets/chunks/*.partNN
 ```
 
-每个分片约 48MB，保存在 GitHub repo 中并由 `raw.githubusercontent.com` 提供跨域下载。前端先读取 `large-asset-manifest.json`，再按 manifest 拉取 raw 分片、合并成 `Uint8Array`，通过 `SplatMesh({ fileBytes, fileName, fileType: "ply" })` 初始化 Spark。这样线上 URL 仍展示同一套 3DGS 内容，但 Pages 发布产物不会包含 230MB / 207MB 的 raw PLY 或 437MB 分片目录。
+每个分片约 48MB，保存在 GitHub repo 中并由 `raw.githubusercontent.com` 提供跨域下载。前端先读取 `large-asset-manifest.json`，再按 manifest 拉取 raw 分片、合并成 `Uint8Array`，通过 `SplatMesh({ fileBytes, fileName, fileType: "ply" })` 初始化 Spark。恢复线上演示时仍应保持 Pages 发布产物不包含 230MB / 207MB 的 raw PLY 或 437MB 分片目录。
 
-页面中的资产计数默认显示为 `3DGS / mesh`：bedroom_4 CLI30K Spark 主路径预期为 `971.3K / 167.1K`。页面会把当前 `visualAssetId`、`visualFormat`、`visualUrl`、`visualUsesSpark`、`visualRawCount`、`visualRemovedOutliers`、`visualCleanupReportUrl`、`colliderUrl`、`sparkRendererVisible`、`visibleColliderMeshes`、`visibleColliderWires`、`colliderRenderMode`、`cameraMode`、`splatQuality`、`lastHitInfo` 写入 `document.documentElement.dataset.visualPhysicsState`，方便确认线上实际命中的资产、显示状态和射线命中的 collider face。`Collider` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
+页面中的资产计数默认显示为 `3DGS / mesh`：bedroom_4 CLI30K Spark 主路径预期为 `971.3K / 167.1K`。页面会把当前 `visualAssetId`、`visualFormat`、`visualUrl`、`visualUsesSpark`、`visualRawCount`、`visualRemovedOutliers`、`visualCleanupReportUrl`、`colliderUrl`、`sparkRendererVisible`、`visibleColliderMeshes`、`visibleColliderWires`、`colliderRenderMode`、`cameraMode`、`splatQuality`、`lastHitInfo` 写入 `document.documentElement.dataset.visualPhysicsState`，方便确认本地实际命中的资产、显示状态和射线命中的 collider face。`Collider` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
 
 当前 collider mesh 会标记这些 runtime roles：
 
@@ -117,7 +121,7 @@ python -m video2mesh.cli clean-point-cloud-outliers \
 
 | 当前 demo | 后续增强 |
 |---|---|
-| Spark GraphDECO `.ply` visual layer | 当前线上使用 48MB 分片 + manifest；后续可转 `.spz` / `.sog` 或走 CDN/LFS 进一步减小体积 |
+| Spark GraphDECO `.ply` visual layer | 当前本地保留 48MB 分片 + manifest；线上暂不发布 demo，后续可转 `.spz` / `.sog` 或走 CDN/LFS 进一步减小体积 |
 | 真实 Poisson GLB collider | object-level mesh / convex hull / V-HACD / CoACD |
 | 轻量 kinematic collision | Rapier / Unity CharacterController / robot controller |
 | mock semantic tint | Video2Mesh semantic/probability splats 或 semantic sidecar |
@@ -143,7 +147,7 @@ exports/<run>/
 ## 当前限制
 
 - 当前默认 bedroom_4 3DGS 和 collider 已来自 Video2Mesh 自己的 CLI dense GraphDECO 30k 本地导出；学长 `.splat/.sog` 资产只作为 Spark 路径兜底。
-- 230MB / 207MB GraphDECO raw PLY 不直接进入线上发布目录；当前通过 48MB 分片在浏览器端合并加载。长期仍建议转 `.spz` / `.sog` 或外链模型文件，减少首屏下载和内存压力。
+- 230MB / 207MB GraphDECO raw PLY 和分片目录不进入当前 Pages 发布产物；demo 暂时只作为本地验证界面保留。长期仍建议转 `.spz` / `.sog` 或外链模型文件，减少首屏下载和内存压力。
 - 没有接入 Rapier rigid body，只做了轻量 kinematic collision 与 mesh raycast。
 - 真实碰撞 mesh 是场景级 collider proxy，还没有拆成桌子、椅子等 object-level collider。
 - 没有加载真实 World Labs Marble `.spz` 或 `collider_mesh_url`，但运行结构与 image-blaster / Icare 的 Spark visual + mesh proxy 边界一致。

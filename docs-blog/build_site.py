@@ -299,6 +299,7 @@ def build_public_site() -> None:
         "api_server.py",
         "build_site.py",
         "codex_queue.py",
+        "demos",
         "run_api.sh",
         "runtime",
         "wrangler.admin.toml",
