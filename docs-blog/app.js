@@ -15,6 +15,7 @@
   let sortMode = "recent";
   let currentDocId = "";
   let pendingEditorDocId = "";
+  let openNavNodes = loadNavOpenNodes();
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -203,18 +204,50 @@
     return `
       <a class="nav-doc-link ${extraClass} ${doc.id === currentDocId ? "active" : ""}" href="#/doc/${encodeURIComponent(doc.id)}">
         <span>${escapeHtml(doc.title)}</span>
-        <small>${escapeHtml(doc.research_stage_title || doc.category)}</small>
       </a>
     `;
   }
 
-  function renderCategoryDocList(category) {
-    const categoryDocs = docsForCategory(category);
-    if (category !== "调研目录") {
-      return categoryDocs.map((doc) => renderNavDocLink(doc)).join("");
+  function navNodeKey(...parts) {
+    return parts.map((part) => String(part || "").replace(/[:\s]+/g, "-")).join(":");
+  }
+
+  function loadNavOpenNodes() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem("v2m-blog-nav-open-v1") || "[]");
+      return new Set(Array.isArray(parsed) ? parsed : []);
+    } catch (_error) {
+      return new Set();
     }
+  }
+
+  function persistNavOpenNodes() {
+    try {
+      window.localStorage.setItem("v2m-blog-nav-open-v1", JSON.stringify(Array.from(openNavNodes)));
+    } catch (_error) {
+      // Navigation state is a convenience only.
+    }
+  }
+
+  function renderNavFolder({ key, title, count, children, open = false }) {
+    return `
+      <div class="nav-tree-folder ${open ? "open" : ""}">
+        <button class="nav-tree-folder-button" type="button" data-nav-folder="${escapeHtml(key)}" aria-expanded="${open ? "true" : "false"}">
+          <span class="nav-tree-caret" aria-hidden="true"></span>
+          <span class="nav-tree-folder-label">${escapeHtml(title)}</span>
+          <span class="nav-tree-count">${count}</span>
+        </button>
+        <div class="nav-tree-branch">
+          <div class="nav-tree-branch-inner">${children}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderResearchNavTree(categoryDocs) {
     const rootDocs = categoryDocs.filter((doc) => doc.research_doc_role === "root");
-    const grouped = catalogStages.map((stage) => {
+    const rootLinks = rootDocs.map((doc) => renderNavDocLink(doc, "root-file")).join("");
+    const folders = catalogStages.map((stage) => {
       const stageDocs = categoryDocs
         .filter((doc) => doc.research_stage === stage.key)
         .sort((a, b) => {
@@ -225,24 +258,35 @@
           return String(a.source_path || "").localeCompare(String(b.source_path || ""), "zh-Hans-CN");
         });
       if (!stageDocs.length) return "";
-      return `
-        <div class="nav-stage-group">
-          <div class="nav-stage-title">${escapeHtml(stage.title)} <span>${stageDocs.length}</span></div>
-          ${stageDocs.map((doc) => renderNavDocLink(doc, doc.research_doc_role === "overview" ? "overview" : "nested")).join("")}
-        </div>
-      `;
+      const key = navNodeKey("research", stage.key);
+      return renderNavFolder({
+        key,
+        title: stage.title,
+        count: stageDocs.length,
+        open: openNavNodes.has(key) || stageDocs.some((doc) => doc.id === currentDocId),
+        children: stageDocs.map((doc) => renderNavDocLink(doc, doc.research_doc_role === "overview" ? "overview" : "nested")).join(""),
+      });
     }).join("");
-    return rootDocs.map((doc) => renderNavDocLink(doc, "overview")).join("") + grouped;
+    return rootLinks + folders;
+  }
+
+  function renderCategoryDocList(category) {
+    const categoryDocs = docsForCategory(category);
+    if (category === "All") return "";
+    if (category !== "调研目录") {
+      return categoryDocs.map((doc) => renderNavDocLink(doc)).join("");
+    }
+    return renderResearchNavTree(categoryDocs);
   }
 
   function renderNavigation() {
     const nav = categories().map((category) => `
-      <div class="nav-group ${category === activeCategory ? "open" : ""}">
-        <button class="nav-item ${category === activeCategory ? "active" : ""}" data-category="${escapeHtml(category)}" type="button" aria-expanded="${category === activeCategory ? "true" : "false"}">
+      <div class="nav-group ${category !== "All" && category === activeCategory ? "open" : ""}">
+        <button class="nav-item ${category === activeCategory ? "active" : ""}" data-category="${escapeHtml(category)}" type="button" aria-expanded="${category !== "All" && category === activeCategory ? "true" : "false"}">
           <span>${escapeHtml(category)}</span><span>${countFor(category)}</span>
         </button>
         <div class="nav-doc-list">
-          ${renderCategoryDocList(category)}
+          <div class="nav-doc-list-inner">${renderCategoryDocList(category)}</div>
         </div>
       </div>
     `).join("");
@@ -267,6 +311,21 @@
         activeTag = "All";
         if (location.hash && location.hash !== "#/" && location.hash !== "#") location.hash = "#/";
         else renderAll();
+      });
+    });
+    document.querySelectorAll("[data-nav-folder]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const key = button.dataset.navFolder || "";
+        const folder = button.closest(".nav-tree-folder");
+        if (!key || !folder) return;
+        const open = !folder.classList.contains("open");
+        folder.classList.toggle("open", open);
+        button.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) openNavNodes.add(key);
+        else openNavNodes.delete(key);
+        persistNavOpenNodes();
       });
     });
     document.querySelectorAll("[data-tag]").forEach((button) => {
