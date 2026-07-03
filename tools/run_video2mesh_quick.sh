@@ -10,6 +10,8 @@ Convention-over-configuration quick entrypoint for the full Video2Mesh baseline:
 video -> dense real frames -> COLMAP sparse point cloud/poses -> GraphDECO 3DGS -> SAM2 masks ->
 3D semantic masks/probabilities -> SVLGaussian frame selection -> coarse meshes ->
 simulator assets and QA reports.
+The default quick route now also builds a COLMAP dense Delaunay scene collider,
+backfills semantic labels onto its faces, and splits one scene-space mesh per object.
 
 Optional environment overrides:
   VIDEO2MESH_ROOT=/root/autodl-tmp/workspace/Video2Mesh
@@ -43,6 +45,10 @@ Optional environment overrides:
   AUTO_PROMPT_MIN_AREA_RATIO=0.001
   AUTO_PROMPT_GRANULARITY=balanced
   MASK_MESH_METHOD=auto
+  RECONSTRUCT_SCENE_MESHES=1|0
+  TRANSFER_SCENE_MESH_SEMANTICS=1|0
+  SPLIT_SCENE_MESH_BY_SEMANTICS=1|0
+  SCENE_MESH_SEMANTIC_ROUTE=local|projected-splats|nearest
   SAM_CHECKPOINT=/root/autodl-tmp/checkpoints/sam/sam_vit_b_01ec64.pth
 USAGE
 }
@@ -151,6 +157,12 @@ PIXEL_STRIDE="${PIXEL_STRIDE:-3}"
 MAX_PIXELS_PER_MASK="${MAX_PIXELS_PER_MASK:-5000}"
 TOP_K="${TOP_K:-4}"
 MASK_MESH_METHOD="${MASK_MESH_METHOD:-auto}"
+RECONSTRUCT_SCENE_MESHES="${RECONSTRUCT_SCENE_MESHES:-1}"
+TRANSFER_SCENE_MESH_SEMANTICS="${TRANSFER_SCENE_MESH_SEMANTICS:-1}"
+SPLIT_SCENE_MESH_BY_SEMANTICS="${SPLIT_SCENE_MESH_BY_SEMANTICS:-1}"
+SCENE_MESH_SEMANTIC_ROUTE="${SCENE_MESH_SEMANTIC_ROUTE:-local}"
+SCENE_MESH_SEMANTIC_MAX_POINTS="${SCENE_MESH_SEMANTIC_MAX_POINTS:-250000}"
+SCENE_MESH_OBJECT_SPLITS_MIN_FACES="${SCENE_MESH_OBJECT_SPLITS_MIN_FACES:-20}"
 
 AUTO_PROMPT_METHOD="${AUTO_PROMPT_METHOD:-sam}"
 if [[ "$AUTO_PROMPT_METHOD" == "sam" && ! -f "$SAM_CHECKPOINT" ]]; then
@@ -197,6 +209,7 @@ echo "[Video2Mesh quick] auto_prompt_method: $AUTO_PROMPT_METHOD" | tee -a "$LOG
 echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] reconstruction: colmap=${RUN_COLMAP} mast3r=${RUN_MAST3R} max_frames=${MAX_FRAMES} every=${EXTRACT_EVERY}" | tee -a "$LOG"
+echo "[Video2Mesh quick] scene_mesh: reconstruct=${RECONSTRUCT_SCENE_MESHES} transfer=${TRANSFER_SCENE_MESH_SEMANTICS} split=${SPLIT_SCENE_MESH_BY_SEMANTICS} route=${SCENE_MESH_SEMANTIC_ROUTE}" | tee -a "$LOG"
 
 g3dgs_args=()
 if [[ "$GS_BACKEND" == "graphdeco" ]]; then
@@ -273,6 +286,25 @@ if [[ "$RUN_COLMAP" == "1" || "$RUN_COLMAP" == "true" ]]; then
   fi
 fi
 
+scene_mesh_args=()
+if [[ "$RECONSTRUCT_SCENE_MESHES" == "1" || "$RECONSTRUCT_SCENE_MESHES" == "true" ]]; then
+  scene_mesh_args+=(--reconstruct-scene-meshes)
+fi
+if [[ "$TRANSFER_SCENE_MESH_SEMANTICS" == "1" || "$TRANSFER_SCENE_MESH_SEMANTICS" == "true" ]]; then
+  scene_mesh_args+=(
+    --transfer-scene-mesh-semantics
+    --scene-mesh-semantic-route "$SCENE_MESH_SEMANTIC_ROUTE"
+    --scene-mesh-semantic-max-points "$SCENE_MESH_SEMANTIC_MAX_POINTS"
+  )
+fi
+if [[ "$SPLIT_SCENE_MESH_BY_SEMANTICS" == "1" || "$SPLIT_SCENE_MESH_BY_SEMANTICS" == "true" ]]; then
+  scene_mesh_args+=(
+    --split-scene-mesh-by-semantics
+    --scene-mesh-object-splits-min-faces "$SCENE_MESH_OBJECT_SPLITS_MIN_FACES"
+    --scene-mesh-object-splits-register-as-object-meshes
+  )
+fi
+
 "$V2M_PYTHON" -B -m video2mesh.cli run-pipeline \
   --project-root "$PROJECT_ROOT" \
   --scene-id "$SCENE_ID" \
@@ -338,6 +370,7 @@ fi
   --render-semantic-preview \
   --semantic-preview-max-frames 6 \
   --semantic-preview-max-points 20000 \
+  "${scene_mesh_args[@]}" \
   --top-k "$TOP_K" \
   --frame-selection-method svlgaussian \
   --frame-svlgaussian-offsets 5 10 \

@@ -92,6 +92,37 @@ COMMON_DECOR_OR_SURFACE_CATEGORIES = {
     "poster",
     "window",
 }
+DEFAULT_OBJECT_COLLIDER_EXCLUDED_CATEGORY_SLUGS = {
+    "background",
+    "ceiling",
+    "floor",
+    "ground",
+    "picture",
+    "poster",
+    "mirror",
+    "room",
+    "sky",
+    "terrain",
+    "wall",
+    "wall-art",
+}
+DEFAULT_OBJECT_COLLIDER_MAX_DIAGONAL_BY_CATEGORY = {
+    "bed": 8.0,
+    "bench": 4.0,
+    "cabinet": 5.0,
+    "chair": 3.0,
+    "couch": 6.0,
+    "curtain": 4.0,
+    "desk": 5.0,
+    "door": 3.0,
+    "dresser": 5.0,
+    "lamp": 5.0,
+    "nightstand": 3.5,
+    "plant": 3.5,
+    "sofa": 6.0,
+    "table": 4.0,
+    "window": 5.0,
+}
 DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH = 4
 DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR = 1.0
 SVLGAUSSIAN_TITLE = "SVLGaussian: Single View Language Gaussian Splatting"
@@ -179,6 +210,15 @@ OBJECT_LABELING_EVIDENCE_FIELDS = ["aliases", "open_vocab_labels", "vlm", "evide
 OBJECT_LABELING_PRODUCTION_SOURCE_SLUGS = sorted(PRODUCTION_LABEL_SOURCE_SLUGS)
 MAST3R_KEYFRAMES_DIR = "scene/mast3r_keyframes"
 SH_C0 = 0.28209479177387814
+DEFAULT_GAUSSIAN_HEALTH_MAX_SCALE_P99 = 0.12
+DEFAULT_GAUSSIAN_HEALTH_MAX_ELONGATION_P99 = 25.0
+DEFAULT_GAUSSIAN_HEALTH_MAX_ELONGATION_MAX = 250.0
+DEFAULT_GAUSSIAN_HEALTH_ROT_NORM_TOLERANCE_P99 = 0.12
+DEFAULT_GAUSSIAN_VIEWER_SAFE_MIN_SCALE = 0.002
+DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_SCALE = 0.04
+DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_ELONGATION = 12.0
+DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MIN = -8.0
+DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MAX = 5.0
 PLY_NUMPY_DTYPES = {
     "char": "i1",
     "int8": "i1",
@@ -932,6 +972,364 @@ def logit(values, eps: float = 1e-6):
     np = import_numpy()
     clipped = np.clip(np.asarray(values, dtype=np.float32), eps, 1.0 - eps)
     return np.log(clipped / (1.0 - clipped))
+
+
+def finite_quantile(values, quantile: float) -> float | None:
+    np = import_numpy()
+    values_np = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = values_np[np.isfinite(values_np)]
+    if finite.size == 0:
+        return None
+    return float(np.quantile(finite, float(quantile)))
+
+
+def finite_summary(values) -> dict[str, Any]:
+    np = import_numpy()
+    values_np = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = values_np[np.isfinite(values_np)]
+    if finite.size == 0:
+        return {"count": 0, "min": None, "p50": None, "p90": None, "p99": None, "max": None, "mean": None}
+    return {
+        "count": int(finite.size),
+        "min": float(np.min(finite)),
+        "p50": float(np.quantile(finite, 0.50)),
+        "p90": float(np.quantile(finite, 0.90)),
+        "p99": float(np.quantile(finite, 0.99)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+    }
+
+
+def audit_gaussian_health(
+    scales,
+    quats,
+    opacities=None,
+    *,
+    max_scale_p99: float = DEFAULT_GAUSSIAN_HEALTH_MAX_SCALE_P99,
+    max_elongation_p99: float = DEFAULT_GAUSSIAN_HEALTH_MAX_ELONGATION_P99,
+    max_elongation_max: float = DEFAULT_GAUSSIAN_HEALTH_MAX_ELONGATION_MAX,
+    rot_norm_tolerance_p99: float = DEFAULT_GAUSSIAN_HEALTH_ROT_NORM_TOLERANCE_P99,
+) -> dict[str, Any]:
+    np = import_numpy()
+    scales_np = np.asarray(scales, dtype=np.float64)
+    quats_np = np.asarray(quats, dtype=np.float64)
+    if scales_np.ndim != 2 or scales_np.shape[1] < 3:
+        raise ValueError(f"Gaussian scales must have shape Nx3, got {scales_np.shape}")
+    if quats_np.ndim != 2 or quats_np.shape[1] < 4:
+        raise ValueError(f"Gaussian rotations must have shape Nx4, got {quats_np.shape}")
+    axis_scales = np.clip(np.abs(scales_np[:, :3]), 1e-12, None)
+    max_axis = np.max(axis_scales, axis=1)
+    min_axis = np.min(axis_scales, axis=1)
+    elongation = max_axis / np.clip(min_axis, 1e-12, None)
+    rot_norm = np.linalg.norm(quats_np[:, :4], axis=1)
+    rot_norm_error = np.abs(rot_norm - 1.0)
+    finite_rows = np.isfinite(axis_scales).all(axis=1) & np.isfinite(quats_np[:, :4]).all(axis=1)
+    issues: list[dict[str, Any]] = []
+
+    max_scale_p99_observed = finite_quantile(max_axis, 0.99)
+    elongation_p99_observed = finite_quantile(elongation, 0.99)
+    elongation_max_observed = finite_quantile(elongation, 1.0)
+    rot_norm_error_p99 = finite_quantile(rot_norm_error, 0.99)
+
+    def add_issue(metric: str, observed: float | None, threshold: float, severity: str, detail: str) -> None:
+        if observed is not None and observed > threshold:
+            issues.append(
+                {
+                    "metric": metric,
+                    "observed": float(observed),
+                    "threshold": float(threshold),
+                    "severity": severity,
+                    "detail": detail,
+                }
+            )
+
+    add_issue(
+        "max_scale_p99",
+        max_scale_p99_observed,
+        max_scale_p99,
+        "warning",
+        "Large Gaussian scale percentiles can over-blur scene/background surfaces in SuperSplat.",
+    )
+    add_issue(
+        "elongation_p99",
+        elongation_p99_observed,
+        max_elongation_p99,
+        "error",
+        "Highly elongated Gaussian splats usually render as long streaks in SuperSplat.",
+    )
+    add_issue(
+        "elongation_max",
+        elongation_max_observed,
+        max_elongation_max,
+        "error",
+        "Extreme single-splat elongation is a strong indicator of a visually unsafe 3DGS export.",
+    )
+    add_issue(
+        "rot_norm_error_p99",
+        rot_norm_error_p99,
+        rot_norm_tolerance_p99,
+        "error",
+        "Quaternion norms far from 1.0 make Gaussian orientation unreliable in viewers.",
+    )
+    non_finite_count = int(scales_np.shape[0] - int(finite_rows.sum()))
+    if non_finite_count:
+        issues.append(
+            {
+                "metric": "non_finite_rows",
+                "observed": non_finite_count,
+                "threshold": 0,
+                "severity": "error",
+                "detail": "Non-finite scale or rotation values cannot be rendered safely.",
+            }
+        )
+    status = "safe" if not any(issue["severity"] == "error" for issue in issues) else "unsafe"
+    if status == "safe" and issues:
+        status = "warning"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "status": status,
+        "vertex_count": int(scales_np.shape[0]),
+        "thresholds": {
+            "max_scale_p99": float(max_scale_p99),
+            "max_elongation_p99": float(max_elongation_p99),
+            "max_elongation_max": float(max_elongation_max),
+            "rot_norm_tolerance_p99": float(rot_norm_tolerance_p99),
+        },
+        "issues": issues,
+        "metrics": {
+            "max_scale": finite_summary(max_axis),
+            "min_scale": finite_summary(min_axis),
+            "elongation": finite_summary(elongation),
+            "rot_norm": finite_summary(rot_norm),
+            "rot_norm_error": finite_summary(rot_norm_error),
+        },
+        "notes": (
+            "This is a numeric SuperSplat safety audit. It does not replace visual QA, "
+            "but unsafe elongation/rotation metrics should block treating the Gaussian export as successful."
+        ),
+    }
+    if opacities is not None:
+        report["metrics"]["opacity"] = finite_summary(opacities)
+    return report
+
+
+def make_viewer_safe_gaussian_arrays(
+    scales,
+    quats,
+    opacities=None,
+    *,
+    min_scale: float = DEFAULT_GAUSSIAN_VIEWER_SAFE_MIN_SCALE,
+    max_scale: float = DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_SCALE,
+    max_elongation: float = DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_ELONGATION,
+    opacity_logit_min: float = DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MIN,
+    opacity_logit_max: float = DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MAX,
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    np = import_numpy()
+    scales_np = np.asarray(scales, dtype=np.float32).copy()
+    quats_np = np.asarray(quats, dtype=np.float32).copy()
+    opacities_np = None if opacities is None else np.asarray(opacities, dtype=np.float32).reshape(-1).copy()
+    if scales_np.ndim != 2 or scales_np.shape[1] < 3:
+        raise ValueError(f"Gaussian scales must have shape Nx3, got {scales_np.shape}")
+    if quats_np.ndim != 2 or quats_np.shape[1] < 4:
+        raise ValueError(f"Gaussian rotations must have shape Nx4, got {quats_np.shape}")
+
+    before_report = audit_gaussian_health(scales_np, quats_np, opacities_np)
+    repaired = np.nan_to_num(scales_np[:, :3], nan=float(min_scale), posinf=float(max_scale), neginf=float(min_scale))
+    repaired = np.clip(np.abs(repaired), float(min_scale), float(max_scale))
+    largest = np.max(repaired, axis=1)
+    smallest = np.clip(np.min(repaired, axis=1), 1e-12, None)
+    elongated = largest / smallest > float(max_elongation)
+    if np.any(elongated):
+        floors = largest[elongated] / float(max_elongation)
+        repaired[elongated] = np.maximum(repaired[elongated], floors[:, None])
+    scales_safe = scales_np.copy()
+    scales_safe[:, :3] = repaired.astype(np.float32)
+
+    quat = np.nan_to_num(quats_np[:, :4], nan=0.0, posinf=0.0, neginf=0.0)
+    norms = np.linalg.norm(quat, axis=1)
+    invalid_rot = ~np.isfinite(norms) | (norms < 1e-8)
+    valid_rot = ~invalid_rot
+    quat[valid_rot] = quat[valid_rot] / norms[valid_rot, None]
+    quat[invalid_rot] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    quats_safe = quats_np.copy()
+    quats_safe[:, :4] = quat.astype(np.float32)
+
+    opacity_clamped = 0
+    opacities_safe = opacities_np
+    if opacities_np is not None:
+        logits = logit(opacities_np)
+        logits_safe = np.clip(logits, float(opacity_logit_min), float(opacity_logit_max))
+        opacity_clamped = int(np.count_nonzero(np.abs(logits - logits_safe) > 1e-7))
+        opacities_safe = (1.0 / (1.0 + np.exp(-logits_safe))).astype(np.float32)
+
+    after_report = audit_gaussian_health(scales_safe, quats_safe, opacities_safe)
+    repair_report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "status": "viewer_safe_postprocessed",
+        "parameters": {
+            "min_scale": float(min_scale),
+            "max_scale": float(max_scale),
+            "max_elongation": float(max_elongation),
+            "opacity_logit_min": float(opacity_logit_min),
+            "opacity_logit_max": float(opacity_logit_max),
+        },
+        "counters": {
+            "scale_abs_clamped": int(np.count_nonzero(np.any(np.abs(scales_np[:, :3] - np.clip(np.abs(scales_np[:, :3]), float(min_scale), float(max_scale))) > 1e-7, axis=1))),
+            "scale_elongation_clamped": int(np.count_nonzero(elongated)),
+            "rotation_reset": int(np.count_nonzero(invalid_rot)),
+            "rotation_normalized": int(np.count_nonzero(valid_rot & (np.abs(norms - 1.0) > 1e-4))),
+            "opacity_clamped": opacity_clamped,
+        },
+        "before": before_report,
+        "after": after_report,
+        "warning": (
+            "Viewer-safe output is a display workaround. If before.status is unsafe, "
+            "the real fix is retraining or stronger training-time shape regularization."
+        ),
+    }
+    return scales_safe, quats_safe, opacities_safe, repair_report
+
+
+def normalized_quat_array(quats):
+    np = import_numpy()
+    quats_np = np.nan_to_num(np.asarray(quats, dtype=np.float64)[:, :4], nan=0.0, posinf=0.0, neginf=0.0)
+    norms = np.linalg.norm(quats_np, axis=1)
+    invalid = ~np.isfinite(norms) | (norms < 1e-8)
+    valid = ~invalid
+    if np.any(valid):
+        quats_np[valid] = quats_np[valid] / norms[valid, None]
+    if np.any(invalid):
+        quats_np[invalid] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return quats_np
+
+
+def rotate_local_axes_by_quat(quats, local_axes):
+    np = import_numpy()
+    q = normalized_quat_array(quats)
+    w = q[:, 0]
+    x = q[:, 1]
+    y = q[:, 2]
+    z = q[:, 3]
+    v = np.asarray(local_axes, dtype=np.float64)
+    uv = np.cross(q[:, 1:4], v)
+    uuv = np.cross(q[:, 1:4], uv)
+    return v + 2.0 * (w[:, None] * uv + uuv)
+
+
+def write_gaussian_shape_preview(
+    path: Path,
+    means,
+    raw_scales,
+    raw_quats,
+    safe_scales,
+    safe_quats,
+    *,
+    max_points: int = 6000,
+    max_risk_lines: int = 140,
+    seed: int = 7,
+) -> dict[str, Any]:
+    np = import_numpy()
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional Pillow
+        raise RuntimeError("Gaussian shape preview requires Pillow.") from exc
+
+    means_np = np.asarray(means, dtype=np.float64)
+    raw_scales_np = np.clip(np.abs(np.asarray(raw_scales, dtype=np.float64)[:, :3]), 1e-12, None)
+    safe_scales_np = np.clip(np.abs(np.asarray(safe_scales, dtype=np.float64)[:, :3]), 1e-12, None)
+    if means_np.ndim != 2 or means_np.shape[1] != 3:
+        raise ValueError(f"means must have shape Nx3, got {means_np.shape}")
+    count = int(means_np.shape[0])
+    rng = np.random.default_rng(int(seed))
+    if count > max_points:
+        sample_indices = rng.choice(count, size=int(max_points), replace=False)
+    else:
+        sample_indices = np.arange(count)
+
+    raw_elongation = raw_scales_np.max(axis=1) / np.clip(raw_scales_np.min(axis=1), 1e-12, None)
+    safe_elongation = safe_scales_np.max(axis=1) / np.clip(safe_scales_np.min(axis=1), 1e-12, None)
+    risk_score = raw_elongation * raw_scales_np.max(axis=1)
+    risk_indices = np.argsort(risk_score)[-min(int(max_risk_lines), count) :]
+
+    bounds_min = np.quantile(means_np, 0.01, axis=0)
+    bounds_max = np.quantile(means_np, 0.99, axis=0)
+    span = np.maximum(bounds_max - bounds_min, 1e-6)
+    bounds_min = bounds_min - span * 0.08
+    bounds_max = bounds_max + span * 0.08
+
+    panel_w = 380
+    panel_h = 280
+    margin = 36
+    gutter = 34
+    header = 48
+    width = margin * 2 + panel_w * 2 + gutter
+    height = header + margin + panel_h * 3 + gutter * 2
+    image = Image.new("RGB", (width, height), (250, 250, 247))
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.text((margin, 16), "Gaussian viewer-safety shape QA: raw vs viewer-safe", fill=(30, 35, 40, 255))
+
+    views = [
+        ("XY", (0, 1)),
+        ("XZ", (0, 2)),
+        ("YZ", (1, 2)),
+    ]
+    columns = [
+        ("raw", raw_scales_np, raw_quats, raw_elongation, (225, 56, 48, 170)),
+        ("viewer-safe", safe_scales_np, safe_quats, safe_elongation, (24, 132, 88, 170)),
+    ]
+
+    def project(points, axes, origin_x: int, origin_y: int):
+        a, b = axes
+        x = (points[:, a] - bounds_min[a]) / max(bounds_max[a] - bounds_min[a], 1e-9)
+        y = (points[:, b] - bounds_min[b]) / max(bounds_max[b] - bounds_min[b], 1e-9)
+        px = origin_x + np.clip(x, 0.0, 1.0) * (panel_w - 1)
+        py = origin_y + (1.0 - np.clip(y, 0.0, 1.0)) * (panel_h - 1)
+        return np.stack([px, py], axis=1)
+
+    def draw_panel(row: int, col: int, title: str, axes, scales_np, quats, elongation, line_color) -> None:
+        ox = margin + col * (panel_w + gutter)
+        oy = header + row * (panel_h + gutter)
+        draw.rectangle((ox, oy, ox + panel_w, oy + panel_h), fill=(255, 255, 255, 255), outline=(190, 196, 204, 255))
+        draw.text((ox + 10, oy + 8), title, fill=(35, 40, 45, 255))
+        sample_xy = project(means_np[sample_indices], axes, ox, oy)
+        for px, py in sample_xy:
+            draw.point((float(px), float(py)), fill=(40, 74, 110, 70))
+
+        longest_axis = np.argmax(scales_np[risk_indices], axis=1)
+        local_axes = np.zeros((risk_indices.shape[0], 3), dtype=np.float64)
+        local_axes[np.arange(risk_indices.shape[0]), longest_axis] = 1.0
+        world_axes = rotate_local_axes_by_quat(np.asarray(quats)[risk_indices], local_axes)
+        lengths = scales_np[risk_indices, longest_axis]
+        centers = means_np[risk_indices]
+        starts = centers - world_axes * lengths[:, None]
+        ends = centers + world_axes * lengths[:, None]
+        start_xy = project(starts, axes, ox, oy)
+        end_xy = project(ends, axes, ox, oy)
+        for start, end in zip(start_xy, end_xy):
+            draw.line((float(start[0]), float(start[1]), float(end[0]), float(end[1])), fill=line_color, width=1)
+
+        summary = (
+            f"p99 elong={float(np.quantile(elongation, 0.99)):.1f}  "
+            f"max scale={float(scales_np.max()):.3f}"
+        )
+        draw.text((ox + 10, oy + panel_h - 22), summary, fill=(55, 60, 65, 230))
+
+    for row, (view_name, axes) in enumerate(views):
+        for col, (col_name, scales_np, quats, elongation, line_color) in enumerate(columns):
+            draw_panel(row, col, f"{col_name} {view_name}", axes, scales_np, quats, elongation, line_color)
+
+    ensure_dir(path.parent)
+    image.save(path)
+    return {
+        "path": str(path),
+        "sampled_points": int(sample_indices.shape[0]),
+        "risk_line_count": int(risk_indices.shape[0]),
+        "raw_elongation_p99": float(np.quantile(raw_elongation, 0.99)),
+        "safe_elongation_p99": float(np.quantile(safe_elongation, 0.99)),
+        "raw_max_scale": float(raw_scales_np.max()),
+        "safe_max_scale": float(safe_scales_np.max()),
+        "notes": "Orthographic shape preview. Blue points show Gaussian centers; colored line segments show the longest local axis for the highest-risk raw Gaussians.",
+    }
 
 
 def write_supersplat_ply(
@@ -2947,6 +3345,149 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
     return 0
 
 
+def clean_point_cloud_outliers(
+    input_ply: Path,
+    output_ply: Path,
+    *,
+    q_min: float,
+    q_max: float,
+    padding_ratio: float,
+    min_keep_ratio: float,
+    keep_largest_cluster: bool,
+    dbscan_eps: float,
+    dbscan_min_points: int,
+    register_as: str | None = None,
+) -> dict[str, Any]:
+    points, colors = read_point_cloud(input_ply)
+    input_count = int(points.shape[0])
+    if input_count == 0:
+        raise ValueError(f"No vertices found in point cloud: {input_ply}")
+    output_points = points
+    output_colors = colors
+    steps: list[dict[str, Any]] = []
+    keep_ratio_floor = max(0.0, min(1.0, float(min_keep_ratio)))
+
+    q_min_clamped = max(0.0, min(1.0, float(q_min)))
+    q_max_clamped = max(q_min_clamped, min(1.0, float(q_max)))
+    if q_min_clamped > 0.0 or q_max_clamped < 1.0:
+        candidate_points, candidate_colors, quantile_report = filter_points_by_quantile_bbox(
+            output_points,
+            output_colors,
+            q_min_clamped,
+            q_max_clamped,
+            float(padding_ratio),
+        )
+        candidate_count = int(candidate_points.shape[0])
+        fallback = candidate_count < max(1, int(round(input_count * keep_ratio_floor)))
+        if fallback:
+            quantile_report = dict(quantile_report or {})
+            quantile_report.update(
+                {
+                    "fallback": "too_few_points_after_quantile_bbox",
+                    "candidate_kept_points": candidate_count,
+                    "kept_points": int(output_points.shape[0]),
+                    "removed_points": 0,
+                    "min_keep_ratio": keep_ratio_floor,
+                }
+            )
+        else:
+            output_points = candidate_points
+            output_colors = candidate_colors
+        steps.append({"name": "quantile_bbox", **(quantile_report or {"skipped": True})})
+
+    if bool(keep_largest_cluster):
+        candidate_points, candidate_colors, dbscan_report = filter_points_by_dbscan_largest_cluster(
+            output_points,
+            output_colors,
+            float(dbscan_eps),
+            int(dbscan_min_points),
+        )
+        candidate_count = int(candidate_points.shape[0])
+        fallback = candidate_count < max(1, int(round(input_count * keep_ratio_floor)))
+        if fallback:
+            dbscan_report = dict(dbscan_report or {})
+            dbscan_report.update(
+                {
+                    "fallback": "too_few_points_after_largest_cluster",
+                    "candidate_kept_points": candidate_count,
+                    "kept_points": int(output_points.shape[0]),
+                    "removed_points": 0,
+                    "min_keep_ratio": keep_ratio_floor,
+                }
+            )
+        else:
+            output_points = candidate_points
+            output_colors = candidate_colors
+        steps.append({"name": "largest_dbscan_cluster", **(dbscan_report or {"skipped": True})})
+
+    write_point_cloud_ascii_ply(output_ply, output_points, output_colors)
+    output_count = int(output_points.shape[0])
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "input_ply": str(input_ply),
+        "output_ply": str(output_ply),
+        "input_count": input_count,
+        "kept_count": output_count,
+        "removed_count": int(input_count - output_count),
+        "removed_ratio": float((input_count - output_count) / max(1, input_count)),
+        "input_bbox": bbox_for_points(points),
+        "output_bbox": bbox_for_points(output_points),
+        "parameters": {
+            "q_min": q_min_clamped,
+            "q_max": q_max_clamped,
+            "padding_ratio": float(padding_ratio),
+            "min_keep_ratio": keep_ratio_floor,
+            "keep_largest_cluster": bool(keep_largest_cluster),
+            "dbscan_eps": float(dbscan_eps),
+            "dbscan_min_points": int(dbscan_min_points),
+            "register_as": register_as,
+        },
+        "steps": steps,
+        "notes": (
+            "Plain point-cloud geometric cleanup for viewer/semantic/mesh inputs. "
+            "Use clean-3dgs-floaters for GraphDECO/SuperSplat PLY files with opacity/scale/rotation attributes."
+        ),
+    }
+    return report
+
+
+def cmd_clean_point_cloud_outliers(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve() if getattr(args, "project_root", None) else Path.cwd()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    input_ply = resolve_project_cli_path(args.input, project_root) if args.input else resolve_existing_path(
+        artifacts.get("scene_3dgs_point_cloud_ply") or artifacts.get("semantic_point_cloud_ply") or artifacts.get("point_cloud"),
+        project_root,
+    )
+    if input_ply is None or not input_ply.exists():
+        raise FileNotFoundError("No input point-cloud PLY found. Pass --input or register a point-cloud artifact.")
+    output_ply = resolve_project_relative_path(args.output, project_root) if args.output else input_ply.with_name(f"{input_ply.stem}_outlier_clean.ply")
+    report = clean_point_cloud_outliers(
+        input_ply,
+        output_ply,
+        q_min=float(args.quantile_min),
+        q_max=float(args.quantile_max),
+        padding_ratio=float(args.padding_ratio),
+        min_keep_ratio=float(args.min_keep_ratio),
+        keep_largest_cluster=bool(args.keep_largest_cluster),
+        dbscan_eps=float(args.dbscan_eps),
+        dbscan_min_points=int(args.dbscan_min_points),
+        register_as=args.register_as,
+    )
+    report_path = resolve_project_relative_path(args.report, project_root) if args.report else output_ply.with_suffix(".outlier_clean_report.json")
+    write_json(report_path, report)
+    if args.register_as:
+        if not manifest:
+            raise FileNotFoundError("--register-as requires an existing Video2Mesh project manifest.")
+        manifest.setdefault("artifacts", {})[f"{args.register_as}_raw"] = str(input_ply)
+        manifest["artifacts"][args.register_as] = str(output_ply)
+        manifest["artifacts"][f"{args.register_as}_outlier_clean_report"] = str(report_path)
+        save_manifest(project_root, manifest)
+    print(f"Cleaned point-cloud PLY: {output_ply}")
+    print(f"Removed {report['removed_count']} / {report['input_count']} point(s). Report: {report_path}")
+    return 0
+
+
 def existing_colmap_sparse_text_dir(project_root: Path, manifest: dict[str, Any]) -> Path | None:
     artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
     candidates = [
@@ -4371,6 +4912,27 @@ def read_ascii_ply_float_property(path: Path, property_name: str) -> list[float]
     return values
 
 
+def read_supersplat_label_sidecar(path: Path) -> tuple[list[Any] | None, list[float] | None, Path | None]:
+    candidates = [
+        path.with_name(f"{path.stem}_labels.json"),
+        path.with_name(f"{path.stem.replace('_supersplat', '')}_supersplat_labels.json"),
+        path.with_name(f"{path.stem.replace('_supersplat', '')}_labels.json"),
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        payload = read_json(candidate)
+        if not isinstance(payload, dict):
+            continue
+        labels = payload.get("object_id")
+        probabilities = payload.get("object_probability")
+        labels_out = list(labels) if isinstance(labels, list) else None
+        probabilities_out = [float(value) for value in probabilities] if isinstance(probabilities, list) else None
+        if labels_out is not None or probabilities_out is not None:
+            return labels_out, probabilities_out, candidate
+    return None, None, None
+
+
 def export_viewer_plys(
     source_ply: Path,
     output_dir: Path,
@@ -4381,26 +4943,85 @@ def export_viewer_plys(
     data = read_gsplat_ply(source_ply)
     labels = read_ascii_ply_property(source_ply, "object_id") if include_labels else None
     probabilities = read_ascii_ply_float_property(source_ply, "object_probability") if include_labels else None
+    source_label_sidecar = None
+    if include_labels and labels is None and probabilities is None:
+        labels, probabilities, source_label_sidecar = read_supersplat_label_sidecar(source_ply)
     display_colors = data["colors"]
     if labels is not None:
         display_colors = semantic_colors_for_labels(np.asarray(labels, dtype=np.int64)) / 255.0
     f_rest = None if labels is not None else data.get("f_rest")
+    health_report = audit_gaussian_health(data["scales"], data["quats"], data["opacities"])
+    safety_report: dict[str, Any] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source_ply": str(source_ply),
+        "status": "source_safe",
+        "raw_gaussian_health": health_report,
+        "viewer_safe_postprocessed": False,
+        "geometry_preserved": True,
+        "vertex_count": int(data["means"].shape[0]),
+        "notes": "The exported SuperSplat PLY was written without scale/rotation/opacity postprocessing.",
+    }
+    write_scales = data["scales"]
+    write_quats = data["quats"]
+    write_opacities = data["opacities"]
+    if health_report.get("status") != "safe":
+        write_scales, write_quats, write_opacities, repair_report = make_viewer_safe_gaussian_arrays(
+            data["scales"],
+            data["quats"],
+            data["opacities"],
+        )
+        safety_report = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "source_ply": str(source_ply),
+            "status": "viewer_safe_postprocessed",
+            "raw_gaussian_health": health_report,
+            "viewer_safe_postprocessed": True,
+            "geometry_preserved": True,
+            "vertex_count": int(data["means"].shape[0]),
+            "viewer_safe_repair": repair_report,
+            "notes": (
+                "The source Gaussian PLY failed the numeric SuperSplat safety audit, so this viewer export clamps "
+                "scale, elongation, rotation, and opacity for display. This is not proof that training produced a "
+                "healthy 3DGS; visual QA and/or retraining are still required."
+            ),
+        }
     plain_path = output_dir / f"{prefix}_point_cloud.ply"
     supersplat_path = output_dir / f"{prefix}_supersplat.ply"
+    safety_report_path = output_dir / f"{prefix}_supersplat_viewer_safety_report.json"
+    shape_preview_path = output_dir / f"{prefix}_supersplat_shape_preview.png"
     write_point_cloud_ascii_ply(plain_path, data["means"], display_colors)
     write_supersplat_ply(
         supersplat_path,
         data["means"],
         display_colors,
-        data["opacities"],
-        data["scales"],
-        data["quats"],
+        write_opacities,
+        write_scales,
+        write_quats,
         labels=labels,
         probabilities=probabilities,
         normals=data.get("normals"),
         f_rest=f_rest,
     )
     label_sidecar = write_supersplat_label_sidecar(supersplat_path, labels, probabilities)
+    safety_report["output_supersplat_ply"] = str(supersplat_path)
+    safety_report["output_point_cloud_ply"] = str(plain_path)
+    safety_report["label_sidecar"] = str(label_sidecar) if label_sidecar else None
+    exported_health = audit_gaussian_health(write_scales, write_quats, write_opacities)
+    try:
+        shape_preview = write_gaussian_shape_preview(
+            shape_preview_path,
+            data["means"],
+            data["scales"],
+            data["quats"],
+            write_scales,
+            write_quats,
+        )
+    except Exception as exc:
+        shape_preview = {"ok": False, "path": str(shape_preview_path), "error": str(exc)}
+    else:
+        shape_preview["ok"] = True
+    safety_report["shape_preview"] = shape_preview
+    write_json(safety_report_path, safety_report)
     return {
         "source_ply": str(source_ply),
         "point_cloud_ply": str(plain_path),
@@ -4418,16 +5039,36 @@ def export_viewer_plys(
             "includes_object_id": False,
             "includes_object_probability": False,
             "label_sidecar": str(label_sidecar) if label_sidecar else None,
+            "source_gaussian_health_status": health_report.get("status"),
+            "source_gaussian_health_ok": health_report.get("status") == "safe",
+            "exported_gaussian_health_status": exported_health.get("status"),
+            "exported_gaussian_health_ok": exported_health.get("status") == "safe",
+            "viewer_safety_status": safety_report["status"],
+            "viewer_safe_postprocessed": bool(safety_report["viewer_safe_postprocessed"]),
+            "geometry_preserved": True,
+            "viewer_safety_report": str(safety_report_path),
+            "shape_preview": shape_preview,
         },
+        "raw_gaussian_health": health_report,
+        "source_gaussian_health_ok": health_report.get("status") == "safe",
+        "exported_gaussian_health_ok": exported_health.get("status") == "safe",
+        "viewer_safety_status": safety_report["status"],
+        "viewer_safe_postprocessed": bool(safety_report["viewer_safe_postprocessed"]),
+        "geometry_preserved": True,
+        "viewer_safety_report": str(safety_report_path),
+        "shape_preview": shape_preview,
+        "exported_gaussian_health": exported_health,
+        "visual_qa_required": health_report.get("status") != "safe",
         "vertex_count": int(data["means"].shape[0]),
         "includes_object_id": bool(labels is not None),
         "includes_object_probability": bool(probabilities is not None),
+        "source_label_sidecar": str(source_label_sidecar) if source_label_sidecar else None,
         "label_sidecar": str(label_sidecar) if label_sidecar else None,
         "notes": (
             "point_cloud_ply is a plain XYZ/RGB PLY for Preview/CloudCompare. "
-            "supersplat_ply uses binary GraphDECO/SuperSplat Gaussian fields including f_dc_*, f_rest_*, "
-            "opacity, scale_*, and rot_*; semantic object_id/object_probability metadata is stored in "
-            "label_sidecar when present."
+            "supersplat_ply is the recommended SuperSplat viewer file. If the source Gaussian audit is unsafe, "
+            "this file is viewer-safe postprocessed and the raw training PLY remains at source_ply. Semantic "
+            "object_id/object_probability metadata is stored in label_sidecar when present."
         ),
     }
 
@@ -13813,6 +14454,3841 @@ def semantic_colors_for_labels(labels):
     return colors
 
 
+def read_semantic_ply_with_probabilities(path: Path):
+    np = import_numpy()
+    parsed = parse_ply_vertex_header(path)
+    if parsed.get("format") != "ascii":
+        raise RuntimeError(f"Only ASCII semantic PLY is supported: {path}")
+    properties = [name for name, _prop_type in parsed.get("properties", [])]
+    property_to_index = {name: idx for idx, name in enumerate(properties)}
+    required = {"x", "y", "z", "object_id"}
+    missing = sorted(required - set(property_to_index))
+    if missing:
+        raise RuntimeError(f"Semantic PLY is missing required properties {missing}: {path}")
+    vertex_count = int(parsed["vertex_count"])
+    points = np.zeros((vertex_count, 3), dtype=np.float64)
+    labels = np.zeros((vertex_count,), dtype=np.int64)
+    probabilities = np.ones((vertex_count,), dtype=np.float64) if "object_probability" in property_to_index else None
+    colors = np.zeros((vertex_count, 3), dtype=np.float64) if {"red", "green", "blue"}.issubset(property_to_index) else None
+    x_col = property_to_index["x"]
+    y_col = property_to_index["y"]
+    z_col = property_to_index["z"]
+    label_col = property_to_index["object_id"]
+    probability_col = property_to_index.get("object_probability")
+    red_col = property_to_index.get("red")
+    green_col = property_to_index.get("green")
+    blue_col = property_to_index.get("blue")
+    with path.open("rb") as f:
+        f.seek(int(parsed["data_offset"]))
+        for row_index in range(vertex_count):
+            raw_line = f.readline()
+            if not raw_line:
+                raise RuntimeError(f"PLY ended before all semantic vertices were read: {path}")
+            row = raw_line.decode("ascii", errors="ignore").strip().split()
+            if len(row) < len(properties):
+                raise RuntimeError(f"Semantic PLY vertex row has too few values: {path}")
+            points[row_index, 0] = float(row[x_col])
+            points[row_index, 1] = float(row[y_col])
+            points[row_index, 2] = float(row[z_col])
+            labels[row_index] = int(float(row[label_col]))
+            if probabilities is not None and probability_col is not None:
+                probabilities[row_index] = min(1.0, max(0.0, float(row[probability_col])))
+            if colors is not None and red_col is not None and green_col is not None and blue_col is not None:
+                colors[row_index, 0] = float(row[red_col]) / 255.0
+                colors[row_index, 1] = float(row[green_col]) / 255.0
+                colors[row_index, 2] = float(row[blue_col]) / 255.0
+    return points, labels, probabilities, colors
+
+
+def nearest_source_neighbors(source_points, target_points, k: int, max_distance: float | None = None):
+    np = import_numpy()
+    source_points_np = np.asarray(source_points, dtype=np.float32)
+    target_points_np = np.asarray(target_points, dtype=np.float32)
+    k = max(1, min(int(k), int(source_points_np.shape[0])))
+    if source_points_np.ndim != 2 or target_points_np.ndim != 2 or source_points_np.shape[1] != 3 or target_points_np.shape[1] != 3:
+        raise ValueError("Nearest transfer expects source and target point arrays with shape Nx3.")
+    if source_points_np.shape[0] == 0:
+        raise ValueError("Nearest transfer source point cloud is empty.")
+
+    if k == 1:
+        indices, distances, engine = nearest_source_indices(source_points_np, target_points_np)
+        return indices.reshape(-1, 1), distances.reshape(-1, 1), engine
+
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+
+        tree = cKDTree(source_points_np)
+        try:
+            distances, indices = tree.query(target_points_np, k=k, workers=-1)
+        except TypeError:
+            distances, indices = tree.query(target_points_np, k=k)
+        return indices.astype(np.int64), distances.astype(np.float64), "scipy_ckdtree"
+    except Exception:
+        pass
+
+    try:
+        from sklearn.neighbors import NearestNeighbors  # type: ignore
+
+        nn = NearestNeighbors(n_neighbors=k, algorithm="auto")
+        nn.fit(source_points_np)
+        distances, indices = nn.kneighbors(target_points_np, return_distance=True)
+        return indices.astype(np.int64), distances.astype(np.float64), "sklearn_nearest_neighbors"
+    except Exception:
+        pass
+
+    if max_distance is not None and float(max_distance) > 0:
+        cell_size = max(float(max_distance), 1e-8)
+        source_cells = np.floor(source_points_np / cell_size).astype(np.int64)
+        cell_map: dict[tuple[int, int, int], list[int]] = {}
+        for index, cell in enumerate(source_cells):
+            key = (int(cell[0]), int(cell[1]), int(cell[2]))
+            cell_map.setdefault(key, []).append(index)
+        offsets = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+        ]
+        indices = np.zeros((target_points_np.shape[0], k), dtype=np.int64)
+        distances = np.full((target_points_np.shape[0], k), np.inf, dtype=np.float64)
+        max_distance_squared = float(max_distance) ** 2
+        for target_index, target in enumerate(target_points_np):
+            base_cell = np.floor(target / cell_size).astype(np.int64)
+            candidate_lists = [
+                cell_map.get((int(base_cell[0] + dx), int(base_cell[1] + dy), int(base_cell[2] + dz)), [])
+                for dx, dy, dz in offsets
+            ]
+            candidate_count = sum(len(items) for items in candidate_lists)
+            if candidate_count == 0:
+                continue
+            candidates = np.empty((candidate_count,), dtype=np.int64)
+            cursor = 0
+            for items in candidate_lists:
+                if not items:
+                    continue
+                end = cursor + len(items)
+                candidates[cursor:end] = items
+                cursor = end
+            diff = source_points_np[candidates] - target.reshape(1, 3)
+            squared = np.einsum("nd,nd->n", diff, diff, optimize=True)
+            within = squared <= max_distance_squared
+            if not np.any(within):
+                continue
+            candidate_indices = candidates[within]
+            candidate_squared = squared[within]
+            keep = min(k, int(candidate_indices.shape[0]))
+            if keep <= 0:
+                continue
+            if candidate_indices.shape[0] > keep:
+                selected = np.argpartition(candidate_squared, kth=keep - 1)[:keep]
+            else:
+                selected = np.arange(candidate_indices.shape[0])
+            selected = selected[np.argsort(candidate_squared[selected])]
+            indices[target_index, :keep] = candidate_indices[selected].astype(np.int64)
+            distances[target_index, :keep] = np.sqrt(candidate_squared[selected].astype(np.float64))
+        return indices, distances, f"numpy_voxel_radius_grid_cell_{cell_size:.8g}"
+
+    indices = np.empty((target_points_np.shape[0], k), dtype=np.int64)
+    distances = np.empty((target_points_np.shape[0], k), dtype=np.float64)
+    max_distance_elements = 8_000_000
+    chunk_size = max(1, min(1024, max_distance_elements // max(1, int(source_points_np.shape[0]))))
+    for start in range(0, target_points_np.shape[0], chunk_size):
+        end = min(start + chunk_size, target_points_np.shape[0])
+        diff = source_points_np[None, :, :] - target_points_np[start:end, None, :]
+        squared = np.einsum("bnd,bnd->bn", diff, diff, optimize=True)
+        if k == 1:
+            best = np.argmin(squared, axis=1)[:, None]
+        else:
+            best = np.argpartition(squared, kth=k - 1, axis=1)[:, :k]
+            best_squared = np.take_along_axis(squared, best, axis=1)
+            order = np.argsort(best_squared, axis=1)
+            best = np.take_along_axis(best, order, axis=1)
+        best_squared = np.take_along_axis(squared, best, axis=1)
+        indices[start:end] = best.astype(np.int64)
+        distances[start:end] = np.sqrt(best_squared.astype(np.float64))
+    return indices, distances, f"numpy_chunked_bruteforce_chunk_{chunk_size}"
+
+
+def mesh_triangle_adjacency(triangles) -> list[list[int]]:
+    edge_to_faces: dict[tuple[int, int], list[int]] = {}
+    for face_index, tri in enumerate(triangles.tolist()):
+        a, b, c = [int(value) for value in tri]
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u <= v else (v, u)
+            edge_to_faces.setdefault(key, []).append(face_index)
+    adjacency = [set() for _ in range(int(triangles.shape[0]))]
+    for faces in edge_to_faces.values():
+        if len(faces) < 2:
+            continue
+        for face in faces:
+            adjacency[face].update(other for other in faces if other != face)
+    return [sorted(neighbors) for neighbors in adjacency]
+
+
+def mesh_connected_components(adjacency: list[list[int]]) -> list[list[int]]:
+    seen = [False] * len(adjacency)
+    components: list[list[int]] = []
+    for start in range(len(adjacency)):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        component = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if not seen[neighbor]:
+                    seen[neighbor] = True
+                    stack.append(neighbor)
+        components.append(component)
+    return components
+
+
+def same_label_regions(labels, adjacency: list[list[int]]) -> list[list[int]]:
+    seen = [False] * len(adjacency)
+    regions: list[list[int]] = []
+    for start in range(len(adjacency)):
+        if seen[start] or int(labels[start]) <= 0:
+            seen[start] = True
+            continue
+        label = int(labels[start])
+        stack = [start]
+        seen[start] = True
+        region = []
+        while stack:
+            current = stack.pop()
+            region.append(current)
+            for neighbor in adjacency[current]:
+                if not seen[neighbor] and int(labels[neighbor]) == label:
+                    seen[neighbor] = True
+                    stack.append(neighbor)
+        regions.append(region)
+    return regions
+
+
+def smooth_face_labels(labels, probabilities, adjacency: list[list[int]], iterations: int, keep_probability: float, min_neighbors: int):
+    np = import_numpy()
+    smoothed = np.asarray(labels, dtype=np.int64).copy()
+    probs = np.asarray(probabilities, dtype=np.float64).copy()
+    for _ in range(max(0, int(iterations))):
+        next_labels = smoothed.copy()
+        next_probs = probs.copy()
+        for face_index, neighbors in enumerate(adjacency):
+            if not neighbors:
+                continue
+            if int(smoothed[face_index]) > 0 and float(probs[face_index]) >= float(keep_probability):
+                continue
+            counts: dict[int, float] = {}
+            prob_sums: dict[int, float] = {}
+            candidate_indices = [face_index, *neighbors]
+            for idx in candidate_indices:
+                label = int(smoothed[idx])
+                if label <= 0:
+                    continue
+                weight = max(float(probs[idx]), 1e-6)
+                counts[label] = counts.get(label, 0.0) + weight
+                prob_sums[label] = prob_sums.get(label, 0.0) + float(probs[idx])
+            if not counts:
+                continue
+            best_label, best_weight = max(counts.items(), key=lambda item: (item[1], item[0]))
+            neighbor_support = sum(1 for idx in neighbors if int(smoothed[idx]) == best_label)
+            if neighbor_support >= int(min_neighbors) and best_weight > counts.get(int(smoothed[face_index]), 0.0):
+                next_labels[face_index] = int(best_label)
+                next_probs[face_index] = max(float(probs[face_index]), prob_sums[best_label] / max(1.0, sum(1 for idx in candidate_indices if int(smoothed[idx]) == best_label)))
+        smoothed = next_labels
+        probs = np.clip(next_probs, 0.0, 1.0)
+    return smoothed, probs
+
+
+def write_face_semantic_debug_ply(path: Path, vertices, triangles, face_labels, face_probabilities) -> None:
+    ensure_dir(path.parent)
+    colors = semantic_colors_for_labels(face_labels)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write("comment Video2Mesh face-semantic debug mesh with duplicated vertices per triangle\n")
+        f.write(f"element vertex {int(triangles.shape[0]) * 3}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("property int object_id\n")
+        f.write("property float object_probability\n")
+        f.write("property int source_face\n")
+        f.write(f"element face {int(triangles.shape[0])}\n")
+        f.write("property list uchar int vertex_indices\n")
+        f.write("end_header\n")
+        for face_index, tri in enumerate(triangles):
+            color = colors[face_index]
+            label = int(face_labels[face_index])
+            probability = float(face_probabilities[face_index])
+            for vertex_index in tri:
+                point = vertices[int(vertex_index)]
+                f.write(
+                    f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} "
+                    f"{int(color[0])} {int(color[1])} {int(color[2])} "
+                    f"{label} {probability:.8f} {face_index}\n"
+                )
+        for face_index in range(int(triangles.shape[0])):
+            base = face_index * 3
+            f.write(f"3 {base} {base + 1} {base + 2}\n")
+
+
+GLTF_COMPONENT_DTYPES = {
+    5120: "i1",
+    5121: "u1",
+    5122: "i2",
+    5123: "u2",
+    5125: "u4",
+    5126: "f4",
+}
+
+GLTF_ACCESSOR_COMPONENTS = {
+    "SCALAR": 1,
+    "VEC2": 2,
+    "VEC3": 3,
+    "VEC4": 4,
+    "MAT2": 4,
+    "MAT3": 9,
+    "MAT4": 16,
+}
+
+
+def read_glb_chunks_light(path: Path) -> tuple[dict[str, Any], bytes]:
+    data = path.read_bytes()
+    if len(data) < 20:
+        raise RuntimeError(f"GLB file is too small: {path}")
+    magic, version, declared_length = struct.unpack_from("<4sII", data, 0)
+    if magic != b"glTF" or version != 2:
+        raise RuntimeError(f"Only glTF 2.0 binary GLB files are supported: {path}")
+    if declared_length != len(data):
+        raise RuntimeError(f"GLB length mismatch for {path}: header={declared_length}, actual={len(data)}")
+
+    offset = 12
+    json_chunk = None
+    bin_chunk = None
+    while offset + 8 <= len(data):
+        chunk_length, chunk_type = struct.unpack_from("<I4s", data, offset)
+        offset += 8
+        chunk = data[offset : offset + chunk_length]
+        offset += chunk_length
+        if chunk_type == b"JSON":
+            json_chunk = chunk
+        elif chunk_type == b"BIN\x00":
+            bin_chunk = chunk
+    if json_chunk is None:
+        raise RuntimeError(f"GLB file has no JSON chunk: {path}")
+    if bin_chunk is None:
+        raise RuntimeError(f"GLB file has no BIN chunk: {path}")
+    return json.loads(json_chunk.rstrip(b" \t\r\n\x00").decode("utf-8")), bin_chunk
+
+
+def read_glb_accessor_light(gltf: dict[str, Any], bin_chunk: bytes, accessor_index: int):
+    np = import_numpy()
+    accessors = gltf.get("accessors", [])
+    buffer_views = gltf.get("bufferViews", [])
+    accessor = accessors[int(accessor_index)]
+    buffer_view = buffer_views[int(accessor["bufferView"])]
+    component_type = int(accessor["componentType"])
+    dtype_code = GLTF_COMPONENT_DTYPES.get(component_type)
+    component_count = GLTF_ACCESSOR_COMPONENTS.get(str(accessor.get("type", "SCALAR")))
+    if dtype_code is None or component_count is None:
+        raise RuntimeError(f"Unsupported GLB accessor type: componentType={component_type}, type={accessor.get('type')}")
+    if int(buffer_view.get("buffer", 0)) != 0:
+        raise RuntimeError("Light GLB reader supports the embedded BIN buffer only.")
+
+    dtype = np.dtype("<" + dtype_code)
+    count = int(accessor["count"])
+    accessor_offset = int(accessor.get("byteOffset", 0))
+    view_offset = int(buffer_view.get("byteOffset", 0))
+    start = view_offset + accessor_offset
+    stride = int(buffer_view.get("byteStride", dtype.itemsize * component_count))
+    expected_stride = dtype.itemsize * component_count
+    if stride == expected_stride:
+        flat_count = count * component_count
+        array = np.frombuffer(bin_chunk, dtype=dtype, count=flat_count, offset=start).copy()
+        return array.reshape(count, component_count)
+
+    rows = np.empty((count, component_count), dtype=dtype)
+    for row in range(count):
+        row_start = start + row * stride
+        rows[row] = np.frombuffer(bin_chunk, dtype=dtype, count=component_count, offset=row_start)
+    return rows
+
+
+def read_glb_triangle_mesh_light(path: Path):
+    np = import_numpy()
+    gltf, bin_chunk = read_glb_chunks_light(path)
+    vertices_chunks = []
+    triangle_chunks = []
+    vertex_offset = 0
+
+    for mesh in gltf.get("meshes", []):
+        for primitive in mesh.get("primitives", []):
+            mode = int(primitive.get("mode", 4))
+            if mode != 4:
+                continue
+            attributes = primitive.get("attributes", {})
+            if "POSITION" not in attributes:
+                continue
+            positions = read_glb_accessor_light(gltf, bin_chunk, int(attributes["POSITION"])).astype(np.float64, copy=False)
+            if positions.ndim != 2 or positions.shape[1] != 3:
+                raise RuntimeError(f"GLB POSITION accessor is not VEC3: {path}")
+            if "indices" in primitive:
+                indices = read_glb_accessor_light(gltf, bin_chunk, int(primitive["indices"])).reshape(-1).astype(np.int64, copy=False)
+            else:
+                indices = np.arange(positions.shape[0], dtype=np.int64)
+            usable = (indices.shape[0] // 3) * 3
+            if usable <= 0:
+                continue
+            triangles = indices[:usable].reshape(-1, 3) + int(vertex_offset)
+            vertices_chunks.append(positions)
+            triangle_chunks.append(triangles)
+            vertex_offset += int(positions.shape[0])
+
+    if not vertices_chunks or not triangle_chunks:
+        raise RuntimeError(f"GLB mesh has no triangle primitives with POSITION data: {path}")
+    return np.vstack(vertices_chunks), np.vstack(triangle_chunks), "light_glb"
+
+
+def read_triangle_mesh_for_semantic_transfer(path: Path):
+    np = import_numpy()
+    if path.suffix.lower() == ".ply":
+        mesh_data = read_ply_triangle_mesh_light(path)
+        vertex_data = mesh_data["vertex_data"]
+        vertices = np.stack(
+            [
+                np.asarray(vertex_data["x"], dtype=np.float64),
+                np.asarray(vertex_data["y"], dtype=np.float64),
+                np.asarray(vertex_data["z"], dtype=np.float64),
+            ],
+            axis=1,
+        )
+        triangles: list[list[int]] = []
+        for face in mesh_data["faces"]:
+            if len(face) < 3:
+                continue
+            base = int(face[0])
+            for idx in range(1, len(face) - 1):
+                triangles.append([base, int(face[idx]), int(face[idx + 1])])
+        if not triangles:
+            raise RuntimeError(f"PLY mesh has no triangular faces: {path}")
+        return vertices, np.asarray(triangles, dtype=np.int64), "light_ply"
+
+    if path.suffix.lower() == ".glb":
+        return read_glb_triangle_mesh_light(path)
+
+    o3d = import_open3d()
+    mesh = o3d.io.read_triangle_mesh(str(path))
+    if mesh.is_empty():
+        raise RuntimeError(f"Open3D could not read mesh: {path}")
+    if len(mesh.triangles) == 0:
+        raise RuntimeError(f"Mesh has no triangles: {path}")
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    triangles = np.asarray(mesh.triangles, dtype=np.int64)
+    return vertices, triangles, "open3d"
+
+
+def downsample_semantic_transfer_source(points, labels, probabilities, max_points: int, min_points_per_label: int, seed: int):
+    np = import_numpy()
+    if max_points <= 0 or int(points.shape[0]) <= int(max_points):
+        return points, labels, probabilities, {"enabled": False, "source_point_count": int(points.shape[0])}
+    rng = np.random.default_rng(int(seed))
+    labels_np = np.asarray(labels, dtype=np.int64)
+    foreground_labels = [int(label) for label in np.unique(labels_np).tolist() if int(label) > 0]
+    selected_chunks = []
+    reserved = 0
+    for label in foreground_labels:
+        label_indices = np.flatnonzero(labels_np == label)
+        if label_indices.size == 0:
+            continue
+        keep = min(label_indices.size, max(0, int(min_points_per_label)))
+        if keep <= 0:
+            continue
+        if label_indices.size > keep:
+            prob = np.asarray(probabilities, dtype=np.float64)[label_indices]
+            order = np.argsort(prob)[-keep:]
+            chosen = label_indices[order]
+        else:
+            chosen = label_indices
+        selected_chunks.append(chosen.astype(np.int64))
+        reserved += int(chosen.size)
+
+    selected = np.concatenate(selected_chunks) if selected_chunks else np.empty((0,), dtype=np.int64)
+    remaining_slots = max(0, int(max_points) - int(selected.size))
+    if remaining_slots > 0:
+        selected_set = set(int(value) for value in selected.tolist())
+        remaining = np.asarray([idx for idx in range(int(points.shape[0])) if idx not in selected_set], dtype=np.int64)
+        if remaining.size > remaining_slots:
+            probs = np.asarray(probabilities, dtype=np.float64)[remaining]
+            # Keep high-confidence points but leave a random tail so surfaces are not only object centers.
+            high_count = int(remaining_slots * 0.75)
+            random_count = remaining_slots - high_count
+            high_selected = remaining[np.argsort(probs)[-high_count:]] if high_count > 0 else np.empty((0,), dtype=np.int64)
+            high_set = set(int(value) for value in high_selected.tolist())
+            random_pool = np.asarray([idx for idx in remaining.tolist() if int(idx) not in high_set], dtype=np.int64)
+            if random_count > 0 and random_pool.size > 0:
+                random_selected = rng.choice(random_pool, size=min(random_count, int(random_pool.size)), replace=False)
+            else:
+                random_selected = np.empty((0,), dtype=np.int64)
+            extra = np.concatenate([high_selected, random_selected])
+        else:
+            extra = remaining
+        selected = np.concatenate([selected, extra.astype(np.int64)])
+
+    if selected.size > max_points:
+        selected = rng.choice(selected, size=int(max_points), replace=False)
+    selected = np.unique(selected.astype(np.int64))
+    return (
+        points[selected],
+        labels_np[selected],
+        np.asarray(probabilities, dtype=np.float64)[selected],
+        {
+            "enabled": True,
+            "source_point_count": int(points.shape[0]),
+            "sampled_point_count": int(selected.size),
+            "max_points": int(max_points),
+            "min_points_per_label": int(min_points_per_label),
+            "reserved_foreground_points": int(reserved),
+            "seed": int(seed),
+        },
+    )
+
+
+def semantic_face_payload(
+    *,
+    method: str,
+    project_root: Path,
+    mesh_path: Path,
+    semantic_manifest_path: Path | None,
+    debug_ply: Path,
+    vertices,
+    triangles,
+    face_labels,
+    face_probabilities,
+    face_vote_confidence,
+    face_mean_distance,
+    face_neighbor_count,
+    legend: dict[str, dict[str, Any]],
+    bbox: dict[str, Any],
+    parameters: dict[str, Any],
+    extra_summary: dict[str, Any] | None = None,
+    extra_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    np = import_numpy()
+    label_counts = {str(int(label)): int(count) for label, count in zip(*np.unique(face_labels, return_counts=True))}
+    object_summaries: dict[str, dict[str, Any]] = {}
+    for label_text, count in label_counts.items():
+        label = int(label_text)
+        legend_item = legend.get(label_text, {})
+        selected = face_labels == label
+        finite_distance = selected & np.isfinite(face_mean_distance)
+        object_summaries[label_text] = {
+            "semantic_id": label,
+            "object_id": legend_item.get("object_id", "unknown" if label <= 0 else f"semantic_{label}"),
+            "label": legend_item.get("name", "unknown" if label <= 0 else f"semantic {label}"),
+            "category": legend_item.get("category", "unknown"),
+            "face_count": int(count),
+            "mean_probability": float(face_probabilities[selected].mean()) if selected.any() else 0.0,
+            "mean_distance": float(face_mean_distance[finite_distance].mean()) if finite_distance.any() else None,
+        }
+
+    adjacency = mesh_triangle_adjacency(triangles)
+    region_summaries = []
+    for region_index, region in enumerate(same_label_regions(face_labels, adjacency)):
+        if not region:
+            continue
+        label = int(face_labels[region[0]])
+        if label <= 0:
+            continue
+        region_np = np.asarray(region, dtype=np.int64)
+        region_vertices = vertices[np.unique(triangles[region_np].reshape(-1))]
+        region_bbox = bbox_for_points(region_vertices)
+        legend_item = legend.get(str(label), {})
+        region_summaries.append(
+            {
+                "region": int(region_index),
+                "semantic_id": label,
+                "object_id": legend_item.get("object_id", f"semantic_{label}"),
+                "label": legend_item.get("name", f"semantic {label}"),
+                "face_count": int(len(region)),
+                "bbox": region_bbox,
+                "mean_probability": float(face_probabilities[region_np].mean()),
+            }
+        )
+
+    face_semantics = []
+    for face_index, label in enumerate(face_labels.tolist()):
+        legend_item = legend.get(str(int(label)), {})
+        face_semantics.append(
+            {
+                "face": int(face_index),
+                "semantic_id": int(label),
+                "object_id": legend_item.get("object_id", "unknown" if int(label) <= 0 else f"semantic_{int(label)}"),
+                "label": legend_item.get("name", "unknown" if int(label) <= 0 else f"semantic {int(label)}"),
+                "category": legend_item.get("category", "unknown"),
+                "probability": round(float(face_probabilities[face_index]), 6),
+                "vote_confidence": round(float(face_vote_confidence[face_index]), 6),
+                "mean_distance": None if not np.isfinite(face_mean_distance[face_index]) else round(float(face_mean_distance[face_index]), 6),
+                "neighbor_count": int(face_neighbor_count[face_index]),
+            }
+        )
+
+    summary = {
+        "mesh_vertex_count": int(vertices.shape[0]),
+        "mesh_face_count": int(triangles.shape[0]),
+        "assigned_face_count": int((face_labels > 0).sum()),
+        "unknown_face_count": int((face_labels <= 0).sum()),
+        "semantic_id_count": len([key for key in legend if int(key) > 0]),
+        "label_counts": label_counts,
+        "mean_assigned_probability": float(face_probabilities[face_labels > 0].mean()) if (face_labels > 0).any() else 0.0,
+        "mean_assigned_distance": float(face_mean_distance[(face_labels > 0) & np.isfinite(face_mean_distance)].mean()) if ((face_labels > 0) & np.isfinite(face_mean_distance)).any() else None,
+    }
+    if extra_summary:
+        summary.update(extra_summary)
+
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": method,
+        "project_root": str(project_root),
+        "mesh": str(mesh_path),
+        "semantic_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
+        "debug_ply": str(debug_ply),
+        "parameters": parameters,
+        "bbox": bbox,
+        "legend": legend,
+        "summary": summary,
+        "objects": object_summaries,
+        "regions": region_summaries,
+        "face_semantics": face_semantics,
+        "notes": (
+            "Face semantics are in triangle-index order. Unity/Web raycast triangleIndex can index face_semantics directly. "
+            "The debug PLY duplicates triangle vertices so per-face colors display reliably."
+        ),
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    return payload
+
+
+def read_gray_u8_image(path: Path, width: int | None = None, height: int | None = None):
+    np = import_numpy()
+    Image = import_pil_image()
+    with Image.open(path) as image:
+        image = image.convert("L")
+        if width is not None and height is not None and image.size != (int(width), int(height)):
+            image = image.resize((int(width), int(height)), Image.Resampling.NEAREST)
+        return np.asarray(image, dtype=np.uint8)
+
+
+def write_label_index_png(path: Path, labels, max_label: int = 255) -> None:
+    np = import_numpy()
+    Image = import_pil_image()
+    ensure_dir(path.parent)
+    arr = np.asarray(labels, dtype=np.int64)
+    arr_max = int(arr.max()) if arr.size else 0
+    if arr_max > int(max_label):
+        raise ValueError(f"Label image max {int(arr.max())} exceeds {max_label}; indexed PNG sidecar supports <= {max_label}.")
+    Image.fromarray(np.clip(arr, 0, int(max_label)).astype(np.uint8), mode="L").save(path)
+
+
+def mask_records_by_object_frame(mask_root: Path) -> dict[tuple[str, str], Path]:
+    records: dict[tuple[str, str], Path] = {}
+    if not mask_root.exists():
+        raise FileNotFoundError(f"2D mask root not found: {mask_root}")
+    for record in scan_mask_records(mask_root):
+        records[(slugify(record.object_id), frame_stem(record.frame_id))] = record.path
+    return records
+
+
+def project_semantic_points_to_label_masks(
+    *,
+    semantic_points,
+    semantic_labels,
+    semantic_probabilities,
+    camera_info: dict[str, Any],
+    frame_ids: list[str],
+    output_dir: Path,
+    point_radius: int,
+    min_probability: float,
+    max_points: int,
+    seed: int,
+) -> tuple[dict[str, Path], list[dict[str, Any]], dict[str, Any]]:
+    np = import_numpy()
+    labels_np = np.asarray(semantic_labels, dtype=np.int64)
+    probs_np = np.asarray(semantic_probabilities, dtype=np.float64)
+    keep = labels_np > 0
+    if min_probability > 0:
+        keep &= probs_np >= float(min_probability)
+    indices = np.flatnonzero(keep)
+    rng = np.random.default_rng(int(seed))
+    sampling_info = {"enabled": False, "source_point_count": int(indices.size)}
+    if max_points > 0 and indices.size > int(max_points):
+        indices = np.sort(rng.choice(indices, size=int(max_points), replace=False))
+        sampling_info = {
+            "enabled": True,
+            "source_point_count": int(keep.sum()),
+            "sampled_point_count": int(indices.size),
+            "max_points": int(max_points),
+            "seed": int(seed),
+        }
+    points = semantic_points[indices]
+    labels = labels_np[indices]
+    probs = probs_np[indices]
+    radius = max(0, int(point_radius))
+    mask_paths: dict[str, Path] = {}
+    frame_reports: list[dict[str, Any]] = []
+    for frame_id in frame_ids:
+        intrinsic = intrinsic_for_frame(camera_info, frame_id)
+        extrinsic = resolve_extrinsic(camera_info["extrinsic"], frame_id)
+        if extrinsic is None:
+            frame_reports.append({"frame_id": frame_id, "status": "skipped_missing_extrinsic"})
+            continue
+        w2c = world_to_camera_matrix(extrinsic, camera_info.get("extrinsic_type") or "world_to_camera")
+        inside, u, v, z = project_points(points, intrinsic, w2c)
+        selected = np.flatnonzero(inside)
+        width = int(intrinsic["w"])
+        height = int(intrinsic["h"])
+        label_image = np.zeros((height, width), dtype=np.uint8)
+        zbuf = np.full((height, width), np.inf, dtype=np.float64)
+        if selected.size:
+            valid_labels = (labels[selected] > 0) & (labels[selected] <= 255)
+            selected = selected[valid_labels]
+            if radius <= 0:
+                pixel = v[selected] * width + u[selected]
+                zbuf_flat = np.full(width * height, np.inf, dtype=np.float64)
+                np.minimum.at(zbuf_flat, pixel, z[selected])
+                nearest = zbuf_flat[pixel]
+                front = z[selected] <= nearest + 1e-9
+                label_flat = label_image.reshape(-1)
+                label_flat[pixel[front]] = labels[selected][front].astype(np.uint8)
+                zbuf = zbuf_flat.reshape(height, width)
+            else:
+                order = selected[np.argsort(z[selected])]
+                for idx in order:
+                    label = int(labels[idx])
+                    uu = int(u[idx])
+                    vv = int(v[idx])
+                    z_value = float(z[idx])
+                    y0 = max(0, vv - radius)
+                    y1 = min(height, vv + radius + 1)
+                    x0 = max(0, uu - radius)
+                    x1 = min(width, uu + radius + 1)
+                    for yy in range(y0, y1):
+                        for xx in range(x0, x1):
+                            if (xx - uu) * (xx - uu) + (yy - vv) * (yy - vv) > radius * radius:
+                                continue
+                            if z_value < zbuf[yy, xx]:
+                                zbuf[yy, xx] = z_value
+                                label_image[yy, xx] = label
+        out_path = output_dir / f"{frame_stem(frame_id)}.png"
+        write_label_index_png(out_path, label_image)
+        mask_paths[frame_stem(frame_id)] = out_path
+        frame_reports.append(
+            {
+                "frame_id": frame_stem(frame_id),
+                "status": "projected",
+                "projected_points": int(selected.size),
+                "labeled_pixels": int((label_image > 0).sum()),
+                "width": width,
+                "height": height,
+            }
+        )
+    return mask_paths, frame_reports, sampling_info
+
+
+def apply_face_region_cleanup(face_labels, face_probabilities, triangles, min_region_faces: int):
+    np = import_numpy()
+    if min_region_faces <= 0:
+        return face_labels, face_probabilities, 0
+    adjacency = mesh_triangle_adjacency(triangles)
+    rejected = 0
+    for region in same_label_regions(face_labels, adjacency):
+        if len(region) < int(min_region_faces):
+            region_np = np.asarray(region, dtype=np.int64)
+            rejected += int((face_labels[region_np] > 0).sum())
+            face_labels[region_np] = 0
+            face_probabilities[region_np] = 0.0
+    return face_labels, face_probabilities, rejected
+
+
+def semantic_label_robust_bboxes(points, labels, probabilities, *, quantile: float, padding_ratio: float, min_probability: float):
+    np = import_numpy()
+    labels_np = np.asarray(labels, dtype=np.int64)
+    probs_np = np.asarray(probabilities, dtype=np.float64)
+    points_np = np.asarray(points, dtype=np.float64)
+    bboxes: dict[int, dict[str, Any]] = {}
+    q = max(0.0, min(0.49, float(quantile)))
+    for label in [int(value) for value in np.unique(labels_np).tolist() if int(value) > 0]:
+        mask = labels_np == label
+        if min_probability > 0:
+            high = mask & (probs_np >= float(min_probability))
+            if int(high.sum()) >= 16:
+                mask = high
+        pts = points_np[mask]
+        if pts.shape[0] == 0:
+            continue
+        lo = np.quantile(pts, q, axis=0) if pts.shape[0] >= 8 else np.min(pts, axis=0)
+        hi = np.quantile(pts, 1.0 - q, axis=0) if pts.shape[0] >= 8 else np.max(pts, axis=0)
+        size = np.maximum(hi - lo, 1e-6)
+        pad = np.maximum(size * float(padding_ratio), 1e-6)
+        bboxes[label] = {
+            "semantic_id": int(label),
+            "min": (lo - pad).tolist(),
+            "max": (hi + pad).tolist(),
+            "raw_count": int((labels_np == label).sum()),
+            "used_count": int(pts.shape[0]),
+            "quantile": float(q),
+            "padding_ratio": float(padding_ratio),
+        }
+    return bboxes
+
+
+def points_inside_label_bbox(sample_points, label: int, label_bboxes: dict[int, dict[str, Any]]):
+    np = import_numpy()
+    bbox = label_bboxes.get(int(label))
+    if not bbox:
+        return np.ones((sample_points.shape[0],), dtype=bool)
+    lo = np.asarray(bbox["min"], dtype=np.float64).reshape(1, 3)
+    hi = np.asarray(bbox["max"], dtype=np.float64).reshape(1, 3)
+    return np.all((sample_points >= lo) & (sample_points <= hi), axis=1)
+
+
+def slug_set_from_csv(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {slugify(item, fallback="") for item in str(value).split(",") if slugify(item, fallback="")}
+
+
+def object_collider_records_from_semantic_manifest(semantic_manifest: Any, requested_object_ids: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(semantic_manifest, dict):
+        return []
+    records = []
+    seen: set[str] = set()
+    objects = semantic_manifest.get("objects")
+    if isinstance(objects, list):
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            object_id = slugify(str(item.get("object_id") or ""), fallback="")
+            if not object_id or object_id == "background" or object_id in seen:
+                continue
+            if requested_object_ids and object_id not in requested_object_ids:
+                continue
+            try:
+                semantic_id = int(item.get("semantic_id", 0))
+            except Exception:
+                semantic_id = 0
+            if semantic_id <= 0:
+                continue
+            records.append(
+                {
+                    "object_id": object_id,
+                    "semantic_id": semantic_id,
+                    "name": item.get("name") or object_id,
+                    "category": item.get("category") or item.get("name") or "unknown",
+                    "asset_role": item.get("asset_role") or "object",
+                    "manifest_record": item,
+                }
+            )
+            seen.add(object_id)
+    mapping = semantic_manifest.get("object_id_to_semantic")
+    if isinstance(mapping, dict):
+        for raw_object_id, raw_semantic_id in mapping.items():
+            object_id = slugify(str(raw_object_id), fallback="")
+            if not object_id or object_id == "background" or object_id in seen:
+                continue
+            if requested_object_ids and object_id not in requested_object_ids:
+                continue
+            try:
+                semantic_id = int(raw_semantic_id)
+            except Exception:
+                continue
+            if semantic_id <= 0:
+                continue
+            records.append(
+                {
+                    "object_id": object_id,
+                    "semantic_id": semantic_id,
+                    "name": object_id,
+                    "category": "unknown",
+                    "asset_role": "object",
+                    "manifest_record": {},
+                }
+            )
+            seen.add(object_id)
+    return records
+
+
+def robust_axis_quantile_filter(points, q_min: float, q_max: float, padding_ratio: float):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
+        return points_np, None, np.zeros((points_np.shape[0],), dtype=bool)
+    low_q = max(0.0, min(1.0, float(q_min)))
+    high_q = max(low_q, min(1.0, float(q_max)))
+    lower = np.quantile(points_np, low_q, axis=0)
+    upper = np.quantile(points_np, high_q, axis=0)
+    extent = np.maximum(upper - lower, 1e-8)
+    padding = extent * max(0.0, float(padding_ratio))
+    lower = lower - padding
+    upper = upper + padding
+    keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
+    report = {
+        "q_min": low_q,
+        "q_max": high_q,
+        "padding_ratio": float(padding_ratio),
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+        "kept_points": int(keep.sum()),
+        "removed_points": int(points_np.shape[0] - int(keep.sum())),
+    }
+    return points_np[keep], report, keep
+
+
+def robust_pca_obb_from_points(points, q_min: float, q_max: float, padding_ratio: float, min_extent: float) -> dict[str, Any]:
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] < 3:
+        raise ValueError("Need at least 3 points to build a robust OBB collider.")
+    center_seed = np.mean(points_np, axis=0)
+    centered = points_np - center_seed.reshape(1, 3)
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+    except Exception as exc:
+        raise RuntimeError("Failed to compute PCA axes for collider proxy.") from exc
+    axes = np.asarray(vh, dtype=np.float64).T
+    if np.linalg.det(axes) < 0:
+        axes[:, -1] *= -1.0
+    projected = centered @ axes
+    low_q = max(0.0, min(1.0, float(q_min)))
+    high_q = max(low_q, min(1.0, float(q_max)))
+    lower = np.quantile(projected, low_q, axis=0)
+    upper = np.quantile(projected, high_q, axis=0)
+    extent = np.maximum(upper - lower, float(min_extent))
+    midpoint = (lower + upper) * 0.5
+    padding = np.maximum(extent * max(0.0, float(padding_ratio)), 0.0)
+    extent = np.maximum(extent + padding * 2.0, float(min_extent))
+    center = center_seed + axes @ midpoint
+    half = extent * 0.5
+    local_corners = np.asarray(
+        [
+            [-half[0], -half[1], -half[2]],
+            [half[0], -half[1], -half[2]],
+            [half[0], half[1], -half[2]],
+            [-half[0], half[1], -half[2]],
+            [-half[0], -half[1], half[2]],
+            [half[0], -half[1], half[2]],
+            [half[0], half[1], half[2]],
+            [-half[0], half[1], half[2]],
+        ],
+        dtype=np.float64,
+    )
+    corners = center.reshape(1, 3) + local_corners @ axes.T
+    return {
+        "center": [float(value) for value in center.tolist()],
+        "axes_columns": [[float(value) for value in row] for row in axes.tolist()],
+        "extent": [float(value) for value in extent.tolist()],
+        "diagonal": float(np.linalg.norm(extent)),
+        "corners": corners,
+        "pca": {
+            "q_min": low_q,
+            "q_max": high_q,
+            "padding_ratio": float(padding_ratio),
+            "projected_min": [float(value) for value in (midpoint - half).tolist()],
+            "projected_max": [float(value) for value in (midpoint + half).tolist()],
+        },
+    }
+
+
+OBB_TRIANGLE_FACES = [
+    [0, 1, 2],
+    [0, 2, 3],
+    [4, 6, 5],
+    [4, 7, 6],
+    [0, 4, 5],
+    [0, 5, 1],
+    [1, 5, 6],
+    [1, 6, 2],
+    [2, 6, 7],
+    [2, 7, 3],
+    [3, 7, 4],
+    [3, 4, 0],
+]
+
+
+def write_scene_obb_obj(path: Path, corners, *, name: str | None = None, index_offset: int = 0) -> int:
+    np = import_numpy()
+    corners_np = np.asarray(corners, dtype=np.float64)
+    if corners_np.shape != (8, 3):
+        raise ValueError(f"OBB corners must be 8x3, got {corners_np.shape}")
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("# Video2Mesh scene-coordinate robust OBB collision proxy\n")
+        if name:
+            f.write(f"o {slugify(name)}\n")
+        for vertex in corners_np:
+            f.write(f"v {float(vertex[0]):.8f} {float(vertex[1]):.8f} {float(vertex[2]):.8f}\n")
+        for face in OBB_TRIANGLE_FACES:
+            a, b, c = [int(index_offset + idx + 1) for idx in face]
+            f.write(f"f {a} {b} {c}\n")
+    return int(corners_np.shape[0])
+
+
+def write_combined_obb_obj(path: Path, objects: dict[str, dict[str, Any]]) -> None:
+    ensure_dir(path.parent)
+    vertex_offset = 0
+    with path.open("w", encoding="utf-8") as f:
+        f.write("# Video2Mesh combined scene-coordinate robust OBB collision proxies\n")
+        for object_id, proxy in objects.items():
+            corners = proxy.get("corners")
+            if corners is None:
+                continue
+            f.write(f"o {slugify(object_id)}\n")
+            for vertex in corners:
+                f.write(f"v {float(vertex[0]):.8f} {float(vertex[1]):.8f} {float(vertex[2]):.8f}\n")
+            for face in OBB_TRIANGLE_FACES:
+                a, b, c = [vertex_offset + int(idx) + 1 for idx in face]
+                f.write(f"f {a} {b} {c}\n")
+            vertex_offset += 8
+
+
+def write_combined_obb_ply(path: Path, objects: dict[str, dict[str, Any]]) -> None:
+    np = import_numpy()
+    vertices = []
+    colors = []
+    faces: list[list[int]] = []
+    for proxy in objects.values():
+        corners = proxy.get("corners")
+        semantic_id = int(proxy.get("semantic_id", 0))
+        if corners is None:
+            continue
+        base = len(vertices)
+        color = semantic_preview_color(semantic_id)
+        for vertex in np.asarray(corners, dtype=np.float64):
+            vertices.append(vertex.tolist())
+            colors.append(color)
+        for face in OBB_TRIANGLE_FACES:
+            faces.append([base + int(idx) for idx in face])
+    write_ascii_triangle_mesh_ply(path, vertices, colors, faces)
+
+
+def scene_aabb_corners(bbox_min: list[float], bbox_max: list[float]) -> list[list[float]]:
+    mins = [float(value) for value in bbox_min[:3]]
+    maxs = [float(value) for value in bbox_max[:3]]
+    for axis in range(3):
+        if maxs[axis] < mins[axis]:
+            mins[axis], maxs[axis] = maxs[axis], mins[axis]
+        if abs(maxs[axis] - mins[axis]) < 1e-6:
+            center = (mins[axis] + maxs[axis]) * 0.5
+            mins[axis] = center - 5e-4
+            maxs[axis] = center + 5e-4
+    x0, y0, z0 = mins
+    x1, y1, z1 = maxs
+    return [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ]
+
+
+def normalize_scene_aabb(bbox: dict[str, Any] | None) -> dict[str, Any] | None:
+    np = import_numpy()
+    if not isinstance(bbox, dict):
+        return None
+    if isinstance(bbox.get("min"), list) and isinstance(bbox.get("max"), list):
+        mins = np.asarray(bbox.get("min")[:3], dtype=np.float64)
+        maxs = np.asarray(bbox.get("max")[:3], dtype=np.float64)
+    elif isinstance(bbox.get("center"), list) and isinstance(bbox.get("size"), list):
+        center = np.asarray(bbox.get("center")[:3], dtype=np.float64)
+        size = np.asarray(bbox.get("size")[:3], dtype=np.float64)
+        mins = center - np.abs(size) * 0.5
+        maxs = center + np.abs(size) * 0.5
+    else:
+        return None
+    lower = np.minimum(mins, maxs)
+    upper = np.maximum(mins, maxs)
+    center = (lower + upper) * 0.5
+    size = upper - lower
+    return {
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+        "center": [float(value) for value in center.tolist()],
+        "size": [float(value) for value in size.tolist()],
+    }
+
+
+def expand_scene_aabb(bbox: dict[str, Any], padding_ratio: float, min_padding: float) -> dict[str, Any]:
+    np = import_numpy()
+    normalized = normalize_scene_aabb(bbox)
+    if normalized is None:
+        raise ValueError("Cannot expand invalid scene AABB.")
+    lower = np.asarray(normalized["min"], dtype=np.float64)
+    upper = np.asarray(normalized["max"], dtype=np.float64)
+    size = np.maximum(upper - lower, 1e-6)
+    padding = np.maximum(size * max(0.0, float(padding_ratio)), max(0.0, float(min_padding)))
+    lower = lower - padding
+    upper = upper + padding
+    center = (lower + upper) * 0.5
+    size = upper - lower
+    return {
+        "min": [float(value) for value in lower.tolist()],
+        "max": [float(value) for value in upper.tolist()],
+        "center": [float(value) for value in center.tolist()],
+        "size": [float(value) for value in size.tolist()],
+        "padding_ratio": float(padding_ratio),
+        "min_padding": float(min_padding),
+    }
+
+
+def points_inside_scene_aabb(points, bbox: dict[str, Any]):
+    np = import_numpy()
+    normalized = normalize_scene_aabb(bbox)
+    if normalized is None:
+        return np.ones((int(np.asarray(points).shape[0]),), dtype=bool)
+    points_np = np.asarray(points, dtype=np.float64)
+    lower = np.asarray(normalized["min"], dtype=np.float64).reshape(1, 3)
+    upper = np.asarray(normalized["max"], dtype=np.float64).reshape(1, 3)
+    return np.all((points_np >= lower) & (points_np <= upper), axis=1)
+
+
+def load_object_bbox_hints(project_root: Path, manifest: dict[str, Any], bbox_source: Path | None = None) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    sources: list[Path] = []
+    if bbox_source is not None:
+        sources.append(resolve_project_cli_path(bbox_source, project_root))
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    for value in [
+        artifacts.get("simulator_asset_bundle"),
+        project_root / "simulator_asset_bundle.json",
+        project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simulator_asset_bundle.json",
+    ]:
+        if not value:
+            continue
+        path = Path(value)
+        sources.append(path if path.is_absolute() else project_root / path)
+
+    hints: dict[str, dict[str, Any]] = {}
+    used: list[str] = []
+    seen: set[Path] = set()
+    for source in sources:
+        try:
+            resolved = source.resolve()
+        except Exception:
+            resolved = source
+        if resolved in seen or not source.exists():
+            continue
+        seen.add(resolved)
+        payload = safe_read_json(source)
+        if not isinstance(payload, dict):
+            continue
+        objects = payload.get("objects")
+        if isinstance(objects, dict):
+            iterable = objects.values()
+        elif isinstance(objects, list):
+            iterable = objects
+        else:
+            iterable = []
+        loaded = 0
+        for item in iterable:
+            if not isinstance(item, dict):
+                continue
+            object_id = slugify(str(item.get("object_id") or ""), fallback="")
+            if not object_id:
+                continue
+            pose = item.get("pose") if isinstance(item.get("pose"), dict) else {}
+            candidates = [
+                item.get("bbox_3d"),
+                pose.get("bbox_3d") if isinstance(pose, dict) else None,
+                {"center": pose.get("position"), "size": pose.get("bbox_size")} if isinstance(pose, dict) else None,
+            ]
+            bbox = next((normalize_scene_aabb(candidate) for candidate in candidates if normalize_scene_aabb(candidate) is not None), None)
+            if bbox is None:
+                continue
+            hints[object_id] = bbox
+            loaded += 1
+        if loaded:
+            used.append(str(source))
+    return hints, used
+
+
+def voxel_component_labels(cells: list[tuple[int, int, int]]) -> list[list[tuple[int, int, int]]]:
+    occupied = set(cells)
+    components: list[list[tuple[int, int, int]]] = []
+    neighbors = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+    while occupied:
+        start = occupied.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            cell = stack.pop()
+            cx, cy, cz = cell
+            for dx, dy, dz in neighbors:
+                nxt = (cx + dx, cy + dy, cz + dz)
+                if nxt not in occupied:
+                    continue
+                occupied.remove(nxt)
+                stack.append(nxt)
+                component.append(nxt)
+        components.append(component)
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def greedy_voxel_boxes(component_cells: list[tuple[int, int, int]]) -> list[dict[str, Any]]:
+    remaining = set(component_cells)
+    boxes: list[dict[str, Any]] = []
+    while remaining:
+        x0, y0, z0 = min(remaining)
+        x1 = x0
+        while (x1 + 1, y0, z0) in remaining:
+            x1 += 1
+        y1 = y0
+        while True:
+            candidate_y = y1 + 1
+            row_ok = all((x, candidate_y, z0) in remaining for x in range(x0, x1 + 1))
+            if not row_ok:
+                break
+            y1 = candidate_y
+        z1 = z0
+        while True:
+            candidate_z = z1 + 1
+            slab_ok = all((x, y, candidate_z) in remaining for x in range(x0, x1 + 1) for y in range(y0, y1 + 1))
+            if not slab_ok:
+                break
+            z1 = candidate_z
+        covered = [(x, y, z) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1) for z in range(z0, z1 + 1)]
+        for cell in covered:
+            remaining.discard(cell)
+        boxes.append(
+            {
+                "cell_min": [int(x0), int(y0), int(z0)],
+                "cell_max": [int(x1), int(y1), int(z1)],
+                "voxel_count": int(len(covered)),
+            }
+        )
+    boxes.sort(key=lambda item: int(item.get("voxel_count", 0)), reverse=True)
+    return boxes
+
+
+def compound_collider_boxes_from_points(
+    points,
+    *,
+    voxel_size: float,
+    max_boxes: int,
+    min_component_voxels: int,
+    max_components: int,
+    box_quantile_min: float = 0.02,
+    box_quantile_max: float = 0.98,
+    box_padding_ratio: float = 0.03,
+    min_box_extent: float = 0.05,
+):
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3 or points_np.shape[0] == 0:
+        return [], {"reason": "empty_points"}
+    base_voxel_size = max(float(voxel_size), 1e-5)
+    multipliers = [1.0, 1.35, 1.8, 2.5, 3.5, 5.0, 7.0]
+    attempts: list[dict[str, Any]] = []
+    best_boxes: list[dict[str, Any]] = []
+    best_report: dict[str, Any] = {}
+    for multiplier in multipliers:
+        effective_voxel_size = base_voxel_size * multiplier
+        lower = points_np.min(axis=0) - effective_voxel_size * 0.5
+        cells_np = np.floor((points_np - lower.reshape(1, 3)) / effective_voxel_size).astype(np.int64)
+        unique_cells, inverse, counts = np.unique(cells_np, axis=0, return_inverse=True, return_counts=True)
+        cells = [tuple(int(value) for value in row.tolist()) for row in unique_cells]
+        cell_count_by_tuple = {cell: int(count) for cell, count in zip(cells, counts.tolist())}
+        cell_points: dict[tuple[int, int, int], list[int]] = {cell: [] for cell in cells}
+        for point_index, cell_index in enumerate(inverse.tolist()):
+            cell_points[cells[int(cell_index)]].append(int(point_index))
+        components = voxel_component_labels(cells)
+        kept_components = [
+            component
+            for component in components
+            if len(component) >= max(1, int(min_component_voxels))
+        ]
+        if not kept_components and components:
+            kept_components = [components[0]]
+        kept_components = kept_components[: max(1, int(max_components))]
+
+        boxes: list[dict[str, Any]] = []
+        for component_index, component in enumerate(kept_components):
+            for box in greedy_voxel_boxes(component):
+                cell_min = np.asarray(box["cell_min"], dtype=np.int64)
+                cell_max = np.asarray(box["cell_max"], dtype=np.int64)
+                voxel_bbox_min = lower + cell_min.astype(np.float64) * effective_voxel_size
+                voxel_bbox_max = lower + (cell_max.astype(np.float64) + 1.0) * effective_voxel_size
+                point_count = 0
+                point_indices: list[int] = []
+                for x in range(int(cell_min[0]), int(cell_max[0]) + 1):
+                    for y in range(int(cell_min[1]), int(cell_max[1]) + 1):
+                        for z in range(int(cell_min[2]), int(cell_max[2]) + 1):
+                            cell = (x, y, z)
+                            point_count += cell_count_by_tuple.get(cell, 0)
+                            point_indices.extend(cell_points.get(cell, []))
+                if point_indices:
+                    box_points = points_np[np.asarray(point_indices, dtype=np.int64)]
+                    q_min = max(0.0, min(1.0, float(box_quantile_min)))
+                    q_max = max(q_min, min(1.0, float(box_quantile_max)))
+                    bbox_min = np.quantile(box_points, q_min, axis=0)
+                    bbox_max = np.quantile(box_points, q_max, axis=0)
+                    extent = np.maximum(bbox_max - bbox_min, float(min_box_extent))
+                    padding = np.maximum(extent * max(0.0, float(box_padding_ratio)), 0.0)
+                    center_seed = (bbox_min + bbox_max) * 0.5
+                    bbox_min = center_seed - extent * 0.5 - padding
+                    bbox_max = center_seed + extent * 0.5 + padding
+                else:
+                    bbox_min = voxel_bbox_min
+                    bbox_max = voxel_bbox_max
+                size = np.maximum(bbox_max - bbox_min, float(min_box_extent))
+                center = (bbox_min + bbox_max) * 0.5
+                bbox_min = center - size * 0.5
+                bbox_max = center + size * 0.5
+                boxes.append(
+                    {
+                        "component": int(component_index),
+                        "bbox_min": [float(value) for value in bbox_min.tolist()],
+                        "bbox_max": [float(value) for value in bbox_max.tolist()],
+                        "center": [float(value) for value in center.tolist()],
+                        "size": [float(value) for value in size.tolist()],
+                        "voxel_bbox_min": [float(value) for value in voxel_bbox_min.tolist()],
+                        "voxel_bbox_max": [float(value) for value in voxel_bbox_max.tolist()],
+                        "voxel_count": int(box.get("voxel_count", 0)),
+                        "point_count": int(point_count),
+                    }
+                )
+        boxes.sort(key=lambda item: (int(item.get("point_count", 0)), int(item.get("voxel_count", 0))), reverse=True)
+        attempt = {
+            "voxel_size": float(effective_voxel_size),
+            "occupied_voxels": int(unique_cells.shape[0]),
+            "component_count": int(len(components)),
+            "kept_component_count": int(len(kept_components)),
+            "box_count": int(len(boxes)),
+            "min_component_voxels": int(min_component_voxels),
+            "max_components": int(max_components),
+        }
+        attempts.append(attempt)
+        best_boxes = boxes
+        best_report = attempt
+        if len(boxes) <= max(1, int(max_boxes)):
+            break
+
+    selected_boxes = best_boxes[: max(1, int(max_boxes))]
+    selected_voxel_count = sum(int(item.get("voxel_count", 0)) for item in selected_boxes)
+    selected_point_count = sum(int(item.get("point_count", 0)) for item in selected_boxes)
+    best_report = {
+        **best_report,
+        "attempts": attempts,
+        "selected_box_count": int(len(selected_boxes)),
+        "selected_voxel_count": int(selected_voxel_count),
+        "selected_point_count": int(selected_point_count),
+        "source_point_count": int(points_np.shape[0]),
+        "max_boxes": int(max_boxes),
+        "box_quantiles": [float(box_quantile_min), float(box_quantile_max)],
+        "box_padding_ratio": float(box_padding_ratio),
+        "min_box_extent": float(min_box_extent),
+    }
+    return selected_boxes, best_report
+
+
+def write_combined_aabb_boxes_obj(path: Path, objects: dict[str, dict[str, Any]], *, comment: str) -> None:
+    ensure_dir(path.parent)
+    vertex_offset = 0
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"# {comment}\n")
+        for object_id, record in objects.items():
+            for box_index, box in enumerate(record.get("boxes", [])):
+                corners = scene_aabb_corners(box["bbox_min"], box["bbox_max"])
+                f.write(f"o {slugify(object_id)}_box_{box_index:03d}\n")
+                for vertex in corners:
+                    f.write(f"v {float(vertex[0]):.8f} {float(vertex[1]):.8f} {float(vertex[2]):.8f}\n")
+                for face in OBB_TRIANGLE_FACES:
+                    a, b, c = [vertex_offset + int(idx) + 1 for idx in face]
+                    f.write(f"f {a} {b} {c}\n")
+                vertex_offset += 8
+
+
+def write_combined_aabb_boxes_ply(path: Path, objects: dict[str, dict[str, Any]]) -> None:
+    vertices = []
+    colors = []
+    faces: list[list[int]] = []
+    for record in objects.values():
+        semantic_id = int(record.get("semantic_id", 0))
+        color = semantic_preview_color(semantic_id)
+        for box in record.get("boxes", []):
+            corners = scene_aabb_corners(box["bbox_min"], box["bbox_max"])
+            base = len(vertices)
+            vertices.extend(corners)
+            colors.extend([color for _ in corners])
+            for face in OBB_TRIANGLE_FACES:
+                faces.append([base + int(idx) for idx in face])
+    write_ascii_triangle_mesh_ply(path, vertices, colors, faces)
+
+
+def write_object_collider_proxy_preview(path: Path, objects: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    np = import_numpy()
+    ensure_dir(path.parent)
+    if not objects:
+        return {"enabled": False, "reason": "no_objects"}
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection  # type: ignore
+    except Exception as exc:
+        return write_object_collider_proxy_preview_pil(path, objects, f"matplotlib_unavailable:{exc}")
+
+    edge_pairs = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    all_points = []
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    for object_id, proxy in objects.items():
+        corners = np.asarray(proxy.get("corners"), dtype=np.float64)
+        if corners.shape != (8, 3):
+            continue
+        all_points.append(corners)
+        color = np.asarray(semantic_preview_color(int(proxy.get("semantic_id", 0))), dtype=np.float64) / 255.0
+        segments = [[corners[start], corners[end]] for start, end in edge_pairs]
+        ax.add_collection3d(Line3DCollection(segments, colors=[color], linewidths=1.5))
+        center = np.asarray(proxy.get("center"), dtype=np.float64)
+        label = str(proxy.get("object_id") or object_id)
+        ax.scatter([center[0]], [center[1]], [center[2]], color=color.reshape(1, 3), s=18)
+        ax.text(center[0], center[1], center[2], label, color="white", fontsize=7)
+    if all_points:
+        stacked = np.vstack(all_points)
+        mins = stacked.min(axis=0)
+        maxs = stacked.max(axis=0)
+        center = (mins + maxs) * 0.5
+        radius = max(float((maxs - mins).max()) * 0.55, 1e-3)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_facecolor("#20282b")
+    fig.patch.set_facecolor("#20282b")
+    ax.grid(False)
+    ax.set_axis_off()
+    ax.view_init(elev=28, azim=-58)
+    plt.tight_layout()
+    fig.savefig(path, dpi=140, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return {"enabled": True, "path": str(path), "object_count": len(objects)}
+
+
+def write_object_collider_proxy_preview_pil(path: Path, objects: dict[str, dict[str, Any]], fallback_reason: str) -> dict[str, Any]:
+    np = import_numpy()
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception as exc:
+        return {"enabled": False, "reason": f"{fallback_reason}; pillow_unavailable:{exc}"}
+
+    edge_pairs = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    projected_by_id = {}
+    all_projected = []
+    for object_id, proxy in objects.items():
+        corners = np.asarray(proxy.get("corners"), dtype=np.float64)
+        if corners.shape != (8, 3):
+            continue
+        x = corners[:, 0]
+        y = corners[:, 1]
+        z = corners[:, 2]
+        projected = np.stack([x - y * 0.55, -z + y * 0.25], axis=1)
+        projected_by_id[object_id] = projected
+        all_projected.append(projected)
+    if not all_projected:
+        return {"enabled": False, "reason": f"{fallback_reason}; no_projectable_objects"}
+
+    width, height = 1200, 800
+    margin = 70
+    stacked = np.vstack(all_projected)
+    mins = stacked.min(axis=0)
+    maxs = stacked.max(axis=0)
+    size = np.maximum(maxs - mins, 1e-6)
+    scale = min((width - margin * 2) / float(size[0]), (height - margin * 2) / float(size[1]))
+
+    def to_px(values):
+        values_np = np.asarray(values, dtype=np.float64)
+        px = (values_np[:, 0] - mins[0]) * scale + margin
+        py = (values_np[:, 1] - mins[1]) * scale + margin
+        return np.stack([px, py], axis=1)
+
+    image = Image.new("RGB", (width, height), (32, 40, 43))
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    for object_id, proxy in objects.items():
+        projected = projected_by_id.get(object_id)
+        if projected is None:
+            continue
+        pts = to_px(projected)
+        color = tuple(int(value) for value in semantic_preview_color(int(proxy.get("semantic_id", 0))))
+        for start, end in edge_pairs:
+            a = tuple(float(value) for value in pts[start])
+            b = tuple(float(value) for value in pts[end])
+            draw.line([a, b], fill=color, width=3)
+        center = np.asarray(proxy.get("center"), dtype=np.float64).reshape(1, 3)
+        center_projected = np.stack([center[:, 0] - center[:, 1] * 0.55, -center[:, 2] + center[:, 1] * 0.25], axis=1)
+        center_px = to_px(center_projected)[0]
+        r = 4
+        draw.ellipse((center_px[0] - r, center_px[1] - r, center_px[0] + r, center_px[1] + r), fill=color)
+        draw.text((float(center_px[0] + 6), float(center_px[1] - 6)), str(object_id), fill=(240, 240, 240), font=font)
+    image.save(path)
+    return {"enabled": True, "path": str(path), "object_count": len(objects), "renderer": "pillow_isometric_fallback", "fallback_reason": fallback_reason}
+
+
+def object_collider_max_diagonal_for_category(category: str, fallback: float) -> float:
+    slug = slugify(category, fallback="unknown")
+    return float(DEFAULT_OBJECT_COLLIDER_MAX_DIAGONAL_BY_CATEGORY.get(slug, fallback))
+
+
+def serializable_proxy_record(proxy: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in proxy.items() if key != "corners"}
+
+
+def relative_path_for_manifest(path_value: str | Path | None, base: Path) -> str | None:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        return str(path.resolve().relative_to(base.resolve()))
+    except Exception:
+        try:
+            return os.path.relpath(str(path), str(base))
+        except Exception:
+            return str(path_value)
+
+
+def unity_quaternion_xyzw_from_axes(axes_columns: Any) -> list[float]:
+    np = import_numpy()
+    axes = np.asarray(axes_columns, dtype=np.float64)
+    if axes.shape != (3, 3):
+        return [0.0, 0.0, 0.0, 1.0]
+    # Matrix columns are the OBB local axes in scene coordinates.
+    m00, m01, m02 = axes[0, 0], axes[0, 1], axes[0, 2]
+    m10, m11, m12 = axes[1, 0], axes[1, 1], axes[1, 2]
+    m20, m21, m22 = axes[2, 0], axes[2, 1], axes[2, 2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (m21 - m12) / s
+        qy = (m02 - m20) / s
+        qz = (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = math.sqrt(max(1.0 + m00 - m11 - m22, 1e-12)) * 2.0
+        qw = (m21 - m12) / s
+        qx = 0.25 * s
+        qy = (m01 + m10) / s
+        qz = (m02 + m20) / s
+    elif m11 > m22:
+        s = math.sqrt(max(1.0 + m11 - m00 - m22, 1e-12)) * 2.0
+        qw = (m02 - m20) / s
+        qx = (m01 + m10) / s
+        qy = 0.25 * s
+        qz = (m12 + m21) / s
+    else:
+        s = math.sqrt(max(1.0 + m22 - m00 - m11, 1e-12)) * 2.0
+        qw = (m10 - m01) / s
+        qx = (m02 + m20) / s
+        qy = (m12 + m21) / s
+        qz = 0.25 * s
+    quat = np.asarray([qx, qy, qz, qw], dtype=np.float64)
+    norm = float(np.linalg.norm(quat))
+    if not math.isfinite(norm) or norm < 1e-8:
+        return [0.0, 0.0, 0.0, 1.0]
+    quat = quat / norm
+    return [float(value) for value in quat.tolist()]
+
+
+def semantic_object_collider_engine_adapter_payload(
+    *,
+    project_root: Path,
+    output_dir: Path,
+    index_path: Path,
+    combined_obj: Path,
+    combined_ply: Path,
+    preview_path: Path,
+    objects: dict[str, dict[str, Any]],
+    skipped: dict[str, Any],
+    semantic_ply: Path,
+    semantic_manifest_path: Path,
+) -> dict[str, Any]:
+    adapter_objects = []
+    for object_id, proxy in objects.items():
+        center = [float(value) for value in proxy.get("center", [0.0, 0.0, 0.0])[:3]]
+        extent = [float(value) for value in proxy.get("extent", [0.0, 0.0, 0.0])[:3]]
+        axes = proxy.get("axes_columns")
+        obj_path = Path(proxy.get("path", ""))
+        adapter_objects.append(
+            {
+                "object_id": object_id,
+                "name": proxy.get("label") or object_id,
+                "category": proxy.get("category") or "unknown",
+                "semantic_id": int(proxy.get("semantic_id", 0)),
+                "asset_role": proxy.get("asset_role", "object"),
+                "collider": {
+                    "type": "oriented_box",
+                    "shape": "box",
+                    "source": proxy.get("source"),
+                    "coordinate_frame": "video2mesh_scene",
+                    "center": center,
+                    "extent": extent,
+                    "half_extent": [float(value) * 0.5 for value in extent],
+                    "axes_columns": axes,
+                    "rotation_xyzw": unity_quaternion_xyzw_from_axes(axes),
+                    "diagonal": float(proxy.get("diagonal", 0.0)),
+                    "mesh_path": str(obj_path),
+                    "mesh_relative": relative_path_for_manifest(obj_path, output_dir),
+                    "recommended_unity_component": "BoxCollider",
+                    "unity": {
+                        "game_object_position": center,
+                        "game_object_rotation_xyzw": unity_quaternion_xyzw_from_axes(axes),
+                        "box_collider_center": [0.0, 0.0, 0.0],
+                        "box_collider_size": extent,
+                        "mesh_collider_convex_fallback": str(obj_path),
+                    },
+                },
+                "debug": {
+                    "raw_point_count": int(proxy.get("raw_point_count", 0)),
+                    "central_point_count": int(proxy.get("central_point_count", 0)),
+                    "raw_aabb": proxy.get("raw_aabb"),
+                    "central_aabb": proxy.get("central_aabb"),
+                    "axis_crop": proxy.get("axis_crop"),
+                    "pca_crop": proxy.get("pca_crop"),
+                    "parameters": proxy.get("parameters"),
+                },
+            }
+        )
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "format": "semantic_3dgs_object_collider_adapter",
+        "coordinate_system": {
+            "frame": "video2mesh_scene",
+            "scale_to_meters": 1.0,
+            "up_axis": "unknown",
+            "notes": "Collider transforms are in the same reconstruction scene frame as the semantic 3DGS centers.",
+        },
+        "source": {
+            "project_root": str(project_root),
+            "semantic_splats_ply": str(semantic_ply),
+            "semantic_splats_manifest": str(semantic_manifest_path),
+            "collider_index": str(index_path),
+        },
+        "artifacts": {
+            "output_dir": str(output_dir),
+            "combined_obj": str(combined_obj),
+            "combined_obj_relative": relative_path_for_manifest(combined_obj, output_dir),
+            "combined_ply": str(combined_ply),
+            "combined_ply_relative": relative_path_for_manifest(combined_ply, output_dir),
+            "preview": str(preview_path) if preview_path.exists() else None,
+        },
+        "objects": adapter_objects,
+        "skipped_objects": skipped,
+        "usage": {
+            "visual_layer": "Render the 3DGS/SuperSplat asset separately.",
+            "static_scene_collision": "Use the cleaned COLMAP/Delaunay or Poisson scene mesh for room-scale static collision.",
+            "object_interaction_collision": "Instantiate these OBB records as BoxCollider triggers or colliders and map hits by object_id.",
+        },
+    }
+
+
+def cmd_export_semantic_3dgs_object_colliders(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = safe_read_json(project_manifest_path(project_root)) if project_manifest_path(project_root).exists() else None
+    if not isinstance(manifest, dict):
+        manifest = {"artifacts": {}, "simulator_assets_dir": "simulator_assets"}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    semantic_ply = (
+        resolve_project_cli_path(args.semantic_splats_ply, project_root)
+        if args.semantic_splats_ply
+        else resolve_existing_artifact_or_default(
+            project_root,
+            artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+            project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_gaussian_probabilities.ply",
+        )
+    )
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    if not semantic_ply.exists():
+        raise FileNotFoundError(f"Missing semantic PLY: {semantic_ply}")
+    if semantic_manifest_path is None or not semantic_manifest_path.exists():
+        raise FileNotFoundError("Missing semantic manifest. Pass --semantic-manifest so object ids/categories can be mapped.")
+    semantic_manifest = safe_read_json(semantic_manifest_path)
+    requested = {slugify(value, fallback="") for value in (args.object_ids or []) if slugify(value, fallback="")}
+    records = object_collider_records_from_semantic_manifest(semantic_manifest, requested)
+    if not records:
+        raise RuntimeError("No foreground semantic object records found for collider export.")
+
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_3dgs_object_colliders"))
+    semantic_points, semantic_labels, semantic_probabilities, _semantic_colors = read_semantic_ply_with_probabilities(semantic_ply)
+    if semantic_probabilities is None:
+        semantic_probabilities = np.ones((semantic_labels.shape[0],), dtype=np.float64)
+
+    excluded_categories = set(DEFAULT_OBJECT_COLLIDER_EXCLUDED_CATEGORY_SLUGS)
+    excluded_categories.update(slug_set_from_csv(args.exclude_categories))
+    include_categories = slug_set_from_csv(args.include_categories)
+    objects: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, Any] = {}
+    for record in records:
+        object_id = str(record["object_id"])
+        category = str(record.get("category") or "unknown")
+        category_slug = slugify(category, fallback="unknown")
+        semantic_id = int(record["semantic_id"])
+        asset_role = str(record.get("asset_role") or "")
+        if asset_role == "background_structure" and not bool(args.include_background_structures):
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": "background_structure"}
+            continue
+        if include_categories and category_slug not in include_categories:
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": "category_not_in_include_list"}
+            continue
+        if category_slug in excluded_categories and not requested:
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": "not_interactive_object_proxy_category"}
+            continue
+        selected = (semantic_labels == semantic_id) & (semantic_probabilities >= float(args.min_probability))
+        selected_points = semantic_points[selected]
+        raw_count = int(selected_points.shape[0])
+        if raw_count < int(args.min_points):
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": f"too_few_semantic_points:{raw_count}"}
+            continue
+        raw_bbox = bbox_for_points(selected_points)
+        axis_points, axis_crop, _axis_keep = robust_axis_quantile_filter(
+            selected_points,
+            float(args.axis_quantile_min),
+            float(args.axis_quantile_max),
+            float(args.axis_padding_ratio),
+        )
+        if axis_points.shape[0] < int(args.min_points_after_clean):
+            skipped[object_id] = {
+                "semantic_id": semantic_id,
+                "category": category,
+                "reason": f"too_few_clean_semantic_points:{int(axis_points.shape[0])}",
+                "raw_count": raw_count,
+            }
+            continue
+        obb = robust_pca_obb_from_points(
+            axis_points,
+            float(args.pca_quantile_min),
+            float(args.pca_quantile_max),
+            float(args.pca_padding_ratio),
+            float(args.min_extent),
+        )
+        max_diag = object_collider_max_diagonal_for_category(category, float(args.max_diagonal))
+        if max_diag > 0 and float(obb["diagonal"]) > max_diag and not requested:
+            skipped[object_id] = {
+                "semantic_id": semantic_id,
+                "category": category,
+                "reason": f"robust_proxy_too_large_diag:{float(obb['diagonal']):.3f}>{max_diag:.3f}",
+                "raw_count": raw_count,
+                "central_count": int(axis_points.shape[0]),
+                "robust_extent": obb["extent"],
+            }
+            continue
+        object_dir = ensure_dir(output_dir / "objects" / object_id)
+        obj_path = object_dir / f"{object_id}_robust_obb_collider.obj"
+        write_scene_obb_obj(obj_path, obb["corners"], name=object_id)
+        proxy_record = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "semantic_id": semantic_id,
+            "label": record.get("name") or object_id,
+            "category": category,
+            "asset_role": asset_role or "object",
+            "proxy_type": "robust_oriented_box",
+            "source": "semantic_3dgs_object_id_cleaned_by_quantile_pca",
+            "semantic_splats_ply": str(semantic_ply),
+            "semantic_splats_manifest": str(semantic_manifest_path),
+            "path": str(obj_path),
+            "coordinate_frame": "video2mesh_scene",
+            "center": obb["center"],
+            "axes_columns": obb["axes_columns"],
+            "extent": obb["extent"],
+            "diagonal": obb["diagonal"],
+            "corners": obb["corners"],
+            "raw_point_count": raw_count,
+            "central_point_count": int(axis_points.shape[0]),
+            "raw_aabb": raw_bbox,
+            "central_aabb": bbox_for_points(axis_points),
+            "axis_crop": axis_crop,
+            "pca_crop": obb["pca"],
+            "parameters": {
+                "min_probability": float(args.min_probability),
+                "min_points": int(args.min_points),
+                "min_points_after_clean": int(args.min_points_after_clean),
+                "axis_quantiles": [float(args.axis_quantile_min), float(args.axis_quantile_max)],
+                "axis_padding_ratio": float(args.axis_padding_ratio),
+                "pca_quantiles": [float(args.pca_quantile_min), float(args.pca_quantile_max)],
+                "pca_padding_ratio": float(args.pca_padding_ratio),
+                "min_extent": float(args.min_extent),
+                "max_diagonal": float(max_diag),
+            },
+            "unity": {
+                "recommended_collider": "BoxCollider or convex MeshCollider proxy",
+                "usage": "Attach this proxy to the interaction/collision layer; keep 3DGS as the visual layer.",
+            },
+        }
+        write_json(object_dir / "collider_proxy.json", serializable_proxy_record(proxy_record))
+        objects[object_id] = proxy_record
+
+    combined_obj = output_dir / "all_object_collider_proxies.obj"
+    combined_ply = output_dir / "all_object_collider_proxies.ply"
+    write_combined_obb_obj(combined_obj, objects)
+    write_combined_obb_ply(combined_ply, objects)
+    preview_path = output_dir / "object_collider_proxy_preview.png"
+    preview_report = write_object_collider_proxy_preview(preview_path, objects) if bool(args.preview) else {"enabled": False, "reason": "disabled"}
+    index_path = output_dir / "object_collider_proxies_index.json"
+    adapter_path = output_dir / "object_collider_engine_adapter.json"
+    adapter_payload = semantic_object_collider_engine_adapter_payload(
+        project_root=project_root,
+        output_dir=output_dir,
+        index_path=index_path,
+        combined_obj=combined_obj,
+        combined_ply=combined_ply,
+        preview_path=preview_path,
+        objects=objects,
+        skipped=skipped,
+        semantic_ply=semantic_ply,
+        semantic_manifest_path=semantic_manifest_path,
+    )
+    write_json(adapter_path, adapter_payload)
+    index_payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": "semantic_3dgs_object_robust_obb_collider_proxies",
+        "project_root": str(project_root),
+        "semantic_splats_ply": str(semantic_ply),
+        "semantic_splats_manifest": str(semantic_manifest_path),
+        "output_dir": str(output_dir),
+        "combined_ply": str(combined_ply),
+        "combined_obj": str(combined_obj),
+        "engine_adapter": str(adapter_path),
+        "preview": str(preview_path) if preview_report.get("enabled") else None,
+        "preview_report": preview_report,
+        "objects": {object_id: serializable_proxy_record(proxy) for object_id, proxy in objects.items()},
+        "skipped_objects": skipped,
+        "summary": {
+            "proxy_count": len(objects),
+            "skipped_count": len(skipped),
+            "semantic_source_point_count": int(semantic_points.shape[0]),
+            "notes": (
+                "Scene-level mesh semantic face coloring is unreliable when semantic PLY labels or a global Delaunay mesh bleed across object boundaries. "
+                "Use these object proxies as interaction/collider targets while 3DGS remains the visual layer."
+            ),
+        },
+    }
+    write_json(index_path, index_payload)
+    manifest.setdefault("artifacts", {})["semantic_3dgs_object_colliders"] = str(index_path)
+    manifest.setdefault("artifacts", {})["semantic_3dgs_object_collider_adapter"] = str(adapter_path)
+    manifest.setdefault("external_stages", {})["semantic_3dgs_object_colliders"] = {
+        "status": "completed",
+        "method": "semantic_3dgs_object_robust_obb_collider_proxies",
+        "semantic_splats_ply": str(semantic_ply),
+        "semantic_splats_manifest": str(semantic_manifest_path),
+        "output": str(index_path),
+        "engine_adapter": str(adapter_path),
+        "proxy_count": len(objects),
+        "skipped_count": len(skipped),
+    }
+    if project_manifest_path(project_root).exists():
+        save_manifest(project_root, manifest)
+    print(f"Exported {len(objects)} semantic 3DGS object collider proxy/proxies: {index_path}")
+    if skipped:
+        print(f"Skipped {len(skipped)} object(s).")
+    print(json.dumps(index_payload["summary"], indent=2, ensure_ascii=False))
+    return 0
+
+
+def auto_compound_voxel_size(points, bbox_hint: dict[str, Any] | None, args: argparse.Namespace) -> float:
+    np = import_numpy()
+    explicit = float(getattr(args, "voxel_size", 0.0) or 0.0)
+    if explicit > 0:
+        return explicit
+    target = max(4, int(getattr(args, "target_grid_resolution", 24) or 24))
+    min_size = max(1e-5, float(getattr(args, "min_auto_voxel_size", 0.08) or 0.08))
+    max_size = max(min_size, float(getattr(args, "max_auto_voxel_size", 1.25) or 1.25))
+    bbox = normalize_scene_aabb(bbox_hint) if bbox_hint else bbox_for_points(np.asarray(points, dtype=np.float64))
+    if bbox is None:
+        return min_size
+    size = np.asarray(bbox.get("size", [0.0, 0.0, 0.0]), dtype=np.float64)
+    positive = size[size > 1e-6]
+    if positive.size == 0:
+        return min_size
+    candidate = float(np.median(positive) / float(target))
+    return float(min(max(candidate, min_size), max_size))
+
+
+def compound_boxes_from_bbox_hint(bbox_hint: dict[str, Any], *, max_axis_boxes: int, max_boxes: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    np = import_numpy()
+    bbox = normalize_scene_aabb(bbox_hint)
+    if bbox is None:
+        return [], {"reason": "invalid_bbox_hint"}
+    lower = np.asarray(bbox["min"], dtype=np.float64)
+    upper = np.asarray(bbox["max"], dtype=np.float64)
+    size = np.maximum(upper - lower, 1e-6)
+    axis = int(np.argmax(size))
+    splits = max(1, min(int(max_axis_boxes), int(max_boxes)))
+    boxes: list[dict[str, Any]] = []
+    for index in range(splits):
+        bmin = lower.copy()
+        bmax = upper.copy()
+        bmin[axis] = lower[axis] + size[axis] * index / splits
+        bmax[axis] = lower[axis] + size[axis] * (index + 1) / splits
+        center = (bmin + bmax) * 0.5
+        extent = bmax - bmin
+        boxes.append(
+            {
+                "component": 0,
+                "bbox_min": [float(value) for value in bmin.tolist()],
+                "bbox_max": [float(value) for value in bmax.tolist()],
+                "center": [float(value) for value in center.tolist()],
+                "size": [float(value) for value in extent.tolist()],
+                "voxel_count": 0,
+                "point_count": 0,
+                "fallback": "bbox_hint_split",
+            }
+        )
+    return boxes, {
+        "method": "bbox_hint_split_fallback",
+        "source_bbox": bbox,
+        "split_axis": ["x", "y", "z"][axis],
+        "box_count": int(len(boxes)),
+        "max_axis_boxes": int(max_axis_boxes),
+        "max_boxes": int(max_boxes),
+    }
+
+
+def semantic_compound_collider_engine_adapter_payload(
+    *,
+    project_root: Path,
+    output_dir: Path,
+    index_path: Path,
+    combined_obj: Path,
+    combined_ply: Path,
+    objects: dict[str, dict[str, Any]],
+    skipped: dict[str, Any],
+    semantic_ply: Path,
+    semantic_manifest_path: Path,
+    bbox_sources: list[str],
+) -> dict[str, Any]:
+    adapter_objects = []
+    for object_id, record in objects.items():
+        obj_path = Path(record.get("path", ""))
+        adapter_boxes = []
+        for box_index, box in enumerate(record.get("boxes", [])):
+            center = [float(value) for value in box.get("center", [0.0, 0.0, 0.0])[:3]]
+            size = [float(value) for value in box.get("size", [0.0, 0.0, 0.0])[:3]]
+            adapter_boxes.append(
+                {
+                    "index": int(box_index),
+                    "center": center,
+                    "size": size,
+                    "half_extent": [float(value) * 0.5 for value in size],
+                    "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    "point_count": int(box.get("point_count", 0)),
+                    "voxel_count": int(box.get("voxel_count", 0)),
+                    "unity": {
+                        "child_name": f"{object_id}_compound_box_{box_index:03d}",
+                        "game_object_position": center,
+                        "game_object_rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        "box_collider_center": [0.0, 0.0, 0.0],
+                        "box_collider_size": size,
+                    },
+                }
+            )
+        adapter_objects.append(
+            {
+                "object_id": object_id,
+                "name": record.get("label") or object_id,
+                "category": record.get("category") or "unknown",
+                "semantic_id": int(record.get("semantic_id", 0)),
+                "asset_role": record.get("asset_role", "object"),
+                "collider": {
+                    "type": "compound_axis_aligned_boxes",
+                    "shape": "compound_box",
+                    "source": record.get("source"),
+                    "coordinate_frame": "video2mesh_scene",
+                    "box_count": int(len(adapter_boxes)),
+                    "boxes": adapter_boxes,
+                    "mesh_path": str(obj_path),
+                    "mesh_relative": relative_path_for_manifest(obj_path, output_dir),
+                    "recommended_unity_component": "BoxCollider",
+                    "recommended_setup": "Create a parent GameObject for this object_id and add child GameObjects with one BoxCollider per box.",
+                },
+                "debug": {
+                    "raw_point_count": int(record.get("raw_point_count", 0)),
+                    "semantic_selected_count": int(record.get("semantic_selected_count", 0)),
+                    "bbox_gate": record.get("bbox_gate"),
+                    "quantile_crop": record.get("quantile_crop"),
+                    "voxelization": record.get("voxelization"),
+                    "raw_aabb": record.get("raw_aabb"),
+                    "used_aabb": record.get("used_aabb"),
+                },
+            }
+        )
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "format": "semantic_3dgs_compound_collider_adapter",
+        "coordinate_system": {
+            "frame": "video2mesh_scene",
+            "scale_to_meters": 1.0,
+            "up_axis": "unknown",
+            "notes": "All compound box transforms are in the same reconstruction scene frame as the semantic 3DGS centers.",
+        },
+        "source": {
+            "project_root": str(project_root),
+            "semantic_splats_ply": str(semantic_ply),
+            "semantic_splats_manifest": str(semantic_manifest_path),
+            "bbox_sources": bbox_sources,
+            "collider_index": str(index_path),
+        },
+        "artifacts": {
+            "output_dir": str(output_dir),
+            "combined_obj": str(combined_obj),
+            "combined_obj_relative": relative_path_for_manifest(combined_obj, output_dir),
+            "combined_ply": str(combined_ply),
+            "combined_ply_relative": relative_path_for_manifest(combined_ply, output_dir),
+        },
+        "objects": adapter_objects,
+        "skipped_objects": skipped,
+        "usage": {
+            "visual_layer": "Render the 3DGS/SuperSplat asset separately.",
+            "static_scene_collision": "Use the cleaned COLMAP/Delaunay or Poisson scene mesh for room-scale static collision.",
+            "object_interaction_collision": "Use these compound BoxCollider records for object-level triggers/collision; map hits by object_id.",
+            "why_not_face_semantics": "Global scene meshes do not preserve object boundaries, and semantic Gaussian labels can bleed. This route gates labels by object bbox hints before voxelizing.",
+        },
+    }
+
+
+def cmd_export_semantic_3dgs_compound_colliders(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = safe_read_json(project_manifest_path(project_root)) if project_manifest_path(project_root).exists() else None
+    if not isinstance(manifest, dict):
+        manifest = {"artifacts": {}, "simulator_assets_dir": "simulator_assets"}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    semantic_ply = (
+        resolve_project_cli_path(args.semantic_splats_ply, project_root)
+        if args.semantic_splats_ply
+        else resolve_existing_artifact_or_default(
+            project_root,
+            artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+            project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_gaussian_probabilities.ply",
+        )
+    )
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    if not semantic_ply.exists():
+        raise FileNotFoundError(f"Missing semantic PLY: {semantic_ply}")
+    if semantic_manifest_path is None or not semantic_manifest_path.exists():
+        raise FileNotFoundError("Missing semantic manifest. Pass --semantic-manifest so object ids/categories can be mapped.")
+    semantic_manifest = safe_read_json(semantic_manifest_path)
+    requested = {slugify(value, fallback="") for value in (args.object_ids or []) if slugify(value, fallback="")}
+    records = object_collider_records_from_semantic_manifest(semantic_manifest, requested)
+    if not records:
+        raise RuntimeError("No foreground semantic object records found for compound collider export.")
+
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_3dgs_compound_colliders"))
+    semantic_points, semantic_labels, semantic_probabilities, _semantic_colors = read_semantic_ply_with_probabilities(semantic_ply)
+    if semantic_probabilities is None:
+        semantic_probabilities = np.ones((semantic_labels.shape[0],), dtype=np.float64)
+    bbox_hints, bbox_sources = load_object_bbox_hints(project_root, manifest, args.bbox_source)
+
+    excluded_categories = set(DEFAULT_OBJECT_COLLIDER_EXCLUDED_CATEGORY_SLUGS)
+    excluded_categories.update(slug_set_from_csv(args.exclude_categories))
+    include_categories = slug_set_from_csv(args.include_categories)
+    objects: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, Any] = {}
+    for record in records:
+        object_id = str(record["object_id"])
+        category = str(record.get("category") or "unknown")
+        category_slug = slugify(category, fallback="unknown")
+        semantic_id = int(record["semantic_id"])
+        asset_role = str(record.get("asset_role") or "")
+        if asset_role == "background_structure" and not bool(args.include_background_structures):
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": "background_structure"}
+            continue
+        if include_categories and category_slug not in include_categories:
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": "category_not_in_include_list"}
+            continue
+        if category_slug in excluded_categories and not requested:
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": "not_interactive_object_proxy_category"}
+            continue
+
+        selected = (semantic_labels == semantic_id) & (semantic_probabilities >= float(args.min_probability))
+        selected_points = semantic_points[selected]
+        raw_count = int(selected_points.shape[0])
+        if raw_count < int(args.min_points):
+            skipped[object_id] = {"semantic_id": semantic_id, "category": category, "reason": f"too_few_semantic_points:{raw_count}"}
+            continue
+        raw_aabb = bbox_for_points(selected_points)
+        bbox_hint = bbox_hints.get(object_id)
+        bbox_gate_report = {"enabled": False, "reason": "missing_bbox_hint"}
+        if bool(args.bbox_gate) and bbox_hint is not None:
+            expanded_bbox = expand_scene_aabb(bbox_hint, float(args.bbox_padding_ratio), float(args.bbox_min_padding))
+            keep = points_inside_scene_aabb(selected_points, expanded_bbox)
+            gated_points = selected_points[keep]
+            bbox_gate_report = {
+                "enabled": True,
+                "source_bbox": bbox_hint,
+                "expanded_bbox": expanded_bbox,
+                "kept_points": int(gated_points.shape[0]),
+                "removed_points": int(selected_points.shape[0] - gated_points.shape[0]),
+                "kept_ratio": float(gated_points.shape[0] / max(1, selected_points.shape[0])),
+            }
+            if gated_points.shape[0] >= int(args.min_points_after_gate) or (requested and gated_points.shape[0] >= 1):
+                selected_points = gated_points
+            elif bool(args.bbox_gate_fallback_keep_ungated):
+                bbox_gate_report["fallback"] = "too_few_points_after_bbox_gate_keep_ungated"
+            elif bool(args.bbox_hint_fallback):
+                selected_points = gated_points
+                bbox_gate_report["fallback"] = "too_few_points_after_bbox_gate_use_bbox_hint_fallback"
+            else:
+                skipped[object_id] = {
+                    "semantic_id": semantic_id,
+                    "category": category,
+                    "reason": f"too_few_points_after_bbox_gate:{int(gated_points.shape[0])}",
+                    "raw_count": raw_count,
+                    "bbox_gate": bbox_gate_report,
+                }
+                continue
+        elif bool(args.require_bbox_gate) and not requested:
+            skipped[object_id] = {
+                "semantic_id": semantic_id,
+                "category": category,
+                "reason": "missing_required_bbox_gate",
+                "raw_count": raw_count,
+            }
+            continue
+
+        using_bbox_hint_fallback = bool(args.bbox_hint_fallback) and bbox_hint is not None and selected_points.shape[0] < int(args.min_points_after_gate)
+        if selected_points.shape[0] < int(args.min_points_after_gate) and not using_bbox_hint_fallback:
+            skipped[object_id] = {
+                "semantic_id": semantic_id,
+                "category": category,
+                "reason": f"too_few_points_after_gate:{int(selected_points.shape[0])}",
+                "raw_count": raw_count,
+                "bbox_gate": bbox_gate_report,
+            }
+            continue
+
+        quantile_crop = {"enabled": False}
+        if bool(args.crop_to_quantile_bbox) and not using_bbox_hint_fallback:
+            cropped, _cropped_colors, quantile_crop_candidate, _keep = filter_points_by_quantile_bbox(
+                selected_points,
+                None,
+                float(args.bbox_quantile_min),
+                float(args.bbox_quantile_max),
+                float(args.quantile_padding_ratio),
+                return_mask=True,
+            )
+            quantile_crop = quantile_crop_candidate or {"enabled": True, "reason": "empty_or_invalid"}
+            quantile_crop["enabled"] = True
+            if cropped.shape[0] >= int(args.min_points_after_gate) or requested:
+                selected_points = cropped
+            else:
+                quantile_crop["fallback"] = "too_few_points_after_quantile_crop_keep_pre_crop"
+
+        if using_bbox_hint_fallback:
+            voxel_size = 0.0
+            boxes, voxelization = compound_boxes_from_bbox_hint(
+                bbox_hint,
+                max_axis_boxes=int(args.bbox_hint_fallback_max_axis_boxes),
+                max_boxes=int(args.max_boxes_per_object),
+            )
+            voxelization = {
+                **voxelization,
+                "source_point_count": int(selected_points.shape[0]),
+                "selected_box_count": int(len(boxes)),
+                "fallback_reason": "semantic_points_too_sparse_or_misaligned_after_bbox_gate",
+            }
+        else:
+            voxel_size = auto_compound_voxel_size(selected_points, bbox_hint, args)
+            boxes, voxelization = compound_collider_boxes_from_points(
+                selected_points,
+                voxel_size=voxel_size,
+                max_boxes=int(args.max_boxes_per_object),
+                min_component_voxels=int(args.min_component_voxels),
+                max_components=int(args.max_components),
+                box_quantile_min=float(args.box_quantile_min),
+                box_quantile_max=float(args.box_quantile_max),
+                box_padding_ratio=float(args.box_padding_ratio),
+                min_box_extent=float(args.min_box_extent),
+            )
+        if not boxes:
+            if bool(args.bbox_hint_fallback) and bbox_hint is not None:
+                boxes, fallback_voxelization = compound_boxes_from_bbox_hint(
+                    bbox_hint,
+                    max_axis_boxes=int(args.bbox_hint_fallback_max_axis_boxes),
+                    max_boxes=int(args.max_boxes_per_object),
+                )
+                voxelization = {
+                    **fallback_voxelization,
+                    "source_point_count": int(selected_points.shape[0]),
+                    "selected_box_count": int(len(boxes)),
+                    "fallback_reason": "no_voxel_compound_boxes",
+                    "failed_voxelization": voxelization,
+                }
+                using_bbox_hint_fallback = True
+            if not boxes:
+                skipped[object_id] = {
+                    "semantic_id": semantic_id,
+                    "category": category,
+                    "reason": "no_compound_boxes",
+                    "raw_count": raw_count,
+                    "used_count": int(selected_points.shape[0]),
+                    "voxelization": voxelization,
+                }
+                continue
+
+        object_dir = ensure_dir(output_dir / "objects" / object_id)
+        obj_path = object_dir / f"{object_id}_compound_box_collider.obj"
+        ply_path = object_dir / f"{object_id}_compound_box_collider.ply"
+        object_record = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "semantic_id": semantic_id,
+            "label": record.get("name") or object_id,
+            "category": category,
+            "asset_role": asset_role or "object",
+            "proxy_type": "compound_axis_aligned_boxes",
+            "source": "bbox_hint_fallback_no_semantic_points" if using_bbox_hint_fallback else "semantic_3dgs_object_id_bbox_gated_voxel_compound_collider",
+            "semantic_splats_ply": str(semantic_ply),
+            "semantic_splats_manifest": str(semantic_manifest_path),
+            "path": str(obj_path),
+            "ply_path": str(ply_path),
+            "coordinate_frame": "video2mesh_scene",
+            "boxes": boxes,
+            "box_count": int(len(boxes)),
+            "raw_point_count": raw_count,
+            "semantic_selected_count": int(selected.sum()),
+            "used_point_count": int(selected_points.shape[0]),
+            "raw_aabb": raw_aabb,
+            "used_aabb": bbox_for_points(selected_points),
+            "bbox_hint": bbox_hint,
+            "bbox_gate": bbox_gate_report,
+            "quantile_crop": quantile_crop,
+            "voxelization": voxelization,
+            "fallback": "bbox_hint" if using_bbox_hint_fallback else None,
+            "parameters": {
+                "min_probability": float(args.min_probability),
+                "min_points": int(args.min_points),
+                "min_points_after_gate": int(args.min_points_after_gate),
+                "bbox_gate": bool(args.bbox_gate),
+                "bbox_padding_ratio": float(args.bbox_padding_ratio),
+                "bbox_min_padding": float(args.bbox_min_padding),
+                "voxel_size": float(voxel_size),
+                "max_boxes_per_object": int(args.max_boxes_per_object),
+                "min_component_voxels": int(args.min_component_voxels),
+                "max_components": int(args.max_components),
+                "bbox_hint_fallback": bool(args.bbox_hint_fallback),
+                "bbox_hint_fallback_max_axis_boxes": int(args.bbox_hint_fallback_max_axis_boxes),
+            },
+            "unity": {
+                "recommended_collider": "compound BoxCollider children",
+                "usage": "Attach boxes as child BoxCollider triggers/colliders; keep 3DGS as the visual layer.",
+            },
+        }
+        write_combined_aabb_boxes_obj(obj_path, {object_id: object_record}, comment="Video2Mesh per-object compound scene-coordinate BoxCollider proxy")
+        write_combined_aabb_boxes_ply(ply_path, {object_id: object_record})
+        write_json(object_dir / "compound_collider.json", object_record)
+        objects[object_id] = object_record
+
+    combined_obj = output_dir / "all_object_compound_colliders.obj"
+    combined_ply = output_dir / "all_object_compound_colliders.ply"
+    write_combined_aabb_boxes_obj(combined_obj, objects, comment="Video2Mesh combined scene-coordinate compound BoxCollider proxies")
+    write_combined_aabb_boxes_ply(combined_ply, objects)
+    index_path = output_dir / "object_compound_colliders_index.json"
+    adapter_path = output_dir / "object_compound_collider_engine_adapter.json"
+    adapter_payload = semantic_compound_collider_engine_adapter_payload(
+        project_root=project_root,
+        output_dir=output_dir,
+        index_path=index_path,
+        combined_obj=combined_obj,
+        combined_ply=combined_ply,
+        objects=objects,
+        skipped=skipped,
+        semantic_ply=semantic_ply,
+        semantic_manifest_path=semantic_manifest_path,
+        bbox_sources=bbox_sources,
+    )
+    write_json(adapter_path, adapter_payload)
+    index_payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": "semantic_3dgs_object_bbox_gated_voxel_compound_colliders",
+        "project_root": str(project_root),
+        "semantic_splats_ply": str(semantic_ply),
+        "semantic_splats_manifest": str(semantic_manifest_path),
+        "bbox_sources": bbox_sources,
+        "output_dir": str(output_dir),
+        "combined_ply": str(combined_ply),
+        "combined_obj": str(combined_obj),
+        "engine_adapter": str(adapter_path),
+        "objects": objects,
+        "skipped_objects": skipped,
+        "summary": {
+            "object_count": len(objects),
+            "box_count": int(sum(len(item.get("boxes", [])) for item in objects.values())),
+            "skipped_count": len(skipped),
+            "semantic_source_point_count": int(semantic_points.shape[0]),
+            "bbox_source_count": len(bbox_sources),
+            "notes": (
+                "This collider route is intentionally more conservative than semantic face coloring. "
+                "It gates noisy semantic 3DGS labels by object bbox hints, removes small voxel components, "
+                "and exports compound BoxCollider proxies for interaction while 3DGS remains the visual layer."
+            ),
+        },
+    }
+    write_json(index_path, index_payload)
+    manifest.setdefault("artifacts", {})["semantic_3dgs_compound_colliders"] = str(index_path)
+    manifest.setdefault("artifacts", {})["semantic_3dgs_compound_collider_adapter"] = str(adapter_path)
+    manifest.setdefault("external_stages", {})["semantic_3dgs_compound_colliders"] = {
+        "status": "completed",
+        "method": "semantic_3dgs_object_bbox_gated_voxel_compound_colliders",
+        "semantic_splats_ply": str(semantic_ply),
+        "semantic_splats_manifest": str(semantic_manifest_path),
+        "output": str(index_path),
+        "engine_adapter": str(adapter_path),
+        "object_count": len(objects),
+        "box_count": index_payload["summary"]["box_count"],
+        "skipped_count": len(skipped),
+    }
+    if project_manifest_path(project_root).exists():
+        save_manifest(project_root, manifest)
+    print(f"Exported {len(objects)} semantic 3DGS compound collider object(s): {index_path}")
+    print(json.dumps(index_payload["summary"], indent=2, ensure_ascii=False))
+    if skipped:
+        print(f"Skipped {len(skipped)} object(s).")
+    return 0
+
+
+def mesh_face_inner_samples(vertices, triangles, mode: str):
+    np = import_numpy()
+    tri = vertices[triangles]
+    a = tri[:, 0, :]
+    b = tri[:, 1, :]
+    c = tri[:, 2, :]
+    center = (a + b + c) / 3.0
+    if mode == "center":
+        samples = [center]
+    elif mode == "inner4":
+        samples = [
+            center,
+            0.60 * a + 0.20 * b + 0.20 * c,
+            0.20 * a + 0.60 * b + 0.20 * c,
+            0.20 * a + 0.20 * b + 0.60 * c,
+        ]
+    elif mode == "inner7":
+        samples = [
+            center,
+            0.60 * a + 0.20 * b + 0.20 * c,
+            0.20 * a + 0.60 * b + 0.20 * c,
+            0.20 * a + 0.20 * b + 0.60 * c,
+            0.45 * a + 0.45 * b + 0.10 * c,
+            0.10 * a + 0.45 * b + 0.45 * c,
+            0.45 * a + 0.10 * b + 0.45 * c,
+        ]
+    else:
+        raise ValueError("--face-sample-mode must be center, inner4, or inner7")
+    stacked = np.stack(samples, axis=1)
+    return stacked.reshape(-1, 3), int(stacked.shape[1])
+
+
+def projected_semantic_label_buffers(
+    semantic_points,
+    semantic_labels,
+    semantic_probabilities,
+    intrinsic: dict[str, float],
+    world_to_camera,
+    *,
+    min_probability: float,
+):
+    np = import_numpy()
+    width = int(intrinsic["w"])
+    height = int(intrinsic["h"])
+    label_flat = np.zeros((width * height,), dtype=np.int64)
+    probability_flat = np.zeros((width * height,), dtype=np.float64)
+    depth_flat = np.full((width * height,), np.inf, dtype=np.float64)
+    inside, u, v, z = project_points(semantic_points, intrinsic, world_to_camera)
+    keep = inside & (semantic_labels > 0)
+    if min_probability > 0:
+        keep &= semantic_probabilities >= float(min_probability)
+    selected = np.flatnonzero(keep)
+    if selected.size == 0:
+        return label_flat, probability_flat, depth_flat, {"inside": int(inside.sum()), "selected": 0, "labeled_pixels": 0}
+    pixel = v[selected] * width + u[selected]
+    selected_depth = z[selected]
+    np.minimum.at(depth_flat, pixel, selected_depth)
+    nearest = selected_depth <= depth_flat[pixel] + 1e-9
+    nearest_indices = selected[nearest]
+    nearest_pixels = pixel[nearest]
+    label_flat[nearest_pixels] = semantic_labels[nearest_indices].astype(np.int64)
+    probability_flat[nearest_pixels] = semantic_probabilities[nearest_indices].astype(np.float64)
+    return (
+        label_flat,
+        probability_flat,
+        depth_flat,
+        {
+            "inside": int(inside.sum()),
+            "selected": int(selected.size),
+            "labeled_pixels": int((label_flat > 0).sum()),
+        },
+    )
+
+
+def evenly_sample_frame_ids(frame_ids: list[str], max_frames: int) -> list[str]:
+    np = import_numpy()
+    if int(max_frames) <= 0 or len(frame_ids) <= int(max_frames):
+        return frame_ids
+    positions = np.linspace(0, len(frame_ids) - 1, int(max_frames))
+    indices = []
+    seen = set()
+    for value in positions:
+        index = int(round(float(value)))
+        index = max(0, min(len(frame_ids) - 1, index))
+        if index not in seen:
+            indices.append(index)
+            seen.add(index)
+    return [frame_ids[index] for index in indices]
+
+
+def cmd_transfer_mesh_semantics_projected_splats(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {"artifacts": {}, "simulator_assets_dir": "simulator_assets"}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+
+    mesh_path = resolve_project_cli_path(args.mesh, project_root)
+    semantic_ply = (
+        resolve_project_cli_path(args.semantic_splats_ply, project_root)
+        if args.semantic_splats_ply
+        else resolve_existing_artifact_or_default(
+            project_root,
+            artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+            project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_gaussian_probabilities.ply",
+        )
+    )
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    camera_info_path = (
+        resolve_project_cli_path(args.camera_info, project_root)
+        if args.camera_info
+        else resolve_existing_artifact_or_default(
+            project_root,
+            artifacts.get("camera_info"),
+            project_root / manifest.get("scene", {}).get("camera_info", "scene/cameras/camera_info.json"),
+        )
+    )
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "mesh_semantics_projected_splats"))
+    output_json = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / f"{mesh_path.stem}_mesh_semantics_projected_splats.json"
+    debug_ply = resolve_project_cli_path(args.debug_ply, project_root) if args.debug_ply else output_dir / f"{mesh_path.stem}_semantic_projected_splats_debug.ply"
+
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing mesh: {mesh_path}")
+    if not semantic_ply.exists():
+        raise FileNotFoundError(f"Missing semantic PLY: {semantic_ply}")
+    if not camera_info_path.exists():
+        raise FileNotFoundError(f"Missing camera_info: {camera_info_path}")
+
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
+    semantic_points, semantic_labels, semantic_probabilities, _semantic_colors = read_semantic_ply_with_probabilities(semantic_ply)
+    if semantic_probabilities is None:
+        semantic_probabilities = np.ones((semantic_labels.shape[0],), dtype=np.float64)
+    semantic_points, semantic_labels, semantic_probabilities, sampling_info = downsample_semantic_transfer_source(
+        semantic_points,
+        semantic_labels,
+        semantic_probabilities,
+        int(args.semantic_max_points),
+        int(args.semantic_min_points_per_label),
+        int(args.seed),
+    )
+
+    vertices, triangles, mesh_reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+    bbox = bbox_for_points(vertices)
+    sample_points, samples_per_face = mesh_face_inner_samples(vertices, triangles, args.face_sample_mode)
+    sample_face_indices = np.repeat(np.arange(int(triangles.shape[0]), dtype=np.int64), int(samples_per_face))
+    camera_info = load_camera_info(camera_info_path)
+    requested_frame_ids = [frame_stem(item) for item in args.frame_ids.split(",") if item.strip()] if args.frame_ids else []
+    available_frame_ids = sorted([frame_stem(key) for key in camera_info.get("extrinsic", {}).keys()], key=frame_id_sort_key)
+    if not requested_frame_ids:
+        requested_frame_ids = available_frame_ids
+    requested_frame_ids = evenly_sample_frame_ids(requested_frame_ids, int(args.max_frames))
+    if not requested_frame_ids:
+        raise RuntimeError("No frame ids available for projected semantic splat mesh fusion.")
+
+    label_max = int(max(0, int(np.max(semantic_labels)) if semantic_labels.size else 0))
+    face_count = int(triangles.shape[0])
+    score_by_label = np.zeros((face_count, label_max + 1), dtype=np.float64)
+    hit_by_label = np.zeros((face_count, label_max + 1), dtype=np.int64)
+    depth_delta_sum_by_label = np.zeros((face_count, label_max + 1), dtype=np.float64)
+    visible_by_face = np.zeros((face_count,), dtype=np.int64)
+    frame_reports: list[dict[str, Any]] = []
+    radius = max(0, int(args.sample_pixel_radius))
+    offsets = [
+        (dx, dy, dx * dx + dy * dy)
+        for dy in range(-radius, radius + 1)
+        for dx in range(-radius, radius + 1)
+        if dx * dx + dy * dy <= radius * radius
+    ]
+    pixel_sigma = max(float(args.pixel_sigma), 1e-6)
+
+    for frame_id in requested_frame_ids:
+        intrinsic = intrinsic_for_frame(camera_info, frame_id)
+        extrinsic = resolve_extrinsic(camera_info["extrinsic"], frame_id)
+        if extrinsic is None:
+            frame_reports.append({"frame_id": frame_id, "status": "skipped_missing_extrinsic"})
+            continue
+        width = int(intrinsic["w"])
+        height = int(intrinsic["h"])
+        w2c = world_to_camera_matrix(extrinsic, camera_info.get("extrinsic_type") or args.extrinsic_type)
+
+        semantic_label_flat, semantic_prob_flat, semantic_depth_flat, semantic_report = projected_semantic_label_buffers(
+            semantic_points,
+            semantic_labels,
+            semantic_probabilities,
+            intrinsic,
+            w2c,
+            min_probability=float(args.semantic_min_probability),
+        )
+        inside, u, v, z = project_points(sample_points, intrinsic, w2c)
+        if args.occlusion_filter:
+            visible, _zbuf = visibility_mask_from_projection(
+                inside,
+                u,
+                v,
+                z,
+                width,
+                height,
+                float(args.mesh_depth_tolerance),
+                float(args.mesh_relative_depth_tolerance),
+            )
+        else:
+            visible = inside
+        visible_indices = np.flatnonzero(visible)
+        visible_faces = sample_face_indices[visible_indices]
+        if visible_faces.size:
+            np.add.at(visible_by_face, visible_faces, 1)
+        matched_hits = 0
+        matched_samples = np.zeros((visible_indices.size,), dtype=bool)
+        if visible_indices.size:
+            base_u = u[visible_indices]
+            base_v = v[visible_indices]
+            base_z = z[visible_indices]
+            base_faces = visible_faces
+            for dx, dy, dist2 in offsets:
+                uu = base_u + int(dx)
+                vv = base_v + int(dy)
+                inside_pixel = (uu >= 0) & (uu < width) & (vv >= 0) & (vv < height)
+                if not bool(inside_pixel.any()):
+                    continue
+                pixel = vv[inside_pixel] * width + uu[inside_pixel]
+                labels_here = semantic_label_flat[pixel]
+                active = labels_here > 0
+                if not bool(active.any()):
+                    continue
+                depth_here = semantic_depth_flat[pixel]
+                target_z = base_z[inside_pixel]
+                depth_delta = np.abs(depth_here - target_z)
+                tolerance = float(args.depth_tolerance) + float(args.relative_depth_tolerance) * np.maximum(target_z, 1e-6)
+                active &= np.isfinite(depth_here) & (depth_delta <= tolerance)
+                if not bool(active.any()):
+                    continue
+                probability = semantic_prob_flat[pixel][active]
+                labels_active = labels_here[active].astype(np.int64)
+                faces_active = base_faces[inside_pixel][active].astype(np.int64)
+                depth_delta_active = depth_delta[active].astype(np.float64)
+                tolerance_active = np.maximum(tolerance[active].astype(np.float64), 1e-6)
+                pixel_weight = math.exp(-0.5 * float(dist2) / (pixel_sigma * pixel_sigma))
+                depth_weight = np.exp(-0.5 * (depth_delta_active / tolerance_active) ** 2)
+                weights = probability.astype(np.float64) * float(pixel_weight) * depth_weight
+                np.add.at(score_by_label, (faces_active, labels_active), weights)
+                np.add.at(hit_by_label, (faces_active, labels_active), 1)
+                np.add.at(depth_delta_sum_by_label, (faces_active, labels_active), depth_delta_active)
+                matched_hits += int(faces_active.size)
+                visible_positions = np.flatnonzero(inside_pixel)[active]
+                matched_samples[visible_positions] = True
+        frame_reports.append(
+            {
+                "frame_id": frame_stem(frame_id),
+                "status": "voted",
+                "semantic_inside_points": semantic_report["inside"],
+                "semantic_selected_points": semantic_report["selected"],
+                "semantic_labeled_pixels": semantic_report["labeled_pixels"],
+                "inside_mesh_samples": int(inside.sum()),
+                "visible_mesh_samples": int(visible.sum()),
+                "matched_mesh_samples": int(matched_samples.sum()),
+                "projection_hits": int(matched_hits),
+            }
+        )
+
+    positive_scores = score_by_label[:, 1:] if label_max >= 1 else np.zeros((face_count, 0), dtype=np.float64)
+    total_scores = positive_scores.sum(axis=1) if positive_scores.size else np.zeros((face_count,), dtype=np.float64)
+    if positive_scores.size:
+        best_offsets = np.argmax(positive_scores, axis=1)
+        best_labels = best_offsets + 1
+        best_scores = score_by_label[np.arange(face_count), best_labels]
+        best_hits = hit_by_label[np.arange(face_count), best_labels]
+        best_depth_delta_sum = depth_delta_sum_by_label[np.arange(face_count), best_labels]
+    else:
+        best_labels = np.zeros((face_count,), dtype=np.int64)
+        best_scores = np.zeros((face_count,), dtype=np.float64)
+        best_hits = np.zeros((face_count,), dtype=np.int64)
+        best_depth_delta_sum = np.zeros((face_count,), dtype=np.float64)
+    confidence = np.zeros((face_count,), dtype=np.float64)
+    valid_total = total_scores > 0
+    confidence[valid_total] = best_scores[valid_total] / np.maximum(total_scores[valid_total], 1e-12)
+    hit_total = hit_by_label[:, 1:].sum(axis=1) if label_max >= 1 else np.zeros((face_count,), dtype=np.int64)
+    face_probability = np.zeros((face_count,), dtype=np.float64)
+    valid_hits = hit_total > 0
+    face_probability[valid_hits] = best_hits[valid_hits] / np.maximum(hit_total[valid_hits], 1)
+    face_mean_depth_delta = np.full((face_count,), np.inf, dtype=np.float64)
+    face_mean_depth_delta[best_hits > 0] = best_depth_delta_sum[best_hits > 0] / np.maximum(best_hits[best_hits > 0], 1)
+
+    face_labels = np.zeros((face_count,), dtype=np.int64)
+    keep_faces = (
+        valid_total
+        & (visible_by_face >= int(args.min_visible_samples))
+        & (best_hits >= int(args.min_projected_votes))
+        & (confidence >= float(args.min_vote_confidence))
+        & (face_probability >= float(args.min_face_probability))
+    )
+    face_labels[keep_faces] = best_labels[keep_faces].astype(np.int64)
+    face_probabilities = np.where(keep_faces, np.clip(face_probability, 0.0, 1.0), 0.0)
+    face_vote_confidence = np.where(keep_faces, np.clip(confidence, 0.0, 1.0), 0.0)
+    face_mean_distance = np.where(keep_faces, face_mean_depth_delta, np.inf)
+    face_neighbor_count = np.where(keep_faces, best_hits, 0).astype(np.int64)
+
+    rejected_by_votes = int((valid_total & ~keep_faces).sum())
+    if args.smooth_iterations > 0:
+        face_labels, face_probabilities = smooth_face_labels(
+            face_labels,
+            face_probabilities,
+            mesh_triangle_adjacency(triangles),
+            args.smooth_iterations,
+            args.smooth_keep_probability,
+            args.smooth_min_neighbors,
+        )
+    face_labels, face_probabilities, rejected_by_region = apply_face_region_cleanup(face_labels, face_probabilities, triangles, int(args.min_region_faces))
+    write_face_semantic_debug_ply(debug_ply, vertices, triangles, face_labels, face_probabilities)
+    legend = semantic_legend_from_manifest(semantic_manifest if isinstance(semantic_manifest, dict) else None, semantic_labels)
+    payload = semantic_face_payload(
+        method="projected_semantic_splat_mesh_surface_fusion",
+        project_root=project_root,
+        mesh_path=mesh_path,
+        semantic_manifest_path=semantic_manifest_path,
+        debug_ply=debug_ply,
+        vertices=vertices,
+        triangles=triangles,
+        face_labels=face_labels,
+        face_probabilities=face_probabilities,
+        face_vote_confidence=face_vote_confidence,
+        face_mean_distance=face_mean_distance,
+        face_neighbor_count=face_neighbor_count,
+        legend=legend,
+        bbox=bbox,
+        parameters={
+            "semantic_splats_ply": str(semantic_ply),
+            "camera_info": str(camera_info_path),
+            "face_sample_mode": args.face_sample_mode,
+            "samples_per_face": int(samples_per_face),
+            "frame_ids": requested_frame_ids,
+            "max_frames": int(args.max_frames),
+            "sample_pixel_radius": int(args.sample_pixel_radius),
+            "pixel_sigma": float(args.pixel_sigma),
+            "semantic_min_probability": float(args.semantic_min_probability),
+            "depth_tolerance": float(args.depth_tolerance),
+            "relative_depth_tolerance": float(args.relative_depth_tolerance),
+            "mesh_depth_tolerance": float(args.mesh_depth_tolerance),
+            "mesh_relative_depth_tolerance": float(args.mesh_relative_depth_tolerance),
+            "min_visible_samples": int(args.min_visible_samples),
+            "min_projected_votes": int(args.min_projected_votes),
+            "min_face_probability": float(args.min_face_probability),
+            "min_vote_confidence": float(args.min_vote_confidence),
+            "smooth_iterations": int(args.smooth_iterations),
+            "smooth_keep_probability": float(args.smooth_keep_probability),
+            "smooth_min_neighbors": int(args.smooth_min_neighbors),
+            "min_region_faces": int(args.min_region_faces),
+            "semantic_max_points": int(args.semantic_max_points),
+            "semantic_min_points_per_label": int(args.semantic_min_points_per_label),
+            "seed": int(args.seed),
+            "mesh_reader": mesh_reader,
+        },
+        extra_summary={
+            "semantic_source_point_count": int(semantic_points.shape[0]),
+            "semantic_source_foreground_count": int((semantic_labels > 0).sum()),
+            "semantic_source_sampling": sampling_info,
+            "frame_count": int(len(requested_frame_ids)),
+            "total_visible_sample_observations": int(visible_by_face.sum()),
+            "total_projected_semantic_hits": int(hit_by_label[:, 1:].sum()) if label_max >= 1 else 0,
+            "faces_with_any_projected_votes": int(valid_total.sum()),
+            "rejected_by_votes": int(rejected_by_votes),
+            "rejected_by_region": int(rejected_by_region),
+            "frame_reports": frame_reports[: min(len(frame_reports), 20)],
+        },
+        extra_payload={
+            "semantic_splats_ply": str(semantic_ply),
+            "camera_info": str(camera_info_path),
+            "frame_reports": frame_reports,
+        },
+    )
+    write_json(output_json, payload)
+    manifest.setdefault("artifacts", {})["mesh_semantics_projected_splats"] = str(output_json)
+    manifest["artifacts"]["mesh_semantics_projected_splats_debug_ply"] = str(debug_ply)
+    manifest.setdefault("external_stages", {})["mesh_semantic_projected_splats_backfill"] = {
+        "status": "completed",
+        "method": "projected_semantic_splat_mesh_surface_fusion",
+        "mesh": str(mesh_path),
+        "semantic_splats_ply": str(semantic_ply),
+        "camera_info": str(camera_info_path),
+        "output": str(output_json),
+        "debug_ply": str(debug_ply),
+        "assigned_face_count": payload["summary"]["assigned_face_count"],
+        "mesh_face_count": payload["summary"]["mesh_face_count"],
+    }
+    save_manifest(project_root, manifest)
+    print(f"Wrote projected-splat mesh semantics: {output_json}")
+    print(f"Wrote semantic debug mesh: {debug_ply}")
+    print(json.dumps(payload["summary"], indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_transfer_mesh_semantics_local(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {"artifacts": {}, "simulator_assets_dir": "simulator_assets"}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    semantic_ply = (
+        resolve_project_cli_path(args.semantic_splats_ply, project_root)
+        if args.semantic_splats_ply
+        else resolve_existing_artifact_or_default(
+            project_root,
+            artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+            project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_gaussian_probabilities.ply",
+        )
+    )
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    mesh_path = resolve_project_cli_path(args.mesh, project_root)
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "mesh_semantics_local"))
+    output_json = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / f"{mesh_path.stem}_mesh_semantics_local.json"
+    debug_ply = resolve_project_cli_path(args.debug_ply, project_root) if args.debug_ply else output_dir / f"{mesh_path.stem}_semantic_local_debug.ply"
+    if not semantic_ply.exists():
+        raise FileNotFoundError(f"Missing semantic PLY: {semantic_ply}")
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing mesh: {mesh_path}")
+
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
+    semantic_points, semantic_labels, semantic_probabilities, _semantic_colors = read_semantic_ply_with_probabilities(semantic_ply)
+    if semantic_probabilities is None:
+        semantic_probabilities = np.ones((semantic_labels.shape[0],), dtype=np.float64)
+    semantic_points, semantic_labels, semantic_probabilities, sampling_info = downsample_semantic_transfer_source(
+        semantic_points,
+        semantic_labels,
+        semantic_probabilities,
+        int(args.semantic_max_points),
+        int(args.semantic_min_points_per_label),
+        int(args.seed),
+    )
+
+    label_bboxes = semantic_label_robust_bboxes(
+        semantic_points,
+        semantic_labels,
+        semantic_probabilities,
+        quantile=float(args.label_bbox_quantile),
+        padding_ratio=float(args.label_bbox_padding_ratio),
+        min_probability=float(args.bbox_min_probability),
+    )
+    vertices, triangles, mesh_reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+    bbox = bbox_for_points(vertices)
+    bbox_diag = float(vector_diagonal(bbox.get("size")) or 0.0) if isinstance(bbox, dict) else 0.0
+    max_distance = args.max_distance
+    if max_distance is None and args.max_distance_ratio and bbox_diag > 0:
+        max_distance = float(bbox_diag) * float(args.max_distance_ratio)
+
+    sample_points, samples_per_face = mesh_face_inner_samples(vertices, triangles, args.face_sample_mode)
+    neighbor_indices, neighbor_distances, engine = nearest_source_neighbors(semantic_points, sample_points, args.k, max_distance=max_distance)
+    source_labels = semantic_labels[neighbor_indices]
+    source_probs = semantic_probabilities[neighbor_indices]
+    valid = np.isfinite(neighbor_distances)
+    if max_distance is not None:
+        valid &= neighbor_distances <= float(max_distance)
+    valid &= source_labels > 0
+
+    face_count = int(triangles.shape[0])
+    face_labels = np.zeros((face_count,), dtype=np.int64)
+    face_probabilities = np.zeros((face_count,), dtype=np.float64)
+    face_vote_confidence = np.zeros((face_count,), dtype=np.float64)
+    face_mean_distance = np.full((face_count,), np.inf, dtype=np.float64)
+    face_neighbor_count = np.zeros((face_count,), dtype=np.int64)
+    rejected_by_distance = 0
+    rejected_by_bbox = 0
+    rejected_by_support = 0
+    rejected_by_probability = 0
+
+    for face_index in range(face_count):
+        start = face_index * samples_per_face
+        end = start + samples_per_face
+        sample_slice = sample_points[start:end]
+        labels_slice = source_labels[start:end]
+        probs_slice = source_probs[start:end]
+        distances_slice = neighbor_distances[start:end]
+        valid_slice = valid[start:end].copy()
+        if not bool(valid_slice.any()):
+            rejected_by_distance += 1
+            continue
+        label_scores: dict[int, float] = {}
+        label_prob_sums: dict[int, float] = {}
+        label_distances: dict[int, list[float]] = {}
+        label_sample_support: dict[int, set[int]] = {}
+        total_score = 0.0
+        for sample_index in range(samples_per_face):
+            for nbr_index in range(int(args.k)):
+                if not bool(valid_slice[sample_index, nbr_index]):
+                    continue
+                label = int(labels_slice[sample_index, nbr_index])
+                if not bool(points_inside_label_bbox(sample_slice[sample_index : sample_index + 1], label, label_bboxes)[0]):
+                    rejected_by_bbox += 1
+                    continue
+                dist = float(distances_slice[sample_index, nbr_index])
+                prob = float(probs_slice[sample_index, nbr_index])
+                weight = prob / (max(dist, float(args.distance_epsilon)) ** float(args.distance_power))
+                label_scores[label] = label_scores.get(label, 0.0) + weight
+                label_prob_sums[label] = label_prob_sums.get(label, 0.0) + prob
+                label_distances.setdefault(label, []).append(dist)
+                label_sample_support.setdefault(label, set()).add(sample_index)
+                total_score += weight
+        if not label_scores or total_score <= 0:
+            rejected_by_bbox += 1
+            continue
+        best_label, best_score = max(label_scores.items(), key=lambda item: (item[1], item[0]))
+        support = len(label_sample_support.get(best_label, set())) / max(1, samples_per_face)
+        confidence = float(best_score / max(total_score, 1e-12))
+        probability = float(label_prob_sums.get(best_label, 0.0) / max(1, len(label_distances.get(best_label, []))))
+        if support < float(args.min_sample_support) or len(label_distances.get(best_label, [])) < int(args.min_neighbor_votes):
+            rejected_by_support += 1
+            continue
+        if probability < float(args.min_face_probability) or confidence < float(args.min_vote_confidence):
+            rejected_by_probability += 1
+            continue
+        face_labels[face_index] = int(best_label)
+        face_probabilities[face_index] = min(1.0, probability)
+        face_vote_confidence[face_index] = min(1.0, confidence)
+        face_mean_distance[face_index] = float(np.mean(label_distances[best_label]))
+        face_neighbor_count[face_index] = int(len(label_distances[best_label]))
+
+    if args.smooth_iterations > 0:
+        face_labels, face_probabilities = smooth_face_labels(
+            face_labels,
+            face_probabilities,
+            mesh_triangle_adjacency(triangles),
+            args.smooth_iterations,
+            args.smooth_keep_probability,
+            args.smooth_min_neighbors,
+        )
+    face_labels, face_probabilities, rejected_by_region = apply_face_region_cleanup(face_labels, face_probabilities, triangles, int(args.min_region_faces))
+    write_face_semantic_debug_ply(debug_ply, vertices, triangles, face_labels, face_probabilities)
+    legend = semantic_legend_from_manifest(semantic_manifest if isinstance(semantic_manifest, dict) else None, semantic_labels)
+    payload = semantic_face_payload(
+        method="semantic_ply_local_multisample_face_transfer",
+        project_root=project_root,
+        mesh_path=mesh_path,
+        semantic_manifest_path=semantic_manifest_path,
+        debug_ply=debug_ply,
+        vertices=vertices,
+        triangles=triangles,
+        face_labels=face_labels,
+        face_probabilities=face_probabilities,
+        face_vote_confidence=face_vote_confidence,
+        face_mean_distance=face_mean_distance,
+        face_neighbor_count=face_neighbor_count,
+        legend=legend,
+        bbox=bbox,
+        parameters={
+            "semantic_splats_ply": str(semantic_ply),
+            "k": int(args.k),
+            "face_sample_mode": args.face_sample_mode,
+            "samples_per_face": int(samples_per_face),
+            "max_distance": max_distance,
+            "max_distance_ratio": args.max_distance_ratio,
+            "min_sample_support": args.min_sample_support,
+            "min_neighbor_votes": args.min_neighbor_votes,
+            "min_face_probability": args.min_face_probability,
+            "min_vote_confidence": args.min_vote_confidence,
+            "distance_power": args.distance_power,
+            "label_bbox_quantile": args.label_bbox_quantile,
+            "label_bbox_padding_ratio": args.label_bbox_padding_ratio,
+            "bbox_min_probability": args.bbox_min_probability,
+            "smooth_iterations": args.smooth_iterations,
+            "smooth_keep_probability": args.smooth_keep_probability,
+            "smooth_min_neighbors": args.smooth_min_neighbors,
+            "min_region_faces": args.min_region_faces,
+            "semantic_max_points": args.semantic_max_points,
+            "semantic_min_points_per_label": args.semantic_min_points_per_label,
+            "seed": args.seed,
+            "engine": engine,
+            "mesh_reader": mesh_reader,
+        },
+        extra_summary={
+            "semantic_source_point_count": int(semantic_points.shape[0]),
+            "semantic_source_foreground_count": int((semantic_labels > 0).sum()),
+            "semantic_source_sampling": sampling_info,
+            "rejected_by_distance": int(rejected_by_distance),
+            "rejected_by_bbox": int(rejected_by_bbox),
+            "rejected_by_support": int(rejected_by_support),
+            "rejected_by_probability": int(rejected_by_probability),
+            "rejected_by_region": int(rejected_by_region),
+        },
+        extra_payload={
+            "semantic_splats_ply": str(semantic_ply),
+            "label_robust_bboxes": {str(key): value for key, value in sorted(label_bboxes.items())},
+        },
+    )
+    write_json(output_json, payload)
+    manifest.setdefault("artifacts", {})["mesh_semantics_local"] = str(output_json)
+    manifest["artifacts"]["mesh_semantics_local_debug_ply"] = str(debug_ply)
+    manifest.setdefault("external_stages", {})["mesh_semantic_local_backfill"] = {
+        "status": "completed",
+        "method": "semantic_ply_local_multisample_face_transfer",
+        "mesh": str(mesh_path),
+        "semantic_splats_ply": str(semantic_ply),
+        "output": str(output_json),
+        "debug_ply": str(debug_ply),
+        "assigned_face_count": payload["summary"]["assigned_face_count"],
+        "mesh_face_count": payload["summary"]["mesh_face_count"],
+    }
+    save_manifest(project_root, manifest)
+    print(f"Wrote local semantic-ply mesh semantics: {output_json}")
+    print(f"Wrote semantic debug mesh: {debug_ply}")
+    print(json.dumps(payload["summary"], indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_transfer_mesh_semantics(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {"artifacts": {}, "simulator_assets_dir": "simulator_assets"}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+
+    semantic_ply = (
+        resolve_project_cli_path(args.semantic_splats_ply, project_root)
+        if args.semantic_splats_ply
+        else resolve_existing_artifact_or_default(
+            project_root,
+            artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+            project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_gaussian_probabilities.ply",
+        )
+    )
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    mesh_path = resolve_project_cli_path(args.mesh, project_root)
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "mesh_semantics"))
+    output_json = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / f"{mesh_path.stem}_mesh_semantics.json"
+    debug_ply = resolve_project_cli_path(args.debug_ply, project_root) if args.debug_ply else output_dir / f"{mesh_path.stem}_semantic_debug.ply"
+
+    if not semantic_ply.exists():
+        raise FileNotFoundError(f"Missing semantic PLY: {semantic_ply}")
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing mesh: {mesh_path}")
+
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
+    semantic_points, semantic_labels, semantic_probabilities, _semantic_colors = read_semantic_ply_with_probabilities(semantic_ply)
+    if semantic_points.shape[0] == 0:
+        raise RuntimeError(f"No semantic points found in: {semantic_ply}")
+    if semantic_probabilities is None:
+        semantic_probabilities = np.ones((semantic_labels.shape[0],), dtype=np.float64)
+    semantic_points, semantic_labels, semantic_probabilities, sampling_info = downsample_semantic_transfer_source(
+        semantic_points,
+        semantic_labels,
+        semantic_probabilities,
+        int(args.semantic_max_points),
+        int(args.semantic_min_points_per_label),
+        int(args.seed),
+    )
+
+    vertices, triangles, mesh_reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+    face_centers = vertices[triangles].mean(axis=1)
+    bbox = bbox_for_points(vertices)
+    bbox_diag = float(vector_diagonal(bbox.get("size")) or 0.0) if isinstance(bbox, dict) else 0.0
+    max_distance = args.max_distance
+    if max_distance is None and args.max_distance_ratio and bbox_diag > 0:
+        max_distance = float(bbox_diag) * float(args.max_distance_ratio)
+
+    neighbor_indices, neighbor_distances, engine = nearest_source_neighbors(semantic_points, face_centers, args.k, max_distance=max_distance)
+    source_labels = semantic_labels[neighbor_indices]
+    source_probs = semantic_probabilities[neighbor_indices]
+    valid = np.isfinite(neighbor_distances)
+    if max_distance is not None:
+        valid &= neighbor_distances <= float(max_distance)
+    positive = valid & (source_labels > 0)
+    distance_weights = np.zeros_like(neighbor_distances, dtype=np.float64)
+    distance_weights[positive] = 1.0 / np.maximum(neighbor_distances[positive], float(args.distance_epsilon)) ** float(args.distance_power)
+    weighted = distance_weights * source_probs
+
+    face_labels = np.zeros((triangles.shape[0],), dtype=np.int64)
+    face_probabilities = np.zeros((triangles.shape[0],), dtype=np.float64)
+    face_vote_confidence = np.zeros((triangles.shape[0],), dtype=np.float64)
+    face_mean_distance = np.full((triangles.shape[0],), np.inf, dtype=np.float64)
+    face_neighbor_count = positive.sum(axis=1).astype(np.int64)
+    rejected_by_distance = int((face_neighbor_count == 0).sum())
+
+    for face_index in range(triangles.shape[0]):
+        if face_neighbor_count[face_index] <= 0:
+            continue
+        label_scores: dict[int, float] = {}
+        label_distance_weights: dict[int, float] = {}
+        label_distances: dict[int, list[float]] = {}
+        total_score = 0.0
+        total_distance_weight = 0.0
+        for label_raw, distance_raw, distance_weight_raw, weighted_raw, is_valid in zip(
+            source_labels[face_index],
+            neighbor_distances[face_index],
+            distance_weights[face_index],
+            weighted[face_index],
+            positive[face_index],
+        ):
+            if not bool(is_valid):
+                continue
+            label = int(label_raw)
+            score = float(weighted_raw)
+            dist_weight = float(distance_weight_raw)
+            label_scores[label] = label_scores.get(label, 0.0) + score
+            label_distance_weights[label] = label_distance_weights.get(label, 0.0) + dist_weight
+            label_distances.setdefault(label, []).append(float(distance_raw))
+            total_score += score
+            total_distance_weight += dist_weight
+        if not label_scores or total_score <= 0.0 or total_distance_weight <= 0.0:
+            continue
+        best_label, best_score = max(label_scores.items(), key=lambda item: (item[1], item[0]))
+        probability = float(best_score / max(total_distance_weight, 1e-12))
+        confidence = float(best_score / max(total_score, 1e-12))
+        if probability < float(args.min_face_probability) or confidence < float(args.min_vote_confidence):
+            continue
+        face_labels[face_index] = int(best_label)
+        face_probabilities[face_index] = min(1.0, probability)
+        face_vote_confidence[face_index] = min(1.0, confidence)
+        face_mean_distance[face_index] = float(np.mean(label_distances.get(best_label, [np.inf])))
+
+    adjacency = mesh_triangle_adjacency(triangles)
+    rejected_by_probability = int(((face_neighbor_count > 0) & (face_labels <= 0)).sum())
+
+    if args.smooth_iterations > 0:
+        face_labels, face_probabilities = smooth_face_labels(
+            face_labels,
+            face_probabilities,
+            adjacency,
+            args.smooth_iterations,
+            args.smooth_keep_probability,
+            args.smooth_min_neighbors,
+        )
+
+    rejected_by_mesh_component = 0
+    if args.min_component_faces > 0:
+        for component in mesh_connected_components(adjacency):
+            if len(component) < int(args.min_component_faces):
+                component_np = np.asarray(component, dtype=np.int64)
+                rejected_by_mesh_component += int((face_labels[component_np] > 0).sum())
+                face_labels[component_np] = 0
+                face_probabilities[component_np] = 0.0
+
+    rejected_by_region = 0
+    regions = same_label_regions(face_labels, adjacency)
+    if args.min_region_faces > 0:
+        for region in regions:
+            if len(region) < int(args.min_region_faces):
+                region_np = np.asarray(region, dtype=np.int64)
+                rejected_by_region += int((face_labels[region_np] > 0).sum())
+                face_labels[region_np] = 0
+                face_probabilities[region_np] = 0.0
+        regions = same_label_regions(face_labels, adjacency)
+
+    legend = semantic_legend_from_manifest(semantic_manifest if isinstance(semantic_manifest, dict) else None, semantic_labels)
+    label_counts = {str(int(label)): int(count) for label, count in zip(*np.unique(face_labels, return_counts=True))}
+    object_summaries: dict[str, dict[str, Any]] = {}
+    for label_text, count in label_counts.items():
+        label = int(label_text)
+        legend_item = legend.get(label_text, {})
+        selected = face_labels == label
+        object_summaries[label_text] = {
+            "semantic_id": label,
+            "object_id": legend_item.get("object_id", "unknown" if label <= 0 else f"semantic_{label}"),
+            "label": legend_item.get("name", "unknown" if label <= 0 else f"semantic {label}"),
+            "category": legend_item.get("category", "unknown"),
+            "face_count": int(count),
+            "mean_probability": float(face_probabilities[selected].mean()) if selected.any() else 0.0,
+            "mean_distance": float(face_mean_distance[selected & np.isfinite(face_mean_distance)].mean()) if (selected & np.isfinite(face_mean_distance)).any() else None,
+        }
+
+    face_semantics = []
+    for face_index, label in enumerate(face_labels.tolist()):
+        legend_item = legend.get(str(int(label)), {})
+        face_semantics.append(
+            {
+                "face": int(face_index),
+                "semantic_id": int(label),
+                "object_id": legend_item.get("object_id", "unknown" if int(label) <= 0 else f"semantic_{int(label)}"),
+                "label": legend_item.get("name", "unknown" if int(label) <= 0 else f"semantic {int(label)}"),
+                "category": legend_item.get("category", "unknown"),
+                "probability": round(float(face_probabilities[face_index]), 6),
+                "vote_confidence": round(float(face_vote_confidence[face_index]), 6),
+                "mean_distance": None if not np.isfinite(face_mean_distance[face_index]) else round(float(face_mean_distance[face_index]), 6),
+                "neighbor_count": int(face_neighbor_count[face_index]),
+            }
+        )
+
+    region_summaries = []
+    for region_index, region in enumerate(regions):
+        if not region:
+            continue
+        label = int(face_labels[region[0]])
+        if label <= 0:
+            continue
+        region_np = np.asarray(region, dtype=np.int64)
+        region_vertices = vertices[np.unique(triangles[region_np].reshape(-1))]
+        region_bbox = bbox_for_points(region_vertices)
+        legend_item = legend.get(str(label), {})
+        region_summaries.append(
+            {
+                "region": int(region_index),
+                "semantic_id": label,
+                "object_id": legend_item.get("object_id", f"semantic_{label}"),
+                "label": legend_item.get("name", f"semantic {label}"),
+                "face_count": int(len(region)),
+                "bbox": region_bbox,
+                "mean_probability": float(face_probabilities[region_np].mean()),
+            }
+        )
+
+    write_face_semantic_debug_ply(debug_ply, vertices, triangles, face_labels, face_probabilities)
+    summary = {
+        "mesh_vertex_count": int(vertices.shape[0]),
+        "mesh_face_count": int(triangles.shape[0]),
+        "assigned_face_count": int((face_labels > 0).sum()),
+        "unknown_face_count": int((face_labels <= 0).sum()),
+        "semantic_source_point_count": int(semantic_points.shape[0]),
+        "semantic_source_foreground_count": int((semantic_labels > 0).sum()),
+        "semantic_source_sampling": sampling_info,
+        "semantic_id_count": len([key for key in legend if int(key) > 0]),
+        "label_counts": label_counts,
+        "rejected_by_distance": rejected_by_distance,
+        "rejected_by_probability": rejected_by_probability,
+        "rejected_by_mesh_component": rejected_by_mesh_component,
+        "rejected_by_region": rejected_by_region,
+        "mean_assigned_probability": float(face_probabilities[face_labels > 0].mean()) if (face_labels > 0).any() else 0.0,
+        "mean_assigned_distance": float(face_mean_distance[(face_labels > 0) & np.isfinite(face_mean_distance)].mean()) if ((face_labels > 0) & np.isfinite(face_mean_distance)).any() else None,
+    }
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "method": "kdtree_nearest_semantic_face_transfer",
+        "project_root": str(project_root),
+        "mesh": str(mesh_path),
+        "semantic_splats_ply": str(semantic_ply),
+        "semantic_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
+        "debug_ply": str(debug_ply),
+        "parameters": {
+            "k": int(args.k),
+            "max_distance": max_distance,
+            "max_distance_ratio": args.max_distance_ratio,
+            "min_face_probability": args.min_face_probability,
+            "min_vote_confidence": args.min_vote_confidence,
+            "distance_power": args.distance_power,
+            "smooth_iterations": args.smooth_iterations,
+            "smooth_keep_probability": args.smooth_keep_probability,
+            "smooth_min_neighbors": args.smooth_min_neighbors,
+            "min_component_faces": args.min_component_faces,
+            "min_region_faces": args.min_region_faces,
+            "semantic_max_points": args.semantic_max_points,
+            "semantic_min_points_per_label": args.semantic_min_points_per_label,
+            "seed": args.seed,
+            "engine": engine,
+            "mesh_reader": mesh_reader,
+        },
+        "bbox": bbox,
+        "legend": legend,
+        "summary": summary,
+        "objects": object_summaries,
+        "regions": region_summaries,
+        "face_semantics": face_semantics,
+        "notes": (
+            "Face semantics are in triangle-index order. Unity/Web raycast triangleIndex can index face_semantics directly. "
+            "The debug PLY duplicates triangle vertices so per-face colors display reliably."
+        ),
+    }
+    write_json(output_json, payload)
+    manifest.setdefault("artifacts", {})["mesh_semantics"] = str(output_json)
+    manifest["artifacts"]["mesh_semantics_debug_ply"] = str(debug_ply)
+    manifest.setdefault("external_stages", {})["mesh_semantic_backfill"] = {
+        "status": "completed",
+        "method": "kdtree_nearest_semantic_face_transfer",
+        "mesh": str(mesh_path),
+        "semantic_splats_ply": str(semantic_ply),
+        "output": str(output_json),
+        "debug_ply": str(debug_ply),
+        "assigned_face_count": summary["assigned_face_count"],
+        "mesh_face_count": summary["mesh_face_count"],
+    }
+    save_manifest(project_root, manifest)
+
+    print(f"Wrote mesh semantics: {output_json}")
+    print(f"Wrote semantic debug mesh: {debug_ply}")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
+
+
+def resolve_scene_mesh_path(project_root: Path, manifest: dict[str, Any], value: Path | None = None) -> Path:
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    if value:
+        return resolve_project_cli_path(value, project_root)
+    for key in ("scene_collider_mesh_ply", "scene_mesh_ply", "colmap_delaunay_mesh_ply"):
+        resolved = resolve_existing_path(artifacts.get(key), project_root)
+        if resolved and resolved.exists():
+            return resolved
+    return project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "scene_meshes" / "colmap_delaunay_dense" / "mesh.ply"
+
+
+def resolve_scene_mesh_semantics_path(project_root: Path, manifest: dict[str, Any], value: Path | None = None, route: str | None = None) -> Path | None:
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    if value:
+        return resolve_project_cli_path(value, project_root)
+    route_to_key = {
+        "local": "mesh_semantics_local",
+        "projected-splats": "mesh_semantics_projected_splats",
+        "nearest": "mesh_semantics",
+    }
+    keys: list[str] = []
+    route_key = route_to_key.get(str(route or ""))
+    if route_key:
+        keys.append(route_key)
+    keys.extend(["mesh_semantics_local", "mesh_semantics_projected_splats", "mesh_semantics"])
+    seen: set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved = resolve_existing_path(artifacts.get(key), project_root)
+        if resolved and resolved.exists():
+            return resolved
+    return None
+
+
+def write_scene_semantic_object_mesh(path: Path, vertices, triangles, face_indices, color: tuple[int, int, int]) -> dict[str, Any]:
+    np = import_numpy()
+    selected_faces = [int(index) for index in face_indices]
+    if not selected_faces:
+        raise ValueError("No selected faces for semantic object mesh split.")
+    remap: dict[int, int] = {}
+    sub_vertices: list[list[float]] = []
+    sub_faces: list[list[int]] = []
+    vertices_np = np.asarray(vertices, dtype=np.float64)
+    triangles_np = np.asarray(triangles, dtype=np.int64)
+    for face_index in selected_faces:
+        face = []
+        for old_index_raw in triangles_np[face_index].tolist():
+            old_index = int(old_index_raw)
+            if old_index not in remap:
+                remap[old_index] = len(sub_vertices)
+                sub_vertices.append(vertices_np[old_index].tolist())
+            face.append(remap[old_index])
+        sub_faces.append(face)
+    colors = np.tile(np.asarray(color, dtype=np.uint8).reshape(1, 3), (len(sub_vertices), 1))
+    write_ascii_triangle_mesh_ply(path, np.asarray(sub_vertices, dtype=np.float64), colors, sub_faces)
+    return {
+        "vertex_count": int(len(sub_vertices)),
+        "face_count": int(len(sub_faces)),
+        "bbox": bbox_for_points(np.asarray(sub_vertices, dtype=np.float64)),
+    }
+
+
+def semantic_face_records_by_label(semantics_payload: dict[str, Any], *, include_unknown: bool, min_probability: float) -> dict[int, list[dict[str, Any]]]:
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for record in semantics_payload.get("face_semantics", []):
+        if not isinstance(record, dict):
+            continue
+        label = int(record.get("semantic_id") or 0)
+        if label <= 0 and not include_unknown:
+            continue
+        probability = float(record.get("probability") or 0.0)
+        if label > 0 and probability < float(min_probability):
+            continue
+        grouped.setdefault(label, []).append(record)
+    return grouped
+
+
+def semantic_split_asset_role(object_meta: dict[str, Any], legend_meta: dict[str, Any], category: str, label_name: str) -> str:
+    raw_role = object_meta.get("asset_role") or legend_meta.get("asset_role")
+    role_slug = slugify(str(raw_role or ""), fallback="")
+    if role_slug in {"background", "background-structure", "structure"}:
+        return "background_structure"
+    category_slug = slugify(category, fallback="")
+    label_slug = slugify(label_name, fallback="")
+    if category_slug in COMMON_BACKGROUND_STRUCTURE_CATEGORIES or label_slug in COMMON_BACKGROUND_STRUCTURE_CATEGORIES:
+        return "background_structure"
+    terms = {item for item in re.split(r"[-_.\s]+", f"{category_slug} {label_slug}") if item}
+    if terms & COMMON_BACKGROUND_CATEGORY_HINTS:
+        return "background_structure"
+    return "object"
+
+
+def cmd_split_mesh_by_semantics(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {"artifacts": {}, "simulator_assets_dir": "simulator_assets", "objects_dir": "objects"}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    mesh_path = resolve_scene_mesh_path(project_root, manifest, args.mesh)
+    semantics_path = (
+        resolve_project_cli_path(args.semantics, project_root)
+        if args.semantics
+        else resolve_scene_mesh_semantics_path(project_root, manifest)
+    )
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_object_meshes"))
+    sim_objects_dir = ensure_dir(project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "objects")
+
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing mesh: {mesh_path}")
+    if semantics_path is None or not semantics_path.exists():
+        raise FileNotFoundError(f"Missing mesh semantics JSON: {semantics_path}")
+
+    semantics = read_json(semantics_path)
+    vertices, triangles, mesh_reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+    face_semantics = semantics.get("face_semantics", []) if isinstance(semantics, dict) else []
+    if len(face_semantics) != int(triangles.shape[0]):
+        raise RuntimeError(
+            f"Face semantic count {len(face_semantics)} does not match mesh triangle count {int(triangles.shape[0])}: {semantics_path}"
+        )
+
+    grouped = semantic_face_records_by_label(
+        semantics,
+        include_unknown=bool(args.include_unknown),
+        min_probability=float(args.min_probability),
+    )
+    objects_payload = semantics.get("objects", {}) if isinstance(semantics.get("objects"), dict) else {}
+    legend = semantics.get("legend", {}) if isinstance(semantics.get("legend"), dict) else {}
+    exported: dict[str, Any] = {}
+    skipped: dict[str, Any] = {}
+
+    for label, records in sorted(grouped.items()):
+        if len(records) < int(args.min_faces):
+            skipped[str(label)] = {"reason": "below_min_faces", "face_count": len(records), "min_faces": int(args.min_faces)}
+            continue
+        label_text = str(int(label))
+        object_meta = objects_payload.get(label_text) if isinstance(objects_payload.get(label_text), dict) else {}
+        legend_meta = legend.get(label_text) if isinstance(legend.get(label_text), dict) else {}
+        object_id = slugify(
+            object_meta.get("object_id")
+            or legend_meta.get("object_id")
+            or (records[0].get("object_id") if records else "")
+            or ("unknown" if label <= 0 else f"semantic_{label}"),
+            fallback="unknown" if label <= 0 else f"semantic-{label}",
+        )
+        label_name = object_meta.get("label") or object_meta.get("name") or legend_meta.get("name") or (records[0].get("label") if records else "")
+        category = object_meta.get("category") or legend_meta.get("category") or (records[0].get("category") if records else "")
+        asset_role = semantic_split_asset_role(object_meta, legend_meta, str(category or ""), str(label_name or ""))
+        face_indices = [int(record["face"]) for record in records]
+        color = semantic_preview_color(int(label))
+        object_dir = ensure_dir(output_dir / object_id)
+        mesh_output = object_dir / f"{object_id}.ply"
+        stats = write_scene_semantic_object_mesh(mesh_output, vertices, triangles, face_indices, color)
+        asset_path = mesh_output
+        if args.copy_to_assets:
+            asset_path = copy_or_link(mesh_output, sim_objects_dir / object_id / mesh_output.name, args.mode)
+        metadata = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "object_id": object_id,
+            "semantic_id": int(label),
+            "label": label_name or object_id,
+            "category": category or "unknown",
+            "asset_role": asset_role,
+            "source": "scene_mesh_semantic_split",
+            "provider": "video2mesh_scene_mesh_semantic_split",
+            "source_mesh": str(mesh_output),
+            "asset_path": str(asset_path),
+            "format": "ply",
+            "coordinate_frame": "video2mesh_scene",
+            "semantic_mesh_source": str(mesh_path),
+            "mesh_semantics": str(semantics_path),
+            "quality": {
+                "face_count": stats["face_count"],
+                "vertex_count": stats["vertex_count"],
+                "mean_probability": object_meta.get("mean_probability"),
+            },
+            "bbox": stats["bbox"],
+            "notes": "Scene collider mesh subset split by face semantic labels. Coordinates stay in the original video2mesh_scene frame for visual/collider alignment.",
+        }
+        if asset_role == "background_structure":
+            metadata["background_structure"] = {
+                "method": "scene_mesh_semantic_split",
+                "category_family": category or label_name or object_id,
+                "source": "mesh_face_semantics",
+            }
+        write_json(object_dir / "mesh_asset.json", metadata)
+        exported[object_id] = metadata
+
+        if args.register_as_object_meshes:
+            object_json_path = project_root / manifest.get("objects_dir", "objects") / object_id / "object.json"
+            if object_json_path.exists():
+                obj = read_json(object_json_path)
+            else:
+                obj = {
+                    "schema_version": DEFAULT_SCHEMA_VERSION,
+                    "object_id": object_id,
+                    "label": label_name or object_id,
+                    "category": category or "unknown",
+                    "asset_role": asset_role,
+                    "source": "scene_mesh_semantic_split",
+                }
+            obj["mesh_asset"] = metadata
+            obj.setdefault("semantic_id", int(label))
+            obj.setdefault("label", label_name or object_id)
+            obj.setdefault("category", category or "unknown")
+            obj.setdefault("asset_role", asset_role)
+            obj["bbox_3d"] = stats["bbox"]
+            obj["point_count"] = max(int(obj.get("point_count") or 0), int(stats["vertex_count"]))
+            if asset_role == "background_structure":
+                obj.setdefault(
+                    "background_structure",
+                    {
+                        "method": "scene_mesh_semantic_split",
+                        "category_family": category or label_name or object_id,
+                        "source": "mesh_face_semantics",
+                    },
+                )
+            write_json(object_json_path, obj)
+
+    index_path = output_dir / "semantic_object_meshes.json"
+    summary = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "mesh": str(mesh_path),
+        "mesh_reader": mesh_reader,
+        "mesh_semantics": str(semantics_path),
+        "output_dir": str(output_dir),
+        "coordinate_frame": "video2mesh_scene",
+        "object_count": len(exported),
+        "skipped": skipped,
+        "objects": exported,
+    }
+    write_json(index_path, summary)
+    manifest.setdefault("artifacts", {})["semantic_object_meshes"] = str(index_path)
+    manifest["artifacts"]["scene_mesh_object_splits"] = str(index_path)
+    if args.register_as_object_meshes:
+        manifest["artifacts"]["object_meshes"] = str(index_path)
+        manifest.setdefault("external_stages", {})["mesh_generation"] = {
+            "status": "scene_mesh_semantic_object_splits" if exported else "scene_mesh_semantic_object_splits_empty",
+            "notes": "Object meshes split from one COLMAP dense scene collider mesh using face-level semantic transfer.",
+            "object_count": len(exported),
+            "mesh_semantics": str(semantics_path),
+        }
+    manifest.setdefault("external_stages", {})["scene_mesh_semantic_object_split"] = {
+        "status": "completed" if exported else "empty",
+        "mesh": str(mesh_path),
+        "mesh_semantics": str(semantics_path),
+        "output": str(index_path),
+        "object_count": len(exported),
+        "skipped": skipped,
+    }
+    save_manifest(project_root, manifest)
+    print(f"Split {len(exported)} semantic object mesh(es): {index_path}")
+    if skipped:
+        print(f"Skipped semantic labels: {', '.join(sorted(skipped))}")
+    return 0
+
+
+def cmd_reconstruct_scene_meshes(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    default_name = "colmap_delaunay_dense" if args.method == "colmap_delaunay" else args.method
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "scene_meshes" / default_name))
+    output_path = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / "mesh.ply"
+
+    if args.method != "colmap_delaunay":
+        raise ValueError(f"Unsupported scene mesh method: {args.method}")
+    dense_workspace = (
+        resolve_project_cli_path(args.colmap_dense_workspace, project_root)
+        if args.colmap_dense_workspace
+        else resolve_existing_artifact_or_default(project_root, artifacts.get("colmap_dense_workspace"), project_root / "external" / "colmap" / "dense")
+    )
+    if not dense_workspace.exists():
+        raise FileNotFoundError(f"Missing COLMAP dense workspace: {dense_workspace}")
+    if output_path.exists() and not args.overwrite:
+        print(f"Scene mesh already exists: {output_path}")
+    else:
+        ensure_dir(output_path.parent)
+        log_path = output_dir / "colmap_delaunay_mesher.log"
+        command = [
+            str(args.colmap_binary),
+            "delaunay_mesher",
+            "--input_path",
+            str(dense_workspace),
+            "--output_path",
+            str(output_path),
+        ]
+        returncode = _run_logged_command(command, cwd=None, log_path=log_path)
+        if returncode != 0:
+            raise RuntimeError(f"COLMAP delaunay_mesher failed with exit code {returncode}. Log: {log_path}")
+    if not output_path.exists():
+        raise RuntimeError(f"COLMAP delaunay_mesher did not create output mesh: {output_path}")
+
+    input_copies: dict[str, str] = {}
+    dense_fused = resolve_existing_path(artifacts.get("colmap_dense_fused_ply"), project_root)
+    if args.copy_input_point_cloud and dense_fused and dense_fused.exists():
+        copied = copy_or_link(dense_fused, output_dir / "inputs" / "colmap_dense_fused.ply", args.mode)
+        input_copies["colmap_dense_fused_ply"] = str(copied)
+
+    try:
+        vertices, triangles, reader = read_triangle_mesh_for_semantic_transfer(output_path)
+        mesh_stats = {
+            "mesh_reader": reader,
+            "vertex_count": int(vertices.shape[0]),
+            "face_count": int(triangles.shape[0]),
+            "bbox": bbox_for_points(vertices),
+        }
+    except Exception as exc:
+        mesh_stats = {"mesh_read_error": str(exc)}
+
+    report_path = output_dir / "scene_mesh_reconstruction.json"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "method": args.method,
+        "mesh": str(output_path),
+        "colmap_dense_workspace": str(dense_workspace),
+        "input_copies": input_copies,
+        "stats": mesh_stats,
+    }
+    write_json(report_path, report)
+    manifest.setdefault("artifacts", {})["scene_mesh_ply"] = str(output_path)
+    manifest["artifacts"]["scene_collider_mesh_ply"] = str(output_path)
+    manifest["artifacts"]["colmap_delaunay_mesh_ply"] = str(output_path)
+    manifest["artifacts"]["scene_mesh_reconstruction"] = str(report_path)
+    manifest.setdefault("external_stages", {})["scene_mesh_reconstruction"] = {
+        "status": "completed",
+        "method": args.method,
+        "mesh": str(output_path),
+        "report": str(report_path),
+        "dense_workspace": str(dense_workspace),
+    }
+    save_manifest(project_root, manifest)
+    print(f"Reconstructed scene mesh: {output_path}")
+    print(f"Scene mesh report: {report_path}")
+    return 0
+
+
+def cmd_transfer_mesh_semantics_ray(args: argparse.Namespace) -> int:
+    np = import_numpy()
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root) if project_manifest_path(project_root).exists() else {"artifacts": {}, "simulator_assets_dir": "simulator_assets", "masks": {"mask_2d_dir": "masks/2d"}}
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+
+    mesh_path = resolve_project_cli_path(args.mesh, project_root)
+    camera_info_path = resolve_project_cli_path(args.camera_info, project_root) if args.camera_info else resolve_existing_artifact_or_default(
+        project_root,
+        artifacts.get("camera_info"),
+        project_root / manifest.get("scene", {}).get("camera_info", "scene/cameras/camera_info.json"),
+    )
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "mesh_semantics_ray"))
+    output_json = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / f"{mesh_path.stem}_mesh_semantics_ray.json"
+    debug_ply = resolve_project_cli_path(args.debug_ply, project_root) if args.debug_ply else output_dir / f"{mesh_path.stem}_semantic_ray_debug.ply"
+
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Missing mesh: {mesh_path}")
+    if not camera_info_path.exists():
+        raise FileNotFoundError(f"Missing camera_info: {camera_info_path}")
+
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else None
+    vertices, triangles, mesh_reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+    face_centers = vertices[triangles].mean(axis=1)
+    bbox = bbox_for_points(vertices)
+    camera_info = load_camera_info(camera_info_path)
+
+    requested_frame_ids = [frame_stem(item) for item in args.frame_ids.split(",") if item.strip()] if args.frame_ids else []
+    available_frame_ids = sorted([frame_stem(key) for key in camera_info.get("extrinsic", {}).keys()], key=frame_id_sort_key)
+    if not requested_frame_ids:
+        requested_frame_ids = available_frame_ids
+    if args.max_frames and int(args.max_frames) > 0:
+        requested_frame_ids = requested_frame_ids[: int(args.max_frames)]
+    if not requested_frame_ids:
+        raise RuntimeError("No frame ids available for ray projection transfer.")
+
+    label_mask_paths: dict[str, Path] = {}
+    mask_mode = "binary_object_masks"
+    mask_records: dict[tuple[str, str], Path] = {}
+    mask_record_count = 0
+    projected_mask_reports: list[dict[str, Any]] = []
+    projected_sampling: dict[str, Any] | None = None
+    semantic_labels_for_legend = np.zeros((0,), dtype=np.int64)
+    semantic_ply_path = None
+    if args.mask_root:
+        mask_root = resolve_project_cli_path(args.mask_root, project_root)
+        mask_records = mask_records_by_object_frame(mask_root)
+        mask_record_count = len(mask_records)
+    elif args.generate_projected_semantic_masks:
+        semantic_ply_path = (
+            resolve_project_cli_path(args.semantic_splats_ply, project_root)
+            if args.semantic_splats_ply
+            else resolve_existing_artifact_or_default(
+                project_root,
+                artifacts.get("semantic_splats_ply") or artifacts.get("semantic_point_cloud_ply"),
+                project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_gaussian_probabilities.ply",
+            )
+        )
+        if not semantic_ply_path.exists():
+            raise FileNotFoundError(f"Missing semantic PLY for projected debug masks: {semantic_ply_path}")
+        semantic_points, semantic_labels, semantic_probabilities, _semantic_colors = read_semantic_ply_with_probabilities(semantic_ply_path)
+        semantic_labels_for_legend = semantic_labels
+        if semantic_probabilities is None:
+            semantic_probabilities = np.ones((semantic_labels.shape[0],), dtype=np.float64)
+        mask_mode = "projected_semantic_point_label_masks"
+        label_mask_paths, projected_mask_reports, projected_sampling = project_semantic_points_to_label_masks(
+            semantic_points=semantic_points,
+            semantic_labels=semantic_labels,
+            semantic_probabilities=semantic_probabilities,
+            camera_info=camera_info,
+            frame_ids=requested_frame_ids,
+            output_dir=output_dir / "projected_semantic_masks",
+            point_radius=int(args.projected_mask_point_radius),
+            min_probability=float(args.projected_mask_min_probability),
+            max_points=int(args.projected_mask_max_points),
+            seed=int(args.seed),
+        )
+    else:
+        mask_root = resolve_project_cli_path(args.mask_root, project_root) if args.mask_root else (project_root / manifest.get("masks", {}).get("mask_2d_dir", "masks/2d"))
+        raise FileNotFoundError(
+            f"P1 ray projection needs real 2D masks under {mask_root}, or pass --generate-projected-semantic-masks for a debug-only projected semantic mask run."
+        )
+
+    if semantic_labels_for_legend.shape[0] == 0 and isinstance(semantic_manifest, dict):
+        semantic_labels_for_legend = np.asarray([int(item.get("semantic_id", 0)) for item in semantic_manifest.get("objects", []) if isinstance(item, dict)], dtype=np.int64)
+    legend = semantic_legend_from_manifest(semantic_manifest if isinstance(semantic_manifest, dict) else None, semantic_labels_for_legend)
+    object_to_semantic = {
+        slugify(item.get("object_id")): int(item.get("semantic_id", 0))
+        for item in (semantic_manifest.get("objects", []) if isinstance(semantic_manifest, dict) else [])
+        if isinstance(item, dict) and item.get("object_id") is not None
+    }
+
+    face_count = int(triangles.shape[0])
+    score_by_label: list[dict[int, float]] = [dict() for _ in range(face_count)]
+    frames_by_face = np.zeros((face_count,), dtype=np.int64)
+    visible_by_face = np.zeros((face_count,), dtype=np.int64)
+    frame_reports: list[dict[str, Any]] = []
+    for frame_id in requested_frame_ids:
+        intrinsic = intrinsic_for_frame(camera_info, frame_id)
+        extrinsic = resolve_extrinsic(camera_info["extrinsic"], frame_id)
+        if extrinsic is None:
+            frame_reports.append({"frame_id": frame_id, "status": "skipped_missing_extrinsic"})
+            continue
+        w2c = world_to_camera_matrix(extrinsic, camera_info.get("extrinsic_type") or args.extrinsic_type)
+        inside, u, v, z = project_points(face_centers, intrinsic, w2c)
+        if args.occlusion_filter:
+            visible, _zbuf = visibility_mask_from_projection(
+                inside,
+                u,
+                v,
+                z,
+                int(intrinsic["w"]),
+                int(intrinsic["h"]),
+                float(args.depth_tolerance),
+                float(args.relative_depth_tolerance),
+            )
+        else:
+            visible = inside
+        visible_indices = np.flatnonzero(visible)
+        visible_by_face[visible_indices] += 1
+        assigned_this_frame = 0
+
+        if mask_mode == "projected_semantic_point_label_masks":
+            mask_path = label_mask_paths.get(frame_stem(frame_id))
+            if not mask_path or not mask_path.exists():
+                frame_reports.append({"frame_id": frame_id, "status": "skipped_missing_projected_mask", "visible_faces": int(visible_indices.size)})
+                continue
+            label_image = read_gray_u8_image(mask_path, int(intrinsic["w"]), int(intrinsic["h"]))
+            sampled_labels = label_image[v[visible_indices], u[visible_indices]].astype(np.int64)
+            active = sampled_labels > 0
+            for face_index, label, depth in zip(visible_indices[active], sampled_labels[active], z[visible_indices[active]]):
+                score_by_label[int(face_index)][int(label)] = score_by_label[int(face_index)].get(int(label), 0.0) + 1.0
+                frames_by_face[int(face_index)] += 1
+                assigned_this_frame += 1
+        else:
+            for object_id, semantic_id in object_to_semantic.items():
+                mask_path = mask_records.get((object_id, frame_stem(frame_id)))
+                if not mask_path:
+                    continue
+                mask = read_gray_u8_image(mask_path, int(intrinsic["w"]), int(intrinsic["h"]))
+                hit = mask[v[visible_indices], u[visible_indices]] >= int(args.mask_threshold)
+                for face_index in visible_indices[hit]:
+                    score_by_label[int(face_index)][int(semantic_id)] = score_by_label[int(face_index)].get(int(semantic_id), 0.0) + 1.0
+                    frames_by_face[int(face_index)] += 1
+                    assigned_this_frame += 1
+
+        frame_reports.append(
+            {
+                "frame_id": frame_stem(frame_id),
+                "status": "voted",
+                "inside_faces": int(inside.sum()),
+                "visible_faces": int(visible.sum()),
+                "assigned_samples": int(assigned_this_frame),
+            }
+        )
+
+    face_labels = np.zeros((face_count,), dtype=np.int64)
+    face_probabilities = np.zeros((face_count,), dtype=np.float64)
+    face_vote_confidence = np.zeros((face_count,), dtype=np.float64)
+    face_mean_distance = np.full((face_count,), np.inf, dtype=np.float64)
+    for face_index, scores in enumerate(score_by_label):
+        if not scores:
+            continue
+        total = float(sum(scores.values()))
+        best_label, best_score = max(scores.items(), key=lambda item: (item[1], item[0]))
+        confidence = float(best_score / max(total, 1e-12))
+        if best_score < float(args.min_frame_votes) or confidence < float(args.min_vote_confidence):
+            continue
+        face_labels[face_index] = int(best_label)
+        face_probabilities[face_index] = min(1.0, best_score / max(1.0, float(visible_by_face[face_index])))
+        face_vote_confidence[face_index] = min(1.0, confidence)
+
+    rejected_by_votes = int(sum(1 for face_index, scores in enumerate(score_by_label) if scores and face_labels[face_index] <= 0))
+    if args.smooth_iterations > 0:
+        face_labels, face_probabilities = smooth_face_labels(
+            face_labels,
+            face_probabilities,
+            mesh_triangle_adjacency(triangles),
+            args.smooth_iterations,
+            args.smooth_keep_probability,
+            args.smooth_min_neighbors,
+        )
+    face_labels, face_probabilities, rejected_by_region = apply_face_region_cleanup(face_labels, face_probabilities, triangles, int(args.min_region_faces))
+    write_face_semantic_debug_ply(debug_ply, vertices, triangles, face_labels, face_probabilities)
+
+    summary_extra = {
+        "mask_mode": mask_mode,
+        "frame_count": int(len(requested_frame_ids)),
+        "frame_reports": frame_reports[: min(len(frame_reports), 20)],
+        "mask_record_count": int(mask_record_count),
+        "projected_mask_frame_count": int(len(label_mask_paths)),
+        "total_visible_face_observations": int(visible_by_face.sum()),
+        "total_labeled_face_observations": int(frames_by_face.sum()),
+        "faces_with_any_votes": int(sum(1 for scores in score_by_label if scores)),
+        "rejected_by_votes": int(rejected_by_votes),
+        "rejected_by_region": int(rejected_by_region),
+    }
+    payload = semantic_face_payload(
+        method="ray_projection_semantic_face_transfer",
+        project_root=project_root,
+        mesh_path=mesh_path,
+        semantic_manifest_path=semantic_manifest_path,
+        debug_ply=debug_ply,
+        vertices=vertices,
+        triangles=triangles,
+        face_labels=face_labels,
+        face_probabilities=face_probabilities,
+        face_vote_confidence=face_vote_confidence,
+        face_mean_distance=face_mean_distance,
+        face_neighbor_count=frames_by_face,
+        legend=legend,
+        bbox=bbox,
+        parameters={
+            "camera_info": str(camera_info_path),
+            "mask_mode": mask_mode,
+            "mask_root": str(resolve_project_cli_path(args.mask_root, project_root)) if args.mask_root else None,
+            "semantic_splats_ply": str(semantic_ply_path) if semantic_ply_path else None,
+            "max_frames": args.max_frames,
+            "frame_ids": requested_frame_ids,
+            "mask_threshold": args.mask_threshold,
+            "min_frame_votes": args.min_frame_votes,
+            "min_vote_confidence": args.min_vote_confidence,
+            "occlusion_filter": args.occlusion_filter,
+            "depth_tolerance": args.depth_tolerance,
+            "relative_depth_tolerance": args.relative_depth_tolerance,
+            "smooth_iterations": args.smooth_iterations,
+            "smooth_keep_probability": args.smooth_keep_probability,
+            "smooth_min_neighbors": args.smooth_min_neighbors,
+            "min_region_faces": args.min_region_faces,
+            "mesh_reader": mesh_reader,
+            "projected_mask_point_radius": args.projected_mask_point_radius,
+            "projected_mask_min_probability": args.projected_mask_min_probability,
+            "projected_mask_max_points": args.projected_mask_max_points,
+            "seed": args.seed,
+        },
+        extra_summary=summary_extra,
+        extra_payload={
+            "camera_info": str(camera_info_path),
+            "projected_mask_reports": projected_mask_reports,
+            "projected_mask_sampling": projected_sampling,
+        },
+    )
+    write_json(output_json, payload)
+    manifest.setdefault("artifacts", {})["mesh_semantics_ray"] = str(output_json)
+    manifest["artifacts"]["mesh_semantics_ray_debug_ply"] = str(debug_ply)
+    manifest.setdefault("external_stages", {})["mesh_semantic_ray_backfill"] = {
+        "status": "completed",
+        "method": "ray_projection_semantic_face_transfer",
+        "mask_mode": mask_mode,
+        "mesh": str(mesh_path),
+        "camera_info": str(camera_info_path),
+        "output": str(output_json),
+        "debug_ply": str(debug_ply),
+        "assigned_face_count": payload["summary"]["assigned_face_count"],
+        "mesh_face_count": payload["summary"]["mesh_face_count"],
+    }
+    save_manifest(project_root, manifest)
+    print(f"Wrote ray-projection mesh semantics: {output_json}")
+    print(f"Wrote semantic debug mesh: {debug_ply}")
+    print(json.dumps(payload["summary"], indent=2, ensure_ascii=False))
+    return 0
+
+
 def write_colored_semantic_ply(path: Path, points, labels, colors_u8) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as f:
@@ -14076,6 +18552,14 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
     }
     requested_exports: set[str] = set()
 
+    def custom_export_name(source_path: Path, prefix: str, include_labels: bool) -> str:
+        cue = f"{prefix} {source_path.stem}".lower()
+        if include_labels or "semantic" in cue:
+            return "semantic"
+        if "scene" in cue:
+            return "scene"
+        return "custom"
+
     def export_one(name: str, source_value: str | Path | None, prefix: str, include_labels: bool = False) -> None:
         requested_exports.add(name)
         if not source_value:
@@ -14093,7 +18577,8 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
             results["exports"][name] = {"ok": False, "source_ply": str(source_path), "error": str(exc)}
 
     if args.splat_ply:
-        export_one("custom", args.splat_ply, args.prefix or args.splat_ply.stem, include_labels=args.include_labels)
+        prefix = args.prefix or args.splat_ply.stem
+        export_one(custom_export_name(args.splat_ply, prefix, args.include_labels), args.splat_ply, prefix, include_labels=args.include_labels)
     else:
         if kind in {"scene", "all"}:
             export_one("scene", artifacts.get("scene_3dgs_ply"), args.prefix or "scene_3dgs", include_labels=False)
@@ -14123,6 +18608,12 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
         if item.get("ok"):
             print(f"- {name}: point_cloud={item.get('point_cloud_ply')}")
             print(f"  {name}: supersplat={item.get('supersplat_ply')}")
+            print(
+                f"  {name}: source_gaussian_health={item.get('raw_gaussian_health', {}).get('status')} "
+                f"viewer_safety={item.get('viewer_safety_status')}"
+            )
+            if item.get("visual_qa_required"):
+                print(f"  {name}: visual QA required before treating the source 3DGS as successful")
         else:
             print(f"- {name}: failed: {item.get('error')}")
     print(f"Manifest: {manifest_path}")
@@ -35171,6 +39662,132 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
         else:
             append_pipeline_step(steps, "render_semantic_preview", "skipped", "--render-semantic-preview not set")
 
+        if args.reconstruct_scene_meshes:
+            cmd_reconstruct_scene_meshes(
+                argparse.Namespace(
+                    project_root=project_root,
+                    method=args.scene_mesh_method,
+                    colmap_dense_workspace=args.scene_mesh_colmap_dense_workspace,
+                    output_dir=args.scene_mesh_output_dir,
+                    output=args.scene_mesh_output,
+                    colmap_binary=args.scene_mesh_colmap_binary or args.colmap_binary,
+                    overwrite=args.scene_mesh_overwrite,
+                    copy_input_point_cloud=args.scene_mesh_copy_input_point_cloud,
+                    mode=args.mode,
+                )
+            )
+            append_pipeline_step(steps, "reconstruct_scene_meshes", "completed")
+            manifest = load_manifest(project_root)
+        elif args.scene_mesh:
+            append_pipeline_step(steps, "reconstruct_scene_meshes", "skipped", f"using existing scene mesh: {args.scene_mesh}")
+        else:
+            append_pipeline_step(steps, "reconstruct_scene_meshes", "skipped", "--reconstruct-scene-meshes not set")
+
+        if args.transfer_scene_mesh_semantics and not args.skip_export_splat_masks:
+            manifest = load_manifest(project_root)
+            scene_mesh_for_semantics = resolve_scene_mesh_path(project_root, manifest, args.scene_mesh)
+            if args.scene_mesh_semantic_route == "local":
+                cmd_transfer_mesh_semantics_local(
+                    argparse.Namespace(
+                        project_root=project_root,
+                        mesh=scene_mesh_for_semantics,
+                        semantic_splats_ply=None,
+                        semantic_manifest=None,
+                        output_dir=args.scene_mesh_semantic_output_dir,
+                        output=None,
+                        debug_ply=None,
+                        k=args.scene_mesh_semantic_k,
+                        face_sample_mode=args.scene_mesh_semantic_face_sample_mode,
+                        max_distance=None,
+                        max_distance_ratio=args.scene_mesh_semantic_max_distance_ratio,
+                        min_sample_support=args.scene_mesh_semantic_min_sample_support,
+                        min_neighbor_votes=args.scene_mesh_semantic_min_neighbor_votes,
+                        min_face_probability=args.scene_mesh_semantic_min_face_probability,
+                        min_vote_confidence=args.scene_mesh_semantic_min_vote_confidence,
+                        distance_power=2.0,
+                        distance_epsilon=1e-5,
+                        label_bbox_quantile=args.scene_mesh_semantic_label_bbox_quantile,
+                        label_bbox_padding_ratio=args.scene_mesh_semantic_label_bbox_padding_ratio,
+                        bbox_min_probability=args.scene_mesh_semantic_bbox_min_probability,
+                        smooth_iterations=args.scene_mesh_semantic_smooth_iterations,
+                        smooth_keep_probability=args.scene_mesh_semantic_smooth_keep_probability,
+                        smooth_min_neighbors=args.scene_mesh_semantic_smooth_min_neighbors,
+                        min_region_faces=args.scene_mesh_semantic_min_region_faces,
+                        semantic_max_points=args.scene_mesh_semantic_max_points,
+                        semantic_min_points_per_label=args.scene_mesh_semantic_min_points_per_label,
+                        seed=args.scene_mesh_semantic_seed,
+                    )
+                )
+            elif args.scene_mesh_semantic_route == "projected-splats":
+                cmd_transfer_mesh_semantics_projected_splats(
+                    argparse.Namespace(
+                        project_root=project_root,
+                        mesh=scene_mesh_for_semantics,
+                        semantic_splats_ply=None,
+                        semantic_manifest=None,
+                        camera_info=None,
+                        output_dir=args.scene_mesh_semantic_output_dir,
+                        output=None,
+                        debug_ply=None,
+                        frame_ids=None,
+                        max_frames=args.scene_mesh_semantic_max_frames,
+                        face_sample_mode=args.scene_mesh_semantic_face_sample_mode,
+                        sample_pixel_radius=args.scene_mesh_semantic_projected_sample_pixel_radius,
+                        pixel_sigma=1.2,
+                        semantic_min_probability=args.scene_mesh_semantic_projected_min_probability,
+                        depth_tolerance=args.scene_mesh_semantic_projected_depth_tolerance,
+                        relative_depth_tolerance=args.scene_mesh_semantic_projected_relative_depth_tolerance,
+                        occlusion_filter=True,
+                        mesh_depth_tolerance=args.scene_mesh_semantic_projected_mesh_depth_tolerance,
+                        mesh_relative_depth_tolerance=args.scene_mesh_semantic_projected_mesh_relative_depth_tolerance,
+                        min_visible_samples=args.scene_mesh_semantic_projected_min_visible_samples,
+                        min_projected_votes=args.scene_mesh_semantic_projected_min_votes,
+                        min_face_probability=args.scene_mesh_semantic_projected_min_face_probability,
+                        min_vote_confidence=args.scene_mesh_semantic_projected_min_vote_confidence,
+                        smooth_iterations=args.scene_mesh_semantic_smooth_iterations,
+                        smooth_keep_probability=args.scene_mesh_semantic_smooth_keep_probability,
+                        smooth_min_neighbors=args.scene_mesh_semantic_smooth_min_neighbors,
+                        min_region_faces=args.scene_mesh_semantic_min_region_faces,
+                        semantic_max_points=args.scene_mesh_semantic_max_points,
+                        semantic_min_points_per_label=args.scene_mesh_semantic_min_points_per_label,
+                        extrinsic_type=args.extrinsic_type,
+                        seed=args.scene_mesh_semantic_seed,
+                    )
+                )
+            else:
+                cmd_transfer_mesh_semantics(
+                    argparse.Namespace(
+                        project_root=project_root,
+                        mesh=scene_mesh_for_semantics,
+                        semantic_splats_ply=None,
+                        semantic_manifest=None,
+                        output_dir=args.scene_mesh_semantic_output_dir,
+                        output=None,
+                        debug_ply=None,
+                        k=args.scene_mesh_semantic_k,
+                        max_distance=None,
+                        max_distance_ratio=args.scene_mesh_semantic_max_distance_ratio,
+                        min_face_probability=args.scene_mesh_semantic_min_face_probability,
+                        min_vote_confidence=args.scene_mesh_semantic_min_vote_confidence,
+                        distance_power=2.0,
+                        distance_epsilon=1e-5,
+                        smooth_iterations=args.scene_mesh_semantic_smooth_iterations,
+                        smooth_keep_probability=args.scene_mesh_semantic_smooth_keep_probability,
+                        smooth_min_neighbors=args.scene_mesh_semantic_smooth_min_neighbors,
+                        min_component_faces=0,
+                        min_region_faces=args.scene_mesh_semantic_min_region_faces,
+                        semantic_max_points=args.scene_mesh_semantic_max_points,
+                        semantic_min_points_per_label=args.scene_mesh_semantic_min_points_per_label,
+                        seed=args.scene_mesh_semantic_seed,
+                    )
+                )
+            append_pipeline_step(steps, "transfer_scene_mesh_semantics", "completed", args.scene_mesh_semantic_route)
+            manifest = load_manifest(project_root)
+        elif args.transfer_scene_mesh_semantics:
+            append_pipeline_step(steps, "transfer_scene_mesh_semantics", "skipped", "semantic splat export skipped")
+        else:
+            append_pipeline_step(steps, "transfer_scene_mesh_semantics", "skipped", "--transfer-scene-mesh-semantics not set")
+
         if not args.skip_object_mask_clouds and not args.skip_fuse_masks:
             cmd_export_object_mask_clouds(
                 argparse.Namespace(
@@ -35340,6 +39957,32 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
         else:
             append_pipeline_step(steps, "reconstruct_object_meshes", "skipped", "--reconstruct-mask-meshes not set")
 
+        if args.split_scene_mesh_by_semantics:
+            manifest = load_manifest(project_root)
+            scene_mesh_semantics = resolve_scene_mesh_semantics_path(
+                project_root,
+                manifest,
+                route=args.scene_mesh_semantic_route if args.transfer_scene_mesh_semantics else None,
+            )
+            cmd_split_mesh_by_semantics(
+                argparse.Namespace(
+                    project_root=project_root,
+                    mesh=args.scene_mesh,
+                    semantics=scene_mesh_semantics,
+                    output_dir=args.scene_mesh_object_splits_output_dir,
+                    min_faces=args.scene_mesh_object_splits_min_faces,
+                    min_probability=args.scene_mesh_object_splits_min_probability,
+                    include_unknown=False,
+                    copy_to_assets=True,
+                    register_as_object_meshes=args.scene_mesh_object_splits_register_as_object_meshes,
+                    mode=args.mode,
+                )
+            )
+            append_pipeline_step(steps, "split_scene_mesh_by_semantics", "completed")
+            manifest = load_manifest(project_root)
+        else:
+            append_pipeline_step(steps, "split_scene_mesh_by_semantics", "skipped", "--split-scene-mesh-by-semantics not set")
+
         should_import_meshes = args.import_meshes or args.mesh_root is not None or args.mesh_manifest is not None or args.create_placeholder_meshes
         if should_import_meshes and not args.skip_import_meshes:
             cmd_import_object_meshes(
@@ -35362,7 +40005,11 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
         else:
             append_pipeline_step(steps, "import_object_meshes", "skipped", "mesh import not requested")
 
-        meshes_available = bool(args.reconstruct_mask_meshes or (should_import_meshes and not args.skip_import_meshes))
+        meshes_available = bool(
+            args.reconstruct_mask_meshes
+            or (args.split_scene_mesh_by_semantics and args.scene_mesh_object_splits_register_as_object_meshes)
+            or (should_import_meshes and not args.skip_import_meshes)
+        )
         if meshes_available:
             if not args.skip_simulator_assets:
                 cmd_export_simulator_assets(
@@ -35811,6 +40458,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--background-seed", type=int, default=7)
     p.add_argument("--register", action=argparse.BooleanOptionalAction, default=False, help="Register the cleaned PLY as artifacts.scene_3dgs_ply.")
     p.set_defaults(func=cmd_clean_3dgs_floaters)
+
+    p = sub.add_parser("clean-point-cloud-outliers", help="Remove long-tail outliers from a plain XYZ/RGB point-cloud PLY before semantic fusion or mesh reconstruction.")
+    add_common_project_arg(p)
+    p.add_argument("--input", type=Path, help="Input plain point-cloud PLY. Defaults to scene/viewer point-cloud artifacts.")
+    p.add_argument("--output", type=Path, help="Defaults to <input>_outlier_clean.ply.")
+    p.add_argument("--report", type=Path, help="Defaults to <output>.outlier_clean_report.json.")
+    p.add_argument("--quantile-min", type=float, default=0.001, help="Per-axis lower quantile for robust bbox crop.")
+    p.add_argument("--quantile-max", type=float, default=0.999, help="Per-axis upper quantile for robust bbox crop.")
+    p.add_argument("--padding-ratio", type=float, default=0.02, help="Extra bbox padding as a fraction of robust extent.")
+    p.add_argument("--min-keep-ratio", type=float, default=0.80, help="Fallback to original cloud if a filter would keep less than this fraction.")
+    p.add_argument("--keep-largest-cluster", action=argparse.BooleanOptionalAction, default=False, help="Optionally keep only the largest DBSCAN cluster after quantile crop.")
+    p.add_argument("--dbscan-eps", type=float, default=0.18)
+    p.add_argument("--dbscan-min-points", type=int, default=20)
+    p.add_argument(
+        "--register-as",
+        choices=["point_cloud", "scene_3dgs_point_cloud_ply", "scene_3dgs_ply", "semantic_point_cloud_ply"],
+        help="Optional manifest artifact key to replace with the cleaned PLY.",
+    )
+    p.set_defaults(func=cmd_clean_point_cloud_outliers)
 
     p = sub.add_parser("prepare-high-quality-3dgs-job", help="Prepare a provider-specific high-quality 3DGS training job without running it.")
     add_common_project_arg(p)
@@ -36434,6 +41100,150 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print JSON report.")
     p.set_defaults(func=cmd_gaussian_probability_quality_report)
 
+    p = sub.add_parser("transfer-mesh-semantics", help="Backfill semantic object_id labels from semantic splats/point cloud onto mesh triangle faces.")
+    add_common_project_arg(p)
+    p.add_argument("--mesh", type=Path, required=True, help="Triangle mesh to annotate, typically a scene collider GLB/PLY/OBJ.")
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic PLY with x/y/z/object_id and optional object_probability. Defaults to manifest semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic manifest used for object_id/name/category legend.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/mesh_semantics.")
+    p.add_argument("--output", type=Path, help="Output mesh_semantics JSON sidecar.")
+    p.add_argument("--debug-ply", type=Path, help="Output colored face-debug PLY.")
+    p.add_argument("--k", type=int, default=8, help="Nearest semantic points queried for each mesh face center.")
+    p.add_argument("--max-distance", type=float, help="Absolute distance cutoff; farther semantic neighbors are ignored.")
+    p.add_argument("--max-distance-ratio", type=float, default=0.015, help="Default cutoff as mesh bbox diagonal ratio when --max-distance is omitted.")
+    p.add_argument("--min-face-probability", type=float, default=0.35, help="Minimum weighted object probability required to label a face.")
+    p.add_argument("--min-vote-confidence", type=float, default=0.45, help="Minimum winning-label vote share required to label a face.")
+    p.add_argument("--distance-power", type=float, default=2.0)
+    p.add_argument("--distance-epsilon", type=float, default=1e-5)
+    p.add_argument("--smooth-iterations", type=int, default=1, help="Optional neighbor smoothing passes for low-confidence/unknown faces.")
+    p.add_argument("--smooth-keep-probability", type=float, default=0.75, help="Faces at or above this probability are kept during smoothing.")
+    p.add_argument("--smooth-min-neighbors", type=int, default=2)
+    p.add_argument("--min-component-faces", type=int, default=0, help="Set all labels in tiny whole-mesh connected components to unknown.")
+    p.add_argument("--min-region-faces", type=int, default=8, help="Set tiny same-label connected regions to unknown.")
+    p.add_argument("--semantic-max-points", type=int, default=0, help="Optional stratified cap on semantic source points for faster transfer; 0 keeps all.")
+    p.add_argument("--semantic-min-points-per-label", type=int, default=2000, help="When downsampling, preserve at least this many high-probability points per semantic id when available.")
+    p.add_argument("--seed", type=int, default=7)
+    p.set_defaults(func=cmd_transfer_mesh_semantics)
+
+    p = sub.add_parser("transfer-mesh-semantics-local", help="Backfill mesh face semantics from semantic PLY using strict local multi-sample voting.")
+    add_common_project_arg(p)
+    p.add_argument("--mesh", type=Path, required=True, help="Triangle mesh to annotate, typically a scene collider GLB/PLY/OBJ.")
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic PLY with x/y/z/object_id and optional object_probability. Defaults to manifest semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic manifest used for object_id/name/category legend.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/mesh_semantics_local.")
+    p.add_argument("--output", type=Path, help="Output mesh_semantics JSON sidecar.")
+    p.add_argument("--debug-ply", type=Path, help="Output colored face-debug PLY.")
+    p.add_argument("--k", type=int, default=8, help="Nearest semantic points queried for each sampled point inside a mesh face.")
+    p.add_argument("--face-sample-mode", choices=["center", "inner4", "inner7"], default="inner4", help="How many interior samples to cast per face before voting.")
+    p.add_argument("--max-distance", type=float, help="Absolute distance cutoff; farther semantic neighbors are ignored.")
+    p.add_argument("--max-distance-ratio", type=float, default=0.008, help="Default cutoff as mesh bbox diagonal ratio when --max-distance is omitted.")
+    p.add_argument("--min-sample-support", type=float, default=0.5, help="Minimum fraction of a face's interior samples supporting the winning label.")
+    p.add_argument("--min-neighbor-votes", type=int, default=3, help="Minimum accepted semantic neighbors for the winning label on a face.")
+    p.add_argument("--min-face-probability", type=float, default=0.55, help="Minimum mean source semantic probability required to label a face.")
+    p.add_argument("--min-vote-confidence", type=float, default=0.65, help="Minimum winning-label weighted vote share required to label a face.")
+    p.add_argument("--distance-power", type=float, default=2.0)
+    p.add_argument("--distance-epsilon", type=float, default=1e-5)
+    p.add_argument("--label-bbox-quantile", type=float, default=0.02, help="Trim this quantile from each semantic label bbox before adding padding.")
+    p.add_argument("--label-bbox-padding-ratio", type=float, default=0.06, help="Padding added to each robust semantic label bbox.")
+    p.add_argument("--bbox-min-probability", type=float, default=0.5, help="Use high-probability semantic points when building label bboxes when enough exist.")
+    p.add_argument("--smooth-iterations", type=int, default=0, help="Optional neighbor smoothing passes; default keeps strict local labels only.")
+    p.add_argument("--smooth-keep-probability", type=float, default=0.75)
+    p.add_argument("--smooth-min-neighbors", type=int, default=2)
+    p.add_argument("--min-region-faces", type=int, default=50, help="Set tiny same-label connected regions to unknown.")
+    p.add_argument("--semantic-max-points", type=int, default=200000, help="Optional stratified cap on semantic source points for faster transfer; 0 keeps all.")
+    p.add_argument("--semantic-min-points-per-label", type=int, default=3000, help="When downsampling, preserve at least this many high-probability points per semantic id when available.")
+    p.add_argument("--seed", type=int, default=7)
+    p.set_defaults(func=cmd_transfer_mesh_semantics_local)
+
+    p = sub.add_parser("transfer-mesh-semantics-projected-splats", help="Backfill mesh face semantics by multi-view projecting semantic 3DGS points onto mesh surface samples.")
+    add_common_project_arg(p)
+    p.add_argument("--mesh", type=Path, required=True, help="Triangle mesh to annotate, typically a scene collider GLB/PLY/OBJ.")
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic PLY with x/y/z/object_id and optional object_probability. Defaults to manifest semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic manifest used for object_id/name/category legend.")
+    p.add_argument("--camera-info", type=Path, help="camera_info.json with intrinsics and world_to_camera/camera_to_world extrinsics.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/mesh_semantics_projected_splats.")
+    p.add_argument("--output", type=Path, help="Output mesh_semantics JSON sidecar.")
+    p.add_argument("--debug-ply", type=Path, help="Output colored face-debug PLY.")
+    p.add_argument("--frame-ids", help="Comma-separated frame ids; defaults to all camera_info extrinsic frames.")
+    p.add_argument("--max-frames", type=int, default=30, help="Evenly sampled frame cap; 0 uses all frames.")
+    p.add_argument("--face-sample-mode", choices=["center", "inner4", "inner7"], default="inner4", help="How many interior mesh samples to project per face.")
+    p.add_argument("--sample-pixel-radius", type=int, default=2, help="Pixel radius around each mesh sample used to find projected semantic splat labels.")
+    p.add_argument("--pixel-sigma", type=float, default=1.2, help="Gaussian falloff in pixels for neighboring semantic splat projections.")
+    p.add_argument("--semantic-min-probability", type=float, default=0.45, help="Minimum semantic splat probability projected into the per-frame label/depth buffer.")
+    p.add_argument("--depth-tolerance", type=float, default=0.08, help="Absolute semantic-depth-vs-mesh-depth tolerance for accepting a projected splat vote.")
+    p.add_argument("--relative-depth-tolerance", type=float, default=0.015)
+    p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True, help="Use projected mesh sample z-buffer so hidden mesh samples do not vote.")
+    p.add_argument("--mesh-depth-tolerance", type=float, default=0.04, help="Absolute z-buffer tolerance for mesh sample visibility.")
+    p.add_argument("--mesh-relative-depth-tolerance", type=float, default=0.01)
+    p.add_argument("--min-visible-samples", type=int, default=2, help="Minimum visible projected mesh sample observations before a face can receive a label.")
+    p.add_argument("--min-projected-votes", type=int, default=3, help="Minimum accepted projected semantic splat votes for the winning label.")
+    p.add_argument("--min-face-probability", type=float, default=0.45, help="Minimum winning-label hit share among projected votes for a face.")
+    p.add_argument("--min-vote-confidence", type=float, default=0.60, help="Minimum winning-label weighted vote share required to label a face.")
+    p.add_argument("--smooth-iterations", type=int, default=0)
+    p.add_argument("--smooth-keep-probability", type=float, default=0.75)
+    p.add_argument("--smooth-min-neighbors", type=int, default=2)
+    p.add_argument("--min-region-faces", type=int, default=50)
+    p.add_argument("--semantic-max-points", type=int, default=250000, help="Optional stratified cap on semantic source points for faster transfer; 0 keeps all.")
+    p.add_argument("--semantic-min-points-per-label", type=int, default=3000)
+    p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
+    p.add_argument("--seed", type=int, default=7)
+    p.set_defaults(func=cmd_transfer_mesh_semantics_projected_splats)
+
+    p = sub.add_parser("transfer-mesh-semantics-ray", help="Backfill mesh face semantics by projecting face centers into multi-view 2D masks.")
+    add_common_project_arg(p)
+    p.add_argument("--mesh", type=Path, required=True, help="Triangle mesh to annotate, typically the final collider GLB/PLY.")
+    p.add_argument("--camera-info", type=Path, help="camera_info.json with intrinsics and world_to_camera/camera_to_world extrinsics.")
+    p.add_argument("--mask-root", type=Path, help="2D object mask root in <object_id>/<frame>.png layout.")
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic PLY used only with --generate-projected-semantic-masks debug mode.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic manifest used for object_id/name/category legend.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/mesh_semantics_ray.")
+    p.add_argument("--output", type=Path, help="Output mesh_semantics JSON sidecar.")
+    p.add_argument("--debug-ply", type=Path, help="Output colored face-debug PLY.")
+    p.add_argument("--frame-ids", help="Comma-separated frame ids; defaults to all camera_info extrinsic frames.")
+    p.add_argument("--max-frames", type=int, default=0, help="Optional cap over selected frame ids.")
+    p.add_argument("--mask-threshold", type=int, default=128)
+    p.add_argument("--min-frame-votes", type=float, default=1.0, help="Minimum winning multi-view mask votes required to label a face.")
+    p.add_argument("--min-vote-confidence", type=float, default=0.55)
+    p.add_argument("--occlusion-filter", action="store_true", help="Keep only nearest projected face center per pixel before mask voting.")
+    p.add_argument("--depth-tolerance", type=float, default=0.02)
+    p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
+    p.add_argument("--smooth-iterations", type=int, default=1)
+    p.add_argument("--smooth-keep-probability", type=float, default=0.75)
+    p.add_argument("--smooth-min-neighbors", type=int, default=2)
+    p.add_argument("--min-region-faces", type=int, default=8)
+    p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
+    p.add_argument("--generate-projected-semantic-masks", action="store_true", help="Debug-only fallback: project semantic 3D points into frames to synthesize label masks when real 2D masks are unavailable.")
+    p.add_argument("--projected-mask-point-radius", type=int, default=2)
+    p.add_argument("--projected-mask-min-probability", type=float, default=0.35)
+    p.add_argument("--projected-mask-max-points", type=int, default=250000)
+    p.add_argument("--seed", type=int, default=7)
+    p.set_defaults(func=cmd_transfer_mesh_semantics_ray)
+
+    p = sub.add_parser("reconstruct-scene-meshes", help="Reconstruct a scene-level collider mesh, currently from a COLMAP dense workspace via delaunay_mesher.")
+    add_common_project_arg(p)
+    p.add_argument("--method", choices=["colmap_delaunay"], default="colmap_delaunay")
+    p.add_argument("--colmap-dense-workspace", type=Path, help="Defaults to manifest artifacts.colmap_dense_workspace or external/colmap/dense.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/scene_meshes/<method>.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/mesh.ply.")
+    p.add_argument("--colmap-binary", default="colmap")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--copy-input-point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Copy COLMAP dense fused.ply beside the mesh for later inspection.")
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.set_defaults(func=cmd_reconstruct_scene_meshes)
+
+    p = sub.add_parser("split-mesh-by-semantics", help="Split one face-annotated scene mesh into one PLY mesh per semantic object label.")
+    add_common_project_arg(p)
+    p.add_argument("--mesh", type=Path, help="Defaults to manifest scene mesh artifact.")
+    p.add_argument("--semantics", type=Path, help="Mesh semantics JSON from transfer-mesh-semantics*.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_object_meshes.")
+    p.add_argument("--min-faces", type=int, default=20)
+    p.add_argument("--min-probability", type=float, default=0.0)
+    p.add_argument("--include-unknown", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--copy-to-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--register-as-object-meshes", action=argparse.BooleanOptionalAction, default=True, help="Update object.json mesh_asset records and artifacts.object_meshes.")
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.set_defaults(func=cmd_split_mesh_by_semantics)
+
     p = sub.add_parser("export-viewer-plys", help="Export plain point-cloud PLY and SuperSplat-compatible Gaussian PLY files.")
     add_common_project_arg(p)
     p.add_argument("--kind", choices=["scene", "semantic", "all"], default="all", help="Which registered splat artifacts to export.")
@@ -36661,6 +41471,66 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--skip-failed", action="store_true")
     p.set_defaults(func=cmd_reconstruct_semantic_3dgs_object_meshes)
+
+    p = sub.add_parser("export-semantic-3dgs-object-colliders", help="Export robust object-level collision proxies from semantic 3DGS Gaussian centers.")
+    add_common_project_arg(p)
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic 3DGS PLY with object_id/object_probability. Defaults to manifest semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic splat manifest with object ids/categories. Defaults to manifest semantic_splats_manifest.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_3dgs_object_colliders.")
+    p.add_argument("--object-ids", nargs="+", help="Optional object ids to export. Requested ids bypass category and max-diagonal skips.")
+    p.add_argument("--include-categories", default="", help="Optional comma-separated category allow-list.")
+    p.add_argument("--exclude-categories", default="", help="Extra comma-separated categories to skip in addition to floor/wall/background-like defaults.")
+    p.add_argument("--include-background-structures", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--min-probability", type=float, default=0.5)
+    p.add_argument("--min-points", type=int, default=200)
+    p.add_argument("--min-points-after-clean", type=int, default=100)
+    p.add_argument("--axis-quantile-min", type=float, default=0.25, help="AABB quantile crop lower bound before PCA.")
+    p.add_argument("--axis-quantile-max", type=float, default=0.75, help="AABB quantile crop upper bound before PCA.")
+    p.add_argument("--axis-padding-ratio", type=float, default=0.04)
+    p.add_argument("--pca-quantile-min", type=float, default=0.15)
+    p.add_argument("--pca-quantile-max", type=float, default=0.85)
+    p.add_argument("--pca-padding-ratio", type=float, default=0.04)
+    p.add_argument("--min-extent", type=float, default=0.05)
+    p.add_argument("--max-diagonal", type=float, default=5.0, help="Fallback maximum OBB diagonal. Some categories have larger built-in caps, e.g. bed.")
+    p.add_argument("--preview", action=argparse.BooleanOptionalAction, default=True, help="Write object_collider_proxy_preview.png when matplotlib is available.")
+    p.set_defaults(func=cmd_export_semantic_3dgs_object_colliders)
+
+    p = sub.add_parser("export-semantic-3dgs-compound-colliders", help="Export bbox-gated compound BoxCollider proxies from semantic 3DGS Gaussian centers.")
+    add_common_project_arg(p)
+    p.add_argument("--semantic-splats-ply", type=Path, help="Semantic 3DGS PLY with object_id/object_probability. Defaults to manifest semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Semantic splat manifest with object ids/categories. Defaults to manifest semantic_splats_manifest.")
+    p.add_argument("--bbox-source", type=Path, help="Optional simulator_asset_bundle.json with object bbox_3d hints for gating noisy semantic splats.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_3dgs_compound_colliders.")
+    p.add_argument("--object-ids", nargs="+", help="Optional object ids to export. Requested ids bypass category skips.")
+    p.add_argument("--include-categories", default="", help="Optional comma-separated category allow-list.")
+    p.add_argument("--exclude-categories", default="", help="Extra comma-separated categories to skip in addition to floor/wall/background-like defaults.")
+    p.add_argument("--include-background-structures", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--min-probability", type=float, default=0.5)
+    p.add_argument("--min-points", type=int, default=32)
+    p.add_argument("--min-points-after-gate", type=int, default=24)
+    p.add_argument("--bbox-gate", action=argparse.BooleanOptionalAction, default=True, help="Gate semantic splats by object bbox hints before voxelizing.")
+    p.add_argument("--require-bbox-gate", action=argparse.BooleanOptionalAction, default=False, help="Skip unrequested objects without bbox hints.")
+    p.add_argument("--bbox-gate-fallback-keep-ungated", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--bbox-hint-fallback", action=argparse.BooleanOptionalAction, default=True, help="Use bbox hints as low-confidence compound colliders when semantic splats are sparse or misaligned.")
+    p.add_argument("--bbox-hint-fallback-max-axis-boxes", type=int, default=3, help="Split long fallback bboxes into this many boxes at most.")
+    p.add_argument("--bbox-padding-ratio", type=float, default=0.12)
+    p.add_argument("--bbox-min-padding", type=float, default=0.15)
+    p.add_argument("--crop-to-quantile-bbox", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--bbox-quantile-min", type=float, default=0.02)
+    p.add_argument("--bbox-quantile-max", type=float, default=0.98)
+    p.add_argument("--quantile-padding-ratio", type=float, default=0.04)
+    p.add_argument("--voxel-size", type=float, default=0.0, help="0 auto-selects from bbox size.")
+    p.add_argument("--target-grid-resolution", type=int, default=24)
+    p.add_argument("--min-auto-voxel-size", type=float, default=0.08)
+    p.add_argument("--max-auto-voxel-size", type=float, default=1.25)
+    p.add_argument("--max-boxes-per-object", type=int, default=32)
+    p.add_argument("--min-component-voxels", type=int, default=3)
+    p.add_argument("--max-components", type=int, default=3)
+    p.add_argument("--box-quantile-min", type=float, default=0.02, help="Lower per-box point quantile used to tighten merged voxel boxes.")
+    p.add_argument("--box-quantile-max", type=float, default=0.98, help="Upper per-box point quantile used to tighten merged voxel boxes.")
+    p.add_argument("--box-padding-ratio", type=float, default=0.03)
+    p.add_argument("--min-box-extent", type=float, default=0.05)
+    p.set_defaults(func=cmd_export_semantic_3dgs_compound_colliders)
 
     p = sub.add_parser("prepare-neus-surface-jobs", help="Prepare external NeuS-style SDF surface extraction jobs from 3DGS-rendered RGB/depth/normal/mask observations.")
     add_common_project_arg(p)
@@ -37527,6 +42397,51 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--semantic-preview-alpha", type=float, default=0.9)
     p.add_argument("--semantic-preview-seed", type=int, default=7)
     p.add_argument("--semantic-preview-include-background", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--reconstruct-scene-meshes", action="store_true", help="Reconstruct a scene-level COLMAP dense Delaunay collider mesh.")
+    p.add_argument("--scene-mesh", type=Path, help="Existing scene mesh used for semantic transfer/splitting when reconstruction is skipped.")
+    p.add_argument("--scene-mesh-method", choices=["colmap_delaunay"], default="colmap_delaunay")
+    p.add_argument("--scene-mesh-output-dir", type=Path)
+    p.add_argument("--scene-mesh-output", type=Path)
+    p.add_argument("--scene-mesh-colmap-dense-workspace", type=Path)
+    p.add_argument("--scene-mesh-colmap-binary", default=None)
+    p.add_argument("--scene-mesh-overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--scene-mesh-copy-input-point-cloud", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--transfer-scene-mesh-semantics", action="store_true", help="Backfill face semantics onto the scene mesh after semantic splat export.")
+    p.add_argument("--scene-mesh-semantic-route", choices=["local", "projected-splats", "nearest"], default="local")
+    p.add_argument("--scene-mesh-semantic-output-dir", type=Path)
+    p.add_argument("--scene-mesh-semantic-k", type=int, default=12)
+    p.add_argument("--scene-mesh-semantic-face-sample-mode", choices=["center", "inner4", "inner7"], default="inner4")
+    p.add_argument("--scene-mesh-semantic-max-distance-ratio", type=float, default=0.004)
+    p.add_argument("--scene-mesh-semantic-min-sample-support", type=float, default=0.5)
+    p.add_argument("--scene-mesh-semantic-min-neighbor-votes", type=int, default=4)
+    p.add_argument("--scene-mesh-semantic-min-face-probability", type=float, default=0.55)
+    p.add_argument("--scene-mesh-semantic-min-vote-confidence", type=float, default=0.52)
+    p.add_argument("--scene-mesh-semantic-label-bbox-quantile", type=float, default=0.02)
+    p.add_argument("--scene-mesh-semantic-label-bbox-padding-ratio", type=float, default=0.06)
+    p.add_argument("--scene-mesh-semantic-bbox-min-probability", type=float, default=0.5)
+    p.add_argument("--scene-mesh-semantic-smooth-iterations", type=int, default=1)
+    p.add_argument("--scene-mesh-semantic-smooth-keep-probability", type=float, default=0.72)
+    p.add_argument("--scene-mesh-semantic-smooth-min-neighbors", type=int, default=2)
+    p.add_argument("--scene-mesh-semantic-min-region-faces", type=int, default=60)
+    p.add_argument("--scene-mesh-semantic-max-points", type=int, default=250000)
+    p.add_argument("--scene-mesh-semantic-min-points-per-label", type=int, default=5000)
+    p.add_argument("--scene-mesh-semantic-max-frames", type=int, default=40)
+    p.add_argument("--scene-mesh-semantic-projected-sample-pixel-radius", type=int, default=2)
+    p.add_argument("--scene-mesh-semantic-projected-min-probability", type=float, default=0.55)
+    p.add_argument("--scene-mesh-semantic-projected-depth-tolerance", type=float, default=0.08)
+    p.add_argument("--scene-mesh-semantic-projected-relative-depth-tolerance", type=float, default=0.015)
+    p.add_argument("--scene-mesh-semantic-projected-mesh-depth-tolerance", type=float, default=0.08)
+    p.add_argument("--scene-mesh-semantic-projected-mesh-relative-depth-tolerance", type=float, default=0.015)
+    p.add_argument("--scene-mesh-semantic-projected-min-visible-samples", type=int, default=1)
+    p.add_argument("--scene-mesh-semantic-projected-min-votes", type=int, default=2)
+    p.add_argument("--scene-mesh-semantic-projected-min-face-probability", type=float, default=0.45)
+    p.add_argument("--scene-mesh-semantic-projected-min-vote-confidence", type=float, default=0.45)
+    p.add_argument("--scene-mesh-semantic-seed", type=int, default=7)
+    p.add_argument("--split-scene-mesh-by-semantics", action="store_true", help="Split the semantic scene mesh into one video2mesh_scene PLY per semantic object.")
+    p.add_argument("--scene-mesh-object-splits-output-dir", type=Path)
+    p.add_argument("--scene-mesh-object-splits-min-faces", type=int, default=20)
+    p.add_argument("--scene-mesh-object-splits-min-probability", type=float, default=0.0)
+    p.add_argument("--scene-mesh-object-splits-register-as-object-meshes", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--skip-object-mask-clouds", action="store_true")
     p.add_argument("--skip-background-structure-quality-report", action="store_true")
     p.add_argument("--background-quality-expected-categories", type=str, nargs="+", default=["floor", "wall", "ceiling"], help="Background structure category families expected in the QA report.")

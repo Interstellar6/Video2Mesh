@@ -7,11 +7,13 @@ import pytest
 
 from video2mesh.cli import (
     apply_3dgs_sparse_filter,
+    audit_gaussian_health,
     augment_points_from_gaussian_support,
     build_observation_point_cloud,
     build_parser,
     bbox_proxy_mesh_from_points,
     clean_3dgs_floaters,
+    cmd_clean_point_cloud_outliers,
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
     cmd_reconstruct_object_meshes,
@@ -33,12 +35,15 @@ from video2mesh.cli import (
     gaussian_occupancy_mesh_from_points,
     graphdeco_shape_regularizer_args,
     make_object_masks_exclusive,
+    make_viewer_safe_gaussian_arrays,
     mesh_support_quality_report,
     parse_ply_vertex_header,
     postprocess_mesh_with_point_support,
     prepare_3dgs_colmap_source,
     quantile_bounds_from_points,
     read_colmap_text_images,
+    read_point_cloud,
+    read_gsplat_ply,
     resolve_export_record_path,
     scaled_intrinsic_for_size,
     select_colmap_sparse_model,
@@ -396,6 +401,111 @@ def test_export_viewer_plys_keeps_semantic_labels_out_of_supersplat_ply(tmp_path
     assert payload["object_probability"] == [0.8999999761581421, 0.800000011920929]
 
 
+def test_gaussian_health_flags_supersplat_streak_risk():
+    np = pytest.importorskip("numpy")
+    scales = np.array(
+        [
+            [0.02, 0.02, 0.02],
+            [4.0, 0.00001, 0.00001],
+            [0.5, 0.002, 0.002],
+        ],
+        dtype=np.float32,
+    )
+    quats = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0, 0.0],
+            [0.7, 0.7, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    report = audit_gaussian_health(scales, quats)
+
+    assert report["status"] == "unsafe"
+    issue_metrics = {item["metric"] for item in report["issues"]}
+    assert "elongation_p99" in issue_metrics
+    assert "rot_norm_error_p99" in issue_metrics
+
+
+def test_viewer_safe_gaussian_arrays_clamp_elongation_and_rotation():
+    np = pytest.importorskip("numpy")
+    scales = np.array([[4.0, 0.00001, 0.00001], [0.03, 0.02, 0.02]], dtype=np.float32)
+    quats = np.array([[4.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5]], dtype=np.float32)
+    opacities = np.array([0.999999, 0.5], dtype=np.float32)
+
+    safe_scales, safe_quats, safe_opacities, repair = make_viewer_safe_gaussian_arrays(scales, quats, opacities)
+    after = audit_gaussian_health(safe_scales, safe_quats, safe_opacities)
+
+    assert repair["status"] == "viewer_safe_postprocessed"
+    assert repair["before"]["status"] == "unsafe"
+    assert after["status"] == "safe"
+    assert float(after["metrics"]["elongation"]["max"]) <= 12.0001
+    assert np.linalg.norm(safe_quats[0]) == pytest.approx(1.0)
+    assert safe_opacities[0] < opacities[0]
+
+
+def test_export_viewer_plys_marks_unsafe_source_and_writes_safe_supersplat(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("PIL.Image")
+    source = tmp_path / "unsafe_scene.ply"
+    write_supersplat_ply(
+        source,
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        np.array([[1.0, 0.4, 0.2], [0.2, 0.4, 1.0]], dtype=np.float32),
+        np.array([0.999999, 0.5], dtype=np.float32),
+        np.array([[4.0, 0.00001, 0.00001], [0.03, 0.02, 0.02]], dtype=np.float32),
+        np.array([[4.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+    )
+
+    report = export_viewer_plys(source, tmp_path, "scene_3dgs", include_labels=False)
+
+    assert report["raw_gaussian_health"]["status"] == "unsafe"
+    assert report["source_gaussian_health_ok"] is False
+    assert report["viewer_safety_status"] == "viewer_safe_postprocessed"
+    assert report["viewer_safe_postprocessed"] is True
+    assert report["geometry_preserved"] is True
+    assert report["visual_qa_required"] is True
+    assert report["exported_gaussian_health"]["status"] == "safe"
+    assert report["exported_gaussian_health_ok"] is True
+    assert report["supersplat_ply_info"]["source_gaussian_health_ok"] is False
+    assert report["supersplat_ply_info"]["geometry_preserved"] is True
+    assert report["shape_preview"]["ok"] is True
+    assert Path(report["shape_preview"]["path"]).exists()
+    exported = read_gsplat_ply(Path(report["supersplat_ply"]))
+    assert np.allclose(exported["means"], np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32))
+    safety_report = json.loads(Path(report["viewer_safety_report"]).read_text(encoding="utf-8"))
+    assert safety_report["viewer_safe_repair"]["before"]["status"] == "unsafe"
+    assert safety_report["geometry_preserved"] is True
+    assert safety_report["shape_preview"]["ok"] is True
+    assert Path(report["supersplat_ply"]).exists()
+
+
+def test_export_viewer_plys_reads_semantic_label_sidecar_for_binary_supersplat(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    source = tmp_path / "semantic_3dgs_supersplat.ply"
+    write_supersplat_ply(
+        source,
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        np.array([[1.0, 0.4, 0.2], [0.2, 0.4, 1.0]], dtype=np.float32),
+        np.array([0.5, 0.5], dtype=np.float32),
+        np.ones((2, 3), dtype=np.float32) * 0.02,
+        np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (2, 1)),
+    )
+    write_json(
+        tmp_path / "semantic_3dgs_supersplat_labels.json",
+        {"schema_version": 1, "object_id": [7, 8], "object_probability": [0.7, 0.8]},
+    )
+
+    report = export_viewer_plys(source, tmp_path, "semantic_3dgs_repaired", include_labels=True)
+
+    assert report["includes_object_id"] is True
+    assert report["source_label_sidecar"].endswith("semantic_3dgs_supersplat_labels.json")
+    sidecar = json.loads(Path(report["label_sidecar"]).read_text(encoding="utf-8"))
+    assert sidecar["object_id"] == [7, 8]
+    assert sidecar["object_probability"] == [0.699999988079071, 0.800000011920929]
+
+
 def test_scaled_intrinsic_for_size_scales_focal_length_and_principal_point():
     intrinsic = {
         "w": 1280,
@@ -517,6 +627,47 @@ def test_filter_points_by_quantile_bbox_removes_outlier_points():
     assert filtered.shape == (3, 3)
     assert filtered_colors.shape == (3, 3)
     assert report["removed_points"] == 1
+
+
+def test_clean_point_cloud_outliers_cli_removes_plain_ply_tail(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    source = tmp_path / "cloud.ply"
+    output = tmp_path / "cloud_clean.ply"
+    report = tmp_path / "cloud_clean.json"
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [0.0, 0.2, 0.0],
+            [0.2, 0.2, 0.0],
+            [100.0, 100.0, 100.0],
+        ],
+        dtype=np.float64,
+    )
+    write_point_cloud_ascii_ply(source, points, np.ones_like(points))
+
+    rc = cmd_clean_point_cloud_outliers(
+        Namespace(
+            project_root=tmp_path,
+            input=source,
+            output=output,
+            report=report,
+            quantile_min=0.0,
+            quantile_max=0.8,
+            padding_ratio=0.0,
+            min_keep_ratio=0.5,
+            keep_largest_cluster=False,
+            dbscan_eps=0.18,
+            dbscan_min_points=2,
+            register_as=None,
+        )
+    )
+
+    assert rc == 0
+    cleaned_points, _colors = read_point_cloud(output)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert cleaned_points.shape[0] == 4
+    assert payload["removed_count"] == 1
 
 
 def test_filter_points_by_pca_quantiles_removes_axis_tail():
@@ -1142,6 +1293,7 @@ def test_3dgs_mesh_cli_commands_are_registered():
     colmap = parser.parse_args(["run-colmap", "--project-root", "proj"])
     g3dgs = parser.parse_args(["run-3dgs", "--project-root", "proj"])
     clean = parser.parse_args(["clean-3dgs-floaters", "--project-root", "proj", "--input", "splats.ply"])
+    clean_cloud = parser.parse_args(["clean-point-cloud-outliers", "--project-root", "proj", "--input", "cloud.ply"])
     obs = parser.parse_args(["export-3dgs-mesh-observations", "--project-root", "proj"])
     obs_with_support = parser.parse_args(
         [
@@ -1167,8 +1319,35 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert pipeline.g3dgs_prefer_dense_colmap_init is True
     assert pipeline.g3dgs_clean_3dgs_floaters is True
     assert pipeline.g3dgs_clean_max_elongation == pytest.approx(25.0)
+    assert pipeline.reconstruct_scene_meshes is False
+    assert pipeline.transfer_scene_mesh_semantics is False
+    assert pipeline.split_scene_mesh_by_semantics is False
+    assert pipeline.scene_mesh_method == "colmap_delaunay"
+    assert pipeline.scene_mesh_semantic_route == "local"
+    assert pipeline.scene_mesh_semantic_max_distance_ratio == pytest.approx(0.004)
+    assert pipeline.scene_mesh_semantic_min_face_probability == pytest.approx(0.55)
+    assert pipeline.scene_mesh_object_splits_register_as_object_meshes is True
+    full_scene_mesh = parser.parse_args(
+        [
+            "run-pipeline",
+            "--project-root",
+            "proj",
+            "--reconstruct-scene-meshes",
+            "--transfer-scene-mesh-semantics",
+            "--split-scene-mesh-by-semantics",
+            "--scene-mesh-semantic-route",
+            "projected-splats",
+        ]
+    )
+    assert full_scene_mesh.reconstruct_scene_meshes is True
+    assert full_scene_mesh.transfer_scene_mesh_semantics is True
+    assert full_scene_mesh.split_scene_mesh_by_semantics is True
+    assert full_scene_mesh.scene_mesh_semantic_route == "projected-splats"
     assert clean.func.__name__ == "cmd_clean_3dgs_floaters"
     assert clean.knn == 24
+    assert clean_cloud.func.__name__ == "cmd_clean_point_cloud_outliers"
+    assert clean_cloud.quantile_min == pytest.approx(0.001)
+    assert clean_cloud.quantile_max == pytest.approx(0.999)
     assert obs.func.__name__ == "cmd_export_3dgs_mesh_observations"
     assert obs.semantic_support_filter is False
     assert obs.depth_mode_band_filter is False

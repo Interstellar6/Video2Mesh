@@ -10,8 +10,12 @@ The canonical documentation is now in [docs/](docs/README.md).
 cd /root/autodl-tmp/workspace/Video2Mesh
 source /etc/network_turbo >/dev/null 2>&1 || true
 
-bash tools/run_video2mesh_quick.sh dataset/<video>.mp4
+bash run.sh dataset/<video>.mp4
 ```
+
+`bash run.sh` wraps `tools/run_video2mesh_quick.sh`; if no argument is passed it
+uses `VIDEO=/path/to/video.mp4` or the first video found under `dataset/` or
+`inputs/`.
 
 Current default route:
 
@@ -21,6 +25,8 @@ video
   -> GraphDECO 3DGS
   -> SAM2 masks
   -> 2D-to-3D semantic fusion
+  -> COLMAP dense Delaunay scene collider mesh
+  -> mesh semantic transfer and semantic object mesh splitting
   -> object mesh / completion jobs
   -> collider and physics proxies
   -> MuJoCo / Unity / Isaac assets
