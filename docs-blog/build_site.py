@@ -42,12 +42,30 @@ CATEGORY_RULES = [
     ("Notes", ["notes", "frame", "匹配", "说明"]),
 ]
 
+RESEARCH_STAGE_DEFS = [
+    ("input-pose-pointcloud", "输入、位姿与点云"),
+    ("visual-3dgs", "视觉重建 / 3DGS"),
+    ("mesh-reconstruction", "Mesh 重建"),
+    ("pointcloud-completion", "点云/背景补全"),
+    ("object-mesh-completion", "物体 Mesh 补全"),
+    ("semantic-scene-graph", "语义与 Scene Graph"),
+    ("collider-physics-proxy", "Collider 与物理代理"),
+    ("object-simulation", "物体仿真"),
+    ("industrial-pipelines", "工业资产管线"),
+    ("experiments", "本项目实验"),
+]
+
+RESEARCH_STAGE_TITLES = dict(RESEARCH_STAGE_DEFS)
+
 
 @dataclass
 class Doc:
     id: str
     title: str
     category: str
+    research_stage: str
+    research_stage_title: str
+    research_doc_role: str
     visibility: str
     summary: str
     source_path: str
@@ -104,6 +122,22 @@ def infer_category(path: Path, title: str, meta: dict[str, Any]) -> str:
         if any(needle.lower() in haystack for needle in needles):
             return category
     return "Notes"
+
+
+def infer_research_stage(path: Path) -> tuple[str, str, str]:
+    relative = str(path.relative_to(ROOT)).replace("\\", "/")
+    prefix = "docs/video2mesh/research-catalog/"
+    if not relative.startswith(prefix):
+        return "", "", ""
+    tail = relative[len(prefix):]
+    if tail == "README.md":
+        return "research-catalog", "调研目录总览", "root"
+    stage_key = tail.split("/", 1)[0]
+    stage_title = RESEARCH_STAGE_TITLES.get(stage_key, "")
+    if not stage_title:
+        return "", "", ""
+    role = "overview" if tail.endswith("/overview.md") else "item"
+    return stage_key, stage_title, role
 
 
 def extract_summary(body: str, meta: dict[str, Any]) -> str:
@@ -223,6 +257,7 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str], copy_assets: bool
         index += 1
     used_ids.add(doc_id)
     category = infer_category(path, title, meta)
+    research_stage, research_stage_title, research_doc_role = infer_research_stage(path)
     visibility = normalize_visibility(meta, path)
     if copy_assets and visibility == "public":
         body = copy_local_assets(path, doc_id, body)
@@ -232,6 +267,9 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str], copy_assets: bool
         id=doc_id,
         title=title,
         category=category,
+        research_stage=research_stage,
+        research_stage_title=research_stage_title,
+        research_doc_role=research_doc_role,
         visibility=visibility,
         summary=extract_summary(body, meta),
         source_path=str(path.relative_to(ROOT)),

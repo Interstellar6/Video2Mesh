@@ -199,6 +199,42 @@
       .sort((a, b) => String(a.source_path || "").localeCompare(String(b.source_path || ""), "zh-Hans-CN") || a.title.localeCompare(b.title, "zh-Hans-CN"));
   }
 
+  function renderNavDocLink(doc, extraClass = "") {
+    return `
+      <a class="nav-doc-link ${extraClass} ${doc.id === currentDocId ? "active" : ""}" href="#/doc/${encodeURIComponent(doc.id)}">
+        <span>${escapeHtml(doc.title)}</span>
+        <small>${escapeHtml(doc.research_stage_title || doc.category)}</small>
+      </a>
+    `;
+  }
+
+  function renderCategoryDocList(category) {
+    const categoryDocs = docsForCategory(category);
+    if (category !== "调研目录") {
+      return categoryDocs.map((doc) => renderNavDocLink(doc)).join("");
+    }
+    const rootDocs = categoryDocs.filter((doc) => doc.research_doc_role === "root");
+    const grouped = catalogStages.map((stage) => {
+      const stageDocs = categoryDocs
+        .filter((doc) => doc.research_stage === stage.key)
+        .sort((a, b) => {
+          const roleRank = { overview: 0, item: 1 };
+          const aRank = roleRank[a.research_doc_role] ?? 2;
+          const bRank = roleRank[b.research_doc_role] ?? 2;
+          if (aRank !== bRank) return aRank - bRank;
+          return String(a.source_path || "").localeCompare(String(b.source_path || ""), "zh-Hans-CN");
+        });
+      if (!stageDocs.length) return "";
+      return `
+        <div class="nav-stage-group">
+          <div class="nav-stage-title">${escapeHtml(stage.title)} <span>${stageDocs.length}</span></div>
+          ${stageDocs.map((doc) => renderNavDocLink(doc, doc.research_doc_role === "overview" ? "overview" : "nested")).join("")}
+        </div>
+      `;
+    }).join("");
+    return rootDocs.map((doc) => renderNavDocLink(doc, "overview")).join("") + grouped;
+  }
+
   function renderNavigation() {
     const nav = categories().map((category) => `
       <div class="nav-group ${category === activeCategory ? "open" : ""}">
@@ -206,12 +242,7 @@
           <span>${escapeHtml(category)}</span><span>${countFor(category)}</span>
         </button>
         <div class="nav-doc-list">
-          ${docsForCategory(category).map((doc) => `
-            <a class="nav-doc-link ${doc.id === currentDocId ? "active" : ""}" href="#/doc/${encodeURIComponent(doc.id)}">
-              <span>${escapeHtml(doc.title)}</span>
-              <small>${escapeHtml(doc.category)}</small>
-            </a>
-          `).join("")}
+          ${renderCategoryDocList(category)}
         </div>
       </div>
     `).join("");
@@ -301,9 +332,27 @@
       || researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/`));
   }
 
+  function docsForStage(stage) {
+    return researchCatalogDocs()
+      .filter((doc) => {
+        if (doc.research_stage) return doc.research_stage === stage.key;
+        return String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/`);
+      })
+      .sort((a, b) => {
+        const roleRank = { overview: 0, item: 1 };
+        const aRank = roleRank[a.research_doc_role] ?? 2;
+        const bRank = roleRank[b.research_doc_role] ?? 2;
+        if (aRank !== bRank) return aRank - bRank;
+        return String(a.source_path || "").localeCompare(String(b.source_path || ""), "zh-Hans-CN")
+          || a.title.localeCompare(b.title, "zh-Hans-CN");
+      });
+  }
+
   function renderCatalog() {
     const catalogDocs = researchCatalogDocs();
-    els.catalogSummary.textContent = `${catalogDocs.length} 篇阶段文档 · ${catalogStages.length} 个流程阶段`;
+    const overviewCount = catalogDocs.filter((doc) => doc.research_doc_role === "overview").length;
+    const itemCount = catalogDocs.filter((doc) => doc.research_doc_role === "item").length;
+    els.catalogSummary.textContent = `${catalogStages.length} 个环节子目录 · ${overviewCount} 篇 Overview · ${itemCount} 篇模型/项目文档`;
     els.catalogStageGrid.innerHTML = catalogStages.map((stage, index) => {
       const doc = docForStage(stage);
       const href = doc ? `#/doc/${encodeURIComponent(doc.id)}` : "#/catalog";
@@ -319,12 +368,38 @@
         </a>
       `;
     }).join("");
-    els.catalogDocList.innerHTML = catalogDocs.map((doc) => `
-      <a href="#/doc/${encodeURIComponent(doc.id)}">
-        <strong>${escapeHtml(doc.title)}</strong>
-        <span>${escapeHtml(visibilityLabel(doc))} · ${escapeHtml(doc.summary || doc.source_path || "")}</span>
-      </a>
-    `).join("");
+    els.catalogDocList.innerHTML = catalogStages.map((stage, index) => {
+      const stageDocs = docsForStage(stage);
+      const overviewDoc = stageDocs.find((doc) => doc.research_doc_role === "overview");
+      const itemDocs = stageDocs.filter((doc) => doc.research_doc_role !== "overview");
+      const overviewHref = overviewDoc ? `#/doc/${encodeURIComponent(overviewDoc.id)}` : "#/catalog";
+      return `
+        <section class="catalog-folder">
+          <header>
+            <a class="catalog-folder-title" href="${overviewHref}">
+              <span>${String(index + 1).padStart(2, "0")}</span>
+              <strong>${escapeHtml(stage.title)}</strong>
+            </a>
+            <small>${itemDocs.length} 个模型/项目 · ${overviewDoc ? "含 Overview" : "缺 Overview"}</small>
+          </header>
+          <p>${escapeHtml(stage.summary)}</p>
+          <div class="catalog-folder-links">
+            ${overviewDoc ? `
+              <a class="overview-link" href="#/doc/${encodeURIComponent(overviewDoc.id)}">
+                <strong>Overview</strong>
+                <span>${escapeHtml(overviewDoc.summary || overviewDoc.title)}</span>
+              </a>
+            ` : ""}
+            ${itemDocs.map((doc) => `
+              <a href="#/doc/${encodeURIComponent(doc.id)}">
+                <strong>${escapeHtml(doc.title)}</strong>
+                <span>${escapeHtml(doc.summary || doc.source_path || "")}</span>
+              </a>
+            `).join("")}
+          </div>
+        </section>
+      `;
+    }).join("");
   }
 
   function visibilityLabel(doc) {
