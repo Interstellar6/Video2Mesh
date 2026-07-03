@@ -241,14 +241,18 @@
     }
   }
 
-  function renderNavFolder({ key, title, count, children, open = false }) {
+  function renderNavFolder({ key, title, count, children, href = "#/catalog", active = false, open = false }) {
     return `
-      <div class="nav-tree-folder ${open ? "open" : ""}">
-        <button class="nav-tree-folder-button" type="button" data-nav-folder="${escapeHtml(key)}" aria-expanded="${open ? "true" : "false"}">
-          <span class="nav-tree-caret" aria-hidden="true"></span>
-          <span class="nav-tree-folder-label">${escapeHtml(title)}</span>
-          <span class="nav-tree-count">${count}</span>
-        </button>
+      <div class="nav-tree-folder ${open ? "open" : ""} ${active ? "active" : ""}">
+        <div class="nav-tree-folder-row">
+          <button class="nav-tree-toggle" type="button" data-nav-folder="${escapeHtml(key)}" aria-expanded="${open ? "true" : "false"}" aria-label="${escapeHtml(open ? "折叠" : "展开")} ${escapeHtml(title)}">
+            <span class="nav-tree-caret" aria-hidden="true"></span>
+          </button>
+          <a class="nav-tree-folder-link ${active ? "active" : ""}" href="${escapeHtml(href)}">
+            <span class="nav-tree-folder-label">${escapeHtml(title)}</span>
+            <span class="nav-tree-count">${count}</span>
+          </a>
+        </div>
         <div class="nav-tree-branch">
           <div class="nav-tree-branch-inner">${children}</div>
         </div>
@@ -257,8 +261,6 @@
   }
 
   function renderResearchNavTree(categoryDocs) {
-    const rootDocs = categoryDocs.filter((doc) => doc.research_doc_role === "root");
-    const rootLinks = rootDocs.map((doc) => renderNavDocLink(doc, "root-file")).join("");
     const folders = catalogStages.map((stage) => {
       const stageDocs = categoryDocs
         .filter((doc) => doc.research_stage === stage.key)
@@ -268,18 +270,23 @@
           const bRank = roleRank[b.research_doc_role] ?? 2;
           if (aRank !== bRank) return aRank - bRank;
           return String(a.source_path || "").localeCompare(String(b.source_path || ""), "zh-Hans-CN");
-        });
+      });
       if (!stageDocs.length) return "";
+      const overviewDoc = stageDocs.find((doc) => doc.research_doc_role === "overview");
+      const itemDocs = stageDocs.filter((doc) => doc.research_doc_role !== "overview");
       const key = navNodeKey("research", stage.key);
+      const stageActive = stageDocs.some((doc) => doc.id === currentDocId);
       return renderNavFolder({
         key,
         title: stage.title,
-        count: stageDocs.length,
-        open: openNavNodes.has(key) || stageDocs.some((doc) => doc.id === currentDocId),
-        children: stageDocs.map((doc) => renderNavDocLink(doc, doc.research_doc_role === "overview" ? "overview" : "nested")).join(""),
+        count: itemDocs.length,
+        href: overviewDoc ? `#/doc/${encodeURIComponent(overviewDoc.id)}` : "#/catalog",
+        active: Boolean(overviewDoc && overviewDoc.id === currentDocId),
+        open: openNavNodes.has(key) || stageActive,
+        children: itemDocs.map((doc) => renderNavDocLink(doc, "nested")).join(""),
       });
     }).join("");
-    return rootLinks + folders;
+    return folders;
   }
 
   function renderCategoryDocList(category) {
@@ -321,6 +328,13 @@
       button.addEventListener("click", () => {
         activeCategory = button.dataset.category || "All";
         activeTag = "All";
+        const rootDoc = activeCategory === catalogCategory ? catalogRootDoc() : null;
+        if (rootDoc) {
+          const rootHash = `#/doc/${encodeURIComponent(rootDoc.id)}`;
+          if (location.hash !== rootHash) location.hash = rootHash;
+          else renderAll();
+          return;
+        }
         if (location.hash && location.hash !== "#/" && location.hash !== "#") location.hash = "#/";
         else renderAll();
       });
@@ -398,6 +412,11 @@
       });
   }
 
+  function catalogRootDoc() {
+    return researchCatalogDocs().find((doc) => doc.research_doc_role === "root")
+      || researchCatalogDocs().find((doc) => String(doc.source_path || "").endsWith(`${researchRoot}README.md`));
+  }
+
   function docForStage(stage) {
     return researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`${researchRoot}${stage.key}/overview.md`))
       || researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`${researchRoot}${stage.key}/`));
@@ -451,16 +470,10 @@
               <span>${String(index + 1).padStart(2, "0")}</span>
               <strong>${escapeHtml(stage.title)}</strong>
             </a>
-            <small>${itemDocs.length} 个模型/项目 · ${overviewDoc ? "含 Overview" : "缺 Overview"}</small>
+            <small>${itemDocs.length} 个模型/项目</small>
           </header>
           <p>${escapeHtml(stage.summary)}</p>
           <div class="catalog-folder-links">
-            ${overviewDoc ? `
-              <a class="overview-link" href="#/doc/${encodeURIComponent(overviewDoc.id)}">
-                <strong>Overview</strong>
-                <span>${escapeHtml(overviewDoc.summary || overviewDoc.title)}</span>
-              </a>
-            ` : ""}
             ${itemDocs.map((doc) => `
               <a href="#/doc/${encodeURIComponent(doc.id)}">
                 <strong>${escapeHtml(doc.title)}</strong>
@@ -1158,7 +1171,7 @@
     els.catalogView.hidden = false;
     els.articleView.hidden = true;
     activeCategory = catalogCategory;
-    updateMainTabs("catalog");
+    updateMainTabs("docs");
     renderNavigation();
     renderCatalog();
     updateReadingProgress();
@@ -1180,7 +1193,7 @@
     els.homeView.hidden = true;
     els.catalogView.hidden = true;
     els.articleView.hidden = false;
-    updateMainTabs(doc.category === catalogCategory ? "catalog" : "docs");
+    updateMainTabs("docs");
     if (!options.keepEditor) closeEditor();
     els.articleMeta.innerHTML = `
       <span>${escapeHtml(doc.category)}</span>
