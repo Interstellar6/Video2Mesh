@@ -175,7 +175,8 @@
   }
 
   function setActiveTab(tabName) {
-    const next = els.panels.some((panel) => panel.dataset.tabPanel === tabName) ? tabName : "auth";
+    const requested = els.panels.some((panel) => panel.dataset.tabPanel === tabName) ? tabName : "auth";
+    const next = apiUser || requested === "auth" ? requested : "auth";
     document.body.dataset.activeAdminTab = next;
     els.tabs.forEach((tab) => {
       const active = tab.dataset.adminTab === next;
@@ -196,6 +197,9 @@
   }
 
   function updateIdentityBadge() {
+    document.querySelectorAll("[data-login-required]").forEach((item) => {
+      item.hidden = !apiUser;
+    });
     if (!apiUser) {
       els.identityBadge.dataset.role = "guest";
       els.identityRole.textContent = "访客";

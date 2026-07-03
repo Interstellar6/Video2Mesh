@@ -5,6 +5,7 @@
   const READING_STORAGE_KEY = "v2m-blog-reading-v1";
   const DEFAULT_API_URL = "https://api.relumeow.top";
   const baseDocs = (seed.docs || []).map(cloneDoc);
+  let privateDocs = [];
   let docs = baseDocs.map(cloneDoc);
   let uploadedDocs = [];
   let draftStore = loadDraftStore();
@@ -64,6 +65,11 @@
     catalogStageGrid: $("catalogStageGrid"),
     catalogDocList: $("catalogDocList"),
     catalogSummary: $("catalogSummary"),
+    annotationForm: $("annotationForm"),
+    commentForm: $("commentForm"),
+    annotationList: $("annotationList"),
+    commentList: $("commentList"),
+    feedbackStatus: $("feedbackStatus"),
   };
 
   const catalogStages = [
@@ -268,7 +274,7 @@
     }
     els.docGrid.innerHTML = list.map((doc) => `
       <a class="doc-card ${isFavorite(doc.id) ? "favorite" : ""}" href="#/doc/${encodeURIComponent(doc.id)}">
-        <header><span>${escapeHtml(doc.category)}</span><span>${escapeHtml(doc.updated)} · ${doc.reading_minutes || 1} min</span></header>
+        <header><span>${escapeHtml(doc.category)}</span><span>${visibilityLabel(doc)} · ${escapeHtml(doc.updated)} · ${doc.reading_minutes || 1} min</span></header>
         <h2>${escapeHtml(doc.title)}</h2>
         <p>${escapeHtml(doc.summary || "暂无摘要。")}</p>
         <div class="doc-tags">${(doc.tags || []).slice(0, 4).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>
@@ -279,19 +285,20 @@
 
   function researchCatalogDocs() {
     return docs
-      .filter((doc) => doc.category === "Research Catalog" || String(doc.source_path || "").includes("docs/research-catalog/"))
+      .filter((doc) => doc.category === "调研目录" || String(doc.source_path || "").includes("docs/video2mesh/research-catalog/"))
       .slice()
       .sort((a, b) => {
         const aPath = String(a.source_path || "");
         const bPath = String(b.source_path || "");
-        if (aPath.endsWith("docs/research-catalog/README.md")) return -1;
-        if (bPath.endsWith("docs/research-catalog/README.md")) return 1;
+        if (aPath.endsWith("docs/video2mesh/research-catalog/README.md")) return -1;
+        if (bPath.endsWith("docs/video2mesh/research-catalog/README.md")) return 1;
         return aPath.localeCompare(bPath, "zh-Hans-CN");
       });
   }
 
   function docForStage(stage) {
-    return researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/research-catalog/${stage.key}/`));
+    return researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/overview.md`))
+      || researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/`));
   }
 
   function renderCatalog() {
@@ -315,9 +322,17 @@
     els.catalogDocList.innerHTML = catalogDocs.map((doc) => `
       <a href="#/doc/${encodeURIComponent(doc.id)}">
         <strong>${escapeHtml(doc.title)}</strong>
-        <span>${escapeHtml(doc.summary || doc.source_path || "")}</span>
+        <span>${escapeHtml(visibilityLabel(doc))} · ${escapeHtml(doc.summary || doc.source_path || "")}</span>
       </a>
     `).join("");
+  }
+
+  function visibilityLabel(doc) {
+    return doc.visibility === "private" ? "私密" : "公开";
+  }
+
+  function isAdminUser(state = readApiSessionState()) {
+    return state.role === "admin" && Boolean(state.sessionToken);
   }
 
   function renderResultSummary(list) {
@@ -359,7 +374,21 @@
     els.siteUserRole.textContent = role;
     els.siteUserName.textContent = name;
     els.siteUserPill.dataset.role = state.role === "admin" ? "admin" : "guest";
-    els.siteUserPill.href = state.role === "admin" ? "https://admin.relumeow.top/#tasks" : "https://admin.relumeow.top/#auth";
+    els.siteUserPill.href = state.role === "admin" ? "/admin/#tasks" : "/admin/#auth";
+    document.querySelectorAll("[data-auth-required]").forEach((item) => {
+      item.hidden = !state.sessionToken;
+    });
+  }
+
+  async function apiFetch(path, options = {}) {
+    const state = readApiSessionState();
+    const headers = new Headers(options.headers || {});
+    if (state.sessionToken) headers.set("Authorization", `Bearer ${state.sessionToken}`);
+    if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    const response = await fetch(`${state.url || DEFAULT_API_URL}${path}`, { ...options, headers });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `${response.status} ${response.statusText}`);
+    return data;
   }
 
   async function restoreSiteUserInfo() {
@@ -378,9 +407,26 @@
       };
       writeApiSessionState(next);
       updateSiteUserInfo({ ...state, ...next });
+      if (next.role === "admin") await loadPrivateDocs();
     } catch (_error) {
       writeApiSessionState({ sessionToken: "", expiresAt: "", username: "", role: "" });
+      privateDocs = [];
+      rebuildDocs();
       updateSiteUserInfo({ url: state.url, sessionToken: "", username: "", role: "" });
+      renderAll();
+    }
+  }
+
+  async function loadPrivateDocs() {
+    try {
+      const data = await apiFetch("/api/docs/private");
+      privateDocs = Array.isArray(data.docs) ? data.docs.map(cloneDoc) : [];
+      rebuildDocs();
+      renderAll();
+      route();
+    } catch (_error) {
+      privateDocs = [];
+      rebuildDocs();
     }
   }
 
@@ -619,7 +665,7 @@
   }
 
   function rebuildDocs() {
-    const merged = [...baseDocs.map(cloneDoc), ...uploadedDocs.map(cloneDoc)];
+    const merged = [...baseDocs.map(cloneDoc), ...privateDocs.map(cloneDoc), ...uploadedDocs.map(cloneDoc)];
     Object.values(draftStore).forEach((draft) => {
       if (!draft?.id || typeof draft.body !== "string") return;
       const doc = normalizeDoc(draft);
@@ -671,7 +717,7 @@
   }
 
   function hasPersistentSource(id) {
-    return baseDocs.some((doc) => doc.id === id) || uploadedDocs.some((doc) => doc.id === id);
+    return baseDocs.some((doc) => doc.id === id) || privateDocs.some((doc) => doc.id === id) || uploadedDocs.some((doc) => doc.id === id);
   }
 
   function setStatus(message) {
@@ -686,8 +732,11 @@
     }
     const draft = draftStore[doc.id];
     els.discardDraft.hidden = !draft;
+    const admin = isAdminUser();
+    els.editDoc.hidden = !admin;
+    els.saveDraft.textContent = admin ? "保存到后台" : "保存草稿";
     if (draft) setStatus(`本地草稿 · ${draft.draft_updated_at || doc.updated || "已保存"}`);
-    else setStatus("可在线编辑，保存后只存到当前浏览器。");
+    else setStatus(admin ? "管理员可编辑，保存后写入后台并重建文档站。" : "访客可评论和批注，文档修改仅管理员可用。");
   }
 
   function updateFavoriteButton() {
@@ -705,6 +754,10 @@
   function openEditor() {
     const doc = currentDoc();
     if (!doc) return;
+    if (!isAdminUser()) {
+      setStatus("只有管理员可以修改文档。");
+      return;
+    }
     els.markdownEditor.value = doc.body || "";
     els.editorPreview.innerHTML = renderMarkdown(els.markdownEditor.value);
     els.editorPanel.hidden = false;
@@ -717,12 +770,35 @@
     els.articleBody.hidden = false;
   }
 
-  function saveDraftFromEditor() {
+  async function saveDraftFromEditor() {
     const doc = currentDoc();
     if (!doc) return;
-    saveDraft(doc, els.markdownEditor.value);
-    showDoc(doc.id, { keepEditor: true, preserveScroll: true });
-    openEditor();
+    if (!isAdminUser()) {
+      setStatus("只有管理员可以保存文档修改。");
+      return;
+    }
+    try {
+      setStatus("正在保存到后台...");
+      const result = await apiFetch(`/api/docs/${encodeURIComponent(doc.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ markdown: els.markdownEditor.value, summary: "站点编辑器保存" }),
+      });
+      const updatedDoc = result.doc ? cloneDoc(result.doc) : null;
+      if (updatedDoc) {
+        const targetList = updatedDoc.visibility === "private" ? privateDocs : baseDocs;
+        const index = targetList.findIndex((item) => item.id === updatedDoc.id);
+        if (index >= 0) targetList[index] = updatedDoc;
+        else targetList.unshift(updatedDoc);
+      }
+      delete draftStore[doc.id];
+      persistDraftStore();
+      rebuildDocs();
+      renderAll();
+      showDoc(doc.id, { preserveScroll: true });
+      setStatus("已保存到后台并触发重建。");
+    } catch (error) {
+      setStatus(error.message || "保存失败");
+    }
   }
 
   function saveDraft(doc, body) {
@@ -799,6 +875,62 @@
     return `${slugify(doc.title || doc.id || "document")}.md`;
   }
 
+  function renderFeedbackList(items, emptyText, type) {
+    if (!items.length) return `<span class="feedback-empty">${escapeHtml(emptyText)}</span>`;
+    return items.map((item) => `
+      <article class="feedback-item">
+        <header><strong>${escapeHtml(item.author || "访客")}</strong><span>${escapeHtml(item.created_at || "")}</span></header>
+        ${type === "annotation" && item.quote ? `<blockquote>${escapeHtml(item.quote)}</blockquote>` : ""}
+        <p>${escapeHtml(item.body || "")}</p>
+      </article>
+    `).join("");
+  }
+
+  async function loadFeedback(docId) {
+    if (!docId || !els.commentList || !els.annotationList) return;
+    els.feedbackStatus.textContent = "加载评论和批注...";
+    try {
+      const data = await apiFetch(`/api/docs/${encodeURIComponent(docId)}/feedback`);
+      els.annotationList.innerHTML = renderFeedbackList(Array.isArray(data.annotations) ? data.annotations : [], "暂无批注。", "annotation");
+      els.commentList.innerHTML = renderFeedbackList(Array.isArray(data.comments) ? data.comments : [], "暂无评论。", "comment");
+      els.feedbackStatus.textContent = "";
+    } catch (error) {
+      els.annotationList.innerHTML = `<span class="feedback-empty">无法加载批注。</span>`;
+      els.commentList.innerHTML = `<span class="feedback-empty">无法加载评论。</span>`;
+      els.feedbackStatus.textContent = error.message || "反馈加载失败";
+    }
+  }
+
+  async function submitFeedback(event, type) {
+    event.preventDefault();
+    const doc = currentDoc();
+    if (!doc) return;
+    const form = event.currentTarget;
+    const formData = new FormData(form);
+    const payload = {
+      author: String(formData.get("author") || "").trim(),
+      body: String(formData.get("body") || "").trim(),
+      quote: String(formData.get("quote") || "").trim(),
+    };
+    if (!payload.body) {
+      els.feedbackStatus.textContent = "请先填写内容。";
+      return;
+    }
+    const endpoint = type === "annotation" ? "annotations" : "comments";
+    try {
+      els.feedbackStatus.textContent = "正在提交...";
+      await apiFetch(`/api/docs/${encodeURIComponent(doc.id)}/${endpoint}`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      form.reset();
+      await loadFeedback(doc.id);
+      els.feedbackStatus.textContent = "已保存到后台。";
+    } catch (error) {
+      els.feedbackStatus.textContent = error.message || "提交失败";
+    }
+  }
+
   function updateTaskLine(body, taskIndex, checked) {
     let seen = -1;
     return String(body || "").split("\n").map((line) => {
@@ -847,7 +979,7 @@
     els.homeView.hidden = true;
     els.catalogView.hidden = false;
     els.articleView.hidden = true;
-    activeCategory = "Research Catalog";
+    activeCategory = "调研目录";
     updateMainTabs("catalog");
     renderNavigation();
     renderCatalog();
@@ -870,10 +1002,11 @@
     els.homeView.hidden = true;
     els.catalogView.hidden = true;
     els.articleView.hidden = false;
-    updateMainTabs(doc.category === "Research Catalog" ? "catalog" : "docs");
+    updateMainTabs(doc.category === "调研目录" ? "catalog" : "docs");
     if (!options.keepEditor) closeEditor();
     els.articleMeta.innerHTML = `
       <span>${escapeHtml(doc.category)}</span>
+      <span>${escapeHtml(visibilityLabel(doc))}</span>
       <span>${escapeHtml(doc.updated)}</span>
       <span>${doc.reading_minutes || 1} min read</span>
       <span>${escapeHtml(doc.source_path || "uploaded")}</span>
@@ -886,6 +1019,7 @@
     renderReadingLibrary();
     updateDraftControls(doc);
     updateFavoriteButton();
+    loadFeedback(doc.id);
     if (pendingEditorDocId === doc.id) {
       pendingEditorDocId = "";
       openEditor();
@@ -936,9 +1070,10 @@
 
   function renderReadingPaths() {
     const pathDefs = [
-      { title: "从视频到资产", tags: ["Pipeline", "Simulation"], query: "pipeline" },
-      { title: "3DGS 与场景理解", tags: ["3DGS", "Scene Graph", "Surveys"], query: "3dgs" },
-      { title: "游戏/交互场景", tags: ["Game Scenes", "Unity", "Game"], query: "game" },
+    { title: "从视频到资产", tags: ["Pipeline", "Simulation"], query: "pipeline" },
+      { title: "调研目录", tags: ["调研目录", "Research Catalog"], query: "mesh" },
+      { title: "项目文档", tags: ["项目文档", "Video2Mesh"], query: "pipeline" },
+      { title: "进度目录", tags: ["进度目录", "Weekly", "P0"], query: "weekly" },
     ];
     els.readingPaths.innerHTML = pathDefs.map((path) => {
       const matches = docs
@@ -1023,7 +1158,7 @@
   }
 
   function renderAll() {
-    els.buildMeta.textContent = `${docs.length} 篇文档 · 构建时间 ${seed.generatedAt || "本地"} · 支持上传 / 在线编辑 Markdown`;
+    els.buildMeta.textContent = `${docs.length} 篇文档 · 构建时间 ${seed.generatedAt || "本地"} · /video2mesh 项目空间`;
     updateSiteUserInfo();
     renderNavigation();
     renderStats();
@@ -1136,6 +1271,8 @@
   els.editorPreview.addEventListener("change", handleEditorPreviewTaskToggle);
   els.tocNav.addEventListener("click", handleTocClick);
   els.clearReadingState.addEventListener("click", clearReadingState);
+  els.annotationForm.addEventListener("submit", (event) => submitFeedback(event, "annotation"));
+  els.commentForm.addEventListener("submit", (event) => submitFeedback(event, "comment"));
   window.addEventListener("scroll", updateReadingProgress, { passive: true });
   window.addEventListener("resize", updateReadingProgress);
   window.addEventListener("hashchange", route);

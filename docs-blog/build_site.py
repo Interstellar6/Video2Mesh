@@ -21,20 +21,17 @@ CONTENT = SITE / "content"
 PUBLIC_BUILD = SITE / "_public"
 
 PINNED_DOCS = [
-    "README.md",
-    "docs/README.md",
-    "docs/research-catalog/README.md",
-    "docs/01-project-overview.md",
-    "docs/02-pipeline-and-commands.md",
-    "docs/07-pipeline-route-matrix.md",
-    "docs/03-research-roadmap.md",
-    "docs/04-mesh-interaction-and-completion.md",
-    "docs/08-web-visual-physics-demo.md",
-    "docs/05-operations-and-showcase.md",
-    "docs/06-site-and-remote-control.md",
+    "docs/video2mesh/research-catalog/README.md",
+    "docs/video2mesh/project-docs/overview.md",
+    "docs/video2mesh/project-docs/project-intro.md",
+    "docs/video2mesh/project-docs/pipeline.md",
+    "docs/video2mesh/project-docs/how-to-run.md",
+    "docs/video2mesh/progress/overview.md",
+    "docs/video2mesh/progress/p0-p1-priority.md",
+    "docs/video2mesh/progress/weekly-2026-07-03.md",
 ]
 
-ROOT_DOC_EXCLUDE = set()
+ROOT_DOC_EXCLUDE = {"README.md"}
 
 CATEGORY_RULES = [
     ("Game Scenes", ["game", "interactive", "游戏", "交互"]),
@@ -51,6 +48,7 @@ class Doc:
     id: str
     title: str
     category: str
+    visibility: str
     summary: str
     source_path: str
     source_kind: str
@@ -161,6 +159,18 @@ def normalize_tags(meta: dict[str, Any], title: str, category: str) -> list[str]
     return unique[:8]
 
 
+def normalize_visibility(meta: dict[str, Any], path: Path) -> str:
+    raw = str(meta.get("visibility") or "").strip().lower()
+    if raw in {"public", "private"}:
+        return raw
+    relative = str(path.relative_to(ROOT)).replace("\\", "/")
+    if "/research-catalog/" in relative or relative.endswith("/research-catalog/README.md"):
+        return "public"
+    if "/project-docs/" in relative or "/progress/" in relative:
+        return "public"
+    return "private"
+
+
 def copy_local_assets(doc_path: Path, doc_id: str, body: str) -> str:
     def split_image_target(raw_url: str) -> tuple[str, str]:
         match = re.match(r'^(\S+)(\s+"[^"]*")\s*$', raw_url.strip())
@@ -201,7 +211,7 @@ def copy_local_assets(doc_path: Path, doc_id: str, body: str) -> str:
     return body
 
 
-def load_doc(path: Path, source_kind: str, used_ids: set[str]) -> Doc:
+def load_doc(path: Path, source_kind: str, used_ids: set[str], copy_assets: bool = True) -> Doc:
     raw = path.read_text(encoding="utf-8")
     meta, body = split_front_matter(raw)
     title = str(meta.get("title") or extract_title(body, path.stem.replace("_", " "))).strip()
@@ -213,13 +223,16 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str]) -> Doc:
         index += 1
     used_ids.add(doc_id)
     category = infer_category(path, title, meta)
-    body = copy_local_assets(path, doc_id, body)
+    visibility = normalize_visibility(meta, path)
+    if copy_assets and visibility == "public":
+        body = copy_local_assets(path, doc_id, body)
     words = re.findall(r"[\w\u4e00-\u9fff]+", strip_markdown(body))
     updated = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
     return Doc(
         id=doc_id,
         title=title,
         category=category,
+        visibility=visibility,
         summary=extract_summary(body, meta),
         source_path=str(path.relative_to(ROOT)),
         source_kind=source_kind,
@@ -231,7 +244,7 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str]) -> Doc:
     )
 
 
-def collect_docs() -> list[Doc]:
+def collect_docs(copy_assets: bool = True) -> list[Doc]:
     used_ids: set[str] = set()
     docs: list[Doc] = []
     seen_docs: set[Path] = set()
@@ -239,25 +252,27 @@ def collect_docs() -> list[Doc]:
         path = ROOT / name
         if path.exists():
             seen_docs.add(path.resolve())
-            docs.append(load_doc(path, "builtin", used_ids))
+            docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
     for path in sorted(ROOT.glob("*.md")):
         if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_docs:
             continue
-        docs.append(load_doc(path, "builtin", used_ids))
-    for path in sorted((ROOT / "docs").rglob("*.md")):
+        docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
+    docs_root = ROOT / "docs" / "video2mesh"
+    for path in sorted(docs_root.rglob("*.md")):
         if path.resolve() in seen_docs:
             continue
-        docs.append(load_doc(path, "builtin", used_ids))
+        docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
     for path in sorted(CONTENT.rglob("*.md")):
-        docs.append(load_doc(path, "content", used_ids))
+        docs.append(load_doc(path, "content", used_ids, copy_assets=copy_assets))
     return docs
 
 
 def write_site_data(docs: list[Doc]) -> None:
+    public_docs = [doc for doc in docs if doc.visibility == "public"]
     payload = {
         "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "docs": [doc.__dict__ for doc in docs],
-        "categories": sorted({doc.category for doc in docs}),
+        "docs": [doc.__dict__ for doc in public_docs],
+        "categories": sorted({doc.category for doc in public_docs}),
     }
     text = "window.V2M_BLOG_DATA = " + json.dumps(payload, ensure_ascii=False, indent=2) + ";\n"
     (SITE / "site-data.js").write_text(text, encoding="utf-8")
@@ -291,11 +306,11 @@ def write_custom_domain() -> None:
 def build_public_site() -> None:
     if PUBLIC_BUILD.exists():
         shutil.rmtree(PUBLIC_BUILD)
+    PUBLIC_BUILD.mkdir(parents=True, exist_ok=True)
     ignore = shutil.ignore_patterns(
         ".env",
         ".env.*",
         "_public",
-        "admin",
         "admin-domain-worker.js",
         "api_server.py",
         "build_site.py",
@@ -308,21 +323,44 @@ def build_public_site() -> None:
         "bedroom_4_scene_3dgs_repaired_supersplat.ply",
         "chunks",
     )
-    shutil.copytree(SITE, PUBLIC_BUILD, ignore=ignore)
+    video2mesh_build = PUBLIC_BUILD / "video2mesh"
+    shutil.copytree(SITE, video2mesh_build, ignore=ignore)
+    admin_src = SITE / "admin"
+    admin_dst = PUBLIC_BUILD / "admin"
+    if admin_src.exists():
+        shutil.copytree(admin_src, admin_dst)
+        for name in ("styles.css", "theme.js"):
+            src = SITE / name
+            if src.exists():
+                shutil.copy2(src, PUBLIC_BUILD / name)
+    (PUBLIC_BUILD / "index.html").write_text(
+        """<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=/video2mesh/">
+<title>Video2Mesh</title>
+<a href="/video2mesh/">进入 Video2Mesh 文档站</a>
+""",
+        encoding="utf-8",
+    )
     (PUBLIC_BUILD / "CNAME").write_text("relumeow.top\n", encoding="utf-8")
 
 
 def main() -> int:
     ASSETS.mkdir(parents=True, exist_ok=True)
     CONTENT.mkdir(parents=True, exist_ok=True)
+    generated_uploads = ASSETS / "uploaded"
+    if generated_uploads.exists():
+        shutil.rmtree(generated_uploads)
     docs = collect_docs()
     write_site_data(docs)
     write_placeholder_asset()
     write_custom_domain()
     build_public_site()
-    print(f"Built docs-blog with {len(docs)} document(s).")
+    public_count = sum(1 for doc in docs if doc.visibility == "public")
+    private_count = len(docs) - public_count
+    print(f"Built docs-blog with {public_count} public document(s), {private_count} private document(s).")
     for doc in docs:
-        print(f"- [{doc.category}] {doc.title} ({doc.source_path})")
+        print(f"- [{doc.visibility}] [{doc.category}] {doc.title} ({doc.source_path})")
     return 0
 
 

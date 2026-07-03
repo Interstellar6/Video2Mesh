@@ -335,6 +335,7 @@ a { color: inherit; }
   background: var(--amber-soft);
   color: var(--ink);
 }
+.site-tab[hidden] { display: none; }
 .user-pill {
   flex: 0 1 auto;
   display: inline-flex;
@@ -912,6 +913,96 @@ a { color: inherit; }
   border-bottom: 1px solid var(--line);
   min-width: 0;
 }
+
+.feedback-panel {
+  margin-top: 30px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+
+.feedback-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.feedback-form {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 14px;
+}
+
+.feedback-form h2,
+.feedback-lists h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.feedback-form input,
+.feedback-form textarea {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+.feedback-form button {
+  min-height: 36px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.feedback-status {
+  min-height: 20px;
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.feedback-lists {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.feedback-list {
+  display: grid;
+  gap: 10px;
+}
+
+.feedback-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 12px;
+}
+
+.feedback-item header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.feedback-item header strong { color: var(--ink); }
+.feedback-item blockquote {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--amber);
+  background: var(--amber-soft);
+  color: var(--muted);
+}
+.feedback-item p { margin: 10px 0 0; white-space: pre-wrap; }
+.feedback-empty { color: var(--muted); font-size: 13px; }
 .action-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .article-actions button:hover,
 .editor-toolbar button:hover { border-color: var(--accent); background: var(--accent-soft); }
@@ -1130,6 +1221,8 @@ a { color: inherit; }
   .toc-panel { position: static; max-height: none; }
   .editor-grid { grid-template-columns: 1fr; }
   .editor-grid textarea { border-right: 0; border-bottom: 1px solid var(--line); }
+  .feedback-grid,
+  .feedback-lists { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {

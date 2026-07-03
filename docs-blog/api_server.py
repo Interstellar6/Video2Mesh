@@ -32,6 +32,7 @@ TASKS_FILE = RUNTIME / "codex_tasks.json"
 USERS_FILE = RUNTIME / "users.json"
 SESSIONS_FILE = RUNTIME / "sessions.json"
 GITHUB_STATES_FILE = RUNTIME / "github_oauth_states.json"
+DOC_FEEDBACK_FILE = RUNTIME / "doc_feedback.json"
 BUILD_SCRIPT = SITE / "build_site.py"
 
 
@@ -957,6 +958,67 @@ def build_site() -> None:
     subprocess.run([sys.executable, str(BUILD_SCRIPT)], cwd=ROOT, check=True)
 
 
+def site_docs() -> list[Any]:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("v2m_build_site", BUILD_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "Could not load docs builder")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.collect_docs(copy_assets=False)
+
+
+def doc_payload(doc: Any, include_body: bool = True) -> dict[str, Any]:
+    payload = dict(doc.__dict__)
+    if not include_body:
+        payload.pop("body", None)
+    return payload
+
+
+def find_site_doc(doc_id: str) -> Any:
+    for doc in site_docs():
+        if str(doc.id) == doc_id:
+            return doc
+    raise ApiError(HTTPStatus.NOT_FOUND, "Document not found")
+
+
+def doc_is_public(doc_id: str) -> bool:
+    try:
+        return str(find_site_doc(doc_id).visibility) == "public"
+    except ApiError:
+        return False
+
+
+def feedback_store() -> dict[str, Any]:
+    data = read_json(DOC_FEEDBACK_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    data.setdefault("comments", {})
+    data.setdefault("annotations", {})
+    data.setdefault("edits", [])
+    return data
+
+
+def write_feedback_store(data: dict[str, Any]) -> None:
+    data["updated_at"] = now_iso()
+    write_json(DOC_FEEDBACK_FILE, data)
+
+
+def public_feedback_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(item.get("id", "")),
+        "doc_id": str(item.get("doc_id", "")),
+        "author": str(item.get("author", "访客")),
+        "body": str(item.get("body", "")),
+        "quote": str(item.get("quote", "")),
+        "anchor": str(item.get("anchor", "")),
+        "created_at": str(item.get("created_at", "")),
+        "updated_at": str(item.get("updated_at", "")),
+    }
+
+
 class ApiError(Exception):
     def __init__(self, status: HTTPStatus, message: str):
         super().__init__(message)
@@ -1013,8 +1075,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply({"ok": True})
                 return
             if parsed.path == "/api/docs" and method == "POST":
-                self.require_auth()
+                self.require_admin()
                 self.create_doc(self.read_body())
+                return
+            if parsed.path == "/api/docs/private" and method == "GET":
+                self.require_admin()
+                self.reply({"ok": True, "docs": [doc_payload(doc) for doc in site_docs() if str(doc.visibility) != "public"]})
+                return
+            doc_item = re.fullmatch(r"/api/docs/([^/]+)", parsed.path)
+            if doc_item and method == "PATCH":
+                self.require_admin()
+                self.update_doc(decode_url_part(doc_item.group(1)), self.read_body())
+                return
+            doc_feedback = re.fullmatch(r"/api/docs/([^/]+)/feedback", parsed.path)
+            if doc_feedback and method == "GET":
+                self.get_doc_feedback(decode_url_part(doc_feedback.group(1)))
+                return
+            doc_comments = re.fullmatch(r"/api/docs/([^/]+)/comments", parsed.path)
+            if doc_comments and method == "POST":
+                self.create_doc_comment(decode_url_part(doc_comments.group(1)), self.read_body())
+                return
+            doc_annotations = re.fullmatch(r"/api/docs/([^/]+)/annotations", parsed.path)
+            if doc_annotations and method == "POST":
+                self.create_doc_annotation(decode_url_part(doc_annotations.group(1)), self.read_body())
                 return
             if parsed.path == "/api/projects":
                 self.require_auth()
@@ -1176,6 +1259,28 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.FORBIDDEN, "Admin role required")
         return user
 
+    def optional_user(self) -> dict[str, Any] | None:
+        token = self.session_token()
+        if not token:
+            return None
+        try:
+            return self.require_auth()
+        except ApiError:
+            return None
+
+    def require_doc_feedback_access(self, doc_id: str) -> Any:
+        doc = find_site_doc(doc_id)
+        if str(doc.visibility) != "public":
+            self.require_admin()
+        return doc
+
+    def feedback_author(self, data: dict[str, Any]) -> str:
+        user = self.optional_user()
+        if user:
+            return str(user.get("username") or user.get("id") or "管理员")
+        author = str(data.get("author") or data.get("nickname") or "").strip()
+        return author[:80] if author else "访客"
+
     def setup_user(self, data: dict[str, Any]) -> None:
         if users_exist():
             raise ApiError(HTTPStatus.CONFLICT, "Admin user already exists")
@@ -1291,6 +1396,87 @@ class Handler(BaseHTTPRequestHandler):
         path.write_text(body, encoding="utf-8")
         build_site()
         self.reply({"ok": True, "path": str(path.relative_to(ROOT)), "title": title, "rebuilt": True}, HTTPStatus.CREATED)
+
+    def update_doc(self, doc_id: str, data: dict[str, Any]) -> None:
+        doc = find_site_doc(doc_id)
+        markdown = str(data.get("markdown") or data.get("body") or "")
+        if not markdown.strip():
+            raise ApiError(HTTPStatus.BAD_REQUEST, "markdown is required")
+        source_path = safe_workspace_path(ROOT, str(doc.source_path))
+        if source_path.suffix.lower() not in {".md", ".markdown"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Only Markdown documents can be updated")
+        if not markdown.startswith("---\n"):
+            existing = source_path.read_text(encoding="utf-8")
+            front_matter = ""
+            if existing.startswith("---\n"):
+                end = existing.find("\n---\n", 4)
+                if end != -1:
+                    front_matter = existing[:end + 5].rstrip() + "\n\n"
+            markdown = front_matter + markdown
+        source_path.write_text(markdown.rstrip() + "\n", encoding="utf-8")
+        store = feedback_store()
+        edits = store.setdefault("edits", [])
+        edits.insert(0, {
+            "id": unique_id("edit-" + datetime.now().strftime("%Y%m%d%H%M%S"), edits),
+            "doc_id": doc_id,
+            "source_path": str(doc.source_path),
+            "author": self.feedback_author({}),
+            "created_at": now_iso(),
+            "summary": str(data.get("summary") or "管理员更新文档"),
+        })
+        write_feedback_store(store)
+        build_site()
+        updated = find_site_doc(doc_id)
+        self.reply({"ok": True, "doc": doc_payload(updated), "rebuilt": True})
+
+    def get_doc_feedback(self, doc_id: str) -> None:
+        self.require_doc_feedback_access(doc_id)
+        store = feedback_store()
+        comments = [public_feedback_item(item) for item in store.get("comments", {}).get(doc_id, [])]
+        annotations = [public_feedback_item(item) for item in store.get("annotations", {}).get(doc_id, [])]
+        self.reply({"ok": True, "doc_id": doc_id, "comments": comments, "annotations": annotations})
+
+    def create_doc_comment(self, doc_id: str, data: dict[str, Any]) -> None:
+        self.require_doc_feedback_access(doc_id)
+        body = str(data.get("body") or data.get("comment") or "").strip()
+        if not body:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "comment body is required")
+        store = feedback_store()
+        comments = store.setdefault("comments", {}).setdefault(doc_id, [])
+        item = {
+            "id": unique_id("comment-" + datetime.now().strftime("%Y%m%d%H%M%S"), comments),
+            "doc_id": doc_id,
+            "author": self.feedback_author(data),
+            "body": body[:5000],
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        comments.insert(0, item)
+        write_feedback_store(store)
+        self.reply({"ok": True, "comment": public_feedback_item(item)}, HTTPStatus.CREATED)
+
+    def create_doc_annotation(self, doc_id: str, data: dict[str, Any]) -> None:
+        self.require_doc_feedback_access(doc_id)
+        body = str(data.get("body") or data.get("comment") or "").strip()
+        quote = str(data.get("quote") or "").strip()
+        anchor = str(data.get("anchor") or "").strip()
+        if not body:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "annotation body is required")
+        store = feedback_store()
+        annotations = store.setdefault("annotations", {}).setdefault(doc_id, [])
+        item = {
+            "id": unique_id("annotation-" + datetime.now().strftime("%Y%m%d%H%M%S"), annotations),
+            "doc_id": doc_id,
+            "author": self.feedback_author(data),
+            "body": body[:5000],
+            "quote": quote[:1000],
+            "anchor": anchor[:400],
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        annotations.insert(0, item)
+        write_feedback_store(store)
+        self.reply({"ok": True, "annotation": public_feedback_item(item)}, HTTPStatus.CREATED)
 
     def create_project(self, data: dict[str, Any]) -> None:
         name = str(data.get("name") or "").strip()
