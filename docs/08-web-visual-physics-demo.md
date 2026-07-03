@@ -68,15 +68,14 @@ real lightweight GLB collider mesh
 
 ## 线上发布形态
 
-`relumeow.top` 的公开站仍由 GitHub Pages 构建 `docs-blog/_public/`。为了避开 GitHub 普通仓库和 Pages 对 100MB 以上单文件的限制，两个 GraphDECO 大 PLY 在线上不直接发布 raw 文件：
+`relumeow.top` 的公开站仍由 GitHub Pages 构建 `docs-blog/_public/`。为了避开 GitHub 普通仓库和 Pages 对 100MB 以上单文件的限制，两个 GraphDECO 大 PLY 在线上不直接发布 raw 文件，也不放进 Pages artifact：
 
 ```text
 assets/large-asset-manifest.json
-assets/chunks/bedroom_4_cli30k_graphdeco_clean_iteration30000.ply.part00..04
-assets/chunks/bedroom_4_scene_3dgs_repaired_supersplat.ply.part00..04
+https://raw.githubusercontent.com/Interstellar6/Video2Mesh/main/docs-blog/demos/visual-physics-proxy/assets/chunks/*.partNN
 ```
 
-每个分片约 48MB。前端先读取 `large-asset-manifest.json`，再按 manifest 拉取分片、合并成 `Uint8Array`，通过 `SplatMesh({ fileBytes, fileName, fileType: "ply" })` 初始化 Spark。这样线上 URL 仍展示同一套 3DGS 内容，但发布产物不会包含 230MB / 207MB 的 raw PLY 单文件。
+每个分片约 48MB，保存在 GitHub repo 中并由 `raw.githubusercontent.com` 提供跨域下载。前端先读取 `large-asset-manifest.json`，再按 manifest 拉取 raw 分片、合并成 `Uint8Array`，通过 `SplatMesh({ fileBytes, fileName, fileType: "ply" })` 初始化 Spark。这样线上 URL 仍展示同一套 3DGS 内容，但 Pages 发布产物不会包含 230MB / 207MB 的 raw PLY 或 437MB 分片目录。
 
 页面中的资产计数默认显示为 `3DGS / mesh`：bedroom_4 CLI30K Spark 主路径预期为 `971.3K / 167.1K`。页面会把当前 `visualAssetId`、`visualFormat`、`visualUrl`、`visualUsesSpark`、`visualRawCount`、`visualRemovedOutliers`、`visualCleanupReportUrl`、`colliderUrl`、`sparkRendererVisible`、`visibleColliderMeshes`、`visibleColliderWires`、`colliderRenderMode`、`cameraMode`、`splatQuality`、`lastHitInfo` 写入 `document.documentElement.dataset.visualPhysicsState`，方便确认线上实际命中的资产、显示状态和射线命中的 collider face。`Collider` 按钮只控制可视化，mesh 即使隐藏仍参与交互。
 

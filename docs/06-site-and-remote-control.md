@@ -47,7 +47,7 @@ bedroom_4_cli30k_graphdeco_clean_iteration30000.ply
 bedroom_4_scene_3dgs_repaired_supersplat.ply
 ```
 
-线上使用 `assets/large-asset-manifest.json` 和 `assets/chunks/*.partNN` 分片发布。更新这些大资产时，先重新生成分片和 manifest，再运行 `python3 docs-blog/build_site.py` 检查 `_public`。
+线上 Pages artifact 只发布 `assets/large-asset-manifest.json`。分片文件保存在 GitHub repo 的 `docs-blog/demos/visual-physics-proxy/assets/chunks/*.partNN`，manifest 中使用 `https://raw.githubusercontent.com/...` 绝对 URL 让浏览器跨域拉取。更新这些大资产时，先重新生成分片和 manifest，再运行 `python3 docs-blog/build_site.py`，确认 `_public` 中没有 `assets/chunks/`，否则 Pages deploy 可能因为 artifact 太大失败。
 
 ## 新增文档
 
