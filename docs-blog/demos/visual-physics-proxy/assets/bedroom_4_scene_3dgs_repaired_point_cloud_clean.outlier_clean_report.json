@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "input_ply": "docs-blog/demos/visual-physics-proxy/assets/bedroom_4_scene_3dgs_repaired_point_cloud.ply",
+  "output_ply": "docs-blog/demos/visual-physics-proxy/assets/bedroom_4_scene_3dgs_repaired_point_cloud_clean.ply",
+  "input_count": 874472,
+  "kept_count": 872374,
+  "removed_count": 2098,
+  "removed_ratio": 0.0023991620086177717,
+  "parameters": {
+    "q_min": 0.001,
+    "q_max": 0.999,
+    "padding_ratio": 0.02,
+    "min_keep_ratio": 0.8,
+    "method": "pure_python_quantile_bbox"
+  },
+  "input_bbox": {
+    "min": [
+      -26.57618141,
+      -15.13860416,
+      -4.11879396
+    ],
+    "max": [
+      17.38750076,
+      61.45074081,
+      52.061409
+    ]
+  },
+  "robust_bounds": {
+    "min": [
+      -8.8688758784946,
+      -6.5214153985584,
+      -3.3324930963238
+    ],
+    "max": [
+      10.878585113184597,
+      13.888148453958381,
+      17.475254086433797
+    ]
+  },
+  "output_bbox": {
+    "min": [
+      -8.86639881,
+      -6.52051258,
+      -3.32994819
+    ],
+    "max": [
+      10.87773323,
+      13.88458157,
+      17.47493935
+    ]
+  },
+  "notes": "Generated locally from the bedroom_4 viewer PLY to remove long-tail outliers before demo rendering; use video2mesh.cli clean-point-cloud-outliers for project runs."
+}

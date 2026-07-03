@@ -166,25 +166,66 @@ video frames + object masks
 
 ## 语义兼容
 
-语义不要塞死在 collider 里。推荐 sidecar：
+语义不要塞死在 collider 里。3DGS 继续做视觉代理，mesh 只做碰撞代理，语义用 sidecar 回灌到 mesh face：
 
 ```json
 {
-  "mesh": "objects/chair_01.glb",
+  "mesh": "colliders/scene_collision.glb",
   "face_semantics": [
-    {"face": 1024, "object_id": "chair_01", "label": "chair", "probability": 0.91}
-  ],
-  "support_surfaces": [
-    {"type": "seat", "normal": [0, 1, 0], "height": 0.45}
+    {"face": 1024, "object_id": "gdino_object_bed", "label": "bed", "probability": 0.91}
   ]
 }
 ```
 
-常用策略：
+P0 用 KDTree / nearest semantic transfer：
 
-- semantic splats / point cloud 作为主语义数据。
-- mesh face center 用 KDTree 或 ray projection 回灌语义。
-- collider 或 trigger 只保存可交互需要的语义字段。
+```text
+semantic_splats / semantic point cloud
+  -> KDTree / radius grid
+mesh faces
+  -> face center
+  -> nearest K semantic points
+  -> distance + probability weighted vote
+  -> face object_id
+```
+
+可复现命令：
+
+```bash
+python -m video2mesh.cli transfer-mesh-semantics \
+  --project-root exports/bedroom_4_shape_regularized_v2_dense100_47_56_20260628_key_results \
+  --semantic-splats-ply exports/bedroom_4_shape_regularized_v2_dense100_47_56_20260628_key_results/semantic_gaussian_probabilities.ply \
+  --semantic-manifest exports/bedroom_4_shape_regularized_v2_dense100_47_56_20260628_key_results/semantic_splats_manifest.json \
+  --mesh tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/mesh_recon_results/postprocessed_keep_candidates/colmap_delaunay_mesh_double_sided_indexed.glb \
+  --output tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/mesh_recon_results/mesh_semantic_backfill_colmap_delaunay_glb/mesh_semantics.json \
+  --debug-ply tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/mesh_recon_results/mesh_semantic_backfill_colmap_delaunay_glb/colored_debug_mesh.ply \
+  --k 8 \
+  --max-distance-ratio 0.015 \
+  --min-face-probability 0.35 \
+  --min-vote-confidence 0.45 \
+  --smooth-iterations 1 \
+  --min-region-faces 8
+```
+
+输出合同：
+
+- `mesh_semantics.json`：`face_semantics` 按 triangle index 排列。
+- `colored_debug_mesh.ply`：复制每个三角形顶点并按 face 语义染色，用来检查串语义和 unknown 区域。
+- Unity/Web 点击或射线命中 collider 后，用 `RaycastHit.triangleIndex` / hit face index 直接查 `face_semantics[triangleIndex]`。
+
+这个方法快、稳定、自动化，适合 COLMAP Delaunay collider、Open3D Poisson collider、GS2Mesh visual mesh。薄墙、床面、桌面等贴近区域可能串语义，所以必须保留 `max_distance` / `max-distance-ratio`、低置信度 unknown、小区域清理和平滑。
+
+P1 再做 ray projection / 多视角投票：
+
+```text
+mesh face center
+  -> project back to video frames
+  -> query 2D mask / semantic mask
+  -> multi-view visibility and vote
+  -> face object_id
+```
+
+多视角投票更适合边界和遮挡，但实现成本更高。当前 collider 闭环先用 P0 KDTree 回灌。
 
 ## SimAnything / PhysSplat 动态线
 

@@ -302,6 +302,8 @@ def build_public_site() -> None:
         "run_api.sh",
         "runtime",
         "wrangler.admin.toml",
+        "bedroom_4_cli30k_graphdeco_clean_iteration30000.ply",
+        "bedroom_4_scene_3dgs_repaired_supersplat.ply",
     )
     shutil.copytree(SITE, PUBLIC_BUILD, ignore=ignore)
     (PUBLIC_BUILD / "CNAME").write_text("relumeow.top\n", encoding="utf-8")

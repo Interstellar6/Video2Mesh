@@ -40,6 +40,15 @@ docs-blog/CNAME
 
 `docs-blog/_public/` 是静态发布目录，已被 Git 忽略。
 
+`docs-blog/demos/visual-physics-proxy/` 里有超过 100MB 的本地 raw PLY 时，不要把 raw PLY 直接放进 Pages 发布产物。当前构建脚本会排除：
+
+```text
+bedroom_4_cli30k_graphdeco_clean_iteration30000.ply
+bedroom_4_scene_3dgs_repaired_supersplat.ply
+```
+
+线上使用 `assets/large-asset-manifest.json` 和 `assets/chunks/*.partNN` 分片发布。更新这些大资产时，先重新生成分片和 manifest，再运行 `python3 docs-blog/build_site.py` 检查 `_public`。
+
 ## 新增文档
 
 1. 把项目主文档放到 `docs/`。

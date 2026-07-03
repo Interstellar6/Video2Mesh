@@ -162,7 +162,7 @@
 
       .metrics {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         gap: 8px;
         margin-top: 12px;
       }
@@ -373,10 +373,9 @@
           display: none;
         }
 
-        .fpv {
-          right: 12px;
-          top: 70px;
-          width: min(46vw, 240px);
+        .fpv,
+        .mode-chip {
+          display: none;
         }
 
         .hud {
@@ -422,13 +421,14 @@
       <div class="panel status-card">
         <h1>视觉代理 3DGS + 碰撞代理 Mesh</h1>
         <p>
-          视觉层默认加载 bedroom_4 真实生成的 3DGS PLY，并保留 Spark .splat / .sog 兜底；移动、射线和落点检测只依赖真实 GLB collider mesh。
-          点击画面会命中碰撞代理，而不是命中视觉点云。
+          视觉层默认用 Spark 加载 bedroom_4 CLI30K clean GraphDECO Gaussian PLY，并保留 repaired PLY / cleaned XYZRGB PLY / .splat / .sog 兜底；移动、射线和落点检测只依赖真实 GLB collider mesh。
+          单击画面会命中碰撞代理并聚焦该 surface，而不是命中视觉点云。
         </p>
         <div class="metrics">
           <div class="metric"><strong id="speedMetric">0.0</strong><span>actor m/s</span></div>
           <div class="metric"><strong id="heightMetric">1.6</strong><span>ground height</span></div>
           <div class="metric"><strong id="hitMetric">none</strong><span>ray hit</span></div>
+          <div class="metric"><strong id="surfaceMetric">none</strong><span>surface role</span></div>
           <div class="metric"><strong id="assetMetric">loading</strong><span>3DGS / mesh</span></div>
         </div>
       </div>
@@ -436,8 +436,11 @@
         <div class="control-row">
           <button id="toggleAssets" class="is-active" type="button">Real Assets</button>
           <button id="toggleVisual" class="is-active" type="button">Visual 3DGS</button>
-          <button id="toggleCollider" class="is-active" type="button">Collider Mesh</button>
+          <button id="toggleCollider" class="is-active" type="button">Collider wire</button>
+          <button id="toggleCameraMode" type="button">Orbit Camera</button>
+          <button id="cycleSplatQuality" type="button">Spark Balanced</button>
           <button id="toggleSemantic" type="button">Semantic Tint</button>
+          <button id="resetCamera" type="button">Reset View</button>
           <button id="resetActor" type="button">Reset</button>
         </div>
         <div class="control-row">
@@ -450,14 +453,14 @@
             <button type="button" data-drive="right" aria-label="Right">▶</button>
           </div>
           <div class="legend">
-            <span><i class="swatch"></i> bedroom_4 真实 3DGS PLY：只负责显示</span>
-            <span><i class="swatch mesh"></i> bedroom_4 GLB collider mesh：负责地面、边界和射线</span>
-            <span><i class="swatch ray"></i> 红色标记：射线命中的 collider face</span>
+            <span><i class="swatch"></i> bedroom_4 CLI30K GraphDECO Gaussian PLY：只负责显示</span>
+            <span><i class="swatch mesh"></i> colmap_delaunay_dense GLB collider mesh：负责地面、边界和射线</span>
+            <span><i class="swatch ray"></i> 红色标记：射线命中的 collider face；单击聚焦，Fly 模式拖拽看向</span>
           </div>
         </div>
       </div>
     </section>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="./visual-physics-proxy.js?v=bedroom4-20260703"></script>
+    <script type="module" src="./visual-physics-proxy.js?v=bedroom4-cli30k-spark-ui-20260703"></script>
   </body>
 </html>
