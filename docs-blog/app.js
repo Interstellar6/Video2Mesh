@@ -666,13 +666,6 @@
 
   function rebuildDocs() {
     const merged = [...baseDocs.map(cloneDoc), ...privateDocs.map(cloneDoc), ...uploadedDocs.map(cloneDoc)];
-    Object.values(draftStore).forEach((draft) => {
-      if (!draft?.id || typeof draft.body !== "string") return;
-      const doc = normalizeDoc(draft);
-      const index = merged.findIndex((item) => item.id === doc.id);
-      if (index >= 0) merged[index] = { ...merged[index], ...doc, has_draft: true };
-      else merged.unshift({ ...doc, has_draft: true });
-    });
     docs = merged;
   }
 
@@ -831,27 +824,7 @@
   }
 
   function createNewDraft() {
-    const id = uniqueId(`draft-${Date.now().toString(36)}`);
-    const body = `# 新建 Markdown\n\n- [ ] 待办项\n\n在这里写内容。\n`;
-    const doc = normalizeDoc({
-      id,
-      title: "新建 Markdown",
-      category: "Drafts",
-      source_path: `drafts/${id}.md`,
-      source_kind: "draft",
-      tags: ["Drafts"],
-      body,
-      updated: today(),
-      draft_updated_at: nowLabel(),
-    });
-    draftStore[id] = { ...doc, has_draft: true };
-    persistDraftStore();
-    rebuildDocs();
-    activeCategory = "Drafts";
-    renderAll();
-    pendingEditorDocId = id;
-    location.hash = `#/doc/${encodeURIComponent(id)}`;
-    if (currentDocId === id) showDoc(id);
+    setStatus("新文档请在 /admin 的 Markdown 同步中创建，避免只保存到当前浏览器。");
   }
 
   function downloadCurrentDoc() {
@@ -944,13 +917,8 @@
   function handleRenderedTaskToggle(event) {
     const input = event.target;
     if (!(input instanceof HTMLInputElement) || !input.matches("[data-task-index]")) return;
-    const doc = currentDoc();
-    if (!doc) return;
-    const nextBody = updateTaskLine(doc.body, Number(input.dataset.taskIndex), input.checked);
-    const y = window.scrollY;
-    saveDraft(doc, nextBody);
-    showDoc(doc.id, { preserveScroll: true });
-    window.scrollTo({ top: y, behavior: "instant" });
+    input.checked = !input.checked;
+    setStatus("请使用管理员编辑器修改文档；后台保存后才会生效。");
   }
 
   function handleEditorPreviewTaskToggle(event) {
@@ -1170,7 +1138,12 @@
 
   async function handleUpload(event) {
     const files = Array.from(event.target.files || []);
+    if (els.uploadList) {
+      els.uploadList.innerHTML = `<span>本地上传预览已停用；请登录 /admin 使用 Markdown 同步保存到后台。</span>`;
+    }
+    event.target.value = "";
     if (!files.length) return;
+    return;
     const imageUrls = new Map();
     files
       .filter((file) => file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name))

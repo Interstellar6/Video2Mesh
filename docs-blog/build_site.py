@@ -311,6 +311,7 @@ def build_public_site() -> None:
         ".env",
         ".env.*",
         "_public",
+        "admin",
         "admin-domain-worker.js",
         "api_server.py",
         "build_site.py",

@@ -1,5 +1,5 @@
 window.V2M_BLOG_DATA = {
-  "generatedAt": "2026-07-03 20:34",
+  "generatedAt": "2026-07-03 20:51",
   "docs": [
     {
       "id": "research-catalog",
