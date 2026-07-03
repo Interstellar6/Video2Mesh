@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 460" role="img" aria-labelledby="title desc">
+  <title id="title">ChallengeCup research catalog pipeline</title>
+  <desc id="desc">Research technologies mapped to the ChallengeCup offline and runtime pipeline.</desc>
+  <rect width="1200" height="460" fill="#f6f8f5"/>
+  <g font-family="Arial, sans-serif">
+    <text x="64" y="76" font-size="32" font-weight="700" fill="#18211f">技术调研如何接入项目</text>
+    <text x="64" y="108" font-size="17" fill="#66736f">外部模型和论文不直接堆在端侧路径里，而是分层接入检测、数据闭环、后处理和部署。</text>
+    <g fill="#ffffff" stroke="#dfe5df">
+      <rect x="64" y="166" width="180" height="96" rx="8"/>
+      <rect x="284" y="166" width="180" height="96" rx="8"/>
+      <rect x="504" y="166" width="180" height="96" rx="8"/>
+      <rect x="724" y="166" width="180" height="96" rx="8"/>
+      <rect x="944" y="166" width="180" height="96" rx="8"/>
+    </g>
+    <g font-size="20" font-weight="700" fill="#18211f">
+      <text x="92" y="206">YOLOv8 / FPN</text>
+      <text x="324" y="206">小目标策略</text>
+      <text x="536" y="206">Teacher 数据闭环</text>
+      <text x="756" y="206">后处理与选模</text>
+      <text x="990" y="206">Ascend 部署</text>
+    </g>
+    <g font-size="14" fill="#66736f">
+      <text x="92" y="234">主检测器和多尺度基础</text>
+      <text x="324" y="234">SAHI / hard crop</text>
+      <text x="536" y="234">UT / ST / AT / DINO</text>
+      <text x="756" y="234">WBF / Model Soups</text>
+      <text x="990" y="234">ONNX / ATC / OM</text>
+    </g>
+    <g stroke="#0d776f" stroke-width="3" fill="none" marker-end="url(#arrow)">
+      <path d="M244 214 H284"/>
+      <path d="M464 214 H504"/>
+      <path d="M684 214 H724"/>
+      <path d="M904 214 H944"/>
+    </g>
+    <path d="M154 294 C300 356 868 356 1040 292" stroke="#d98923" stroke-width="3" fill="none" marker-end="url(#arrowAmber)"/>
+    <text x="394" y="382" fill="#74440b" font-size="17">所有候选必须回到原始 validation gate，不能只看局部漂亮样例</text>
+  </g>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#0d776f"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#d98923"/>
+    </marker>
+  </defs>
+</svg>
+

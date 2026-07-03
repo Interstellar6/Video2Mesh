@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320">
+  <rect width="960" height="320" fill="#fbfcfa"/>
+  <g font-family="Arial, sans-serif" fill="#18211f">
+    <text x="46" y="54" font-size="28" font-weight="700">YOLOv8 主检测链路</text>
+    <g fill="#ffffff" stroke="#dfe5df">
+      <rect x="54" y="110" width="154" height="80" rx="6"/>
+      <rect x="250" y="110" width="154" height="80" rx="6"/>
+      <rect x="446" y="110" width="154" height="80" rx="6"/>
+      <rect x="642" y="110" width="154" height="80" rx="6"/>
+    </g>
+    <text x="86" y="146" font-size="18" font-weight="700">R1 YOLO</text>
+    <text x="88" y="170" font-size="14" fill="#66736f">split / labels</text>
+    <text x="282" y="146" font-size="18" font-weight="700">YOLOv8n</text>
+    <text x="278" y="170" font-size="14" fill="#66736f">train / val</text>
+    <text x="472" y="146" font-size="18" font-weight="700">1056 + TTA</text>
+    <text x="482" y="170" font-size="14" fill="#66736f">high precision</text>
+    <text x="678" y="146" font-size="18" font-weight="700">Gate</text>
+    <text x="674" y="170" font-size="14" fill="#66736f">mAP50 / mAP50-95</text>
+    <path d="M208 150 H250 M404 150 H446 M600 150 H642" stroke="#0d776f" stroke-width="3"/>
+  </g>
+</svg>
+

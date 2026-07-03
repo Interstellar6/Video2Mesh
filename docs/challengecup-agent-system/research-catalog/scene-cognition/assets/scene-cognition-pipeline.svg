@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 320">
+  <rect width="980" height="320" fill="#fbfcfa"/>
+  <g font-family="Arial, sans-serif">
+    <text x="48" y="58" font-size="28" font-weight="700" fill="#18211f">场景认知接入链路</text>
+    <g fill="#ffffff" stroke="#dfe5df">
+      <rect x="76" y="126" width="170" height="80" rx="6"/>
+      <rect x="318" y="126" width="170" height="80" rx="6"/>
+      <rect x="560" y="126" width="170" height="80" rx="6"/>
+      <rect x="802" y="126" width="120" height="80" rx="6"/>
+    </g>
+    <text x="120" y="160" font-size="19" font-weight="700" fill="#18211f">Frame</text>
+    <text x="340" y="160" font-size="19" font-weight="700" fill="#18211f">Scene model</text>
+    <text x="586" y="160" font-size="19" font-weight="700" fill="#18211f">Task policy</text>
+    <text x="828" y="160" font-size="19" font-weight="700" fill="#18211f">Detect</text>
+    <text x="104" y="184" font-size="14" fill="#66736f">IR / SAR image</text>
+    <text x="342" y="184" font-size="14" fill="#66736f">Places365 / CLIP</text>
+    <text x="588" y="184" font-size="14" fill="#66736f">threshold / classes</text>
+    <text x="820" y="184" font-size="14" fill="#66736f">YOLO output</text>
+    <path d="M246 166 H318 M488 166 H560 M730 166 H802" stroke="#0d776f" stroke-width="3"/>
+  </g>
+</svg>

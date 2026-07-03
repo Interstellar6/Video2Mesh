@@ -1,8 +1,11 @@
 (function () {
   const seed = window.V2M_BLOG_DATA || { docs: [], categories: [], generatedAt: "" };
-  const DRAFT_STORAGE_KEY = "v2m-blog-drafts-v1";
+  const siteConfig = seed.site || {};
+  const projectRoute = siteConfig.route || "video2mesh";
+  const projectPath = `/${projectRoute}`;
+  const DRAFT_STORAGE_KEY = `${projectRoute}-blog-drafts-v1`;
   const API_STORAGE_KEY = "v2m-blog-api-v1";
-  const READING_STORAGE_KEY = "v2m-blog-reading-v1";
+  const READING_STORAGE_KEY = `${projectRoute}-blog-reading-v1`;
   const DEFAULT_API_URL = "https://api.relumeow.top";
   const baseDocs = (seed.docs || []).map(cloneDoc);
   let privateDocs = [];
@@ -16,6 +19,7 @@
   let currentDocId = "";
   let pendingEditorDocId = "";
   let openNavNodes = loadNavOpenNodes();
+  let annotationSelectionTimer = 0;
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -68,12 +72,15 @@
     catalogSummary: $("catalogSummary"),
     annotationForm: $("annotationForm"),
     commentForm: $("commentForm"),
+    annotationPopover: $("annotationPopover"),
+    annotationQuotePreview: $("annotationQuotePreview"),
+    cancelAnnotation: $("cancelAnnotation"),
     annotationList: $("annotationList"),
     commentList: $("commentList"),
     feedbackStatus: $("feedbackStatus"),
   };
 
-  const catalogStages = [
+  const defaultCatalogStages = [
     {
       key: "input-pose-pointcloud",
       title: "输入、位姿与点云",
@@ -145,6 +152,11 @@
       tags: ["Experiments", "Video2Mesh"],
     },
   ];
+  const catalogStages = Array.isArray(siteConfig.catalogStages) && siteConfig.catalogStages.length
+    ? siteConfig.catalogStages
+    : defaultCatalogStages;
+  const catalogCategory = siteConfig.catalogCategory || "调研目录";
+  const researchRoot = siteConfig.researchRoot || "docs/video2mesh/research-catalog/";
 
   const escapeHtml = (value) => String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -214,7 +226,7 @@
 
   function loadNavOpenNodes() {
     try {
-      const parsed = JSON.parse(window.localStorage.getItem("v2m-blog-nav-open-v1") || "[]");
+      const parsed = JSON.parse(window.localStorage.getItem(`${projectRoute}-blog-nav-open-v1`) || "[]");
       return new Set(Array.isArray(parsed) ? parsed : []);
     } catch (_error) {
       return new Set();
@@ -223,7 +235,7 @@
 
   function persistNavOpenNodes() {
     try {
-      window.localStorage.setItem("v2m-blog-nav-open-v1", JSON.stringify(Array.from(openNavNodes)));
+      window.localStorage.setItem(`${projectRoute}-blog-nav-open-v1`, JSON.stringify(Array.from(openNavNodes)));
     } catch (_error) {
       // Navigation state is a convenience only.
     }
@@ -273,7 +285,7 @@
   function renderCategoryDocList(category) {
     const categoryDocs = docsForCategory(category);
     if (category === "All") return "";
-    if (category !== "调研目录") {
+    if (category !== catalogCategory) {
       return categoryDocs.map((doc) => renderNavDocLink(doc)).join("");
     }
     return renderResearchNavTree(categoryDocs);
@@ -375,27 +387,27 @@
 
   function researchCatalogDocs() {
     return docs
-      .filter((doc) => doc.category === "调研目录" || String(doc.source_path || "").includes("docs/video2mesh/research-catalog/"))
+      .filter((doc) => doc.category === catalogCategory || String(doc.source_path || "").includes(researchRoot))
       .slice()
       .sort((a, b) => {
         const aPath = String(a.source_path || "");
         const bPath = String(b.source_path || "");
-        if (aPath.endsWith("docs/video2mesh/research-catalog/README.md")) return -1;
-        if (bPath.endsWith("docs/video2mesh/research-catalog/README.md")) return 1;
+        if (aPath.endsWith(`${researchRoot}README.md`)) return -1;
+        if (bPath.endsWith(`${researchRoot}README.md`)) return 1;
         return aPath.localeCompare(bPath, "zh-Hans-CN");
       });
   }
 
   function docForStage(stage) {
-    return researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/overview.md`))
-      || researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/`));
+    return researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`${researchRoot}${stage.key}/overview.md`))
+      || researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`${researchRoot}${stage.key}/`));
   }
 
   function docsForStage(stage) {
     return researchCatalogDocs()
       .filter((doc) => {
         if (doc.research_stage) return doc.research_stage === stage.key;
-        return String(doc.source_path || "").includes(`docs/video2mesh/research-catalog/${stage.key}/`);
+        return String(doc.source_path || "").includes(`${researchRoot}${stage.key}/`);
       })
       .sort((a, b) => {
         const roleRank = { overview: 0, item: 1 };
@@ -729,6 +741,11 @@
         const target = href.startsWith("#") || href.startsWith("/") ? "_self" : "_blank";
         return `<a href="${href}" target="${target}" rel="noreferrer">${label}</a>`;
       })
+      .replace(/(^|[\s(])((?:https?:\/\/)[^\s<)]+)/g, (_m, prefix, href) => {
+        const cleanHref = href.replace(/[.,;:!?，。；：！？]+$/, "");
+        const suffix = href.slice(cleanHref.length);
+        return `${prefix}<a href="${cleanHref}" target="_blank" rel="noreferrer">${cleanHref}</a>${suffix}`;
+      })
       .replace(/`([^`]+)`/g, "<code>$1</code>")
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/\*([^*]+)\*/g, "<em>$1</em>");
@@ -993,6 +1010,60 @@
     `).join("");
   }
 
+  function selectedArticleQuote() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+    const range = selection.getRangeAt(0);
+    if (!els.articleBody.contains(range.commonAncestorContainer)) return null;
+    const quote = selection.toString().replace(/\s+/g, " ").trim();
+    if (quote.length < 2) return null;
+    const rect = range.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return null;
+    return {
+      quote: quote.slice(0, 1000),
+      anchor: currentDocId,
+      x: rect.left + rect.width / 2,
+      y: rect.bottom,
+    };
+  }
+
+  function showAnnotationPopover(selectionInfo) {
+    if (!selectionInfo || !els.annotationPopover) return;
+    const form = els.annotationForm;
+    form.elements.quote.value = selectionInfo.quote;
+    form.elements.anchor.value = selectionInfo.anchor || currentDocId;
+    els.annotationQuotePreview.textContent = selectionInfo.quote;
+    els.annotationPopover.hidden = false;
+    window.requestAnimationFrame(() => {
+      const popoverRect = els.annotationPopover.getBoundingClientRect();
+      const margin = 14;
+      const left = Math.max(margin, Math.min(selectionInfo.x - popoverRect.width / 2, window.innerWidth - popoverRect.width - margin));
+      const top = Math.max(margin, Math.min(selectionInfo.y + 10, window.innerHeight - popoverRect.height - margin));
+      els.annotationPopover.style.left = `${Math.round(left)}px`;
+      els.annotationPopover.style.top = `${Math.round(top)}px`;
+      form.elements.body.focus();
+    });
+  }
+
+  function hideAnnotationPopover() {
+    if (!els.annotationPopover) return;
+    els.annotationPopover.hidden = true;
+    els.annotationForm.reset();
+    els.annotationQuotePreview.textContent = "";
+  }
+
+  function handleArticleSelection() {
+    if (!els.articleView.hidden && els.annotationPopover && !els.annotationPopover.hidden && els.annotationPopover.contains(document.activeElement)) return;
+    const info = selectedArticleQuote();
+    if (!info) return;
+    showAnnotationPopover(info);
+  }
+
+  function scheduleArticleSelectionCheck(delay = 40) {
+    window.clearTimeout(annotationSelectionTimer);
+    annotationSelectionTimer = window.setTimeout(handleArticleSelection, delay);
+  }
+
   async function loadFeedback(docId) {
     if (!docId || !els.commentList || !els.annotationList) return;
     els.feedbackStatus.textContent = "加载评论和批注...";
@@ -1018,6 +1089,7 @@
       author: String(formData.get("author") || "").trim(),
       body: String(formData.get("body") || "").trim(),
       quote: String(formData.get("quote") || "").trim(),
+      anchor: String(formData.get("anchor") || "").trim(),
     };
     if (!payload.body) {
       els.feedbackStatus.textContent = "请先填写内容。";
@@ -1031,8 +1103,12 @@
         body: JSON.stringify(payload),
       });
       form.reset();
+      if (type === "annotation") {
+        hideAnnotationPopover();
+        window.getSelection()?.removeAllRanges();
+      }
       await loadFeedback(doc.id);
-      els.feedbackStatus.textContent = "已保存到后台。";
+      els.feedbackStatus.textContent = type === "annotation" ? "批注已保存。" : "评论已保存。";
     } catch (error) {
       els.feedbackStatus.textContent = error.message || "提交失败";
     }
@@ -1081,7 +1157,7 @@
     els.homeView.hidden = true;
     els.catalogView.hidden = false;
     els.articleView.hidden = true;
-    activeCategory = "调研目录";
+    activeCategory = catalogCategory;
     updateMainTabs("catalog");
     renderNavigation();
     renderCatalog();
@@ -1104,7 +1180,7 @@
     els.homeView.hidden = true;
     els.catalogView.hidden = true;
     els.articleView.hidden = false;
-    updateMainTabs(doc.category === "调研目录" ? "catalog" : "docs");
+    updateMainTabs(doc.category === catalogCategory ? "catalog" : "docs");
     if (!options.keepEditor) closeEditor();
     els.articleMeta.innerHTML = `
       <span>${escapeHtml(doc.category)}</span>
@@ -1115,6 +1191,7 @@
       ${draftStore[doc.id] ? "<span>本地草稿</span>" : ""}
     `;
     els.articleBody.innerHTML = renderMarkdown(doc.body);
+    hideAnnotationPopover();
     if (options.keepEditor) els.editorPreview.innerHTML = renderMarkdown(els.markdownEditor.value);
     renderToc(doc);
     renderRelated(doc);
@@ -1171,12 +1248,14 @@
   }
 
   function renderReadingPaths() {
-    const pathDefs = [
-    { title: "从视频到资产", tags: ["Pipeline", "Simulation"], query: "pipeline" },
-      { title: "调研目录", tags: ["调研目录", "Research Catalog"], query: "mesh" },
-      { title: "项目文档", tags: ["项目文档", "Video2Mesh"], query: "pipeline" },
-      { title: "进度目录", tags: ["进度目录", "Weekly", "P0"], query: "weekly" },
-    ];
+    const pathDefs = Array.isArray(siteConfig.readingPaths) && siteConfig.readingPaths.length
+      ? siteConfig.readingPaths
+      : [
+        { title: "从视频到资产", tags: ["Pipeline", "Simulation"], query: "pipeline" },
+        { title: "调研目录", tags: ["调研目录", "Research Catalog"], query: "mesh" },
+        { title: "项目文档", tags: ["项目文档", "Video2Mesh"], query: "pipeline" },
+        { title: "进度目录", tags: ["进度目录", "Weekly", "P0"], query: "weekly" },
+      ];
     els.readingPaths.innerHTML = pathDefs.map((path) => {
       const matches = docs
         .filter((doc) => path.tags.includes(doc.category) || (doc.tags || []).some((tag) => path.tags.includes(tag)) || doc.title.toLowerCase().includes(path.query))
@@ -1260,7 +1339,7 @@
   }
 
   function renderAll() {
-    els.buildMeta.textContent = `${docs.length} 篇文档 · 构建时间 ${seed.generatedAt || "本地"} · /video2mesh 项目空间`;
+    els.buildMeta.textContent = `${docs.length} 篇文档 · 构建时间 ${seed.generatedAt || "本地"} · ${siteConfig.space || `${projectPath} 项目空间`}`;
     updateSiteUserInfo();
     renderNavigation();
     renderStats();
@@ -1375,6 +1454,22 @@
     setStatus("正在编辑，尚未保存。");
   });
   els.articleBody.addEventListener("change", handleRenderedTaskToggle);
+  els.articleBody.addEventListener("pointerup", () => scheduleArticleSelectionCheck(60));
+  els.articleBody.addEventListener("mouseup", () => scheduleArticleSelectionCheck(40));
+  els.articleBody.addEventListener("keyup", (event) => {
+    if (event.key === "Escape") hideAnnotationPopover();
+    else scheduleArticleSelectionCheck(40);
+  });
+  document.addEventListener("selectionchange", () => {
+    if (els.articleView.hidden || els.annotationPopover.contains(document.activeElement)) return;
+    scheduleArticleSelectionCheck(80);
+  });
+  els.cancelAnnotation.addEventListener("click", hideAnnotationPopover);
+  document.addEventListener("pointerdown", (event) => {
+    if (els.annotationPopover.hidden) return;
+    if (els.annotationPopover.contains(event.target) || els.articleBody.contains(event.target)) return;
+    hideAnnotationPopover();
+  });
   els.editorPreview.addEventListener("change", handleEditorPreviewTaskToggle);
   els.tocNav.addEventListener("click", handleTocClick);
   els.clearReadingState.addEventListener("click", clearReadingState);

@@ -53,9 +53,69 @@ RESEARCH_STAGE_DEFS = [
     ("object-simulation", "物体仿真"),
     ("industrial-pipelines", "工业资产管线"),
     ("experiments", "本项目实验"),
+    ("target-detection", "目标检测"),
+    ("scene-cognition", "场景认知"),
+    ("task-decision-postprocess", "任务决策与后处理"),
+    ("data-engine-semisupervised", "数据闭环与半监督"),
+    ("deployment", "端侧部署"),
 ]
 
 RESEARCH_STAGE_TITLES = dict(RESEARCH_STAGE_DEFS)
+
+VIDEO2MESH_SITE = {
+    "route": "video2mesh",
+    "title": "Video2Mesh Field Notes",
+    "brand": "Video2Mesh",
+    "mark": "V2M",
+    "subtitle": "Field Notes",
+    "description": "Video2Mesh 项目文档、调研和运行手册的静态博客网站。",
+    "space": "/video2mesh 项目空间",
+    "researchRoot": "docs/video2mesh/research-catalog/",
+    "catalogCategory": "调研目录",
+    "catalogStages": [
+        {"key": "input-pose-pointcloud", "title": "输入、位姿与点云", "summary": "视频抽帧、COLMAP/MVS、learned pose fallback、稠密点云和坐标尺度合同。", "image": "assets/uploaded/input-pose-pointcloud/stage-input-pose.svg", "tags": ["COLMAP", "Point Cloud", "Pose"]},
+        {"key": "visual-3dgs", "title": "视觉重建 / 3DGS", "summary": "GraphDECO 3DGS、Spark、SuperSplat 和 visual proxy 的工程边界。", "image": "assets/v2m-docs-mark.svg", "tags": ["3DGS", "Spark", "SuperSplat"]},
+        {"key": "mesh-reconstruction", "title": "Mesh 重建", "summary": "COLMAP Delaunay、Poisson、GS2Mesh、SuGaR、2DGS/GOF 的阶段定位。", "image": "assets/uploaded/mesh-reconstruction/stage-mesh.svg", "tags": ["Mesh", "GS2Mesh", "SuGaR"]},
+        {"key": "pointcloud-completion", "title": "点云/背景补全", "summary": "点云清理、背景 clean plate、inpainting 与场景结构补全。", "image": "assets/uploaded/pointcloud-completion/stage-completion.svg", "tags": ["Completion", "Inpainting"]},
+        {"key": "object-mesh-completion", "title": "物体 Mesh 补全", "summary": "Hunyuan3D、Meshy、TRELLIS、InstantMesh、image-blaster object jobs。", "image": "assets/uploaded/pointcloud-completion/stage-completion.svg", "tags": ["Object Mesh", "image-blaster"]},
+        {"key": "semantic-scene-graph", "title": "语义与 Scene Graph", "summary": "SAM/Grounded-SAM、semantic splats、mesh face sidecar 和交互查询。", "image": "assets/uploaded/semantic-scene-graph/stage-semantics.svg", "tags": ["Semantics", "Scene Graph"]},
+        {"key": "collider-physics-proxy", "title": "Collider 与物理代理", "summary": "static collider、primitive proxy、convex decomposition 和 runtime physics。", "image": "assets/uploaded/object-simulation/stage-simulation.svg", "tags": ["Collider", "Physics"]},
+        {"key": "object-simulation", "title": "物体仿真", "summary": "rigid body、soft body、PhysSplat/Sim Anything 和 dynamic Gaussian。", "image": "assets/uploaded/object-simulation/stage-simulation.svg", "tags": ["Simulation", "PhysSplat"]},
+        {"key": "industrial-pipelines", "title": "工业资产管线", "summary": "World Labs / Icare、image-blaster、Spark viewer 和 GLB runtime 约定。", "image": "assets/uploaded/research-catalog/pipeline-overview.svg", "tags": ["World Labs", "Spark"]},
+        {"key": "experiments", "title": "本项目实验", "summary": "GS2Mesh、Open3D Poisson、COLMAP Delaunay、语义投影和 Web demo。", "image": "assets/uploaded/experiments/04-visual-physics-proxy-demo.png", "tags": ["Experiments", "Video2Mesh"]},
+    ],
+    "readingPaths": [
+        {"title": "从视频到资产", "tags": ["Pipeline", "Simulation"], "query": "pipeline"},
+        {"title": "调研目录", "tags": ["调研目录", "Research Catalog"], "query": "mesh"},
+        {"title": "项目文档", "tags": ["项目文档", "Video2Mesh"], "query": "pipeline"},
+        {"title": "进度目录", "tags": ["进度目录", "Weekly", "P0"], "query": "weekly"},
+    ],
+}
+
+CHALLENGECUP_SITE = {
+    "route": "challengecup-agent-system",
+    "title": "ChallengeCup Agent System",
+    "brand": "ChallengeCup",
+    "mark": "CC",
+    "subtitle": "Agent System",
+    "description": "ChallengeCup 多模态模型协同自主智能体系统的赛题分析、技术调研、进度和项目使用文档。",
+    "space": "/challengecup-agent-system 项目空间",
+    "researchRoot": "docs/challengecup-agent-system/research-catalog/",
+    "catalogCategory": "调研目录",
+    "catalogStages": [
+        {"key": "target-detection", "title": "目标检测", "summary": "YOLOv8、FPN、多尺度输入、SAHI 和 tiny soldier 检测瓶颈。", "image": "assets/uploaded/challengecup-research-catalog/research-catalog-pipeline.svg", "tags": ["YOLOv8", "FPN", "SAHI"]},
+        {"key": "scene-cognition", "title": "场景认知", "summary": "Places365、EfficientNet、MobileCLIP 和 air/sea/urban/forest 场景标签。", "image": "assets/uploaded/challengecup-places365-resnet50/scene-cognition-pipeline.svg", "tags": ["Places365", "EfficientNet", "MobileCLIP"]},
+        {"key": "task-decision-postprocess", "title": "任务决策与后处理", "summary": "场景先验、precision policy、WBF、Model Soups、candidate gate。", "image": "assets/uploaded/challengecup-model-soups/model-soups-pipeline.svg", "tags": ["Policy", "WBF", "Model Soups"]},
+        {"key": "data-engine-semisupervised", "title": "数据闭环与半监督", "summary": "Teacher-Student、Grounding DINO、Copy-Paste、错例审计和数据回流。", "image": "assets/uploaded/challengecup-soft-teacher/teacher-student-pipeline.svg", "tags": ["Teacher", "Pseudo Label", "Copy-Paste"]},
+        {"key": "deployment", "title": "端侧部署", "summary": "YOLO 权重导出 ONNX，经 CANN/ATC 转换为 Ascend 310B 可运行 OM。", "image": "assets/uploaded/challengecup-ascend-cann-atc/ascend-deploy-pipeline.svg", "tags": ["Ascend", "ONNX", "ATC"]},
+    ],
+    "readingPaths": [
+        {"title": "赛题分析目录", "tags": ["赛题分析目录", "R1"], "query": "赛题"},
+        {"title": "调研目录", "tags": ["调研目录", "YOLOv8", "Teacher Student"], "query": "模型"},
+        {"title": "进度目录", "tags": ["进度目录", "Results"], "query": "mAP"},
+        {"title": "项目使用文档目录", "tags": ["项目使用文档目录", "How to Run"], "query": "运行"},
+    ],
+}
 
 
 @dataclass
@@ -126,14 +186,18 @@ def infer_category(path: Path, title: str, meta: dict[str, Any]) -> str:
 
 def infer_research_stage(path: Path) -> tuple[str, str, str]:
     relative = str(path.relative_to(ROOT)).replace("\\", "/")
-    prefix = "docs/video2mesh/research-catalog/"
-    if not relative.startswith(prefix):
+    matched_prefix = ""
+    for prefix in ("docs/video2mesh/research-catalog/", "docs/challengecup-agent-system/research-catalog/"):
+        if relative.startswith(prefix):
+            matched_prefix = prefix
+            break
+    if not matched_prefix:
         return "", "", ""
-    tail = relative[len(prefix):]
+    tail = relative[len(matched_prefix):]
     if tail == "README.md":
         return "research-catalog", "调研目录总览", "root"
     stage_key = tail.split("/", 1)[0]
-    stage_title = RESEARCH_STAGE_TITLES.get(stage_key, "")
+    stage_title = RESEARCH_STAGE_TITLES.get(stage_key) or stage_key.replace("-", " ").title()
     if not stage_title:
         return "", "", ""
     role = "overview" if tail.endswith("/overview.md") else "item"
@@ -282,38 +346,41 @@ def load_doc(path: Path, source_kind: str, used_ids: set[str], copy_assets: bool
     )
 
 
-def collect_docs(copy_assets: bool = True) -> list[Doc]:
+def collect_docs(docs_subdir: str = "video2mesh", pinned_docs: list[str] | None = None, copy_assets: bool = True) -> list[Doc]:
     used_ids: set[str] = set()
     docs: list[Doc] = []
     seen_docs: set[Path] = set()
-    for name in PINNED_DOCS:
+    for name in (pinned_docs if pinned_docs is not None else PINNED_DOCS):
         path = ROOT / name
         if path.exists():
             seen_docs.add(path.resolve())
             docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
-    for path in sorted(ROOT.glob("*.md")):
-        if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_docs:
-            continue
-        docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
-    docs_root = ROOT / "docs" / "video2mesh"
+    if docs_subdir == "video2mesh":
+        for path in sorted(ROOT.glob("*.md")):
+            if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_docs:
+                continue
+            docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
+    docs_root = ROOT / "docs" / docs_subdir
     for path in sorted(docs_root.rglob("*.md")):
         if path.resolve() in seen_docs:
             continue
         docs.append(load_doc(path, "builtin", used_ids, copy_assets=copy_assets))
-    for path in sorted(CONTENT.rglob("*.md")):
-        docs.append(load_doc(path, "content", used_ids, copy_assets=copy_assets))
+    if docs_subdir == "video2mesh":
+        for path in sorted(CONTENT.rglob("*.md")):
+            docs.append(load_doc(path, "content", used_ids, copy_assets=copy_assets))
     return docs
 
 
-def write_site_data(docs: list[Doc]) -> None:
+def write_site_data(docs: list[Doc], config: dict[str, Any], target: Path) -> None:
     public_docs = [doc for doc in docs if doc.visibility == "public"]
     payload = {
         "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "site": config,
         "docs": [doc.__dict__ for doc in public_docs],
         "categories": sorted({doc.category for doc in public_docs}),
     }
     text = "window.V2M_BLOG_DATA = " + json.dumps(payload, ensure_ascii=False, indent=2) + ";\n"
-    (SITE / "site-data.js").write_text(text, encoding="utf-8")
+    target.write_text(text, encoding="utf-8")
 
 
 def write_placeholder_asset() -> None:
@@ -341,10 +408,67 @@ def write_custom_domain() -> None:
     (SITE / "CNAME").write_text("relumeow.top\n", encoding="utf-8")
 
 
-def build_public_site() -> None:
-    if PUBLIC_BUILD.exists():
-        shutil.rmtree(PUBLIC_BUILD)
-    PUBLIC_BUILD.mkdir(parents=True, exist_ok=True)
+def patch_project_shell(target: Path, config: dict[str, Any]) -> None:
+    index = target / "index.html"
+    html = index.read_text(encoding="utf-8")
+    route = config["route"]
+    html = html.replace("<title>Video2Mesh Field Notes</title>", f"<title>{config['title']}</title>")
+    html = html.replace('content="Video2Mesh 项目文档、调研和运行手册的静态博客网站。"', f'content="{config["description"]}"')
+    html = html.replace('/video2mesh/#/', f'/{route}/#/')
+    html = html.replace('/video2mesh/#/catalog', f'/{route}/#/catalog')
+    html = html.replace('aria-label="Video2Mesh Field Notes"', f'aria-label="{config["title"]}"')
+    html = html.replace("<strong>Video2Mesh</strong>", f"<strong>{config['brand']}</strong>")
+    html = html.replace('<span class="brand-mark">V2M</span>', f'<span class="brand-mark">{config.get("mark", config["brand"][:3])}</span>')
+    html = html.replace("<em>Field Notes</em>", f"<em>{config['subtitle']}</em>")
+    html = html.replace("<h1>Project Research Blog</h1>", f"<h1>{config['title']}</h1>")
+    if route == "challengecup-agent-system":
+        html = html.replace("Video2Mesh 文档知识库", "ChallengeCup 文档知识库")
+        html = html.replace("搜索 3DGS、Scene Graph、Unity、流水线...", "搜索 YOLOv8、R1、teacher、mAP、Ascend...")
+        html = html.replace("从扫描视频到可仿真的 3D 场景资产", "多模态模型协同自主智能体系统")
+        html = html.replace("把 Video2Mesh 的调研目录、项目文档、进度周报和旧文档集中在 /video2mesh 子路由下；公开文档可访客批注，私密文档仅管理员可见。", "把赛题分析目录、调研目录、进度目录和项目使用文档目录集中在 /challengecup-agent-system 子路由下。")
+        html = html.replace("打开调研目录", "打开调研目录")
+        html = html.replace("新增 `.md` 到 `docs/video2mesh/`。", "新增 `.md` 到 `docs/challengecup-agent-system/`。")
+        html = html.replace("场景扫描与可交互资产调研目录", "ChallengeCup 技术调研目录")
+        html = html.replace("按 Video2Mesh 流程阶段组织学术模型、工业项目和本项目实验，快速定位每个方案该接在 pipeline 的哪里。", "按目标检测、场景认知、任务决策、数据闭环和端侧部署组织模型与项目调研。")
+        html = html.replace('src="./assets/uploaded/research-catalog/pipeline-overview.svg"', 'src="./assets/uploaded/challengecup-research-catalog/research-catalog-pipeline.svg"')
+        html = html.replace('alt="Video2Mesh 调研流程总览"', 'alt="ChallengeCup 技术调研流程总览"')
+        html = html.replace('src="./assets/uploaded/research-catalog/pipeline-overview.svg"', 'src="./assets/uploaded/challengecup-research-catalog/research-catalog-pipeline.svg"')
+    index.write_text(html, encoding="utf-8")
+
+
+def uploaded_asset_roots(config: dict[str, Any], docs: list[Doc]) -> set[str]:
+    roots: set[str] = set()
+    pattern = re.compile(r"assets/uploaded/([^/]+)/")
+    for stage in config.get("catalogStages", []):
+        image = str(stage.get("image", ""))
+        match = pattern.search(image)
+        if match:
+            roots.add(match.group(1))
+    for doc in docs:
+        for match in pattern.finditer(doc.body):
+            roots.add(match.group(1))
+    return roots
+
+
+def copy_project_uploaded_assets(config: dict[str, Any], docs: list[Doc], target: Path) -> None:
+    src_uploaded = ASSETS / "uploaded"
+    if not src_uploaded.exists():
+        return
+    dst_uploaded = target / "assets" / "uploaded"
+    dst_uploaded.mkdir(parents=True, exist_ok=True)
+    for name in sorted(uploaded_asset_roots(config, docs)):
+        src = src_uploaded / name
+        if not src.exists():
+            continue
+        dst = dst_uploaded / name
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+
+
+def build_project_site(config: dict[str, Any], docs: list[Doc]) -> None:
+    route = config["route"]
+    target = PUBLIC_BUILD / route
     ignore = shutil.ignore_patterns(
         ".env",
         ".env.*",
@@ -361,9 +485,21 @@ def build_public_site() -> None:
         "bedroom_4_cli30k_graphdeco_clean_iteration30000.ply",
         "bedroom_4_scene_3dgs_repaired_supersplat.ply",
         "chunks",
+        "site-data.js",
+        "uploaded",
     )
-    video2mesh_build = PUBLIC_BUILD / "video2mesh"
-    shutil.copytree(SITE, video2mesh_build, ignore=ignore)
+    shutil.copytree(SITE, target, ignore=ignore)
+    patch_project_shell(target, config)
+    write_site_data(docs, config, target / "site-data.js")
+    copy_project_uploaded_assets(config, docs, target)
+
+
+def build_public_site(video_docs: list[Doc], challengecup_docs: list[Doc]) -> None:
+    if PUBLIC_BUILD.exists():
+        shutil.rmtree(PUBLIC_BUILD)
+    PUBLIC_BUILD.mkdir(parents=True, exist_ok=True)
+    build_project_site(VIDEO2MESH_SITE, video_docs)
+    build_project_site(CHALLENGECUP_SITE, challengecup_docs)
     admin_src = SITE / "admin"
     admin_dst = PUBLIC_BUILD / "admin"
     if admin_src.exists():
@@ -376,8 +512,9 @@ def build_public_site() -> None:
         """<!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="0; url=/video2mesh/">
-<title>Video2Mesh</title>
+<title>Project Docs</title>
 <a href="/video2mesh/">进入 Video2Mesh 文档站</a>
+<a href="/challengecup-agent-system/">进入 ChallengeCup Agent System 文档站</a>
 """,
         encoding="utf-8",
     )
@@ -390,15 +527,26 @@ def main() -> int:
     generated_uploads = ASSETS / "uploaded"
     if generated_uploads.exists():
         shutil.rmtree(generated_uploads)
-    docs = collect_docs()
-    write_site_data(docs)
+    video_docs = collect_docs("video2mesh", PINNED_DOCS)
+    challengecup_docs = collect_docs(
+        "challengecup-agent-system",
+        [
+            "docs/challengecup-agent-system/README.md",
+            "docs/challengecup-agent-system/contest-analysis/README.md",
+            "docs/challengecup-agent-system/research-catalog/README.md",
+            "docs/challengecup-agent-system/progress/README.md",
+            "docs/challengecup-agent-system/project-docs/README.md",
+        ],
+    )
+    write_site_data(video_docs, VIDEO2MESH_SITE, SITE / "site-data.js")
     write_placeholder_asset()
     write_custom_domain()
-    build_public_site()
-    public_count = sum(1 for doc in docs if doc.visibility == "public")
-    private_count = len(docs) - public_count
+    build_public_site(video_docs, challengecup_docs)
+    all_docs = video_docs + challengecup_docs
+    public_count = sum(1 for doc in all_docs if doc.visibility == "public")
+    private_count = len(all_docs) - public_count
     print(f"Built docs-blog with {public_count} public document(s), {private_count} private document(s).")
-    for doc in docs:
+    for doc in all_docs:
         print(f"- [{doc.visibility}] [{doc.category}] {doc.title} ({doc.source_path})")
     return 0
 

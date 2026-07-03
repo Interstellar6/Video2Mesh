@@ -188,31 +188,38 @@
                 </div>
               </section>
               <div id="articleBody" class="article-body"></div>
-              <section class="feedback-panel" aria-label="文档评论和批注">
-                <div class="feedback-grid">
-                  <form id="annotationForm" class="feedback-form">
-                    <h2>批注</h2>
-                    <input name="author" type="text" placeholder="昵称（可选）" />
-                    <input name="quote" type="text" placeholder="引用片段或段落位置" />
-                    <textarea name="body" rows="4" placeholder="写下批注意见" required></textarea>
-                    <button type="submit">提交批注</button>
-                  </form>
-                  <form id="commentForm" class="feedback-form">
-                    <h2>评论</h2>
-                    <input name="author" type="text" placeholder="昵称（可选）" />
-                    <textarea name="body" rows="4" placeholder="写下评论" required></textarea>
-                    <button type="submit">发表评论</button>
-                  </form>
-                </div>
+              <div id="annotationPopover" class="annotation-popover" hidden>
+                <form id="annotationForm" class="annotation-popover-card">
+                  <header>
+                    <strong>添加批注</strong>
+                    <button id="cancelAnnotation" type="button" aria-label="关闭批注窗口">×</button>
+                  </header>
+                  <blockquote id="annotationQuotePreview"></blockquote>
+                  <input name="author" type="text" placeholder="昵称（可选）" />
+                  <input name="quote" type="hidden" />
+                  <input name="anchor" type="hidden" />
+                  <textarea name="body" rows="3" placeholder="写下对选中内容的批注意见" required></textarea>
+                  <button type="submit">提交批注</button>
+                </form>
+              </div>
+              <section class="feedback-panel" aria-label="文档评论">
+                <header class="feedback-panel-header">
+                  <h2>评论</h2>
+                </header>
+                <form id="commentForm" class="feedback-form comment-form">
+                  <input name="author" type="text" placeholder="昵称（可选）" />
+                  <textarea name="body" rows="4" placeholder="写下整体评论" required></textarea>
+                  <button type="submit">发表评论</button>
+                </form>
                 <div id="feedbackStatus" class="feedback-status"></div>
                 <div class="feedback-lists">
                   <section>
-                    <h2>批注列表</h2>
-                    <div id="annotationList" class="feedback-list"></div>
-                  </section>
-                  <section>
                     <h2>评论区</h2>
                     <div id="commentList" class="feedback-list"></div>
+                  </section>
+                  <section>
+                    <h2>公开批注</h2>
+                    <div id="annotationList" class="feedback-list"></div>
                   </section>
                 </div>
               </section>
@@ -229,7 +236,7 @@
         </article>
       </main>
     </div>
-    <script src="./site-data.js?v=20260704-nav-tree"></script>
-    <script src="./app.js?v=20260704-nav-tree"></script>
+    <script src="./site-data.js?v=20260704-feedback-notes"></script>
+    <script src="./app.js?v=20260704-feedback-notes"></script>
   </body>
 </html>

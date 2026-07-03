@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 330">
+  <rect width="980" height="330" fill="#fbfcfa"/>
+  <g font-family="Arial, sans-serif">
+    <text x="48" y="58" font-size="28" font-weight="700" fill="#18211f">Model Soup / 权重插值</text>
+    <rect x="84" y="126" width="180" height="80" rx="6" fill="#ffffff" stroke="#dfe5df"/>
+    <rect x="336" y="126" width="180" height="80" rx="6" fill="#fff0d8" stroke="#d98923"/>
+    <rect x="588" y="126" width="180" height="80" rx="6" fill="#dcefeb" stroke="#0d776f"/>
+    <text x="122" y="160" fill="#18211f" font-size="19" font-weight="700">baseline</text>
+    <text x="118" y="184" fill="#66736f" font-size="14">train960</text>
+    <text x="378" y="160" fill="#18211f" font-size="19" font-weight="700">specialist</text>
+    <text x="372" y="184" fill="#66736f" font-size="14">scene-hard</text>
+    <text x="624" y="160" fill="#18211f" font-size="19" font-weight="700">interp_cp_a252</text>
+    <text x="634" y="184" fill="#66736f" font-size="14">single deployable weight</text>
+    <path d="M264 166 H336 M516 166 H588" stroke="#0d776f" stroke-width="3"/>
+  </g>
+</svg>
+
