@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <text x="50" y="62" font-family="Inter, Arial" font-size="30" font-weight="800" fill="#18211f">语义、Scene Graph 与交互查询</text>
+  <text x="52" y="92" font-family="Inter, Arial" font-size="15" fill="#66736f">语义应作为 sidecar 保持可查询，而不是随 mesh 简化一起丢失</text>
+  <g font-family="Inter, Arial" fill="#ffffff" stroke="#cbd8d1">
+    <rect x="82" y="146" width="160" height="90" rx="8"/>
+    <rect x="370" y="146" width="160" height="90" rx="8"/>
+    <rect x="658" y="146" width="160" height="90" rx="8"/>
+    <text x="112" y="184" font-size="17" font-weight="800" fill="#18211f">2D masks</text>
+    <text x="103" y="211" font-size="13" fill="#66736f">SAM / Grounded-SAM</text>
+    <text x="398" y="184" font-size="17" font-weight="800" fill="#18211f">3D labels</text>
+    <text x="405" y="211" font-size="13" fill="#66736f">point / Gaussian vote</text>
+    <text x="684" y="184" font-size="17" font-weight="800" fill="#18211f">face sidecar</text>
+    <text x="694" y="211" font-size="13" fill="#66736f">triangle index query</text>
+  </g>
+  <g stroke="#0d776f" stroke-width="3" fill="none">
+    <path d="M255 190H352"/><path d="M543 190H640"/>
+  </g>
+  <g font-family="Inter, Arial" font-size="13" fill="#66736f">
+    <text x="118" y="306">raycast hit -> triangleIndex -> object_id / affordance / material</text>
+    <rect x="110" y="322" width="676" height="42" rx="6" fill="#10201e"/>
+    <text x="132" y="349" fill="#e8fff9">face_semantics[triangleIndex] = { label: "bed", probability: 0.91, material: "cloth" }</text>
+  </g>
+</svg>

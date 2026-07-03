@@ -14,6 +14,7 @@
       <nav class="site-navbar" aria-label="站点导航">
         <div class="site-tabs">
           <a class="site-tab active" href="#/" data-main-tab="docs">文档导航</a>
+          <a class="site-tab" href="#/catalog" data-main-tab="catalog">调研目录</a>
           <a class="site-tab" href="https://admin.relumeow.top/#cloud" data-main-tab="codex">Codex 会话管理</a>
           <a class="site-tab" href="https://admin.relumeow.top/#docs" data-main-tab="sync">Markdown 同步</a>
           <a class="site-tab" href="https://admin.relumeow.top/#auth" data-main-tab="auth">用户鉴权</a>
@@ -81,10 +82,11 @@
         <section id="homeView" class="home-view">
           <section class="feature-row">
             <article class="hero-card">
-              <img src="./assets/v2m-docs-mark.svg" alt="" />
+              <img src="./assets/uploaded/research-catalog/pipeline-overview.svg" alt="" />
               <div>
                 <h2>从扫描视频到可仿真的 3D 场景资产</h2>
                 <p>把项目说明、流水线、3DGS 调研、scene graph、游戏交互场景和运行手册集中在一个可搜索、可上传、可交互的静态博客中。</p>
+                <a class="hero-link" href="#/catalog">打开调研目录</a>
               </div>
             </article>
             <article class="quick-card">
@@ -135,6 +137,25 @@
           </section>
           <div id="resultSummary" class="result-summary"></div>
           <section id="docGrid" class="doc-grid" aria-live="polite"></section>
+        </section>
+
+        <section id="catalogView" class="catalog-view" hidden>
+          <header class="catalog-hero">
+            <div>
+              <span>Research Catalog</span>
+              <h2>场景扫描与可交互资产调研目录</h2>
+              <p>按 Video2Mesh 流程阶段组织学术模型、工业项目和本项目实验，快速定位每个方案该接在 pipeline 的哪里。</p>
+            </div>
+            <img src="./assets/uploaded/research-catalog/pipeline-overview.svg" alt="Video2Mesh 调研流程总览" />
+          </header>
+          <div id="catalogStageGrid" class="catalog-stage-grid"></div>
+          <section class="catalog-directory">
+            <header>
+              <h2>阶段文档</h2>
+              <span id="catalogSummary"></span>
+            </header>
+            <div id="catalogDocList" class="catalog-doc-list"></div>
+          </section>
         </section>
 
         <article id="articleView" class="article-view" hidden>

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <text x="50" y="62" font-family="Inter, Arial" font-size="30" font-weight="800" fill="#18211f">点云与物体补全</text>
+  <text x="52" y="92" font-family="Inter, Arial" font-size="15" fill="#66736f">补全要拆开：物体外观、背景 clean plate、物理代理不是同一件事</text>
+  <g font-family="Inter, Arial" stroke="#cbd8d1">
+    <rect x="70" y="140" width="220" height="152" rx="8" fill="#ffffff"/>
+    <text x="96" y="178" font-size="18" font-weight="800" fill="#18211f">Object visual completion</text>
+    <text x="96" y="212" font-size="14" fill="#66736f">Hunyuan3D / Meshy</text>
+    <text x="96" y="238" font-size="14" fill="#66736f">TRELLIS / InstantMesh</text>
+    <path d="M118 260C150 220 186 220 224 260Z" fill="#dcefeb" stroke="#0d776f" stroke-width="3"/>
+    <rect x="340" y="140" width="220" height="152" rx="8" fill="#ffffff"/>
+    <text x="366" y="178" font-size="18" font-weight="800" fill="#18211f">Background clean plate</text>
+    <text x="366" y="212" font-size="14" fill="#66736f">object removal</text>
+    <text x="366" y="238" font-size="14" fill="#66736f">inpaint + rebuild</text>
+    <rect x="392" y="256" width="118" height="20" fill="#fff0d8" stroke="#d98923"/>
+    <rect x="610" y="140" width="220" height="152" rx="8" fill="#ffffff"/>
+    <text x="636" y="178" font-size="18" font-weight="800" fill="#18211f">Physics proxy completion</text>
+    <text x="636" y="212" font-size="14" fill="#66736f">box / capsule / convex</text>
+    <text x="636" y="238" font-size="14" fill="#66736f">stable interaction</text>
+    <rect x="662" y="250" width="90" height="36" fill="#e8f8ef" stroke="#1f6a43" stroke-width="3"/>
+  </g>
+</svg>

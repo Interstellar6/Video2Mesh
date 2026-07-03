@@ -23,6 +23,7 @@ PUBLIC_BUILD = SITE / "_public"
 PINNED_DOCS = [
     "README.md",
     "docs/README.md",
+    "docs/research-catalog/README.md",
     "docs/01-project-overview.md",
     "docs/02-pipeline-and-commands.md",
     "docs/07-pipeline-route-matrix.md",
@@ -243,7 +244,7 @@ def collect_docs() -> list[Doc]:
         if path.name in ROOT_DOC_EXCLUDE or path.resolve() in seen_docs:
             continue
         docs.append(load_doc(path, "builtin", used_ids))
-    for path in sorted((ROOT / "docs").glob("*.md")):
+    for path in sorted((ROOT / "docs").rglob("*.md")):
         if path.resolve() in seen_docs:
             continue
         docs.append(load_doc(path, "builtin", used_ids))

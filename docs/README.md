@@ -17,10 +17,12 @@ tags:
 |---|---|---|
 | [01-project-overview.md](01-project-overview.md) | 这个项目到底做什么？ | 项目目标、资产分层、当前边界、参考项目角色 |
 | [02-pipeline-and-commands.md](02-pipeline-and-commands.md) | 怎么跑？产物在哪里？ | 端到端流水线、远端命令、关键输出、QA |
+| [research-catalog/README.md](research-catalog/README.md) | 调研资料按流程阶段怎么找？ | 输入/位姿、3DGS、mesh、补全、语义、仿真、工业管线和本项目实验目录 |
 | [07-pipeline-route-matrix.md](07-pipeline-route-matrix.md) | 每个流程阶段该选哪条路线？ | 当前选型、备选方法、适用场景和风险对比 |
 | [03-research-roadmap.md](03-research-roadmap.md) | 学术和业界路线怎么选？ | 场景扫描、3DGS、mesh、Scene Graph、方法优先级 |
 | [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) | 怎么让场景可交互？遮挡怎么补？ | 3DGS-to-mesh、collider、补全、语义、SimAnything 动态线 |
 | [08-web-visual-physics-demo.md](08-web-visual-physics-demo.md) | Web 端能不能先演示视逻分离？ | 视觉代理 3DGS + 碰撞代理 mesh 的静态 Web demo |
+| [09-weekly-report-2026-07-03.md](09-weekly-report-2026-07-03.md) | 本周给导师汇报什么？ | 场景扫描调研、mesh 重建实验、语义投影融合、Web demo 和下一步计划 |
 | [05-operations-and-showcase.md](05-operations-and-showcase.md) | 展示和排错怎么做？ | 远端环境、历史 run、展示清单、常见失败处理 |
 | [06-site-and-remote-control.md](06-site-and-remote-control.md) | relumeow.top 怎么更新？ | Markdown 网站、API、登录、远程控制边界 |
 

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <g font-family="Inter, Arial, sans-serif">
+    <text x="50" y="58" font-size="30" font-weight="800" fill="#18211f">输入、位姿与点云</text>
+    <text x="52" y="88" font-size="15" fill="#66736f">从视频抽帧建立相机、稠密点云与后续 3DGS / mesh 的共同坐标系</text>
+  </g>
+  <g transform="translate(68 140)">
+    <rect width="128" height="86" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <circle cx="42" cy="43" r="22" fill="#0d776f"/>
+    <polygon points="54,43 84,28 84,58" fill="#83d9cd"/>
+    <text x="24" y="124" font-family="Inter, Arial" font-size="14" fill="#18211f">扫描视频</text>
+  </g>
+  <g transform="translate(270 140)">
+    <rect width="128" height="86" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <g stroke="#0d776f" stroke-width="3" fill="none">
+      <path d="M24 62C42 20 82 18 104 62"/>
+      <circle cx="42" cy="52" r="5"/>
+      <circle cx="86" cy="52" r="5"/>
+    </g>
+    <text x="26" y="124" font-family="Inter, Arial" font-size="14" fill="#18211f">COLMAP / SfM</text>
+  </g>
+  <g transform="translate(472 140)">
+    <rect width="128" height="86" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <g fill="#0d776f">
+      <circle cx="30" cy="52" r="4"/><circle cx="45" cy="34" r="3"/><circle cx="62" cy="58" r="5"/>
+      <circle cx="78" cy="42" r="3"/><circle cx="96" cy="62" r="4"/><circle cx="86" cy="26" r="3"/>
+    </g>
+    <text x="34" y="124" font-family="Inter, Arial" font-size="14" fill="#18211f">稠密点云</text>
+  </g>
+  <g transform="translate(674 140)">
+    <rect width="128" height="86" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <path d="M30 62L60 24L98 64Z" fill="#dcefeb" stroke="#0d776f" stroke-width="3"/>
+    <text x="20" y="124" font-family="Inter, Arial" font-size="14" fill="#18211f">坐标/尺度合同</text>
+  </g>
+  <g stroke="#0d776f" stroke-width="3" fill="none">
+    <path d="M210 183H254"/><path d="M412 183H456"/><path d="M614 183H658"/>
+  </g>
+</svg>

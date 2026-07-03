@@ -60,7 +60,84 @@
     recentList: $("recentList"),
     clearReadingState: $("clearReadingState"),
     readingProgressBar: $("readingProgressBar"),
+    catalogView: $("catalogView"),
+    catalogStageGrid: $("catalogStageGrid"),
+    catalogDocList: $("catalogDocList"),
+    catalogSummary: $("catalogSummary"),
   };
+
+  const catalogStages = [
+    {
+      key: "input-pose-pointcloud",
+      title: "输入、位姿与点云",
+      summary: "视频抽帧、COLMAP/MVS、learned pose fallback、稠密点云和坐标尺度合同。",
+      image: "assets/uploaded/input-pose-pointcloud/stage-input-pose.svg",
+      tags: ["COLMAP", "Point Cloud", "Pose"],
+    },
+    {
+      key: "visual-3dgs",
+      title: "视觉重建 / 3DGS",
+      summary: "GraphDECO 3DGS、Spark、SuperSplat 和 visual proxy 的工程边界。",
+      image: "assets/v2m-docs-mark.svg",
+      tags: ["3DGS", "Spark", "SuperSplat"],
+    },
+    {
+      key: "mesh-reconstruction",
+      title: "Mesh 重建",
+      summary: "COLMAP Delaunay、Poisson、GS2Mesh、SuGaR、2DGS/GOF 的阶段定位。",
+      image: "assets/uploaded/mesh-reconstruction/stage-mesh.svg",
+      tags: ["Mesh", "GS2Mesh", "SuGaR"],
+    },
+    {
+      key: "pointcloud-completion",
+      title: "点云/背景补全",
+      summary: "点云清理、背景 clean plate、inpainting 与场景结构补全。",
+      image: "assets/uploaded/pointcloud-completion/stage-completion.svg",
+      tags: ["Completion", "Inpainting"],
+    },
+    {
+      key: "object-mesh-completion",
+      title: "物体 Mesh 补全",
+      summary: "Hunyuan3D、Meshy、TRELLIS、InstantMesh、image-blaster object jobs。",
+      image: "assets/uploaded/pointcloud-completion/stage-completion.svg",
+      tags: ["Object Mesh", "image-blaster"],
+    },
+    {
+      key: "semantic-scene-graph",
+      title: "语义与 Scene Graph",
+      summary: "SAM/Grounded-SAM、semantic splats、mesh face sidecar 和交互查询。",
+      image: "assets/uploaded/semantic-scene-graph/stage-semantics.svg",
+      tags: ["Semantics", "Scene Graph"],
+    },
+    {
+      key: "collider-physics-proxy",
+      title: "Collider 与物理代理",
+      summary: "static collider、primitive proxy、convex decomposition 和 runtime physics。",
+      image: "assets/uploaded/object-simulation/stage-simulation.svg",
+      tags: ["Collider", "Physics"],
+    },
+    {
+      key: "object-simulation",
+      title: "物体仿真",
+      summary: "rigid body、soft body、PhysSplat/Sim Anything 和 dynamic Gaussian。",
+      image: "assets/uploaded/object-simulation/stage-simulation.svg",
+      tags: ["Simulation", "PhysSplat"],
+    },
+    {
+      key: "industrial-pipelines",
+      title: "工业资产管线",
+      summary: "World Labs / Icare、image-blaster、Spark viewer 和 GLB runtime 约定。",
+      image: "assets/uploaded/research-catalog/pipeline-overview.svg",
+      tags: ["World Labs", "Spark"],
+    },
+    {
+      key: "experiments",
+      title: "本项目实验",
+      summary: "GS2Mesh、Open3D Poisson、COLMAP Delaunay、语义投影和 Web demo。",
+      image: "assets/uploaded/experiments/04-visual-physics-proxy-demo.png",
+      tags: ["Experiments", "Video2Mesh"],
+    },
+  ];
 
   const escapeHtml = (value) => String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -196,6 +273,49 @@
         <p>${escapeHtml(doc.summary || "暂无摘要。")}</p>
         <div class="doc-tags">${(doc.tags || []).slice(0, 4).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>
         <footer><span>${isFavorite(doc.id) ? "已收藏" : doc.source_kind || "doc"}</span><span>打开 →</span></footer>
+      </a>
+    `).join("");
+  }
+
+  function researchCatalogDocs() {
+    return docs
+      .filter((doc) => doc.category === "Research Catalog" || String(doc.source_path || "").includes("docs/research-catalog/"))
+      .slice()
+      .sort((a, b) => {
+        const aPath = String(a.source_path || "");
+        const bPath = String(b.source_path || "");
+        if (aPath.endsWith("docs/research-catalog/README.md")) return -1;
+        if (bPath.endsWith("docs/research-catalog/README.md")) return 1;
+        return aPath.localeCompare(bPath, "zh-Hans-CN");
+      });
+  }
+
+  function docForStage(stage) {
+    return researchCatalogDocs().find((doc) => String(doc.source_path || "").includes(`docs/research-catalog/${stage.key}/`));
+  }
+
+  function renderCatalog() {
+    const catalogDocs = researchCatalogDocs();
+    els.catalogSummary.textContent = `${catalogDocs.length} 篇阶段文档 · ${catalogStages.length} 个流程阶段`;
+    els.catalogStageGrid.innerHTML = catalogStages.map((stage, index) => {
+      const doc = docForStage(stage);
+      const href = doc ? `#/doc/${encodeURIComponent(doc.id)}` : "#/catalog";
+      return `
+        <a class="catalog-stage-card" href="${href}">
+          <img src="${escapeHtml(stage.image)}" alt="" loading="lazy" decoding="async">
+          <div>
+            <span>${String(index + 1).padStart(2, "0")}</span>
+            <h3>${escapeHtml(stage.title)}</h3>
+            <p>${escapeHtml(stage.summary)}</p>
+            <footer>${stage.tags.map((tag) => `<small>${escapeHtml(tag)}</small>`).join("")}</footer>
+          </div>
+        </a>
+      `;
+    }).join("");
+    els.catalogDocList.innerHTML = catalogDocs.map((doc) => `
+      <a href="#/doc/${encodeURIComponent(doc.id)}">
+        <strong>${escapeHtml(doc.title)}</strong>
+        <span>${escapeHtml(doc.summary || doc.source_path || "")}</span>
       </a>
     `).join("");
   }
@@ -713,10 +833,26 @@
     currentDocId = "";
     closeEditor();
     els.homeView.hidden = false;
+    els.catalogView.hidden = true;
     els.articleView.hidden = true;
+    updateMainTabs("docs");
     renderNavigation();
     updateReadingProgress();
     renderDocGrid();
+  }
+
+  function showCatalog() {
+    currentDocId = "";
+    closeEditor();
+    els.homeView.hidden = true;
+    els.catalogView.hidden = false;
+    els.articleView.hidden = true;
+    activeCategory = "Research Catalog";
+    updateMainTabs("catalog");
+    renderNavigation();
+    renderCatalog();
+    updateReadingProgress();
+    window.scrollTo({ top: 0, behavior: "instant" });
   }
 
   function showDoc(id, options = {}) {
@@ -732,7 +868,9 @@
     renderNavigation();
     markRecent(doc.id);
     els.homeView.hidden = true;
+    els.catalogView.hidden = true;
     els.articleView.hidden = false;
+    updateMainTabs(doc.category === "Research Catalog" ? "catalog" : "docs");
     if (!options.keepEditor) closeEditor();
     els.articleMeta.innerHTML = `
       <span>${escapeHtml(doc.category)}</span>
@@ -861,9 +999,18 @@
     }
   }
 
+  function updateMainTabs(active) {
+    document.querySelectorAll("[data-main-tab]").forEach((tab) => {
+      tab.classList.toggle("active", tab.dataset.mainTab === active);
+    });
+  }
+
   function route() {
     const match = location.hash.match(/^#\/doc\/(.+)$/);
     if (match) showDoc(decodeURIComponent(match[1]));
+    else if (location.hash === "#/catalog") {
+      showCatalog();
+    }
     else if (!location.hash || location.hash === "#/" || location.hash === "#") {
       showHome();
     }
@@ -882,6 +1029,7 @@
     renderStats();
     renderReadingPaths();
     renderReadingLibrary();
+    renderCatalog();
     renderDocGrid();
   }
 

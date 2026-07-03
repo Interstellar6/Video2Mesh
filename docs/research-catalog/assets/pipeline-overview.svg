@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Video2Mesh research catalog pipeline overview</title>
+  <desc id="desc">A staged pipeline from scan video to 3DGS, mesh, semantics, collider, physics and engine adapters.</desc>
+  <rect width="1200" height="560" rx="0" fill="#f7f9f6"/>
+  <g fill="none" stroke="#d6dfd8" stroke-width="2">
+    <path d="M80 112H1120"/>
+    <path d="M80 280H1120"/>
+    <path d="M80 448H1120"/>
+  </g>
+  <g font-family="Inter, Arial, sans-serif">
+    <text x="76" y="62" font-size="34" font-weight="800" fill="#15211f">Video2Mesh 调研目录按流程阶段组织</text>
+    <text x="78" y="92" font-size="16" fill="#65726e">从扫描视频到可展示、可碰撞、可语义查询、可仿真的分层资产包</text>
+  </g>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0d776f"/>
+    </marker>
+  </defs>
+  <g font-family="Inter, Arial, sans-serif" font-size="15">
+    <g transform="translate(72 132)">
+      <rect width="188" height="96" rx="8" fill="#ffffff" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">输入 / 位姿</text>
+      <text x="18" y="58" fill="#66736f">视频、抽帧、相机</text>
+      <text x="18" y="78" fill="#66736f">COLMAP / MASt3R</text>
+    </g>
+    <g transform="translate(310 132)">
+      <rect width="188" height="96" rx="8" fill="#ffffff" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">视觉重建</text>
+      <text x="18" y="58" fill="#66736f">GraphDECO 3DGS</text>
+      <text x="18" y="78" fill="#66736f">Spark / SuperSplat</text>
+    </g>
+    <g transform="translate(548 132)">
+      <rect width="188" height="96" rx="8" fill="#ffffff" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">Mesh 重建</text>
+      <text x="18" y="58" fill="#66736f">Delaunay / Poisson</text>
+      <text x="18" y="78" fill="#66736f">GS2Mesh / SuGaR</text>
+    </g>
+    <g transform="translate(786 132)">
+      <rect width="188" height="96" rx="8" fill="#ffffff" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">补全</text>
+      <text x="18" y="58" fill="#66736f">object mesh</text>
+      <text x="18" y="78" fill="#66736f">background clean plate</text>
+    </g>
+    <g transform="translate(72 300)">
+      <rect width="188" height="96" rx="8" fill="#fffefa" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">语义 / Scene Graph</text>
+      <text x="18" y="58" fill="#66736f">SAM / Grounded-SAM</text>
+      <text x="18" y="78" fill="#66736f">face sidecar</text>
+    </g>
+    <g transform="translate(310 300)">
+      <rect width="188" height="96" rx="8" fill="#fffefa" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">Collider / 物理代理</text>
+      <text x="18" y="58" fill="#66736f">GLB collider</text>
+      <text x="18" y="78" fill="#66736f">primitive / convex</text>
+    </g>
+    <g transform="translate(548 300)">
+      <rect width="188" height="96" rx="8" fill="#fffefa" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">物体仿真</text>
+      <text x="18" y="58" fill="#66736f">rigid / soft object</text>
+      <text x="18" y="78" fill="#66736f">PhysSplat</text>
+    </g>
+    <g transform="translate(786 300)">
+      <rect width="188" height="96" rx="8" fill="#fffefa" stroke="#ccd7d0"/>
+      <text x="18" y="32" font-weight="800" fill="#10201e">引擎适配</text>
+      <text x="18" y="58" fill="#66736f">Web / Unity</text>
+      <text x="18" y="78" fill="#66736f">MuJoCo / Isaac</text>
+    </g>
+  </g>
+  <g stroke="#0d776f" stroke-width="3" marker-end="url(#arrow)" fill="none">
+    <path d="M260 180H300"/>
+    <path d="M498 180H538"/>
+    <path d="M736 180H776"/>
+    <path d="M880 230C880 270 170 260 170 292"/>
+    <path d="M260 348H300"/>
+    <path d="M498 348H538"/>
+    <path d="M736 348H776"/>
+  </g>
+  <g transform="translate(1012 144)" font-family="Inter, Arial, sans-serif">
+    <rect width="120" height="230" rx="8" fill="#0d776f"/>
+    <text x="22" y="42" font-size="17" font-weight="800" fill="#ffffff">原则</text>
+    <text x="18" y="82" font-size="14" fill="#dff7f2">视觉要像</text>
+    <text x="18" y="118" font-size="14" fill="#dff7f2">物理要稳</text>
+    <text x="18" y="154" font-size="14" fill="#dff7f2">语义可查</text>
+    <text x="18" y="190" font-size="14" fill="#dff7f2">资产分层</text>
+  </g>
+</svg>

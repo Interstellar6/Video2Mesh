@@ -1,5 +1,5 @@
 window.V2M_BLOG_DATA = {
-  "generatedAt": "2026-07-03 18:09",
+  "generatedAt": "2026-07-03 18:45",
   "docs": [
     {
       "id": "readme",
@@ -29,13 +29,13 @@ window.V2M_BLOG_DATA = {
       "summary": "Video2Mesh 精简后的唯一主文档入口，按项目总览、流水线、研究路线、交互仿真、运行展示和网站运维分类。",
       "source_path": "docs/README.md",
       "source_kind": "builtin",
-      "updated": "2026-07-02",
+      "updated": "2026-07-03",
       "tags": [
         "Video2Mesh",
         "Docs",
         "Overview"
       ],
-      "body": "\n# Video2Mesh 文档中心\n\n这个目录是 Video2Mesh 的精简文档入口。旧的根目录长报告已经合并到这里，不再作为主文档维护。\n\n## 文档结构\n\n| 文档 | 读者问题 | 内容 |\n|---|---|---|\n| [01-project-overview.md](01-project-overview.md) | 这个项目到底做什么？ | 项目目标、资产分层、当前边界、参考项目角色 |\n| [02-pipeline-and-commands.md](02-pipeline-and-commands.md) | 怎么跑？产物在哪里？ | 端到端流水线、远端命令、关键输出、QA |\n| [07-pipeline-route-matrix.md](07-pipeline-route-matrix.md) | 每个流程阶段该选哪条路线？ | 当前选型、备选方法、适用场景和风险对比 |\n| [03-research-roadmap.md](03-research-roadmap.md) | 学术和业界路线怎么选？ | 场景扫描、3DGS、mesh、Scene Graph、方法优先级 |\n| [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) | 怎么让场景可交互？遮挡怎么补？ | 3DGS-to-mesh、collider、补全、语义、SimAnything 动态线 |\n| [08-web-visual-physics-demo.md](08-web-visual-physics-demo.md) | Web 端能不能先演示视逻分离？ | 视觉代理 3DGS + 碰撞代理 mesh 的静态 Web demo |\n| [05-operations-and-showcase.md](05-operations-and-showcase.md) | 展示和排错怎么做？ | 远端环境、历史 run、展示清单、常见失败处理 |\n| [06-site-and-remote-control.md](06-site-and-remote-control.md) | relumeow.top 怎么更新？ | Markdown 网站、API、登录、远程控制边界 |\n\n## 当前结论\n\nVideo2Mesh 的核心路线不是“从视频直接生成一个完美 mesh”，而是把真实扫描视频拆成多层资产：\n\n```text\nvideo\n  -> COLMAP / learned pose fallback\n  -> GraphDECO 3DGS visual scene\n  -> 2D/3D object masks\n  -> semantic / probability splats\n  -> object visual mesh\n  -> collider / physics proxy\n  -> simulator adapters and review pack\n```\n\n最重要的工程判断：\n\n- 3DGS 负责高质量视觉层，不直接负责碰撞。\n- mesh/collider 是物理和交互代理，不要求和视觉 3DGS 一样精细。\n- semantic layer 独立保存，必要时投到 mesh face、collider 或 trigger。\n- 遮挡补全要分成 object visual completion、background clean plate、physics proxy completion 三件事。\n- SimAnything / PhysSplat 应作为 dynamic Gaussian 和物理属性增强线，不替代 mesh/collider 主链路。\n\n## 优先级\n\n| 优先级 | 目标 | 当前推荐 |\n|---|---|---|\n| P0 | 跑通可展示闭环 | COLMAP + GraphDECO + SAM2 + 3D masks + simulator bundle |\n| P0 | 场景级碰撞 | dense point cloud / Poisson / simplified static collider |\n| P1 | 物体 visual mesh | 3DGS rendered RGB/depth/normal/mask -> TSDF / Poisson |\n| P1 | 动态物体 collider | primitive compound / convex hull / CoACD or V-HACD |\n| P1 | 遮挡补全 | Hunyuan3D / Meshy / TRELLIS / image-blaster 生成完整视觉 mesh，再按 bbox 对齐 |\n| P2 | 高质量 3DGS-to-mesh | GS2Mesh-style stereo depth fusion、SuGaR、2DGS、GOF |\n| P2 | 动态 Gaussian | SimAnything / PhysSplat-style semantic Gaussian -> physics object |\n\n## 旧文档合并说明\n\n| 旧主题 | 新位置 |\n|---|---|\n| `Video2Mesh_PROJECT_README.md`、`README.md` | [01-project-overview.md](01-project-overview.md) |\n| `VIDEO2MESH_PIPELINE.md`、`SVLGaussian_frame_matching_notes.md` | [02-pipeline-and-commands.md](02-pipeline-and-commands.md) |\n| `SCENE_SCANNING_SOLUTIONS_SURVEY.md`、`FEED_FORWARD_GAUSSIAN_SCENE_GRAPH_SURVEY.md` | [03-research-roadmap.md](03-research-roadmap.md) |\n| `MESH_RECONSTRUCTION_METHODS_SURVEY.md`、`INTERACTIVE_GAME_SCENE_FROM_3DGS_SURVEY.md`、`SIM_ANYTHING_PHYS_SPLAT_SURVEY.md` | [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) |\n| `REMOTE_SETUP_STATUS.md`、`Video2Mesh_real_demo_runbook.md`、`Video2Mesh_milscene*.md` | [05-operations-and-showcase.md](05-operations-and-showcase.md) |\n| `docs-blog/content/*.md` | [06-site-and-remote-control.md](06-site-and-remote-control.md) |\n",
+      "body": "\n# Video2Mesh 文档中心\n\n这个目录是 Video2Mesh 的精简文档入口。旧的根目录长报告已经合并到这里，不再作为主文档维护。\n\n## 文档结构\n\n| 文档 | 读者问题 | 内容 |\n|---|---|---|\n| [01-project-overview.md](01-project-overview.md) | 这个项目到底做什么？ | 项目目标、资产分层、当前边界、参考项目角色 |\n| [02-pipeline-and-commands.md](02-pipeline-and-commands.md) | 怎么跑？产物在哪里？ | 端到端流水线、远端命令、关键输出、QA |\n| [research-catalog/README.md](research-catalog/README.md) | 调研资料按流程阶段怎么找？ | 输入/位姿、3DGS、mesh、补全、语义、仿真、工业管线和本项目实验目录 |\n| [07-pipeline-route-matrix.md](07-pipeline-route-matrix.md) | 每个流程阶段该选哪条路线？ | 当前选型、备选方法、适用场景和风险对比 |\n| [03-research-roadmap.md](03-research-roadmap.md) | 学术和业界路线怎么选？ | 场景扫描、3DGS、mesh、Scene Graph、方法优先级 |\n| [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) | 怎么让场景可交互？遮挡怎么补？ | 3DGS-to-mesh、collider、补全、语义、SimAnything 动态线 |\n| [08-web-visual-physics-demo.md](08-web-visual-physics-demo.md) | Web 端能不能先演示视逻分离？ | 视觉代理 3DGS + 碰撞代理 mesh 的静态 Web demo |\n| [09-weekly-report-2026-07-03.md](09-weekly-report-2026-07-03.md) | 本周给导师汇报什么？ | 场景扫描调研、mesh 重建实验、语义投影融合、Web demo 和下一步计划 |\n| [05-operations-and-showcase.md](05-operations-and-showcase.md) | 展示和排错怎么做？ | 远端环境、历史 run、展示清单、常见失败处理 |\n| [06-site-and-remote-control.md](06-site-and-remote-control.md) | relumeow.top 怎么更新？ | Markdown 网站、API、登录、远程控制边界 |\n\n## 当前结论\n\nVideo2Mesh 的核心路线不是“从视频直接生成一个完美 mesh”，而是把真实扫描视频拆成多层资产：\n\n```text\nvideo\n  -> COLMAP / learned pose fallback\n  -> GraphDECO 3DGS visual scene\n  -> 2D/3D object masks\n  -> semantic / probability splats\n  -> object visual mesh\n  -> collider / physics proxy\n  -> simulator adapters and review pack\n```\n\n最重要的工程判断：\n\n- 3DGS 负责高质量视觉层，不直接负责碰撞。\n- mesh/collider 是物理和交互代理，不要求和视觉 3DGS 一样精细。\n- semantic layer 独立保存，必要时投到 mesh face、collider 或 trigger。\n- 遮挡补全要分成 object visual completion、background clean plate、physics proxy completion 三件事。\n- SimAnything / PhysSplat 应作为 dynamic Gaussian 和物理属性增强线，不替代 mesh/collider 主链路。\n\n## 优先级\n\n| 优先级 | 目标 | 当前推荐 |\n|---|---|---|\n| P0 | 跑通可展示闭环 | COLMAP + GraphDECO + SAM2 + 3D masks + simulator bundle |\n| P0 | 场景级碰撞 | dense point cloud / Poisson / simplified static collider |\n| P1 | 物体 visual mesh | 3DGS rendered RGB/depth/normal/mask -> TSDF / Poisson |\n| P1 | 动态物体 collider | primitive compound / convex hull / CoACD or V-HACD |\n| P1 | 遮挡补全 | Hunyuan3D / Meshy / TRELLIS / image-blaster 生成完整视觉 mesh，再按 bbox 对齐 |\n| P2 | 高质量 3DGS-to-mesh | GS2Mesh-style stereo depth fusion、SuGaR、2DGS、GOF |\n| P2 | 动态 Gaussian | SimAnything / PhysSplat-style semantic Gaussian -> physics object |\n\n## 旧文档合并说明\n\n| 旧主题 | 新位置 |\n|---|---|\n| `Video2Mesh_PROJECT_README.md`、`README.md` | [01-project-overview.md](01-project-overview.md) |\n| `VIDEO2MESH_PIPELINE.md`、`SVLGaussian_frame_matching_notes.md` | [02-pipeline-and-commands.md](02-pipeline-and-commands.md) |\n| `SCENE_SCANNING_SOLUTIONS_SURVEY.md`、`FEED_FORWARD_GAUSSIAN_SCENE_GRAPH_SURVEY.md` | [03-research-roadmap.md](03-research-roadmap.md) |\n| `MESH_RECONSTRUCTION_METHODS_SURVEY.md`、`INTERACTIVE_GAME_SCENE_FROM_3DGS_SURVEY.md`、`SIM_ANYTHING_PHYS_SPLAT_SURVEY.md` | [04-mesh-interaction-and-completion.md](04-mesh-interaction-and-completion.md) |\n| `REMOTE_SETUP_STATUS.md`、`Video2Mesh_real_demo_runbook.md`、`Video2Mesh_milscene*.md` | [05-operations-and-showcase.md](05-operations-and-showcase.md) |\n| `docs-blog/content/*.md` | [06-site-and-remote-control.md](06-site-and-remote-control.md) |\n",
       "headings": [
         {
           "level": "2",
@@ -56,6 +56,35 @@ window.V2M_BLOG_DATA = {
           "level": "2",
           "text": "旧文档合并说明",
           "slug": "旧文档合并说明"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "research-catalog",
+      "title": "场景扫描与可交互资产调研目录",
+      "category": "Research Catalog",
+      "summary": "按 Video2Mesh 流程阶段整理学术、工业和本项目实验路线，作为 relumeow.top 的可浏览调研目录入口。",
+      "source_path": "docs/research-catalog/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "3DGS",
+        "Mesh",
+        "Simulation"
+      ],
+      "body": "\n# 场景扫描与可交互资产调研目录\n\n这个目录把本周调研内容按 Video2Mesh 的流程阶段重新组织。目标不是堆论文名，而是回答一个更工程化的问题：**从扫描视频到可交互仿真/游戏资产，每个阶段有哪些可借用模型、项目和产业方案，它们应该接在我们 pipeline 的什么位置。**\n\n![Video2Mesh 调研目录总览](assets/uploaded/research-catalog/pipeline-overview.svg \"Video2Mesh 从扫描视频到视觉层、mesh、补全、语义、碰撞代理、物体仿真和引擎适配的调研目录\")\n\n## 阶段目录\n\n| 阶段 | 子目录 | 主要关注 |\n|---|---|---|\n| 输入、位姿与点云 | [input-pose-pointcloud](input-pose-pointcloud/README.md) | COLMAP、MASt3R/DUSt3R/VGGT、MVS、稠密点云、尺度和坐标合同 |\n| 视觉重建 / 3DGS | [visual-3dgs](visual-3dgs/README.md) | GraphDECO 3DGS、Spark、SuperSplat、3DGS 作为 visual proxy |\n| Mesh 重建 | [mesh-reconstruction](mesh-reconstruction/README.md) | COLMAP Delaunay、Poisson/Open3D、GS2Mesh、SuGaR、2DGS/GOF |\n| 点云/背景补全 | [pointcloud-completion](pointcloud-completion/README.md) | 点云清理、背景 clean plate、inpainting、场景结构补全 |\n| 物体 Mesh 补全 | [object-mesh-completion](object-mesh-completion/README.md) | Hunyuan3D、Meshy、TRELLIS、InstantMesh、image-blaster object jobs |\n| 语义与 Scene Graph | [semantic-scene-graph](semantic-scene-graph/README.md) | SAM/Grounded-SAM、2D-to-3D fusion、semantic splats、face sidecar |\n| Collider 与物理代理 | [collider-physics-proxy](collider-physics-proxy/README.md) | static collider、primitive proxy、convex decomposition、Rapier/Unity collision |\n| 物体仿真 | [object-simulation](object-simulation/README.md) | rigid body、soft body、PhysSplat/Sim Anything、动态 Gaussian |\n| 工业资产管线 | [industrial-pipelines](industrial-pipelines/README.md) | World Labs / Icare、image-blaster、Spark viewer、GLB runtime asset convention |\n| 本项目实验 | [experiments](experiments/README.md) | GS2Mesh、Open3D Poisson、COLMAP Delaunay、语义投影、Web visual/physics proxy demo |\n\n## 当前总判断\n\nVideo2Mesh 的目标产物应是分层资产包，而不是一个全能 mesh：\n\n```text\nscan video\n  -> camera / dense geometry\n  -> 3DGS visual proxy\n  -> scene collider mesh\n  -> object visual mesh / completion\n  -> semantic face and object sidecar\n  -> physics proxy and material metadata\n  -> Web / Unity / MuJoCo / Isaac adapters\n```\n\n核心原则：\n\n- 3DGS / Spark / Splat 负责视觉真实感。\n- mesh / collider 负责碰撞、导航、点击和交互。\n- 语义应保存在 sidecar，而不是绑死在会被简化或替换的 mesh 里。\n- 物体补全、背景 clean plate、物理代理补全要拆开。\n- Sim Anything / PhysSplat 这类动态 Gaussian 方法值得跟踪，但短期不替代 mesh/collider 主链路。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "阶段目录",
+          "slug": "阶段目录"
+        },
+        {
+          "level": "2",
+          "text": "当前总判断",
+          "slug": "当前总判断"
         }
       ],
       "reading_minutes": 1
@@ -685,13 +714,432 @@ window.V2M_BLOG_DATA = {
         }
       ],
       "reading_minutes": 1
+    },
+    {
+      "id": "09-weekly-report-2026-07-03",
+      "title": "周报：场景扫描路线调研与 Video2Mesh Mesh 重建实验",
+      "category": "Reports",
+      "summary": "汇报本周围绕场景扫描学术/工业方案、3DGS-to-mesh 重建路线、语义投影融合和视觉/碰撞代理 Demo 的工作进展。",
+      "source_path": "docs/09-weekly-report-2026-07-03.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Weekly Report",
+        "3DGS",
+        "Mesh",
+        "Collider",
+        "SimAnything",
+        "Reports"
+      ],
+      "body": "\n# 周报：场景扫描路线调研与 Video2Mesh Mesh 重建实验\n\n汇报周期：截至 2026-07-03\n\n## 一、本周总体进展\n\n本周主要围绕“扫描场景如何进入可交互仿真/游戏环境”做了两条线的工作：一是调研学术界和工业界的场景扫描、3DGS、Mesh 和交互资产方案；二是在 Video2Mesh 项目中实际测试多种 mesh 重建路线，并基于“视觉代理、碰撞代理、物体语义分层”的思路实现了一个初步 Web demo。\n\n目前比较明确的判断是：项目不应追求从视频直接生成一个完美的统一 mesh，而应产出分层资产包，即 3DGS 负责高质量视觉层，mesh/collider 负责碰撞和交互，语义和物理属性通过 sidecar 或 scene graph 单独管理。这个判断和学长文档、World Labs / Icare、image-blaster 等工业实践中的“visual layer + collision layer + interaction metadata”思路基本一致。\n\n## 二、场景扫描方案调研\n\n本周重点调研和梳理了以下几类方案：\n\n- 学术路线：COLMAP / MVS、3DGS、SuGaR、GS2Mesh、2DGS/GOF、TSDF/Poisson 等从图像或 3DGS 到 mesh 的方法。结论是，传统 COLMAP dense + Delaunay/Poisson 更适合作为场景级静态碰撞代理；GS2Mesh 和 SuGaR 更适合做高质量 visual mesh 的对照或后续升级，而不适合作为 P0 主链路直接替代 collider。\n- 工业路线：学长文档、World Labs / Icare、image-blaster 等方案都倾向于把 3DGS/Spark/Splat 作为视觉代理，把 GLB mesh 或简化 collider 作为交互代理。World Labs 更偏 static world/background 生成，image-blaster 更偏 object mesh generation 和浏览器查看约定，最终 simulator asset bundle、物理属性和引擎适配仍需要 Video2Mesh 自己承接。\n- 项目边界：Video2Mesh 的合理目标是从扫描视频生成可复用的多层资产，包括 3DGS visual scene、scene collider、object visual mesh、object collider、语义 face/object sidecar、physics metadata 和 Unity/MuJoCo/Isaac/Web adapter。\n\n这一轮调研后，本周把后续方向收敛为三层：场景级 static collider 先稳定，物体级 visual mesh 再细化，最后再接入物体交互、补全和动态仿真。\n\n## 三、Mesh 重建实验进展\n\n本周在 bedroom 场景上实际尝试了 Open3D、COLMAP、CloudCompare/3D Recon/Poisson、SuGaR、GS2Mesh 等路线，主要结果如下。\n\n### 1. GS2Mesh 路线\n\nGS2Mesh 能从训练后的 3DGS 出发，通过渲染多视角/双目深度再做 TSDF 融合，整体思路比直接拿 Gaussian center 连面更合理。实测结果中，raw mesh 规模较大，约 4.48M vertices / 8.09M triangles，原始文件约 333MB；减面后可以得到约 10 万级别面数、几 MB 级别的 GLB。视觉上床、窗帘和大结构能被保留下来，但仍有墙面破碎、漂浮片和局部缺失，适合作为 P1/P2 object visual mesh 或 benchmark，不适合直接作为轻量 collider。\n\n![图一：GS2Mesh 输出效果](assets/uploaded/09-weekly-report-2026-07-03/01-gs2mesh.png)\n\n### 2. Open3D Poisson / 3DGS 点云路线\n\nOpen3D Poisson 使用过滤后的 3DGS center point cloud 作为输入，本次 `alpha005_sample500k` 路线输入 50 万点，输出约 100,965 vertices / 200,000 triangles，GLB 约 5.23MB。优点是自动化程度高、输出体量可控；缺点是几何上容易出现透明壳状伪影、表面粘连、漂浮物和错面，说明 3DGS 的 Gaussian center 并不等价于真实表面采样。这个路线可以作为快速 baseline 或 fallback，但不是最终 visual mesh 的理想方案。\n\n![图二：Open3D Poisson 3DGS alpha005 sample500k](assets/uploaded/09-weekly-report-2026-07-03/02-open3d-poisson-3dgs-alpha005-sample500k.png)\n\n### 3. COLMAP Delaunay Dense 路线\n\nCOLMAP dense + Delaunay mesher 的输出更加符合 static collider 的需求。本次输出约 82,920 vertices / 167,082 triangles，GLB 约 3.0MB，体量接近 Web/Unity 里可用的碰撞代理。它的视觉细节不如 3DGS 和 GS2Mesh，局部也有大三角面和缺口，但作为地面、墙体、床体周围的 static collision mesh 更稳。这也是当前最适合作为 P0 场景级碰撞代理的路线。\n\n![图三：COLMAP Delaunay dense mesh](assets/uploaded/09-weekly-report-2026-07-03/03-colmap-delaunay-dense.png)\n\n### 4. CloudCompare / 3D Recon / Poisson 与 SuGaR\n\nCloudCompare + Poisson/3D Recon 主要用于人工检查和传统建面对照。它能较快形成可查看 mesh，但对 3DGS 点云和稠密点云都比较依赖法线质量，容易补出不真实的大薄片，因此更适合做 debug 或 collider fallback。SuGaR 方向也做了依赖和可行性验证，但当前 Video2Mesh 环境中的 Python/Torch/PyTorch3D 兼容性还没有完全打通，尚未形成稳定结果。后续如果继续做 SuGaR，建议单独建立环境，把它作为高质量对照实验，而不是塞进主流程。\n\n## 四、语义投影融合尝试\n\n本周还尝试了把语义信息回灌到 mesh face 上的方法。P0 最近邻/KDTree 方案速度快，可以生成 face-level semantic sidecar；P1 多视角投影方案尝试把 mesh face 投回相机视角后根据语义 mask 投票。当前图五对应的是 `p1_ray_projected_debug` 的调试结果。\n\n这条路线目前效果不理想，主要问题是：当前 run 缺少真正的 SAM/GDINO 2D mask，只能用 semantic point label 投影出的 debug mask 代替；多视角投票虽然覆盖面更高，但标签串色明显，床、墙、窗帘、地面之间容易互相污染，平均置信度也偏低。因此目前可以保留为实验工具，但暂时不能作为生产级语义融合结果。后续需要接入真实 2D mask、深度可见性过滤、face graph smoothing 和 object support 约束。\n\n![图五：mesh 语义投影融合调试结果](assets/uploaded/09-weekly-report-2026-07-03/05-mesh-semantic-transfer-ray-projection.png)\n\n## 五、视觉代理 + 碰撞代理 Demo\n\n基于前面的调研和实验，本周实现了一个初步 Web demo：`http://127.0.0.1:4173/demos/visual-physics-proxy/`。（还没找到服务器）\n\n这个 demo 的核心不是最终画质，而是验证分层架构：GraphDECO/3DGS 只负责视觉显示，COLMAP Delaunay GLB 作为隐藏但有效的 collider mesh，射线检测、地面探测和角色移动都只依赖 mesh，不依赖 3DGS 点云本身。这个 demo 对应后续进入 Unity/Web/MuJoCo 时需要的资产拆分方式，也能直观展示“视觉真实”和“物理可交互”为什么应该分开做。\n\n![图四：视觉代理 3DGS + 碰撞代理 mesh Demo](assets/uploaded/09-weekly-report-2026-07-03/04-visual-physics-proxy-demo.png)\n\n## 六、本周形成的主要判断\n\n1. 场景级可交互闭环应优先走 `COLMAP dense/Delaunay -> simplified collider GLB -> Web/Unity raycast/physics`，不要把 3DGS 本身当 collider。\n2. 物体级 mesh 应优先研究 per-object 重建，而不是整场景一次性重建。整场景 mesh 更适合做静态碰撞，物体 mesh 更适合做视觉补全、抓取、移动和语义交互。\n3. 直接从 3DGS center point cloud 做 Poisson 容易出壳状伪影，后续更应依赖 3DGS rendered RGB/depth/mask、TSDF fusion、GS2Mesh-style stereo depth 或 SuGaR/2DGS 这类 surface-aware 方法。\n4. 语义不应硬烘进 mesh 顶点色，而应保存为 face/object sidecar。这样 collider 后续可以减面、替换或拆分，语义合同仍然可查询。\n5. image-blaster、Hunyuan3D、Meshy、TRELLIS 等生成式方法更适合 object completion；背景 clean plate、物体 visual completion 和 physics proxy completion 要分开处理。\n\n## 七、Sim Anything / PhysSplat 方向\n\n本周还关注到 Sim Anything / PhysSplat 这条方向。它和我们当前“视觉代理 + 碰撞代理 + 语义/物理 sidecar”的分层思路不同：PhysSplat 更倾向于把物理属性估计、粒子采样和动态仿真信息注入到 3DGS/semantic Gaussian 体系里，让静态 3D scene 获得动态形变和交互效果。\n\n这条线对我们后续做物体交互有启发，尤其是对枕头、被子、布料、植物等非刚体对象，可以作为 P2 动态 Gaussian 或物理属性估计方向继续探索。不过它不能直接替代我们当前的 mesh/collider 主链路。当前能看到 PhysSplat 官方 GitHub 入口和 README，但完整模型/权重、数据和工程复现质量仍需要进一步确认。因此短期仍建议把它作为研究旁线，先不影响 P0/P1 的 mesh 和 collider 闭环。\n\n参考：\n\n- PhysSplat / Sim Anything official repository: <https://github.com/Maxwell-Zhao/PhysSplat>\n- PhysSplat paper: <https://arxiv.org/pdf/2411.12789>\n\n## 八、下一步计划\n\n下周建议重点推进三件事：\n\n1. Per-object mesh 重建：从当前整场景重建转向物体级重建，利用 object mask、3DGS rendered depth/mask 和 TSDF fusion，对床、桌子、椅子等对象分别生成 visual mesh，并和 GS2Mesh / SuGaR 结果做对照。\n2. 残缺物体补全：把遮挡补全拆成 object visual completion、background clean plate 和 physics proxy completion。短期可先用 image-blaster/Hunyuan3D/Meshy/TRELLIS 生成 object-local mesh，再用 observed 3D bbox、support plane 和语义信息 fit 回原场景。\n3. 物体交互闭环：在 Web demo 的基础上，把 collider 从单一 scene mesh 拆成 object-level collider / primitive proxy，并把 face/object semantics、物理材质、可移动性、可点击 affordance 接入到交互逻辑中。\n\n如果时间允许，可以继续做 Sim Anything / PhysSplat 的复现性检查，重点看它是否能为 Video2Mesh 提供物体物理属性估计或动态 Gaussian 展示，而不是替代已有的 mesh/collider 管线。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "一、本周总体进展",
+          "slug": "一本周总体进展"
+        },
+        {
+          "level": "2",
+          "text": "二、场景扫描方案调研",
+          "slug": "二场景扫描方案调研"
+        },
+        {
+          "level": "2",
+          "text": "三、Mesh 重建实验进展",
+          "slug": "三mesh-重建实验进展"
+        },
+        {
+          "level": "3",
+          "text": "1. GS2Mesh 路线",
+          "slug": "1.-gs2mesh-路线"
+        },
+        {
+          "level": "3",
+          "text": "2. Open3D Poisson / 3DGS 点云路线",
+          "slug": "2.-open3d-poisson-3dgs-点云路线"
+        },
+        {
+          "level": "3",
+          "text": "3. COLMAP Delaunay Dense 路线",
+          "slug": "3.-colmap-delaunay-dense-路线"
+        },
+        {
+          "level": "3",
+          "text": "4. CloudCompare / 3D Recon / Poisson 与 SuGaR",
+          "slug": "4.-cloudcompare-3d-recon-poisson-与-sugar"
+        },
+        {
+          "level": "2",
+          "text": "四、语义投影融合尝试",
+          "slug": "四语义投影融合尝试"
+        },
+        {
+          "level": "2",
+          "text": "五、视觉代理 + 碰撞代理 Demo",
+          "slug": "五视觉代理--碰撞代理-demo"
+        },
+        {
+          "level": "2",
+          "text": "六、本周形成的主要判断",
+          "slug": "六本周形成的主要判断"
+        },
+        {
+          "level": "2",
+          "text": "七、Sim Anything / PhysSplat 方向",
+          "slug": "七sim-anything-physsplat-方向"
+        },
+        {
+          "level": "2",
+          "text": "八、下一步计划",
+          "slug": "八下一步计划"
+        }
+      ],
+      "reading_minutes": 2
+    },
+    {
+      "id": "collider-physics-proxy",
+      "title": "Collider 与物理代理阶段",
+      "category": "Research Catalog",
+      "summary": "整理 static collider、primitive proxy、convex decomposition、Rapier/Unity 交互代理在 Video2Mesh 中的职责。",
+      "source_path": "docs/research-catalog/collider-physics-proxy/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Collider",
+        "Physics",
+        "Unity"
+      ],
+      "body": "\n# Collider 与物理代理阶段\n\n碰撞代理的目标不是“看起来最真实”，而是“交互稳定、体量可控、运行时可消费”。这也是学长文档、World Labs / Icare、image-blaster viewer 给出的共同工程信号。\n\n## 主要方法和项目\n\n| 方法 / 项目 | 简介 | 适合对象 | Video2Mesh 用法 |\n|---|---|---|---|\n| Static triangle mesh collider | 简化后的 GLB/mesh 作为静态环境碰撞 | 地面、墙体、大型静态家具、房间壳体 | COLMAP Delaunay / Poisson mesh -> simplified GLB |\n| Primitive fitting | box、capsule、sphere、cylinder 等基本形体 | 桌、柜、床、椅腿、花盆等 | 物体交互 P1 的首选 collider |\n| Convex hull / convex decomposition | 用凸包或多个 convex parts 近似复杂物体 | 可移动刚体、可抓取物体 | 后续可接 CoACD / V-HACD |\n| Rapier | Web 端物理引擎 | 浏览器 demo 和 image-blaster-style viewer | 可加载 GLB collider 或 primitive rigid body |\n| Unity MeshCollider / Rigidbody | Unity 运行时物理组件 | 项目引擎适配 | static 用 concave mesh，dynamic 优先 convex/compound |\n| MuJoCo / Isaac | 仿真环境 | 机器人和物理仿真 | 需要质量、摩擦、joint、body type 等 metadata |\n\n## 推荐策略\n\n| 资产 | 推荐 collider |\n|---|---|\n| 房间地面/墙体 | static simplified mesh |\n| 床/柜/桌等大型静态家具 | box / convex hull / compound primitive |\n| 可移动小物体 | primitive / convex decomposition |\n| 布料、枕头、植物叶片 | visual mesh + soft/dynamic side route，不直接用复杂 concave collider |\n\n## 和视觉层的关系\n\n```text\n3DGS visual layer\n  -> visible only\n\ncollider mesh / primitive proxy\n  -> raycast\n  -> ground probe\n  -> movement blocking\n  -> physics body\n```\n\n本项目 Web demo 已验证：3DGS 视觉层可以完全不参与 raycast，隐藏的 COLMAP Delaunay GLB collider 仍能承担点击、地面探测和移动阻挡。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要方法和项目",
+          "slug": "主要方法和项目"
+        },
+        {
+          "level": "2",
+          "text": "推荐策略",
+          "slug": "推荐策略"
+        },
+        {
+          "level": "2",
+          "text": "和视觉层的关系",
+          "slug": "和视觉层的关系"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "experiments",
+      "title": "本项目实验目录",
+      "category": "Research Catalog",
+      "summary": "汇总 Video2Mesh 本周在 bedroom 场景上的 GS2Mesh、Open3D Poisson、COLMAP Delaunay、语义投影融合和 Web Demo 实验。",
+      "source_path": "docs/research-catalog/experiments/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Experiments",
+        "Video2Mesh",
+        "Mesh"
+      ],
+      "body": "\n# 本项目实验目录\n\n本目录汇总本周在 Video2Mesh bedroom 场景上的真实实验结果。它和前面的调研目录对应：不是只看论文效果，而是看这些方法接到我们自己的 pipeline 后能不能形成可用资产。\n\n## 实验一：GS2Mesh\n\nGS2Mesh 路线从训练好的 3DGS 出发，通过渲染多视角/双目深度再做 TSDF 融合。实测 raw mesh 约 4.48M vertices / 8.09M triangles，原始文件约 333MB；减面后可以得到几 MB 级别 GLB。结构比直接 Gaussian center Poisson 更合理，但墙面破碎和漂浮片仍明显。\n\n![GS2Mesh 输出效果](assets/uploaded/experiments/01-gs2mesh.png \"GS2Mesh 输出保留了床、窗帘和大结构，但仍有墙面破碎、漂浮片和局部缺失\")\n\n结论：适合作为 P1/P2 object visual mesh 或 benchmark，不适合作为 P0 lightweight collider。\n\n## 实验二：Open3D Poisson / 3DGS 点云\n\nOpen3D Poisson 使用过滤后的 3DGS center point cloud。`alpha005_sample500k` 路线输入 50 万点，输出约 100,965 vertices / 200,000 triangles，GLB 约 5.23MB。\n\n![Open3D Poisson 3DGS alpha005 sample500k](assets/uploaded/experiments/02-open3d-poisson-3dgs-alpha005-sample500k.png \"Open3D Poisson 输出体量可控，但壳状伪影、粘连和漂浮面明显\")\n\n结论：适合快速 baseline 或 fallback；不应把 3DGS center 当作最终真实表面。\n\n## 实验三：COLMAP Delaunay Dense\n\nCOLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，GLB 约 3.0MB。视觉细节不如 3DGS，但作为 static collider 更稳定。\n\n![COLMAP Delaunay dense mesh](assets/uploaded/experiments/03-colmap-delaunay-dense.png \"COLMAP Delaunay dense mesh 更适合场景级 static collision proxy\")\n\n结论：当前最适合作为 P0 场景级碰撞代理。\n\n## 实验四：语义投影融合\n\n本周尝试 P0 KDTree 语义回灌和 P1 ray projection 多视角投票。P1 当前使用 projected semantic point label masks 做 debug，缺少真实 SAM/GDINO 2D masks，因此串色明显、置信度偏低。\n\n![mesh 语义投影融合调试结果](assets/uploaded/experiments/05-mesh-semantic-transfer-ray-projection.png \"P1 ray projection debug 覆盖更高，但床、墙、窗帘、地面之间存在明显串色\")\n\n结论：P1 路线保留，但需要真实 2D mask、深度可见性过滤和 face graph smoothing。\n\n## 实验五：视觉代理 + 碰撞代理 Web Demo\n\n本周实现了 `visual-physics-proxy` demo：3DGS 只负责视觉显示，COLMAP Delaunay GLB 作为隐藏 collider 承担 raycast、ground probe 和移动阻挡。\n\n![视觉代理 3DGS + 碰撞代理 mesh Demo](assets/uploaded/experiments/04-visual-physics-proxy-demo.png \"Web demo 验证了 3DGS visual layer 与 mesh collision layer 可以分离\")\n\n结论：该 demo 已验证最小架构闭环，后续应拆成 object-level collider，并接入 face/object semantics 和物理材质。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "实验一：GS2Mesh",
+          "slug": "实验一gs2mesh"
+        },
+        {
+          "level": "2",
+          "text": "实验二：Open3D Poisson / 3DGS 点云",
+          "slug": "实验二open3d-poisson-3dgs-点云"
+        },
+        {
+          "level": "2",
+          "text": "实验三：COLMAP Delaunay Dense",
+          "slug": "实验三colmap-delaunay-dense"
+        },
+        {
+          "level": "2",
+          "text": "实验四：语义投影融合",
+          "slug": "实验四语义投影融合"
+        },
+        {
+          "level": "2",
+          "text": "实验五：视觉代理 + 碰撞代理 Web Demo",
+          "slug": "实验五视觉代理--碰撞代理-web-demo"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "industrial-pipelines",
+      "title": "工业资产管线阶段",
+      "category": "Research Catalog",
+      "summary": "按 World Labs / Icare、image-blaster、Spark viewer 等工业方案整理 visual layer、collider 和 simulator asset bundle 的边界。",
+      "source_path": "docs/research-catalog/industrial-pipelines/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "World Labs",
+        "image-blaster",
+        "Spark"
+      ],
+      "body": "\n# 工业资产管线阶段\n\n工业界给出的最重要信号是：真实可交互 3D 场景通常不是一个单文件 mesh，而是由视觉资产、碰撞资产、语义/交互 metadata 和 runtime viewer 组成。\n\n## 主要项目和案例\n\n| 项目 / 案例 | 简介 | 可借鉴点 | 边界 |\n|---|---|---|---|\n| World Labs / Marble | 面向 static world/background 的生成和资产输出，通常包含 splat/SPZ、pano、collider mesh 等多层资产 | clean plate / world generation；视觉资产和 collider 分开交付 | 不直接负责 Video2Mesh 的物体级仿真 asset bundle |\n| Icare / World Labs game | 真实浏览器 3D 游戏案例，使用 Spark/Splat 类视觉层和独立碰撞/交互资产 | 证明 visual proxy + collision proxy 是产业级可落地架构 | 不是从任意扫描视频自动得到所有物理属性 |\n| image-blaster | 管理 world/object 目录、reference image、object mesh jobs、React/Three/Rapier viewer | object mesh generation convention、GLB viewer、Rapier 交互分层 | 不生成 MuJoCo/Isaac/Unity adapter，也不拥有 simulator_asset_bundle |\n| Spark / SuperSplat runtime | 浏览器端 splat 渲染和查看工具 | Web 视觉展示与调试 | 不能替代 collider / physics solver |\n\n## 对 Video2Mesh 的分层启发\n\n```text\nvisual layer:\n  3DGS / SPZ / SOG / Splat\n\ncollision layer:\n  GLB collider / primitive proxy / convex parts\n\nsemantic and physics sidecar:\n  object_id / label / affordance / material / mass / friction\n\nruntime adapter:\n  Web / Unity / MuJoCo / Isaac\n```\n\n## 与 image-blaster 的正确关系\n\nimage-blaster 可以成为 Video2Mesh 的 object mesh helper：\n\n```text\nVideo2Mesh selected object frames\n  -> image-blaster world/object folder\n  -> Hunyuan3D / Meshy mesh job\n  -> generated object-local mesh\n  -> Video2Mesh import and fit\n  -> simulator asset bundle\n```\n\n但最终 simulator bundle、坐标对齐、物理属性、引擎 adapter 仍应由 Video2Mesh 负责。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要项目和案例",
+          "slug": "主要项目和案例"
+        },
+        {
+          "level": "2",
+          "text": "对 Video2Mesh 的分层启发",
+          "slug": "对-video2mesh-的分层启发"
+        },
+        {
+          "level": "2",
+          "text": "与 image-blaster 的正确关系",
+          "slug": "与-image-blaster-的正确关系"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "input-pose-pointcloud",
+      "title": "输入、位姿与点云阶段",
+      "category": "Research Catalog",
+      "summary": "调研从扫描视频获得相机、稠密点云和统一坐标系的模型与项目，包括 COLMAP、MASt3R/DUSt3R/VGGT 和 MVS。",
+      "source_path": "docs/research-catalog/input-pose-pointcloud/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "COLMAP",
+        "Point Cloud",
+        "Pose"
+      ],
+      "body": "\n# 输入、位姿与点云阶段\n\n这一阶段负责把原始扫描视频变成后续所有模块共享的坐标系统：相机内外参、稠密点云、尺度约束和可追踪帧。它是 3DGS、mesh、语义回灌和 simulator asset bundle 的地基。\n\n![输入位姿阶段](assets/uploaded/input-pose-pointcloud/stage-input-pose.svg \"从扫描视频到 COLMAP/SfM、稠密点云和坐标尺度合同\")\n\n## 主要项目和模型\n\n| 项目 / 方法 | 简介 | 输入输出 | 对 Video2Mesh 的作用 | 风险 |\n|---|---|---|---|---|\n| COLMAP SfM/MVS | 经典摄影测量工具链，估计相机位姿、稀疏点云和稠密 workspace | 输入多帧图片，输出 cameras/images/points3D、dense fused point cloud | 当前最稳的 P0 位姿和 dense geometry 来源，能直接接 GraphDECO 3DGS、Delaunay mesher 和 Poisson baseline | 纹理弱、反光、重复图案时可能失败；需要较好帧覆盖 |\n| COLMAP dense stereo | 基于已知相机做 patch-match stereo 和 fusion | 输入 COLMAP sparse model，输出 fused.ply / dense workspace | 场景级 mesh/collider 的主输入，比直接使用 Gaussian center 更可靠 | 稠密点云仍会有空洞、噪声和漂浮点 |\n| MASt3R / DUSt3R | 学习式多视图几何，弱纹理/小基线下可作为传统 SfM 的补充 | 输入图像对或多视图，输出对应关系、深度/点云、相机关系 | 可作为 COLMAP 失败时的 pose/depth fallback，或为物体级 depth fusion 提供先验 | 输出坐标尺度和 COLMAP/3DGS 生态不完全一致，需要适配 |\n| VGGT 类 feed-forward 模型 | 端到端估计相机、深度、点云等 3D 表征 | 输入图片集合，输出 camera/depth/point map | 可作为快速预处理或弱纹理场景 fallback | 工程稳定性、尺度一致性和大场景鲁棒性需实测 |\n| Open3D / CloudCompare 点云处理 | 点云过滤、法线估计、下采样、可视检查 | 输入 PLY/PCD，输出 cleaned point cloud / normals | 用于 mesh 前处理、debug 和人工检查 | 清理规则容易影响真实薄结构 |\n\n## 我们项目中的接入位置\n\n```text\nvideo frames\n  -> COLMAP sparse/dense\n  -> scene/cameras/camera_info.json\n  -> scene/reconstruction/point_cloud.ply\n  -> GraphDECO 3DGS / Delaunay mesh / Poisson baseline\n```\n\n当前建议：\n\n- P0 仍以 COLMAP 为主，因为它的输出标准、生态成熟，而且和 GraphDECO / COLMAP Delaunay / CloudCompare 都能接起来。\n- learned pose/depth 方法适合作为 fallback 或 object-level depth enhancement，不要一开始就替代主链路。\n- 所有后续资产必须明确记录坐标系、scale、camera convention，否则 object mesh 和 collider 回填会错位。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要项目和模型",
+          "slug": "主要项目和模型"
+        },
+        {
+          "level": "2",
+          "text": "我们项目中的接入位置",
+          "slug": "我们项目中的接入位置"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "mesh-reconstruction",
+      "title": "Mesh 重建阶段",
+      "category": "Research Catalog",
+      "summary": "按场景级 collider 和物体级 visual mesh 两个目标，整理 COLMAP Delaunay、Poisson、GS2Mesh、SuGaR、2DGS/GOF 等路线。",
+      "source_path": "docs/research-catalog/mesh-reconstruction/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Mesh",
+        "GS2Mesh",
+        "SuGaR",
+        "Poisson"
+      ],
+      "body": "\n# Mesh 重建阶段\n\nMesh 重建不能只问“哪个方法画面最好”，还要区分目标：场景级 static collider 需要稳定、轻量、可碰撞；物体级 visual mesh 需要更好的外观、边界和补全能力。\n\n![Mesh 重建路线](assets/uploaded/mesh-reconstruction/stage-mesh.svg \"Delaunay/Poisson 适合 static collider；GS2Mesh/TSDF、SuGaR/2DGS 更适合 visual mesh 对照和升级\")\n\n## 主要项目和模型\n\n| 项目 / 方法 | 简介 | 当前定位 | 实测/判断 |\n|---|---|---|---|\n| COLMAP Delaunay mesher | 利用 COLMAP dense workspace 直接生成 mesh | P0 scene collider 主路线 | 本项目 bedroom 场景输出约 82,920 vertices / 167,082 triangles，GLB 约 3.0MB，适合 Web/Unity 静态碰撞代理 |\n| Open3D Poisson / BPA | 点云 + normals 到 watertight-ish mesh 的自动化 baseline | baseline / fallback / debug | 对 3DGS center point cloud 容易生成壳状伪影和漂浮面 |\n| CloudCompare / PoissonRecon | 点云人工检查、法线估计、Poisson 建面工具链 | 人工检查和传统建面对照 | 快速可视化好用，但不应直接作为唯一生产路线 |\n| GS2Mesh | 从训练后 3DGS 渲染 stereo/multiview，再估深并 TSDF fusion | P1/P2 object visual mesh benchmark | 思路比直接 Gaussian center 连面更合理；raw mesh 很大，需减面和清理 |\n| SuGaR | surface-aligned Gaussians + mesh extraction + editable mesh | P2 高质量 visual mesh 对照 | 需要额外环境和优化，短期不放进 P0 主链路 |\n| 2DGS / GOF | 从 Gaussian 表面约束角度改训练或优化形式 | P2/P3 研究升级 | 有潜力减少后处理 mesh 问题，但工程替换成本高 |\n| Neural SDF / NeuS / VolSDF | 神经隐式表面重建 | P3 离线高质量资产 | 训练成本高，和当前 3DGS 主链路并行成本大 |\n\n## 推荐路线\n\n```text\nscene collider:\n  COLMAP dense workspace -> Delaunay mesh -> simplify -> GLB\n\nobject visual mesh:\n  3DGS rendered RGB/depth/mask -> masked TSDF -> cleanup -> GLB\n\nquality benchmark:\n  GS2Mesh / SuGaR / 2DGS on selected objects or small scenes\n```\n\n## 判断\n\n当前 P0 应把 COLMAP Delaunay 作为场景 collider 主链路；Open3D/CloudCompare Poisson 做 baseline 和人工检查；GS2Mesh/SuGaR 做后续 per-object visual mesh 对照。这样可以先完成交互闭环，再逐步提高物体 mesh 质量。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要项目和模型",
+          "slug": "主要项目和模型"
+        },
+        {
+          "level": "2",
+          "text": "推荐路线",
+          "slug": "推荐路线"
+        },
+        {
+          "level": "2",
+          "text": "判断",
+          "slug": "判断"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "object-mesh-completion",
+      "title": "物体 Mesh 补全阶段",
+      "category": "Research Catalog",
+      "summary": "梳理 Hunyuan3D、Meshy、TRELLIS、InstantMesh、image-blaster 等物体级生成和补全方案。",
+      "source_path": "docs/research-catalog/object-mesh-completion/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Object Mesh",
+        "Hunyuan3D",
+        "image-blaster"
+      ],
+      "body": "\n# 物体 Mesh 补全阶段\n\n物体级补全适合从 object crops、selected frames、mask 和粗 3D bbox 出发，生成 object-local visual mesh，再对齐回原始场景。\n\n## 主要项目和模型\n\n| 项目 / 方法 | 简介 | 输入输出 | 对 Video2Mesh 的作用 | 注意 |\n|---|---|---|---|---|\n| Hunyuan3D | 单图/少图到 3D asset 的生成式模型/服务生态 | 输入 reference image，输出 mesh/texture | 可作为 image-blaster object mesh backend，补全遮挡物体外观 | 尺度、朝向、支撑面必须由 Video2Mesh 校准 |\n| Meshy | 商业 3D asset 生成服务 | 文本/图片到 mesh | 可作为 object mesh alternative backend | 结果需要 provenance 和 QA |\n| TRELLIS | 3D asset generation 研究/开源路线 | 图片/文本到 3D asset | 可作为本地或远端 object completion 候选 | 环境、质量和授权需单独评估 |\n| InstantMesh | feed-forward image-to-3D mesh 方案 | 单图/多视图到 mesh | 快速生成 object-local mesh baseline | 复杂遮挡和真实尺度需要后处理 |\n| image-blaster | 管理 world/object 目录、reference image、Hunyuan/Meshy jobs 和 React/Three viewer 的工程项目 | `worlds/<world>/output/<object>/object.json`、GLB/OBJ | 可复用其 object mesh generation convention 和 viewer 思路 | 它不是 simulator bundle 生成器 |\n\n## 接入 Video2Mesh 的正确位置\n\n```text\nobject masks / selected frames\n  -> prepare-object-images\n  -> export-image-blaster\n  -> Hunyuan3D / Meshy / TRELLIS / InstantMesh\n  -> import-object-meshes\n  -> fit-object-local-meshes-to-bbox\n  -> export-simulator-assets\n```\n\n## 关键 QA\n\n- object-local mesh 是否对齐 observed 3D bbox。\n- 支撑面是否贴近 floor/table/chair seat。\n- scale 是否可信。\n- 是否需要拆分 visual mesh 和 collider proxy。\n- 补全来源和置信度是否写入 metadata，便于导师/用户知道哪些部分是生成的。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要项目和模型",
+          "slug": "主要项目和模型"
+        },
+        {
+          "level": "2",
+          "text": "接入 Video2Mesh 的正确位置",
+          "slug": "接入-video2mesh-的正确位置"
+        },
+        {
+          "level": "2",
+          "text": "关键 QA",
+          "slug": "关键-qa"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "object-simulation",
+      "title": "物体仿真阶段",
+      "category": "Research Catalog",
+      "summary": "按刚体、软体、动态 Gaussian 三条线整理物体交互和 Sim Anything / PhysSplat 的关系。",
+      "source_path": "docs/research-catalog/object-simulation/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Simulation",
+        "PhysSplat",
+        "SimAnything"
+      ],
+      "body": "\n# 物体仿真阶段\n\n物体仿真应分为刚体、软体和 dynamic Gaussian 三条线。它们消费的资产合同不同，不应强行合并成一个 mesh。\n\n![物体仿真](assets/uploaded/object-simulation/stage-simulation.svg \"刚体、软体和 dynamic Gaussian 三种物体仿真路径\")\n\n## 主要路线\n\n| 路线 | 简介 | 适合对象 | 对 Video2Mesh 的意义 |\n|---|---|---|---|\n| Rigid body simulation | 刚体 + collider + mass/friction/restitution | 桌椅、杯子、柜门、盒子 | P1 物体交互闭环，最容易进入 Unity/MuJoCo/Isaac |\n| Soft body / cloth | 布料、枕头、被子、植物叶片等形变对象 | pillow、blanket、curtain、plant | 需要比刚体更复杂的材质和 solver |\n| PhysSplat / Sim Anything | MLLM 估计物理属性，粒子/高斯动态模拟，动态 splat 渲染 | 非刚体、局部形变、动态视觉展示 | P2 研究旁线，可为物理属性估计和 dynamic Gaussian 提供启发 |\n| VLM physical property inference | 用 VLM/MLLM 估计材质、质量范围、摩擦、可移动性 | 所有 object metadata | 可作为 simulator_asset_bundle 的初稿，但必须 QA |\n\n## Sim Anything / PhysSplat 的定位\n\nPhysSplat 的目标不是把 3DGS 转成传统 mesh，而是把物理属性估计和动态模拟注入 semantic Gaussian/particle 表示中。它对我们后续做布料、枕头、植物等非刚体交互有启发，但短期不替代 mesh/collider 主链路。\n\n当前建议：\n\n- P0/P1：先做 rigid-body 资产合同，即 visual mesh + collider + physics sidecar。\n- P2：对特定对象探索 dynamic Gaussian 或 PhysSplat-style 物理属性估计。\n- 所有自动推理出的质量、摩擦、恢复系数都要标注来源和置信度。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要路线",
+          "slug": "主要路线"
+        },
+        {
+          "level": "2",
+          "text": "Sim Anything / PhysSplat 的定位",
+          "slug": "sim-anything-physsplat-的定位"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "pointcloud-completion",
+      "title": "点云清理与背景补全阶段",
+      "category": "Research Catalog",
+      "summary": "整理点云去噪、背景 clean plate、2D/3D inpainting 和场景结构补全在 Video2Mesh 中的位置。",
+      "source_path": "docs/research-catalog/pointcloud-completion/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Completion",
+        "Point Cloud",
+        "Inpainting"
+      ],
+      "body": "\n# 点云清理与背景补全阶段\n\n补全不是一个单独按钮。对 Video2Mesh 来说，至少要拆成三件事：点云/高斯清理、背景 clean plate、场景结构补全。\n\n![点云与补全阶段](assets/uploaded/pointcloud-completion/stage-completion.svg \"物体外观补全、背景 clean plate 和物理代理补全需要拆开处理\")\n\n## 主要方向\n\n| 方向 | 简介 | 项目中的作用 | 风险 |\n|---|---|---|---|\n| 3DGS floater cleaning | 根据 opacity、scale、elongation、空间离群过滤高斯 | 让 3DGS 视觉层更干净，也避免后续点云建面被远端漂浮点拉坏 | 过度清理会删掉真实薄结构 |\n| Point cloud outlier removal | quantile bbox、statistical/radius outlier、voxel downsample | 给 Poisson、Delaunay preview、semantic projection 提供更稳输入 | 参数依赖场景 |\n| Background clean plate | 移除前景物体后补全地板/墙面/背景图像，再更新背景 3D 表征 | 当物体可移动时，恢复被遮挡的地面/墙面 | 需要真实 2D masks 和多视角一致性 |\n| 2D image/video inpainting | 对视频帧局部缺失区域补图 | clean plate 的前置工具 | 单帧好看不代表多视角一致 |\n| Scene layout / plane fitting | floor/wall/ceiling/door/window/cabinet 等结构化估计 | 给 collider、navmesh、support plane 提供稳定结构 | 自动识别门窗柜等细类仍需 VLM/scene graph 增强 |\n\n## 和物体补全的边界\n\n```text\nobject completion:\n  补全被遮挡物体本身\n\nbackground clean plate:\n  补全物体移开后露出的地板/墙面\n\nphysics proxy completion:\n  补全交互需要的保守碰撞形状\n```\n\n这三件事不能混在一起。一个完整椅子 mesh 不能自动恢复椅子背后的地板；一个好看的 inpainted 背景也不能直接提供椅子的碰撞体。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要方向",
+          "slug": "主要方向"
+        },
+        {
+          "level": "2",
+          "text": "和物体补全的边界",
+          "slug": "和物体补全的边界"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "semantic-scene-graph",
+      "title": "语义与 Scene Graph 阶段",
+      "category": "Research Catalog",
+      "summary": "整理 2D/3D 语义分割、semantic splats、mesh face sidecar 和 scene graph 在交互场景中的作用。",
+      "source_path": "docs/research-catalog/semantic-scene-graph/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "Semantics",
+        "Scene Graph",
+        "SAM"
+      ],
+      "body": "\n# 语义与 Scene Graph 阶段\n\n语义层要服务交互查询：点击到哪个 face、属于哪个 object、是什么材质、能不能移动、能不能抓取、和其他物体有什么关系。\n\n![语义与 Scene Graph](assets/uploaded/semantic-scene-graph/stage-semantics.svg \"从 2D masks 到 3D labels，再到 mesh face sidecar 和交互查询\")\n\n## 主要项目和方法\n\n| 项目 / 方法 | 简介 | 对 Video2Mesh 的作用 | 风险 |\n|---|---|---|---|\n| Segment Anything / SAM | 通用 2D mask 生成/提示分割 | 生成 object masks，支持视频帧中的对象区域 | 无语义类别，需要 detector/VLM 命名 |\n| GroundingDINO / Grounded-SAM | 文本提示驱动检测 + mask | 开放词汇发现床、桌、椅、窗帘等对象 | 边界和类别稳定性需多帧融合 |\n| 2D-to-3D mask fusion | 将每帧 mask 投影/投票到 3D 点或 Gaussian | 生成 3D object masks、semantic/probability splats | 遮挡和深度误差会造成串色 |\n| Semantic splats | 给 3DGS/point cloud 携带 object probability | 支持可视化、hover、语义筛选和 mesh 回灌 | 不等同于 mesh face 语义 |\n| Mesh face sidecar | 按 triangle index 保存 label/probability/material/affordance | 点击 collider 后直接查 object_id 和交互属性 | mesh 简化/替换时需要重建索引或映射 |\n| Scene graph / VLM relation QA | 物体关系、支撑关系、可交互属性推理 | 给 simulator asset bundle 补 affordance、support、material | VLM 输出必须可复核 |\n\n## 推荐数据合同\n\n```json\n{\n  \"mesh\": \"colliders/scene_collision.glb\",\n  \"face_semantics\": [\n    {\n      \"face\": 1024,\n      \"object_id\": \"bed_01\",\n      \"label\": \"bed\",\n      \"probability\": 0.91,\n      \"material\": \"cloth\",\n      \"affordance\": [\"support\", \"sit_or_lie\"]\n    }\n  ]\n}\n```\n\n## 当前项目状态\n\n本周已验证 P0 KDTree 语义回灌和 P1 ray projection debug 路线。P1 当前没有真实 2D masks，只能用 projected semantic point label masks 调试，因此串色明显，暂时不能作为生产级语义融合结果。下一步应接入真实 2D mask、深度可见性过滤和 face graph smoothing。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要项目和方法",
+          "slug": "主要项目和方法"
+        },
+        {
+          "level": "2",
+          "text": "推荐数据合同",
+          "slug": "推荐数据合同"
+        },
+        {
+          "level": "2",
+          "text": "当前项目状态",
+          "slug": "当前项目状态"
+        }
+      ],
+      "reading_minutes": 1
+    },
+    {
+      "id": "visual-3dgs",
+      "title": "视觉重建与 3DGS 阶段",
+      "category": "Research Catalog",
+      "summary": "梳理 GraphDECO 3DGS、Spark、SuperSplat 等视觉代理方案，以及它们和 mesh/collider 的边界。",
+      "source_path": "docs/research-catalog/visual-3dgs/README.md",
+      "source_kind": "builtin",
+      "updated": "2026-07-03",
+      "tags": [
+        "Research Catalog",
+        "3DGS",
+        "Spark",
+        "SuperSplat"
+      ],
+      "body": "\n# 视觉重建与 3DGS 阶段\n\n3DGS 在 Video2Mesh 中应该被定位为 **visual proxy**：它负责让扫描场景看起来真实，但不直接承担碰撞、导航、刚体交互和语义查询。\n\n## 主要项目和模型\n\n| 项目 / 方法 | 简介 | 适合承担 | 不适合承担 |\n|---|---|---|---|\n| GraphDECO 3D Gaussian Splatting | 经典 3DGS 训练实现，用 COLMAP 相机和点云初始化高斯场景 | 当前 P0/P1 真实场景视觉层，生成高质量 splat/PLY | 直接输出可靠 mesh topology 或 collider |\n| Spark / SparkJS | 浏览器端 3DGS/Splat 渲染 runtime，World Labs / Icare 生态中常见 | Web visual layer，加载 `.ply/.splat/.spz/.sog` 等视觉资产 | 物理碰撞和复杂交互本身 |\n| SuperSplat | 3DGS 浏览器查看、编辑和导出工具 | 本地/远端检查 splat 质量、清理 floaters、截图展示 | simulator asset bundle 生成 |\n| 2DGS / GOF / surface-aware GS | 让 Gaussian 更贴近表面、改善 mesh extraction 的研究路线 | P2 替换或增强训练端，提高后续 mesh 质量 | 短期 P0 工程主链路 |\n\n## 核心边界\n\n```text\nGraphDECO 3DGS\n  -> visual display\n  -> rendered RGB / depth / mask evidence\n  -> object visual mesh reconstruction helper\n\nnot:\n  -> collider\n  -> navigation mesh\n  -> final simulator physics body\n```\n\n## 对 Video2Mesh 的结论\n\n3DGS 应该继续作为视觉质量最强的场景层，同时为后续 mesh 重建提供 rendered RGB/depth/mask evidence。不要直接把 Gaussian center 当作真实表面点云去建最终 mesh，因为当前实验证明这会导致壳状伪影、漂浮片和语义串色。\n",
+      "headings": [
+        {
+          "level": "2",
+          "text": "主要项目和模型",
+          "slug": "主要项目和模型"
+        },
+        {
+          "level": "2",
+          "text": "核心边界",
+          "slug": "核心边界"
+        },
+        {
+          "level": "2",
+          "text": "对 Video2Mesh 的结论",
+          "slug": "对-video2mesh-的结论"
+        }
+      ],
+      "reading_minutes": 1
     }
   ],
   "categories": [
     "Operations",
     "Overview",
     "Pipeline",
+    "Reports",
     "Research",
+    "Research Catalog",
     "Simulation",
     "Site"
   ]

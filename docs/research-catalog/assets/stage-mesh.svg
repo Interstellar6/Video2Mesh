@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <text x="50" y="62" font-family="Inter, Arial" font-size="30" font-weight="800" fill="#18211f">Mesh 重建路线</text>
+  <text x="52" y="92" font-family="Inter, Arial" font-size="15" fill="#66736f">场景级 collider 优先稳定；物体级 visual mesh 再追求高质量和补全</text>
+  <g stroke="#9bb7af" stroke-width="2" fill="#ffffff" font-family="Inter, Arial">
+    <polygon points="94,260 190,112 286,260" fill="#dcefeb"/>
+    <line x1="94" y1="260" x2="190" y2="190"/><line x1="286" y1="260" x2="190" y2="190"/><line x1="190" y1="112" x2="190" y2="190"/>
+    <text x="118" y="312" font-size="16" font-weight="800" fill="#18211f">Delaunay / Poisson</text>
+    <text x="122" y="338" font-size="13" fill="#66736f">static scene collider</text>
+    <polygon points="378,250 430,118 514,156 540,268 448,310" fill="#fff0d8"/>
+    <line x1="378" y1="250" x2="514" y2="156"/><line x1="430" y1="118" x2="448" y2="310"/><line x1="540" y1="268" x2="378" y2="250"/>
+    <text x="398" y="342" font-size="16" font-weight="800" fill="#18211f">GS2Mesh / TSDF</text>
+    <text x="392" y="368" font-size="13" fill="#66736f">rendered depth to mesh</text>
+    <polygon points="646,252 690,116 780,134 808,238 736,304" fill="#e8f8ef"/>
+    <line x1="646" y1="252" x2="780" y2="134"/><line x1="690" y1="116" x2="736" y2="304"/><line x1="808" y1="238" x2="646" y2="252"/>
+    <text x="686" y="342" font-size="16" font-weight="800" fill="#18211f">SuGaR / 2DGS</text>
+    <text x="668" y="368" font-size="13" fill="#66736f">surface-aware benchmark</text>
+  </g>
+</svg>

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <text x="50" y="62" font-family="Inter, Arial" font-size="30" font-weight="800" fill="#18211f">物体仿真与运行时资产</text>
+  <text x="52" y="92" font-family="Inter, Arial" font-size="15" fill="#66736f">刚体/软体/动态 Gaussian 是不同运行时合同，不能混成一个 mesh</text>
+  <g font-family="Inter, Arial">
+    <rect x="84" y="148" width="190" height="150" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="112" y="188" font-size="18" font-weight="800" fill="#18211f">Rigid body</text>
+    <text x="112" y="218" font-size="14" fill="#66736f">box / convex / compound</text>
+    <rect x="132" y="242" width="78" height="38" fill="#dcefeb" stroke="#0d776f" stroke-width="3"/>
+    <rect x="356" y="148" width="190" height="150" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="384" y="188" font-size="18" font-weight="800" fill="#18211f">Soft / deformable</text>
+    <text x="384" y="218" font-size="14" fill="#66736f">cloth / pillow / plant</text>
+    <path d="M404 258C426 228 474 230 500 258C476 286 426 286 404 258Z" fill="#fff0d8" stroke="#d98923" stroke-width="3"/>
+    <rect x="628" y="148" width="190" height="150" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="656" y="188" font-size="18" font-weight="800" fill="#18211f">Dynamic Gaussian</text>
+    <text x="656" y="218" font-size="14" fill="#66736f">PhysSplat / PGAS</text>
+    <g fill="#0d776f">
+      <circle cx="682" cy="256" r="5"/><circle cx="708" cy="238" r="4"/><circle cx="734" cy="266" r="6"/><circle cx="760" cy="246" r="4"/>
+    </g>
+  </g>
+</svg>
