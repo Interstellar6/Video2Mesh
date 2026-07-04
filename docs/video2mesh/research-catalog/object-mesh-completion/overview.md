@@ -25,6 +25,7 @@ visibility: public
 | Meshy | 商业 3D asset 生成服务 | 文本/图片到 mesh | 可作为 object mesh alternative backend | 结果需要 provenance 和 QA |
 | TRELLIS | 3D asset generation 研究/开源路线 | 图片/文本到 3D asset | 可作为本地或远端 object completion 候选 | 环境、质量和授权需单独评估 |
 | InstantMesh | feed-forward image-to-3D mesh 方案 | 单图/多视图到 mesh | 快速生成 object-local mesh baseline | 复杂遮挡和真实尺度需要后处理 |
+| Restore3D | 面向破损/遮挡物体的形状与纹理联合修复 | 多视角 broken-object images 到 textured mesh | 适合处理局部缺失、破损或严重遮挡物体，保留 observed/restored provenance | 需要稳定多视角 crop、mask/depth rectification 和 bbox 回填 |
 | image-blaster | 管理 world/object 目录、reference image、Hunyuan/Meshy jobs 和 React/Three viewer 的工程项目 | `worlds/<world>/output/<object>/object.json`、GLB/OBJ | 可复用其 object mesh generation convention 和 viewer 思路 | 它不是 simulator bundle 生成器 |
 
 ## 接入 Video2Mesh 的正确位置
@@ -33,7 +34,7 @@ visibility: public
 object masks / selected frames
   -> prepare-object-images
   -> export-image-blaster
-  -> Hunyuan3D / Meshy / TRELLIS / InstantMesh
+  -> Hunyuan3D / Meshy / TRELLIS / InstantMesh / Restore3D
   -> import-object-meshes
   -> fit-object-local-meshes-to-bbox
   -> export-simulator-assets
