@@ -15,6 +15,8 @@ visibility: public
 
 3DGS 在 Video2Mesh 中应该被定位为 **visual proxy**：它负责让扫描场景看起来真实，但不直接承担碰撞、导航、刚体交互和语义查询。
 
+![3DGS 视觉代理在 Video2Mesh 中的位置](../assets/pipeline-overview.svg "3DGS 是视觉真实感层，不直接承担 collider、导航网格或 simulator physics body")
+
 ## 主要项目和模型
 
 | 项目 / 方法 | 简介 | 适合承担 | 不适合承担 |

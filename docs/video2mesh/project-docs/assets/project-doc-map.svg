@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="420" viewBox="0 0 980 420" role="img" aria-labelledby="title desc">
+  <title id="title">Video2Mesh project docs map</title>
+  <desc id="desc">Reading map from project introduction to pipeline contract, run guide, and exported runtime assets.</desc>
+  <rect width="980" height="420" fill="#f7f8f6"/>
+  <rect x="42" y="40" width="896" height="340" rx="8" fill="#fff" stroke="#dfe5df"/>
+  <text x="76" y="88" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#14201c">Video2Mesh 项目文档阅读地图</text>
+  <text x="76" y="122" font-family="Arial, sans-serif" font-size="15" fill="#63706a">先理解项目边界，再看 pipeline 合同，最后按 how-to-run 复现实验或导出资产。</text>
+  <g font-family="Arial, sans-serif">
+    <rect x="80" y="174" width="180" height="96" rx="8" fill="#e8f4f1" stroke="#9ccbc2"/>
+    <text x="110" y="210" font-size="18" font-weight="700" fill="#08766f">Project Intro</text>
+    <text x="110" y="238" font-size="13" fill="#3d534c">目标、分层资产、边界</text>
+    <path d="M270 222 H338" stroke="#08766f" stroke-width="3" fill="none"/>
+    <path d="M338 222 l-12 -8 v16z" fill="#08766f"/>
+    <rect x="350" y="174" width="180" height="96" rx="8" fill="#fff8e9" stroke="#e3bd73"/>
+    <text x="392" y="210" font-size="18" font-weight="700" fill="#9a650f">Pipeline</text>
+    <text x="386" y="238" font-size="13" fill="#654b20">视频到 3D 资产合同</text>
+    <path d="M540 222 H608" stroke="#08766f" stroke-width="3" fill="none"/>
+    <path d="M608 222 l-12 -8 v16z" fill="#08766f"/>
+    <rect x="620" y="174" width="180" height="96" rx="8" fill="#eef1fb" stroke="#b9c4e4"/>
+    <text x="667" y="210" font-size="18" font-weight="700" fill="#344784">How to Run</text>
+    <text x="656" y="238" font-size="13" fill="#4d5b82">本地验证与远端完整运行</text>
+  </g>
+  <g font-family="Arial, sans-serif" font-size="13" fill="#5f6b66">
+    <rect x="154" y="310" width="672" height="38" rx="6" fill="#f7faf8" stroke="#dfe5df"/>
+    <text x="180" y="334">输出资产：3DGS 视觉层、mesh/collider 交互层、semantic sidecar、simulator bundle、Web/Unity/MuJoCo/Isaac adapter</text>
+  </g>
+</svg>

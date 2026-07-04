@@ -15,6 +15,8 @@ visibility: public
 
 工业界给出的最重要信号是：真实可交互 3D 场景通常不是一个单文件 mesh，而是由视觉资产、碰撞资产、语义/交互 metadata 和 runtime viewer 组成。
 
+![工业资产管线的多层输出](../assets/pipeline-overview.svg "工业管线启发 Video2Mesh 将视觉层、碰撞层、语义物理 sidecar 和 runtime adapter 分开交付")
+
 ## 主要项目和案例
 
 | 项目 / 案例 | 简介 | 可借鉴点 | 边界 |

@@ -15,6 +15,8 @@ visibility: public
 
 碰撞代理的目标不是“看起来最真实”，而是“交互稳定、体量可控、运行时可消费”。这也是学长文档、World Labs / Icare、image-blaster viewer 给出的共同工程信号。
 
+![Collider 与物理代理在 pipeline 中的位置](../assets/stage-simulation.svg "collider proxy 负责 raycast、ground probe、movement blocking 和 runtime physics body")
+
 ## 主要方法和项目
 
 | 方法 / 项目 | 简介 | 适合对象 | Video2Mesh 用法 |

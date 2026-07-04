@@ -15,6 +15,8 @@ visibility: public
 
 物体级补全适合从 object crops、selected frames、mask 和粗 3D bbox 出发，生成 object-local visual mesh，再对齐回原始场景。
 
+![物体补全阶段输入输出](../assets/stage-completion.svg "物体补全从 selected frames 和 mask 出发生成 object-local mesh，再由 Video2Mesh 对齐回场景")
+
 ## 主要项目和模型
 
 | 项目 / 方法 | 简介 | 输入输出 | 对 Video2Mesh 的作用 | 注意 |

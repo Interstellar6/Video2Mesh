@@ -1,6 +1,7 @@
 ---
 title: Video2Mesh 项目文档 Overview
 id: video2mesh-project-docs-overview
+doc_type: overview
 category: 项目文档
 visibility: public
 summary: Video2Mesh 项目文档入口，串联项目简介、pipeline 和运行方式。
@@ -13,7 +14,9 @@ tags:
 
 这个目录只放项目当前对外可读的稳定说明，不混入旧调研长文和实验草稿。
 
-## 文档结构
+![Video2Mesh 项目文档阅读地图](assets/project-doc-map.svg "项目文档从项目边界、pipeline 合同到运行入口和 runtime 资产导出")
+
+## 阅读路径
 
 | 文档 | 解决的问题 |
 |---|---|
