@@ -30,7 +30,7 @@ visibility: public
 | 语义与 Scene Graph | [semantic-scene-graph](semantic-scene-graph/overview.md) | SAM/Grounded-SAM、2D-to-3D fusion、semantic splats、face sidecar |
 | Collider 与物理代理 | [collider-physics-proxy](collider-physics-proxy/overview.md) | static collider、primitive proxy、convex decomposition、Rapier/Unity collision |
 | 物体仿真 | [object-simulation](object-simulation/overview.md) | rigid body、soft body、PhysSplat/Sim Anything、动态 Gaussian |
-| 工业资产管线 | [industrial-pipelines](industrial-pipelines/overview.md) | World Labs / Icare、image-blaster、Spark viewer、GLB runtime asset convention |
+| 工业资产管线 | [industrial-pipelines](industrial-pipelines/overview.md) | SimFoundry、World Labs / Icare、image-blaster、Spark viewer、GLB runtime asset convention |
 | 本项目实验 | [experiments](experiments/overview.md) | GS2Mesh、Open3D Poisson、COLMAP Delaunay、语义投影、Web visual/physics proxy demo |
 
 ## 当前总判断
