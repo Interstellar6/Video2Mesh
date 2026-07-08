@@ -46,6 +46,11 @@ The slower Gaussian probability backprojection route is also optional now; the
 default route uses semantic splats directly for mesh semantic transfer. Re-enable
 the projected probability experiment with `GAUSSIAN_BACKPROJECT=1`.
 
+If the GraphDECO 3DGS run is available but the lightweight gsplat preview
+dependencies are not installed, keep the visual/mesh pipeline moving with
+`RENDER_GSPLAT_PREVIEW=0`. This only skips the preview render, not the
+GraphDECO training output or viewer PLY exports.
+
 The default 3DGS cleanup is intentionally conservative for room-scale scenes:
 it does not remove KNN/MAD sparse points or low-opacity elongated Gaussians by
 default, because those rules removed real walls and floors in bedroom scans.
@@ -72,12 +77,29 @@ GraphDECO's reference trainer is still single-scene/single-process in this
 pipeline, so use `GRAPHDECO_CUDA_VISIBLE_DEVICES=<gpu>` for one run, or launch
 multiple independent scenes/parameter sweeps on different GPUs.
 
+Some servers ship a COLMAP binary that can run sparse/dense MVS but was built
+without CGAL-backed Delaunay meshing. In that case keep `COLMAP_BINARY` for
+SfM/MVS and point only the scene mesh stage at a CGAL-capable binary or wrapper:
+
+```bash
+SCENE_MESH_COLMAP_BINARY=tools/colmap_with_libstdcxx.sh \
+COLMAP_REAL_BINARY=/data/zyx/workspace/Video2MeshWorkspace/colmap_cuda/bin/colmap \
+COLMAP_LIBSTDCXX_DIR=/data/zyx/workspace/Video2MeshWorkspace/third_party/runtime_libs/libstdcxx_compat \
+RENDER_GSPLAT_PREVIEW=0 \
+bash run.sh dataset/<video>.mp4
+```
+
 Prepared production-upgrade jobs and external per-object mesh jobs also support
 outer-loop GPU assignment. For generated `run_mesh_jobs.sh` scripts, use:
 
 ```bash
 RUN_PARALLEL=1 GPU_POOL=0,1,2,3 MAX_PARALLEL_JOBS=4 bash run_mesh_jobs.sh
 ```
+
+For future multi-object or multi-configuration training/reconstruction stages,
+prefer this outer-loop GPU pool style by default. Single-scene stages that are
+CPU-bound or single-process by design should stay single-task until their own
+backend supports robust distributed execution.
 
 For commands, QA and research decisions, start here:
 

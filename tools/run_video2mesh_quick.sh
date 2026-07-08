@@ -24,6 +24,7 @@ Optional environment overrides:
   MAST3R_CONFIG=config/base.yaml
   MAST3R_CALIB=/path/to/intrinsics.yaml
   COLMAP_BINARY=colmap
+  SCENE_MESH_COLMAP_BINARY=colmap
   COLMAP_MATCHER=exhaustive
   COLMAP_GPU_INDEX="-1"
   COLMAP_DENSE_GPU_INDEX="-1"
@@ -44,6 +45,7 @@ Optional environment overrides:
   GRAPHDECO_OPACITY_RESET_INTERVAL=3000
   GRAPHDECO_SH_DEGREE=3
   GRAPHDECO_EXTRA_ARGS=""
+  RENDER_GSPLAT_PREVIEW=1|0
   STRICT_3DGS_PRESERVE_BACKGROUND_PLANES=1
   STRICT_3DGS_GEOMETRIC_OUTLIERS=0
   STRICT_3DGS_ELONGATION_FILTER=0
@@ -132,6 +134,7 @@ RUN_MAST3R="${RUN_MAST3R:-0}"
 RUN_COLMAP="${RUN_COLMAP:-1}"
 GS_BACKEND="${GS_BACKEND:-graphdeco}"
 RUN_GSPLAT="${RUN_GSPLAT:-$([[ "$GS_BACKEND" == "minimal" ]] && printf 1 || printf 0)}"
+RENDER_GSPLAT_PREVIEW="${RENDER_GSPLAT_PREVIEW:-1}"
 RUN_SAM2="${RUN_SAM2:-1}"
 MAX_FRAMES="${MAX_FRAMES:-200}"
 EXTRACT_EVERY="${EXTRACT_EVERY:-1}"
@@ -139,6 +142,7 @@ START_SEC="${START_SEC:-}"
 END_SEC="${END_SEC:-}"
 DURATION_SEC="${DURATION_SEC:-}"
 COLMAP_BINARY="${COLMAP_BINARY:-colmap}"
+SCENE_MESH_COLMAP_BINARY="${SCENE_MESH_COLMAP_BINARY:-$COLMAP_BINARY}"
 COLMAP_CAMERA_MODEL="${COLMAP_CAMERA_MODEL:-PINHOLE}"
 COLMAP_CAMERA_PARAMS="${COLMAP_CAMERA_PARAMS:-}"
 COLMAP_MATCHER="${COLMAP_MATCHER:-exhaustive}"
@@ -317,7 +321,8 @@ echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] reconstruction: colmap=${RUN_COLMAP} mast3r=${RUN_MAST3R} max_frames=${MAX_FRAMES} every=${EXTRACT_EVERY}" | tee -a "$LOG"
 echo "[Video2Mesh quick] gpu: colmap=${COLMAP_GPU_INDEX} colmap_dense=${COLMAP_DENSE_GPU_INDEX} graphdeco_visible=${GRAPHDECO_CUDA_VISIBLE_DEVICES:-inherit} groundingdino=${GROUNDINGDINO_DEVICE} sam=${SAM_DEVICE} sam2=${SAM2_DEVICE}" | tee -a "$LOG"
-echo "[Video2Mesh quick] scene_mesh: reconstruct=${RECONSTRUCT_SCENE_MESHES} transfer=${TRANSFER_SCENE_MESH_SEMANTICS} split=${SPLIT_SCENE_MESH_BY_SEMANTICS} route=${SCENE_MESH_SEMANTIC_ROUTE}" | tee -a "$LOG"
+echo "[Video2Mesh quick] gsplat_preview: ${RENDER_GSPLAT_PREVIEW}" | tee -a "$LOG"
+echo "[Video2Mesh quick] scene_mesh: reconstruct=${RECONSTRUCT_SCENE_MESHES} transfer=${TRANSFER_SCENE_MESH_SEMANTICS} split=${SPLIT_SCENE_MESH_BY_SEMANTICS} route=${SCENE_MESH_SEMANTIC_ROUTE} colmap=${SCENE_MESH_COLMAP_BINARY}" | tee -a "$LOG"
 echo "[Video2Mesh quick] defaults: strict_3dgs_clean=${STRICT_3DGS_CLEAN} scene_only=${STRICT_3DGS_GEOMETRIC_OUTLIERS}/${STRICT_3DGS_ELONGATION_FILTER} auto_merge=${AUTO_MERGE_OBJECT_MASKS}/${OBJECT_MERGE_APPLY} gaussian_backproject=${GAUSSIAN_BACKPROJECT} mask_mesh_format=${MASK_MESH_FORMAT} simulator_adapters=${RUN_SIMULATOR_ADAPTERS}" | tee -a "$LOG"
 
 g3dgs_args=()
@@ -429,7 +434,10 @@ fi
 
 scene_mesh_args=()
 if [[ "$RECONSTRUCT_SCENE_MESHES" == "1" || "$RECONSTRUCT_SCENE_MESHES" == "true" ]]; then
-  scene_mesh_args+=(--reconstruct-scene-meshes)
+  scene_mesh_args+=(
+    --reconstruct-scene-meshes
+    --scene-mesh-colmap-binary "$SCENE_MESH_COLMAP_BINARY"
+  )
 fi
 if [[ "$TRANSFER_SCENE_MESH_SEMANTICS" == "1" || "$TRANSFER_SCENE_MESH_SEMANTICS" == "true" ]]; then
   scene_mesh_args+=(
@@ -484,6 +492,16 @@ if [[ "$GAUSSIAN_BACKPROJECT" == "1" || "$GAUSSIAN_BACKPROJECT" == "true" ]]; th
   )
 fi
 
+gsplat_preview_args=()
+if [[ "$RENDER_GSPLAT_PREVIEW" == "1" || "$RENDER_GSPLAT_PREVIEW" == "true" ]]; then
+  gsplat_preview_args+=(
+    --render-gsplat-preview
+    --preview-max-frames 6
+    --preview-width "$GSPLAT_WIDTH"
+    --preview-height "$GSPLAT_HEIGHT"
+  )
+fi
+
 "$V2M_PYTHON" -B -m video2mesh.cli run-pipeline \
   --project-root "$PROJECT_ROOT" \
   --scene-id "$SCENE_ID" \
@@ -506,10 +524,7 @@ fi
   --reconstruction-preview-max-frames 4 \
   --reconstruction-preview-max-points 12000 \
   "${g3dgs_args[@]}" \
-  --render-gsplat-preview \
-  --preview-max-frames 6 \
-  --preview-width "$GSPLAT_WIDTH" \
-  --preview-height "$GSPLAT_HEIGHT" \
+  "${gsplat_preview_args[@]}" \
   "${prompt_discovery_args[@]}" \
   --auto-prompt-method "$AUTO_PROMPT_METHOD" \
   --auto-prompt-frame-index "$AUTO_PROMPT_FRAME_INDEX" \

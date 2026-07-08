@@ -56,6 +56,12 @@ Gaussian probability backprojection 现在也不作为 quick run 默认阻塞项
 GAUSSIAN_BACKPROJECT=1 bash run.sh dataset/<video>.mp4
 ```
 
+如果 GraphDECO 30k 已经正常输出，但当前环境没有安装 `torch + gsplat` 预览依赖，可以只跳过 gsplat preview，不影响 3DGS PLY、semantic splats、Delaunay mesh 和 simulator bundle：
+
+```bash
+RENDER_GSPLAT_PREVIEW=0 bash run.sh dataset/<video>.mp4
+```
+
 常用调参：
 
 ```bash
@@ -98,6 +104,22 @@ bash run.sh dataset/<video>.mp4
 ```bash
 RUN_PARALLEL=1 GPU_POOL=0,1,2,3 MAX_PARALLEL_JOBS=4 bash run_mesh_jobs.sh
 ```
+
+以后新增的多物体、多候选、多参数训练/重建阶段，默认也应沿用这种外层 GPU pool 调度：每个对象或每个配置一个进程，按 `GPU_POOL` 分配设备。COLMAP Delaunay、mesh semantic transfer、bundle export 这类 CPU/IO 或单任务阶段则先保持单进程稳定。
+
+## COLMAP Delaunay 环境
+
+部分服务器的系统 `colmap` 可以跑 sparse/dense，但 `delaunay_mesher` 会报 `Delaunay meshing requires CGAL`。这时不要替换整条 COLMAP 路线，直接给 scene mesh 阶段指定一个带 CGAL 的 COLMAP binary 或 wrapper：
+
+```bash
+SCENE_MESH_COLMAP_BINARY=tools/colmap_with_libstdcxx.sh \
+COLMAP_REAL_BINARY=/data/zyx/workspace/Video2MeshWorkspace/colmap_cuda/bin/colmap \
+COLMAP_LIBSTDCXX_DIR=/data/zyx/workspace/Video2MeshWorkspace/third_party/runtime_libs/libstdcxx_compat \
+RENDER_GSPLAT_PREVIEW=0 \
+bash run.sh dataset/<video>.mp4
+```
+
+`tools/colmap_with_libstdcxx.sh` 只给 COLMAP 进程补新版 `libstdc++` 搜索路径，避免把整个 Python/conda 环境的 `LD_LIBRARY_PATH` 污染掉。
 
 ## 本地文档站
 
