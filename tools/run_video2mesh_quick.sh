@@ -25,6 +25,12 @@ Optional environment overrides:
   MAST3R_CALIB=/path/to/intrinsics.yaml
   COLMAP_BINARY=colmap
   COLMAP_MATCHER=exhaustive
+  COLMAP_GPU_INDEX="-1"
+  COLMAP_DENSE_GPU_INDEX="-1"
+  GRAPHDECO_CUDA_VISIBLE_DEVICES=""
+  SAM_DEVICE=cuda
+  SAM2_DEVICE=cuda
+  GROUNDINGDINO_DEVICE=auto
   COLMAP_MAPPER_EXTRA_ARGS=""
   GS_BACKEND=graphdeco|minimal|none
   GRAPHDECO_ROOT=/root/autodl-tmp/workspace/gaussian-splatting
@@ -118,6 +124,8 @@ GROUNDINGDINO_ROOT="${GROUNDINGDINO_ROOT:-/root/autodl-tmp/workspace/GroundingDI
 GROUNDINGDINO_CHECKPOINT="${GROUNDINGDINO_CHECKPOINT:-/root/autodl-tmp/checkpoints/groundingdino/groundingdino_swint_ogc.pth}"
 GROUNDINGDINO_CONFIG="${GROUNDINGDINO_CONFIG:-}"
 GROUNDINGDINO_DEVICE="${GROUNDINGDINO_DEVICE:-auto}"
+SAM_DEVICE="${SAM_DEVICE:-cuda}"
+SAM2_DEVICE="${SAM2_DEVICE:-cuda}"
 OBJECT_PROMPT_QUERIES="${OBJECT_PROMPT_QUERIES:-}"
 
 RUN_MAST3R="${RUN_MAST3R:-0}"
@@ -136,6 +144,9 @@ COLMAP_CAMERA_PARAMS="${COLMAP_CAMERA_PARAMS:-}"
 COLMAP_MATCHER="${COLMAP_MATCHER:-exhaustive}"
 COLMAP_SEQUENTIAL_OVERLAP="${COLMAP_SEQUENTIAL_OVERLAP:-20}"
 COLMAP_USE_GPU="${COLMAP_USE_GPU:-0}"
+COLMAP_GPU_INDEX="${COLMAP_GPU_INDEX:-${CUDA_VISIBLE_DEVICES:--1}}"
+COLMAP_GPU_INDEX="${COLMAP_GPU_INDEX// /}"
+COLMAP_DENSE_GPU_INDEX="${COLMAP_DENSE_GPU_INDEX:-$COLMAP_GPU_INDEX}"
 COLMAP_MAPPER_EXTRA_ARGS="${COLMAP_MAPPER_EXTRA_ARGS:-}"
 COLMAP_REFINE_FOCAL_LENGTH="${COLMAP_REFINE_FOCAL_LENGTH:-1}"
 COLMAP_REFINE_PRINCIPAL_POINT="${COLMAP_REFINE_PRINCIPAL_POINT:-0}"
@@ -151,6 +162,7 @@ GRAPHDECO_DENSIFY_GRAD_THRESHOLD="${GRAPHDECO_DENSIFY_GRAD_THRESHOLD:-0.002}"
 GRAPHDECO_OPACITY_RESET_INTERVAL="${GRAPHDECO_OPACITY_RESET_INTERVAL:-3000}"
 GRAPHDECO_SH_DEGREE="${GRAPHDECO_SH_DEGREE:-3}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
+GRAPHDECO_CUDA_VISIBLE_DEVICES="${GRAPHDECO_CUDA_VISIBLE_DEVICES:-}"
 GSPLAT_ITERATIONS="${GSPLAT_ITERATIONS:-500}"
 GSPLAT_MAX_FRAMES="${GSPLAT_MAX_FRAMES:-6}"
 GSPLAT_MAX_POINTS="${GSPLAT_MAX_POINTS:-24000}"
@@ -304,17 +316,22 @@ echo "[Video2Mesh quick] auto_prompt_method: $AUTO_PROMPT_METHOD" | tee -a "$LOG
 echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] reconstruction: colmap=${RUN_COLMAP} mast3r=${RUN_MAST3R} max_frames=${MAX_FRAMES} every=${EXTRACT_EVERY}" | tee -a "$LOG"
+echo "[Video2Mesh quick] gpu: colmap=${COLMAP_GPU_INDEX} colmap_dense=${COLMAP_DENSE_GPU_INDEX} graphdeco_visible=${GRAPHDECO_CUDA_VISIBLE_DEVICES:-inherit} groundingdino=${GROUNDINGDINO_DEVICE} sam=${SAM_DEVICE} sam2=${SAM2_DEVICE}" | tee -a "$LOG"
 echo "[Video2Mesh quick] scene_mesh: reconstruct=${RECONSTRUCT_SCENE_MESHES} transfer=${TRANSFER_SCENE_MESH_SEMANTICS} split=${SPLIT_SCENE_MESH_BY_SEMANTICS} route=${SCENE_MESH_SEMANTIC_ROUTE}" | tee -a "$LOG"
 echo "[Video2Mesh quick] defaults: strict_3dgs_clean=${STRICT_3DGS_CLEAN} scene_only=${STRICT_3DGS_GEOMETRIC_OUTLIERS}/${STRICT_3DGS_ELONGATION_FILTER} auto_merge=${AUTO_MERGE_OBJECT_MASKS}/${OBJECT_MERGE_APPLY} gaussian_backproject=${GAUSSIAN_BACKPROJECT} mask_mesh_format=${MASK_MESH_FORMAT} simulator_adapters=${RUN_SIMULATOR_ADAPTERS}" | tee -a "$LOG"
 
 g3dgs_args=()
 if [[ "$GS_BACKEND" == "graphdeco" ]]; then
+  graphdeco_cuda_prefix=""
+  if [[ -n "$GRAPHDECO_CUDA_VISIBLE_DEVICES" ]]; then
+    graphdeco_cuda_prefix="CUDA_VISIBLE_DEVICES=${GRAPHDECO_CUDA_VISIBLE_DEVICES} "
+  fi
   g3dgs_args=(
     --prepare-3dgs-source
     --g3dgs-output-path scene/reconstruction/3dgs_graphdeco
     --g3dgs-work-dir external/graphdeco_3dgs
     --g3dgs-clean-init-point-cloud
-    --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_SAVE_ITERATIONS} --test_iterations ${GRAPHDECO_TEST_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --sh_degree ${GRAPHDECO_SH_DEGREE} --densify_until_iter ${GRAPHDECO_DENSIFY_UNTIL_ITER} --densify_from_iter ${GRAPHDECO_DENSIFY_FROM_ITER} --densification_interval ${GRAPHDECO_DENSIFICATION_INTERVAL} --densify_grad_threshold ${GRAPHDECO_DENSIFY_GRAD_THRESHOLD} --opacity_reset_interval ${GRAPHDECO_OPACITY_RESET_INTERVAL} ${GRAPHDECO_EXTRA_ARGS} --disable_viewer"
+    --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${graphdeco_cuda_prefix}${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_SAVE_ITERATIONS} --test_iterations ${GRAPHDECO_TEST_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --sh_degree ${GRAPHDECO_SH_DEGREE} --densify_until_iter ${GRAPHDECO_DENSIFY_UNTIL_ITER} --densify_from_iter ${GRAPHDECO_DENSIFY_FROM_ITER} --densification_interval ${GRAPHDECO_DENSIFICATION_INTERVAL} --densify_grad_threshold ${GRAPHDECO_DENSIFY_GRAD_THRESHOLD} --opacity_reset_interval ${GRAPHDECO_OPACITY_RESET_INTERVAL} ${GRAPHDECO_EXTRA_ARGS} --disable_viewer"
   )
   if [[ "$STRICT_3DGS_CLEAN" == "1" || "$STRICT_3DGS_CLEAN" == "true" ]]; then
     g3dgs_args+=(
@@ -379,6 +396,8 @@ if [[ "$RUN_COLMAP" == "1" || "$RUN_COLMAP" == "true" ]]; then
     --colmap-camera-model "$COLMAP_CAMERA_MODEL"
     --colmap-matcher "$COLMAP_MATCHER"
     --colmap-sequential-overlap "$COLMAP_SEQUENTIAL_OVERLAP"
+    --colmap-gpu-index "$COLMAP_GPU_INDEX"
+    --colmap-dense-gpu-index "$COLMAP_DENSE_GPU_INDEX"
   )
   if [[ -n "$COLMAP_CAMERA_PARAMS" ]]; then
     colmap_args+=(--colmap-camera-params "$COLMAP_CAMERA_PARAMS")
@@ -506,11 +525,11 @@ fi
   --auto-prompt-min-parent-area-ratio "$AUTO_PROMPT_MIN_PARENT_AREA_RATIO" \
   --sam-checkpoint "$SAM_CHECKPOINT" \
   --sam-model-type "$SAM_MODEL_TYPE" \
-  --sam-device cuda \
+  --sam-device "$SAM_DEVICE" \
   --mask-backend "$MASK_BACKEND" \
   --sam2-checkpoint "$SAM2_CHECKPOINT" \
   --sam2-model-cfg "$SAM2_MODEL_CFG" \
-  --sam2-device cuda \
+  --sam2-device "$SAM2_DEVICE" \
   --sam2-offload-video-to-cpu \
   --sam2-offload-state-to-cpu \
   --track-max-frames "$TRACK_MAX_FRAMES" \

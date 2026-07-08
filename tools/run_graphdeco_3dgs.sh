@@ -38,6 +38,7 @@ Optional environment overrides:
   STRICT_CLUSTER_EPS_RATIO=0.015
   STRICT_CLUSTER_MIN_POINTS=300
   STRICT_PRESERVE_BACKGROUND_PLANES=1
+  GRAPHDECO_CUDA_VISIBLE_DEVICES=""
   GRAPHDECO_EXTRA_ARGS=""
   TRAIN_IMAGES=images
 USAGE
@@ -83,6 +84,7 @@ STRICT_BBOX_PADDING_RATIO="${STRICT_BBOX_PADDING_RATIO:-0.12}"
 STRICT_CLUSTER_EPS_RATIO="${STRICT_CLUSTER_EPS_RATIO:-0.015}"
 STRICT_CLUSTER_MIN_POINTS="${STRICT_CLUSTER_MIN_POINTS:-300}"
 STRICT_PRESERVE_BACKGROUND_PLANES="${STRICT_PRESERVE_BACKGROUND_PLANES:-1}"
+GRAPHDECO_CUDA_VISIBLE_DEVICES="${GRAPHDECO_CUDA_VISIBLE_DEVICES:-}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 TRAIN_IMAGES="${TRAIN_IMAGES:-images}"
 SOURCE_PATH="${SOURCE_PATH:-$PROJECT_ROOT/external/graphdeco_3dgs/colmap_source}"
@@ -149,6 +151,12 @@ echo "[Video2Mesh GraphDECO] output:  $OUTPUT_PATH"
 echo "[Video2Mesh GraphDECO] graphdeco: $GRAPHDECO_ROOT"
 echo "[Video2Mesh GraphDECO] iterations=$ITERATIONS resolution=$RESOLUTION"
 echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from_iter=$DENSIFY_FROM_ITER"
+echo "[Video2Mesh GraphDECO] cuda_visible_devices=${GRAPHDECO_CUDA_VISIBLE_DEVICES:-inherit}"
+
+graphdeco_cuda_prefix=""
+if [[ -n "$GRAPHDECO_CUDA_VISIBLE_DEVICES" ]]; then
+  graphdeco_cuda_prefix="CUDA_VISIBLE_DEVICES=${GRAPHDECO_CUDA_VISIBLE_DEVICES} "
+fi
 
 "$V2M_PYTHON" -B -m video2mesh.cli run-3dgs \
   --project-root "$PROJECT_ROOT" \
@@ -162,10 +170,13 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
   --image-mode copy \
   --clean-init-point-cloud \
   --prepare-only \
-  --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $SAVE_ITERATIONS --test_iterations $TEST_ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --sh_degree $SH_DEGREE --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER --densification_interval $DENSIFICATION_INTERVAL --densify_grad_threshold $DENSIFY_GRAD_THRESHOLD --opacity_reset_interval $OPACITY_RESET_INTERVAL $GRAPHDECO_EXTRA_ARGS --disable_viewer"
+  --command-template "cd $GRAPHDECO_ROOT && ${graphdeco_cuda_prefix}$GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $SAVE_ITERATIONS --test_iterations $TEST_ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --sh_degree $SH_DEGREE --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER --densification_interval $DENSIFICATION_INTERVAL --densify_grad_threshold $DENSIFY_GRAD_THRESHOLD --opacity_reset_interval $OPACITY_RESET_INTERVAL $GRAPHDECO_EXTRA_ARGS --disable_viewer"
 
 (
   cd "$GRAPHDECO_ROOT"
+  if [[ -n "$GRAPHDECO_CUDA_VISIBLE_DEVICES" ]]; then
+    export CUDA_VISIBLE_DEVICES="$GRAPHDECO_CUDA_VISIBLE_DEVICES"
+  fi
   "$GRAPHDECO_PYTHON" train.py \
     -s "$SOURCE_PATH" \
     -m "$OUTPUT_PATH" \

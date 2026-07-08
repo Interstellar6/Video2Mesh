@@ -76,6 +76,29 @@ BACKGROUND_PLANE_INCLUDE_OTHER_PLANES=0 bash run.sh dataset/<video>.mp4
 OBJECT_MERGE_APPLY=0 bash run.sh dataset/<video>.mp4
 ```
 
+## 多 GPU 运行
+
+mil8 这类 8 卡机器上，单个 quick run 里最适合多卡加速的是 COLMAP dense stereo；GraphDECO 官方 trainer 在当前 pipeline 里仍按单场景单进程运行。推荐做法是不要在外层固定 `CUDA_VISIBLE_DEVICES=0`，而是分阶段指定：
+
+```bash
+COLMAP_USE_GPU=1 \
+COLMAP_GPU_INDEX=0,1,2,3,4,5,6,7 \
+COLMAP_DENSE_GPU_INDEX=0,1,2,3,4,5,6,7 \
+GRAPHDECO_CUDA_VISIBLE_DEVICES=0 \
+GROUNDINGDINO_DEVICE=cuda:1 \
+SAM_DEVICE=cuda:1 \
+SAM2_DEVICE=cuda:1 \
+bash run.sh dataset/<video>.mp4
+```
+
+如果某张卡被占用，可以从 `COLMAP_DENSE_GPU_INDEX` 里删掉对应编号。后续做多场景或多参数训练时，可以启动多个独立 run，并用不同的 `GRAPHDECO_CUDA_VISIBLE_DEVICES` 分配到不同 GPU；这比临时把 GraphDECO 改成 DDP 更稳。
+
+外部 object mesh / production-upgrade jobs 也按外层任务并行来吃多卡。生成的 `run_mesh_jobs.sh` 默认仍是串行；需要并行时显式打开：
+
+```bash
+RUN_PARALLEL=1 GPU_POOL=0,1,2,3 MAX_PARALLEL_JOBS=4 bash run_mesh_jobs.sh
+```
+
 ## 本地文档站
 
 ```bash

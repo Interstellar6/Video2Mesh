@@ -52,6 +52,33 @@ default, because those rules removed real walls and floors in bedroom scans.
 Use `STRICT_3DGS_GEOMETRIC_OUTLIERS=1` or `STRICT_3DGS_ELONGATION_FILTER=1`
 only for debugging a noisy visual layer.
 
+On multi-GPU servers, keep `CUDA_VISIBLE_DEVICES` unset for the full quick
+pipeline unless you are intentionally pinning the whole process. Prefer explicit
+stage assignment:
+
+```bash
+COLMAP_USE_GPU=1 \
+COLMAP_GPU_INDEX=0,1,2,3,4,5,6,7 \
+COLMAP_DENSE_GPU_INDEX=0,1,2,3,4,5,6,7 \
+GRAPHDECO_CUDA_VISIBLE_DEVICES=0 \
+GROUNDINGDINO_DEVICE=cuda:1 \
+SAM_DEVICE=cuda:1 \
+SAM2_DEVICE=cuda:1 \
+bash run.sh dataset/<video>.mp4
+```
+
+COLMAP dense stereo is the main single-run multi-GPU acceleration point.
+GraphDECO's reference trainer is still single-scene/single-process in this
+pipeline, so use `GRAPHDECO_CUDA_VISIBLE_DEVICES=<gpu>` for one run, or launch
+multiple independent scenes/parameter sweeps on different GPUs.
+
+Prepared production-upgrade jobs and external per-object mesh jobs also support
+outer-loop GPU assignment. For generated `run_mesh_jobs.sh` scripts, use:
+
+```bash
+RUN_PARALLEL=1 GPU_POOL=0,1,2,3 MAX_PARALLEL_JOBS=4 bash run_mesh_jobs.sh
+```
+
 For commands, QA and research decisions, start here:
 
 - [Project Overview](docs/01-project-overview.md)

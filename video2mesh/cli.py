@@ -2503,7 +2503,9 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
         "colmap_binary": str(colmap_bin),
         "camera_model": camera_model,
         "matcher": args.matcher,
+        "gpu_index": str(args.gpu_index),
         "dense_reconstruction": bool(args.dense_reconstruction),
+        "dense_gpu_index": str(args.dense_gpu_index),
         "steps": [],
     }
 
@@ -2537,6 +2539,8 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
             *camera_args,
             "--SiftExtraction.use_gpu",
             "1" if args.use_gpu else "0",
+            "--SiftExtraction.gpu_index",
+            str(args.gpu_index),
         ],
     )
     if args.matcher == "sequential":
@@ -2547,6 +2551,8 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
             str(database_path),
             "--SiftMatching.use_gpu",
             "1" if args.use_gpu else "0",
+            "--SiftMatching.gpu_index",
+            str(args.gpu_index),
             "--SequentialMatching.overlap",
             str(args.sequential_overlap),
         ]
@@ -2558,6 +2564,8 @@ def cmd_run_colmap(args: argparse.Namespace) -> int:
             str(database_path),
             "--SiftMatching.use_gpu",
             "1" if args.use_gpu else "0",
+            "--SiftMatching.gpu_index",
+            str(args.gpu_index),
         ]
     else:
         raise ValueError(f"Unsupported COLMAP matcher: {args.matcher}")
@@ -4146,6 +4154,12 @@ def write_high_quality_3dgs_runner(
         f'OUTPUT_PATH="{output_path}"',
         f'PROJECT_ROOT="{project_root}"',
         f'LOG_PATH="{log_path}"',
+        'GPU_DEVICE="${GPU_DEVICE:-${GRAPHDECO_CUDA_VISIBLE_DEVICES:-}}"',
+        "",
+        'if [[ -n "${GPU_DEVICE}" ]]; then',
+        '  export CUDA_VISIBLE_DEVICES="${GPU_DEVICE}"',
+        "fi",
+        'echo "[Video2Mesh high-quality 3DGS] provider=${PROVIDER} cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-inherit}"',
         "",
         'if [[ ! -f "${SOURCE_PATH}/sparse/0/points3D.txt" ]]; then',
         '  echo "Missing COLMAP points3D.txt: ${SOURCE_PATH}/sparse/0/points3D.txt" >&2',
@@ -25086,7 +25100,70 @@ def cmd_prepare_multiview_mesh_jobs(args: argparse.Namespace) -> int:
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        *commands,
+        'RUN_PARALLEL="${RUN_PARALLEL:-0}"',
+        'GPU_POOL="${GPU_POOL:-}"',
+        'MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-}"',
+        'IFS="," read -r -a GPU_IDS <<< "${GPU_POOL}"',
+        'if [[ -z "${MAX_PARALLEL_JOBS}" ]]; then',
+        '  if [[ -n "${GPU_POOL}" ]]; then',
+        '    MAX_PARALLEL_JOBS="${#GPU_IDS[@]}"',
+        "  else",
+        "    MAX_PARALLEL_JOBS=1",
+        "  fi",
+        "fi",
+        'if [[ "${MAX_PARALLEL_JOBS}" -lt 1 ]]; then',
+        "  MAX_PARALLEL_JOBS=1",
+        "fi",
+        "",
+        "commands=(",
+        *[f"  {shlex.quote(command)}" for command in commands],
+        ")",
+        "",
+        "run_mesh_job() {",
+        '  local idx="$1"',
+        '  local command="$2"',
+        '  local gpu=""',
+        '  if [[ -n "${GPU_POOL}" && "${#GPU_IDS[@]}" -gt 0 ]]; then',
+        '    gpu="${GPU_IDS[$((idx % ${#GPU_IDS[@]}))]}"',
+        "  fi",
+        '  echo "[Video2Mesh mesh job] index=${idx} gpu=${gpu:-inherit}"',
+        '  if [[ -n "${gpu}" ]]; then',
+        '    CUDA_VISIBLE_DEVICES="${gpu}" bash -lc "${command}"',
+        "  else",
+        '    bash -lc "${command}"',
+        "  fi",
+        "}",
+        "",
+        'echo "[Video2Mesh mesh jobs] count=${#commands[@]} run_parallel=${RUN_PARALLEL} gpu_pool=${GPU_POOL:-inherit} max_parallel=${MAX_PARALLEL_JOBS}"',
+        'if [[ "${#commands[@]}" -eq 0 ]]; then',
+        '  echo "[Video2Mesh mesh jobs] no commands; fill --command-template or run external backend manually."',
+        "  exit 0",
+        "fi",
+        "",
+        'if [[ "${RUN_PARALLEL}" == "1" || "${RUN_PARALLEL}" == "true" ]]; then',
+        "  status=0",
+        "  pids=()",
+        '  for idx in "${!commands[@]}"; do',
+        '    run_mesh_job "${idx}" "${commands[$idx]}" &',
+        '    pids+=("$!")',
+        '    if [[ "${#pids[@]}" -ge "${MAX_PARALLEL_JOBS}" ]]; then',
+        '      if ! wait "${pids[0]}"; then',
+        "        status=1",
+        "      fi",
+        '      pids=("${pids[@]:1}")',
+        "    fi",
+        "  done",
+        '  for pid in "${pids[@]}"; do',
+        '    if ! wait "${pid}"; then',
+        "      status=1",
+        "    fi",
+        "  done",
+        '  exit "${status}"',
+        "fi",
+        "",
+        'for idx in "${!commands[@]}"; do',
+        '  run_mesh_job "${idx}" "${commands[$idx]}"',
+        "done",
         "",
     ]
     script_path.write_text("\n".join(lines), encoding="utf-8")
@@ -39531,6 +39608,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     matcher=args.colmap_matcher,
                     sequential_overlap=args.colmap_sequential_overlap,
                     use_gpu=args.colmap_use_gpu,
+                    gpu_index=args.colmap_gpu_index,
                     refine_focal_length=args.colmap_refine_focal_length,
                     refine_principal_point=args.colmap_refine_principal_point,
                     refine_extra_params=args.colmap_refine_extra_params,
@@ -40848,6 +40926,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--matcher", choices=["sequential", "exhaustive"], default="exhaustive")
     p.add_argument("--sequential-overlap", type=int, default=20)
     p.add_argument("--use-gpu", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--gpu-index", default="-1", help="COLMAP SIFT extraction/matching GPU index. Use comma-separated indices on multi-GPU builds.")
     p.add_argument("--refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
@@ -42714,6 +42793,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colmap-matcher", choices=["sequential", "exhaustive"], default="exhaustive")
     p.add_argument("--colmap-sequential-overlap", type=int, default=20)
     p.add_argument("--colmap-use-gpu", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--colmap-gpu-index", default="-1", help="COLMAP SIFT extraction/matching GPU index. Use comma-separated indices on multi-GPU builds.")
     p.add_argument("--colmap-refine-focal-length", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--colmap-refine-principal-point", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--colmap-refine-extra-params", action=argparse.BooleanOptionalAction, default=False)
