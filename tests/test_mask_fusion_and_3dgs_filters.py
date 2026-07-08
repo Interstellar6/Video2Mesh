@@ -46,6 +46,7 @@ from video2mesh.cli import (
     read_gsplat_ply,
     resolve_export_record_path,
     scaled_intrinsic_for_size,
+    scene_bbox_cluster_keep_mask,
     select_colmap_sparse_model,
     source_labels_from_object_masks,
     write_json,
@@ -883,6 +884,36 @@ def test_clean_3dgs_floaters_can_preserve_background_planes(tmp_path: Path):
     assert header["vertex_count"] == plane.shape[0]
 
 
+def test_scene_bbox_cluster_filter_removes_dense_detached_cluster():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("open3d")
+    main = np.array([[x * 0.05, y * 0.05, 0.0] for x in range(8) for y in range(8)], dtype=np.float32)
+    detached = np.array([[5.0 + x * 0.01, 5.0 + y * 0.01, 0.0] for x in range(5) for y in range(5)], dtype=np.float32)
+    points = np.vstack([main, detached])
+
+    keep, report = scene_bbox_cluster_keep_mask(
+        points,
+        reference_points=main,
+        bbox_filter=True,
+        bbox_quantile_min=0.0,
+        bbox_quantile_max=1.0,
+        bbox_padding_ratio=0.05,
+        cluster_filter=True,
+        cluster_eps=0.08,
+        cluster_eps_ratio=0.0,
+        cluster_min_samples=3,
+        cluster_min_points=10,
+        cluster_min_ratio=0.0,
+        cluster_keep_largest=True,
+        min_keep_ratio=0.50,
+    )
+
+    assert int(keep.sum()) == main.shape[0]
+    assert keep[: main.shape[0]].all()
+    assert not keep[main.shape[0] :].any()
+    assert report["removed_count"] == detached.shape[0]
+
+
 def test_graphdeco_shape_regularizer_args_supports_cli_prefix():
     args = Namespace(
         g3dgs_shape_regularizer=True,
@@ -1313,12 +1344,20 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert colmap.dense_reconstruction is True
     assert colmap.dense_max_image_size == 2000
     assert g3dgs.prefer_dense_colmap_init is True
+    assert g3dgs.clean_init_point_cloud is True
     assert g3dgs.clean_3dgs_floaters is True
+    assert g3dgs.clean_strict_scene_filter is True
     assert g3dgs.clean_max_elongation == pytest.approx(25.0)
     pipeline = parser.parse_args(["run-pipeline", "--project-root", "proj"])
     assert pipeline.g3dgs_prefer_dense_colmap_init is True
+    assert pipeline.g3dgs_clean_init_point_cloud is True
     assert pipeline.g3dgs_clean_3dgs_floaters is True
+    assert pipeline.g3dgs_clean_strict_scene_filter is True
     assert pipeline.g3dgs_clean_max_elongation == pytest.approx(25.0)
+    assert pipeline.auto_merge_object_masks is True
+    assert pipeline.object_merge_apply is True
+    assert pipeline.mask_mesh_format == "ply"
+    assert pipeline.skip_simulator_adapters is True
     assert pipeline.reconstruct_scene_meshes is False
     assert pipeline.transfer_scene_mesh_semantics is False
     assert pipeline.split_scene_mesh_by_semantics is False

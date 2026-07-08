@@ -30,6 +30,11 @@ Optional environment overrides:
   CLEAN_MAX_ELONGATION=25
   CLEAN_MIN_OPACITY=0.01
   CLEAN_LOW_OPACITY=0.08
+  STRICT_3DGS_CLEAN=1
+  STRICT_REFERENCE_POINT_CLOUD=/path/to/external/colmap/dense/fused.ply
+  STRICT_BBOX_PADDING_RATIO=0.12
+  STRICT_CLUSTER_EPS_RATIO=0.015
+  STRICT_CLUSTER_MIN_POINTS=300
   GRAPHDECO_EXTRA_ARGS=""
   TRAIN_IMAGES=images
 USAGE
@@ -67,6 +72,11 @@ CLEAN_OUTLIER_MAD="${CLEAN_OUTLIER_MAD:-2.5}"
 CLEAN_MAX_ELONGATION="${CLEAN_MAX_ELONGATION:-25}"
 CLEAN_MIN_OPACITY="${CLEAN_MIN_OPACITY:-0.01}"
 CLEAN_LOW_OPACITY="${CLEAN_LOW_OPACITY:-0.08}"
+STRICT_3DGS_CLEAN="${STRICT_3DGS_CLEAN:-1}"
+STRICT_REFERENCE_POINT_CLOUD="${STRICT_REFERENCE_POINT_CLOUD:-$PROJECT_ROOT/external/colmap/dense/fused.ply}"
+STRICT_BBOX_PADDING_RATIO="${STRICT_BBOX_PADDING_RATIO:-0.12}"
+STRICT_CLUSTER_EPS_RATIO="${STRICT_CLUSTER_EPS_RATIO:-0.015}"
+STRICT_CLUSTER_MIN_POINTS="${STRICT_CLUSTER_MIN_POINTS:-300}"
 GRAPHDECO_EXTRA_ARGS="${GRAPHDECO_EXTRA_ARGS:-}"
 TRAIN_IMAGES="${TRAIN_IMAGES:-images}"
 SOURCE_PATH="${SOURCE_PATH:-$PROJECT_ROOT/external/graphdeco_3dgs/colmap_source}"
@@ -144,6 +154,7 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
   --point-cloud "$POINT_CLOUD" \
   --camera-model PINHOLE \
   --image-mode copy \
+  --clean-init-point-cloud \
   --prepare-only \
   --command-template "cd $GRAPHDECO_ROOT && $GRAPHDECO_PYTHON train.py -s {source_path} -m {output_path} --iterations $ITERATIONS --save_iterations $SAVE_ITERATIONS --test_iterations $TEST_ITERATIONS --resolution $RESOLUTION --images $TRAIN_IMAGES --sh_degree $SH_DEGREE --densify_until_iter $DENSIFY_UNTIL_ITER --densify_from_iter $DENSIFY_FROM_ITER --densification_interval $DENSIFICATION_INTERVAL --densify_grad_threshold $DENSIFY_GRAD_THRESHOLD --opacity_reset_interval $OPACITY_RESET_INTERVAL $GRAPHDECO_EXTRA_ARGS --disable_viewer"
 
@@ -169,22 +180,42 @@ echo "[Video2Mesh GraphDECO] densify_until_iter=$DENSIFY_UNTIL_ITER densify_from
 
 RAW_SPLAT="$OUTPUT_PATH/point_cloud/iteration_$ITERATIONS/point_cloud.ply"
 CLEAN_SPLAT="$OUTPUT_PATH/point_cloud/iteration_$ITERATIONS/point_cloud_clean.ply"
+CLEAN_STRICT_SPLAT="$OUTPUT_PATH/point_cloud/iteration_$ITERATIONS/point_cloud_clean_strict.ply"
 IMPORT_SPLAT="$RAW_SPLAT"
 if [[ "$CLEAN_3DGS_FLOATERS" == "1" ]]; then
   if [[ ! -f "$RAW_SPLAT" ]]; then
     echo "[Video2Mesh GraphDECO] Missing trained 3DGS PLY for cleaning: $RAW_SPLAT" >&2
     exit 2
   fi
+  clean_output="$CLEAN_SPLAT"
+  clean_args=()
+  if [[ "$STRICT_3DGS_CLEAN" == "1" || "$STRICT_3DGS_CLEAN" == "true" ]]; then
+    clean_output="$CLEAN_STRICT_SPLAT"
+    clean_args+=(
+      --strict-scene-filter
+      --bbox-padding-ratio "$STRICT_BBOX_PADDING_RATIO"
+      --cluster-eps-ratio "$STRICT_CLUSTER_EPS_RATIO"
+      --cluster-min-points "$STRICT_CLUSTER_MIN_POINTS"
+    )
+    if [[ -n "$STRICT_REFERENCE_POINT_CLOUD" && -f "$STRICT_REFERENCE_POINT_CLOUD" ]]; then
+      clean_args+=(--reference-point-cloud "$STRICT_REFERENCE_POINT_CLOUD")
+    fi
+  fi
   "$V2M_PYTHON" -B -m video2mesh.cli clean-3dgs-floaters \
     --project-root "$PROJECT_ROOT" \
     --input "$RAW_SPLAT" \
-    --output "$CLEAN_SPLAT" \
+    --output "$clean_output" \
     --knn "$CLEAN_KNN" \
     --outlier-mad "$CLEAN_OUTLIER_MAD" \
     --max-elongation "$CLEAN_MAX_ELONGATION" \
     --min-opacity "$CLEAN_MIN_OPACITY" \
-    --low-opacity "$CLEAN_LOW_OPACITY"
-  IMPORT_SPLAT="$CLEAN_SPLAT"
+    --low-opacity "$CLEAN_LOW_OPACITY" \
+    "${clean_args[@]}"
+  if [[ "$STRICT_3DGS_CLEAN" == "1" || "$STRICT_3DGS_CLEAN" == "true" ]]; then
+    IMPORT_SPLAT="$CLEAN_STRICT_SPLAT"
+  else
+    IMPORT_SPLAT="$CLEAN_SPLAT"
+  fi
 fi
 
 "$V2M_PYTHON" -B -m video2mesh.cli import-3dgs-result \

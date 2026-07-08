@@ -3180,6 +3180,169 @@ def background_plane_protection_mask(
     return protected, report
 
 
+def scene_bbox_cluster_keep_mask(
+    points,
+    *,
+    reference_points=None,
+    bbox_filter: bool,
+    bbox_quantile_min: float,
+    bbox_quantile_max: float,
+    bbox_padding_ratio: float,
+    cluster_filter: bool,
+    cluster_eps: float,
+    cluster_eps_ratio: float,
+    cluster_min_samples: int,
+    cluster_min_points: int,
+    cluster_min_ratio: float,
+    cluster_keep_largest: bool,
+    min_keep_ratio: float,
+) -> tuple[Any, dict[str, Any]]:
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3:
+        raise ValueError(f"Expected Nx3 points for scene filtering, got {points_np.shape}")
+    count = int(points_np.shape[0])
+    keep = np.ones(count, dtype=bool)
+    keep_floor = max(1, int(round(count * max(0.0, min(1.0, float(min_keep_ratio))))))
+    report: dict[str, Any] = {
+        "enabled": bool(bbox_filter or cluster_filter),
+        "input_count": count,
+        "min_keep_ratio": float(min_keep_ratio),
+        "steps": [],
+    }
+    if count == 0 or not report["enabled"]:
+        report["kept_count"] = count
+        report["removed_count"] = 0
+        return keep, report
+
+    if bbox_filter:
+        ref = points_np if reference_points is None else np.asarray(reference_points, dtype=np.float64)
+        bounds = quantile_bounds_from_points(ref, float(bbox_quantile_min), float(bbox_quantile_max), float(bbox_padding_ratio))
+        if bounds is None:
+            report["steps"].append({"name": "reference_quantile_bbox", "enabled": True, "reason": "empty_reference_points"})
+        else:
+            lower, upper = bounds
+            bbox_keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
+            candidate_keep = keep & bbox_keep
+            candidate_count = int(candidate_keep.sum())
+            step = {
+                "name": "reference_quantile_bbox",
+                "enabled": True,
+                "reference_count": int(ref.shape[0]) if ref.ndim == 2 else 0,
+                "q_min": float(bbox_quantile_min),
+                "q_max": float(bbox_quantile_max),
+                "padding_ratio": float(bbox_padding_ratio),
+                "min": [float(value) for value in lower.tolist()],
+                "max": [float(value) for value in upper.tolist()],
+                "candidate_kept_count": candidate_count,
+                "candidate_removed_count": int(count - candidate_count),
+            }
+            if candidate_count < keep_floor:
+                step["fallback"] = "too_few_points_after_bbox_filter"
+            else:
+                keep = candidate_keep
+                step["kept_count"] = candidate_count
+                step["removed_count"] = int(count - candidate_count)
+            report["steps"].append(step)
+
+    if cluster_filter:
+        active_indices = np.flatnonzero(keep)
+        if active_indices.size < max(1, int(cluster_min_samples)):
+            report["steps"].append(
+                {
+                    "name": "dbscan_significant_clusters",
+                    "enabled": True,
+                    "reason": "too_few_active_points",
+                    "active_count": int(active_indices.size),
+                    "min_samples": int(cluster_min_samples),
+                }
+            )
+        else:
+            active_points = points_np[active_indices]
+            diag = float(np.linalg.norm(np.maximum(active_points.max(axis=0) - active_points.min(axis=0), 1e-8)))
+            eps = float(cluster_eps) if float(cluster_eps) > 0 else diag * float(cluster_eps_ratio)
+            if eps <= 0:
+                report["steps"].append(
+                    {
+                        "name": "dbscan_significant_clusters",
+                        "enabled": True,
+                        "reason": "non_positive_eps",
+                        "bbox_diagonal": diag,
+                        "eps": eps,
+                    }
+                )
+            else:
+                o3d = import_open3d()
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(active_points)
+                labels = np.asarray(
+                    pcd.cluster_dbscan(eps=eps, min_points=max(1, int(cluster_min_samples)), print_progress=False),
+                    dtype=np.int64,
+                )
+                valid = labels >= 0
+                valid_labels = labels[valid]
+                step = {
+                    "name": "dbscan_significant_clusters",
+                    "enabled": True,
+                    "active_count": int(active_indices.size),
+                    "eps": float(eps),
+                    "eps_ratio": float(cluster_eps_ratio),
+                    "bbox_diagonal": diag,
+                    "min_samples": int(cluster_min_samples),
+                    "noise_points": int((~valid).sum()),
+                }
+                if valid_labels.size == 0:
+                    step["reason"] = "no_clusters"
+                    step["kept_count"] = int(keep.sum())
+                    step["removed_count"] = 0
+                    report["steps"].append(step)
+                else:
+                    unique, counts = np.unique(valid_labels, return_counts=True)
+                    largest_idx = int(np.argmax(counts))
+                    largest_label = int(unique[largest_idx])
+                    largest_count = int(counts[largest_idx])
+                    min_cluster_count = max(
+                        int(cluster_min_points),
+                        int(math.ceil(float(cluster_min_ratio) * float(active_indices.size))),
+                    )
+                    kept_labels = {
+                        int(label)
+                        for label, label_count in zip(unique.tolist(), counts.tolist())
+                        if int(label_count) >= min_cluster_count
+                    }
+                    if cluster_keep_largest:
+                        kept_labels.add(largest_label)
+                    cluster_keep_local = np.asarray([int(label) in kept_labels for label in labels], dtype=bool)
+                    candidate_keep = keep.copy()
+                    candidate_keep[active_indices] = cluster_keep_local
+                    candidate_count = int(candidate_keep.sum())
+                    step.update(
+                        {
+                            "cluster_count": int(unique.shape[0]),
+                            "largest_cluster": largest_label,
+                            "largest_cluster_points": largest_count,
+                            "min_cluster_points": int(cluster_min_points),
+                            "min_cluster_ratio": float(cluster_min_ratio),
+                            "effective_min_cluster_points": int(min_cluster_count),
+                            "kept_cluster_count": int(len(kept_labels)),
+                            "kept_clusters": sorted(kept_labels)[:50],
+                            "candidate_kept_count": candidate_count,
+                            "candidate_removed_count": int(count - candidate_count),
+                        }
+                    )
+                    if candidate_count < keep_floor:
+                        step["fallback"] = "too_few_points_after_cluster_filter"
+                    else:
+                        keep = candidate_keep
+                        step["kept_count"] = candidate_count
+                        step["removed_count"] = int(count - candidate_count)
+                    report["steps"].append(step)
+
+    report["kept_count"] = int(keep.sum())
+    report["removed_count"] = int(count - int(keep.sum()))
+    return keep, report
+
+
 def clean_3dgs_floaters(
     input_ply: Path,
     output_ply: Path,
@@ -3190,6 +3353,20 @@ def clean_3dgs_floaters(
     min_opacity: float,
     low_opacity: float,
     remove_low_opacity: bool,
+    strict_scene_filter: bool = False,
+    reference_point_cloud: Path | None = None,
+    bbox_filter: bool = True,
+    bbox_quantile_min: float = 0.005,
+    bbox_quantile_max: float = 0.995,
+    bbox_padding_ratio: float = 0.12,
+    cluster_filter: bool = True,
+    cluster_eps: float = 0.0,
+    cluster_eps_ratio: float = 0.015,
+    cluster_min_samples: int = 20,
+    cluster_min_points: int = 300,
+    cluster_min_ratio: float = 0.001,
+    cluster_keep_largest: bool = True,
+    strict_min_keep_ratio: float = 0.50,
     preserve_background_planes: bool = False,
     background_up_axis: str = "y",
     background_max_planes: int = 8,
@@ -3241,6 +3418,32 @@ def clean_3dgs_floaters(
     if remove_low_opacity:
         remove |= transparent
     candidate_remove = remove.copy()
+    strict_scene_report: dict[str, Any] = {"enabled": False}
+    if strict_scene_filter:
+        reference_points = None
+        reference_path = Path(reference_point_cloud).resolve() if reference_point_cloud else None
+        if reference_path and reference_path.exists():
+            reference_points, _reference_colors = read_point_cloud(reference_path)
+        strict_keep, strict_scene_report = scene_bbox_cluster_keep_mask(
+            means,
+            reference_points=reference_points,
+            bbox_filter=bool(bbox_filter),
+            bbox_quantile_min=float(bbox_quantile_min),
+            bbox_quantile_max=float(bbox_quantile_max),
+            bbox_padding_ratio=float(bbox_padding_ratio),
+            cluster_filter=bool(cluster_filter),
+            cluster_eps=float(cluster_eps),
+            cluster_eps_ratio=float(cluster_eps_ratio),
+            cluster_min_samples=int(cluster_min_samples),
+            cluster_min_points=int(cluster_min_points),
+            cluster_min_ratio=float(cluster_min_ratio),
+            cluster_keep_largest=bool(cluster_keep_largest),
+            min_keep_ratio=float(strict_min_keep_ratio),
+        )
+        strict_scene_report["reference_point_cloud"] = str(reference_path) if reference_path else None
+        strict_removed = ~strict_keep
+        remove |= strict_removed
+        strict_scene_report["candidate_removed_count"] = int(strict_removed.sum())
     background_plane_report: dict[str, Any] = {"enabled": False}
     if preserve_background_planes:
         protected, background_plane_report = background_plane_protection_mask(
@@ -3279,8 +3482,23 @@ def clean_3dgs_floaters(
             "min_opacity": float(min_opacity),
             "low_opacity": float(low_opacity),
             "remove_low_opacity": bool(remove_low_opacity),
+            "strict_scene_filter": bool(strict_scene_filter),
+            "reference_point_cloud": str(reference_point_cloud) if reference_point_cloud else None,
+            "bbox_filter": bool(bbox_filter),
+            "bbox_quantile_min": float(bbox_quantile_min),
+            "bbox_quantile_max": float(bbox_quantile_max),
+            "bbox_padding_ratio": float(bbox_padding_ratio),
+            "cluster_filter": bool(cluster_filter),
+            "cluster_eps": float(cluster_eps),
+            "cluster_eps_ratio": float(cluster_eps_ratio),
+            "cluster_min_samples": int(cluster_min_samples),
+            "cluster_min_points": int(cluster_min_points),
+            "cluster_min_ratio": float(cluster_min_ratio),
+            "cluster_keep_largest": bool(cluster_keep_largest),
+            "strict_min_keep_ratio": float(strict_min_keep_ratio),
             "preserve_background_planes": bool(preserve_background_planes),
         },
+        "strict_scene_filter": strict_scene_report,
         "background_plane_protection": background_plane_report,
         "geometry_outlier": {
             "removed_count": int(geometric_outlier.sum()),
@@ -3309,7 +3527,9 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
     )
     if input_ply is None or not input_ply.exists():
         raise FileNotFoundError("No input 3DGS PLY found. Pass --input or register a scene_3dgs_ply artifact.")
-    output_ply = resolve_project_relative_path(args.output, project_root) if args.output else input_ply.with_name(f"{input_ply.stem}_clean.ply")
+    default_suffix = "_clean_strict" if bool(getattr(args, "strict_scene_filter", False)) else "_clean"
+    output_ply = resolve_project_relative_path(args.output, project_root) if args.output else input_ply.with_name(f"{input_ply.stem}{default_suffix}.ply")
+    reference_point_cloud = resolve_project_cli_path(args.reference_point_cloud, project_root) if getattr(args, "reference_point_cloud", None) else None
     report = clean_3dgs_floaters(
         input_ply,
         output_ply,
@@ -3319,6 +3539,20 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
         min_opacity=float(args.min_opacity),
         low_opacity=float(args.low_opacity),
         remove_low_opacity=bool(args.remove_low_opacity),
+        strict_scene_filter=bool(getattr(args, "strict_scene_filter", False)),
+        reference_point_cloud=reference_point_cloud,
+        bbox_filter=bool(getattr(args, "bbox_filter", True)),
+        bbox_quantile_min=float(getattr(args, "bbox_quantile_min", 0.005)),
+        bbox_quantile_max=float(getattr(args, "bbox_quantile_max", 0.995)),
+        bbox_padding_ratio=float(getattr(args, "bbox_padding_ratio", 0.12)),
+        cluster_filter=bool(getattr(args, "cluster_filter", True)),
+        cluster_eps=float(getattr(args, "cluster_eps", 0.0)),
+        cluster_eps_ratio=float(getattr(args, "cluster_eps_ratio", 0.015)),
+        cluster_min_samples=int(getattr(args, "cluster_min_samples", 20)),
+        cluster_min_points=int(getattr(args, "cluster_min_points", 300)),
+        cluster_min_ratio=float(getattr(args, "cluster_min_ratio", 0.001)),
+        cluster_keep_largest=bool(getattr(args, "cluster_keep_largest", True)),
+        strict_min_keep_ratio=float(getattr(args, "strict_min_keep_ratio", 0.50)),
         preserve_background_planes=bool(args.preserve_background_planes),
         background_up_axis=args.background_up_axis,
         background_max_planes=int(args.background_max_planes),
@@ -3339,6 +3573,9 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
         manifest.setdefault("artifacts", {})["scene_3dgs_ply_raw"] = str(input_ply)
         manifest["artifacts"]["scene_3dgs_ply"] = str(output_ply)
         manifest["artifacts"]["scene_3dgs_clean_report"] = str(report_path)
+        if bool(getattr(args, "strict_scene_filter", False)):
+            manifest["artifacts"]["scene_3dgs_ply_clean_strict"] = str(output_ply)
+            manifest["artifacts"]["scene_3dgs_clean_strict_report"] = str(report_path)
         save_manifest(project_root, manifest)
     print(f"Cleaned 3DGS PLY: {output_ply}")
     print(f"Removed {report['removed_count']} / {report['input_count']} Gaussian(s). Report: {report_path}")
@@ -3449,6 +3686,47 @@ def clean_point_cloud_outliers(
         ),
     }
     return report
+
+
+def maybe_clean_3dgs_init_point_cloud(
+    init_point_cloud: Path,
+    source_path: Path,
+    args: argparse.Namespace,
+) -> tuple[Path, dict[str, Any]]:
+    if not bool(getattr(args, "clean_init_point_cloud", True)):
+        return init_point_cloud, {"enabled": False, "reason": "--no-clean-init-point-cloud"}
+    if not init_point_cloud.exists():
+        return init_point_cloud, {"enabled": False, "reason": f"missing input point cloud: {init_point_cloud}"}
+
+    output = source_path / "video2mesh_init_point_cloud_clean.ply"
+    report_path = output.with_suffix(".outlier_clean_report.json")
+    try:
+        report = clean_point_cloud_outliers(
+            init_point_cloud,
+            output,
+            q_min=float(getattr(args, "init_clean_quantile_min", 0.005)),
+            q_max=float(getattr(args, "init_clean_quantile_max", 0.995)),
+            padding_ratio=float(getattr(args, "init_clean_padding_ratio", 0.08)),
+            min_keep_ratio=float(getattr(args, "init_clean_min_keep_ratio", 0.50)),
+            keep_largest_cluster=bool(getattr(args, "init_clean_keep_largest_cluster", False)),
+            dbscan_eps=float(getattr(args, "init_clean_dbscan_eps", 0.18)),
+            dbscan_min_points=int(getattr(args, "init_clean_dbscan_min_points", 20)),
+            register_as=None,
+        )
+        write_json(report_path, report)
+        if int(report.get("kept_count") or 0) <= 0:
+            report["fallback"] = "empty_cleaned_point_cloud"
+            return init_point_cloud, report
+        report["enabled"] = True
+        report["report_path"] = str(report_path)
+        return output, report
+    except Exception as exc:
+        return init_point_cloud, {
+            "enabled": False,
+            "reason": f"init point-cloud clean failed; using original: {exc}",
+            "input_ply": str(init_point_cloud),
+            "output_ply": str(output),
+        }
 
 
 def cmd_clean_point_cloud_outliers(args: argparse.Namespace) -> int:
@@ -3575,6 +3853,8 @@ def prepare_3dgs_colmap_source(
     init_point_cloud = resolve_project_cli_path(point_cloud, project_root) if point_cloud else None
     dense_init_export = None
     if init_point_cloud is not None and init_point_cloud.exists():
+        original_init_point_cloud = init_point_cloud
+        init_point_cloud, init_clean_report = maybe_clean_3dgs_init_point_cloud(init_point_cloud, source_path, args)
         points, colors = read_point_cloud(init_point_cloud)
         points_lines = [
             "# 3D point list with one line of data per point:",
@@ -3593,7 +3873,9 @@ def prepare_3dgs_colmap_source(
             )
         (sparse_dir / "points3D.txt").write_text("\n".join(points_lines) + "\n", encoding="utf-8")
         dense_init_export = {
-            "source_point_cloud": str(init_point_cloud),
+            "source_point_cloud": str(original_init_point_cloud),
+            "effective_point_cloud": str(init_point_cloud),
+            "clean_init_point_cloud": init_clean_report,
             "point_count": int(points.shape[0]),
             "track_observations": False,
             "notes": "points3D.txt was initialized from a dense/fused point cloud; cameras/images still come from real COLMAP sparse reconstruction.",
@@ -3718,8 +4000,11 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
     splat_ply_for_registration = args.splat_ply
     if command and completed.returncode == 0 and bool(getattr(args, "clean_3dgs_floaters", True)):
         raw_splat_ply = resolve_project_cli_path(args.splat_ply, project_root) if args.splat_ply else find_latest_splat_ply(output_path)
-        clean_splat_ply = raw_splat_ply.with_name(f"{raw_splat_ply.stem}_clean.ply")
+        strict_enabled = bool(getattr(args, "clean_strict_scene_filter", True))
+        clean_suffix = "_clean_strict" if strict_enabled else "_clean"
+        clean_splat_ply = raw_splat_ply.with_name(f"{raw_splat_ply.stem}{clean_suffix}.ply")
         clean_report_path = clean_splat_ply.with_suffix(".clean_report.json")
+        reference_point_cloud = resolve_project_cli_path(getattr(args, "clean_reference_point_cloud", None), project_root) if getattr(args, "clean_reference_point_cloud", None) else existing_colmap_dense_fused_ply(project_root, manifest)
         clean_report = clean_3dgs_floaters(
             raw_splat_ply,
             clean_splat_ply,
@@ -3729,6 +4014,20 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
             min_opacity=float(args.clean_min_opacity),
             low_opacity=float(args.clean_low_opacity),
             remove_low_opacity=bool(args.clean_remove_low_opacity),
+            strict_scene_filter=strict_enabled,
+            reference_point_cloud=reference_point_cloud,
+            bbox_filter=bool(getattr(args, "clean_bbox_filter", True)),
+            bbox_quantile_min=float(getattr(args, "clean_bbox_quantile_min", 0.005)),
+            bbox_quantile_max=float(getattr(args, "clean_bbox_quantile_max", 0.995)),
+            bbox_padding_ratio=float(getattr(args, "clean_bbox_padding_ratio", 0.12)),
+            cluster_filter=bool(getattr(args, "clean_cluster_filter", True)),
+            cluster_eps=float(getattr(args, "clean_cluster_eps", 0.0)),
+            cluster_eps_ratio=float(getattr(args, "clean_cluster_eps_ratio", 0.015)),
+            cluster_min_samples=int(getattr(args, "clean_cluster_min_samples", 20)),
+            cluster_min_points=int(getattr(args, "clean_cluster_min_points", 300)),
+            cluster_min_ratio=float(getattr(args, "clean_cluster_min_ratio", 0.001)),
+            cluster_keep_largest=bool(getattr(args, "clean_cluster_keep_largest", True)),
+            strict_min_keep_ratio=float(getattr(args, "clean_strict_min_keep_ratio", 0.50)),
             preserve_background_planes=bool(getattr(args, "clean_preserve_background_planes", False)),
             background_up_axis=str(getattr(args, "clean_background_up_axis", "y")),
             background_max_planes=int(getattr(args, "clean_background_max_planes", 8)),
@@ -3747,6 +4046,8 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
         run_manifest["clean_3dgs_floaters"] = clean_report
         run_manifest["clean_3dgs_floaters_report"] = str(clean_report_path)
         run_manifest["splat_ply_for_registration"] = str(clean_splat_ply)
+        if strict_enabled:
+            run_manifest["clean_3dgs_floaters_strict_report"] = str(clean_report_path)
         splat_ply_for_registration = clean_splat_ply
 
     write_json(stage_root / "3dgs_run_manifest.json", run_manifest)
@@ -22515,7 +22816,26 @@ def object_labels_compatible(a: dict[str, Any], b: dict[str, Any]) -> bool:
         return True
     text_a = normalized_object_label_text(a)
     text_b = normalized_object_label_text(b)
-    object_words = {"chair", "table", "sofa", "couch", "plant", "flower", "cabinet", "shelf", "bed", "desk", "stool"}
+    object_words = {
+        "bed",
+        "cabinet",
+        "chair",
+        "couch",
+        "curtain",
+        "desk",
+        "door",
+        "flower",
+        "lamp",
+        "light",
+        "nightstand",
+        "pillow",
+        "plant",
+        "shelf",
+        "sofa",
+        "stool",
+        "table",
+        "window",
+    }
     if any(token in text_a and token in text_b for token in object_words):
         return True
     return category_a in UNKNOWN_LABEL_VALUES or category_b in UNKNOWN_LABEL_VALUES
@@ -22885,6 +23205,86 @@ def cmd_suggest_object_mask_merges(args: argparse.Namespace) -> int:
         if not args.no_markdown:
             print(f"Markdown: {markdown_path}")
     return 1 if bool(args.fail_on_suggestions) and suggestions else 0
+
+
+def auto_merge_object_mask_components(
+    project_root: Path,
+    report: dict[str, Any],
+    *,
+    remove_sources: bool,
+    max_components: int,
+    min_component_score: float,
+) -> dict[str, Any]:
+    components = report.get("components") if isinstance(report.get("components"), list) else []
+    selected: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for item in components:
+        if not isinstance(item, dict):
+            continue
+        sources = [slugify(source) for source in item.get("sources", []) if slugify(source)]
+        if len(sources) < 2:
+            skipped.append({"target": item.get("target"), "sources": sources, "reason": "fewer_than_two_sources"})
+            continue
+        if bool(item.get("review_only")):
+            skipped.append({"target": item.get("target"), "sources": sources, "reason": item.get("review_reason") or "review_only"})
+            continue
+        if float(item.get("score_min") or 0.0) < float(min_component_score):
+            skipped.append({"target": item.get("target"), "sources": sources, "reason": "score_below_auto_merge_threshold"})
+            continue
+        selected.append(item)
+        if int(max_components) > 0 and len(selected) >= int(max_components):
+            break
+
+    merged = []
+    failed = []
+    for index, item in enumerate(selected, start=1):
+        sources = [slugify(source) for source in item.get("sources", []) if slugify(source)]
+        target = slugify(item.get("target") or f"auto_merged_object_{index:02d}", f"auto_merged_object_{index:02d}")
+        try:
+            cmd_merge_object_masks(
+                argparse.Namespace(
+                    project_root=project_root,
+                    sources=sources,
+                    target=target,
+                    name=None,
+                    category=None,
+                    description=None,
+                    confidence=float(item.get("score_min") or item.get("score_mean") or 0.0),
+                    mask_root=None,
+                    point_cloud=None,
+                    object_labels=None,
+                    remove_sources=bool(remove_sources),
+                )
+            )
+            merged.append(
+                {
+                    "target": target,
+                    "sources": sources,
+                    "score_min": float(item.get("score_min") or 0.0),
+                    "score_mean": float(item.get("score_mean") or 0.0),
+                }
+            )
+        except Exception as exc:
+            failed.append({"target": target, "sources": sources, "error": str(exc)})
+
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "status": "object_masks_auto_merged" if merged and not failed else "object_masks_auto_merge_partial" if merged else "no_object_masks_auto_merged",
+        "selected_count": len(selected),
+        "merged_count": len(merged),
+        "failed_count": len(failed),
+        "skipped_count": len(skipped),
+        "remove_sources": bool(remove_sources),
+        "parameters": {
+            "max_components": int(max_components),
+            "min_component_score": float(min_component_score),
+        },
+        "merged": merged,
+        "failed": failed,
+        "skipped": skipped,
+        "notes": "Conservative automatic merge runs only on non-review connected components above the configured score threshold.",
+    }
 
 
 def find_frame_image(frames_dir: Path, frame_id: str) -> Path | None:
@@ -39303,6 +39703,14 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     image_mode=args.image_mode,
                     use_existing_colmap_sparse=args.g3dgs_use_existing_colmap_sparse,
                     prefer_dense_colmap_init=args.g3dgs_prefer_dense_colmap_init,
+                    clean_init_point_cloud=args.g3dgs_clean_init_point_cloud,
+                    init_clean_quantile_min=args.g3dgs_init_clean_quantile_min,
+                    init_clean_quantile_max=args.g3dgs_init_clean_quantile_max,
+                    init_clean_padding_ratio=args.g3dgs_init_clean_padding_ratio,
+                    init_clean_min_keep_ratio=args.g3dgs_init_clean_min_keep_ratio,
+                    init_clean_keep_largest_cluster=args.g3dgs_init_clean_keep_largest_cluster,
+                    init_clean_dbscan_eps=args.g3dgs_init_clean_dbscan_eps,
+                    init_clean_dbscan_min_points=args.g3dgs_init_clean_dbscan_min_points,
                     filter_sparse_points=args.g3dgs_filter_sparse_points,
                     sparse_max_reprojection_error=args.g3dgs_sparse_max_reprojection_error,
                     sparse_min_track_length=args.g3dgs_sparse_min_track_length,
@@ -39313,6 +39721,20 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     clean_min_opacity=args.g3dgs_clean_min_opacity,
                     clean_low_opacity=args.g3dgs_clean_low_opacity,
                     clean_remove_low_opacity=args.g3dgs_clean_remove_low_opacity,
+                    clean_strict_scene_filter=args.g3dgs_clean_strict_scene_filter,
+                    clean_reference_point_cloud=args.g3dgs_clean_reference_point_cloud,
+                    clean_bbox_filter=args.g3dgs_clean_bbox_filter,
+                    clean_bbox_quantile_min=args.g3dgs_clean_bbox_quantile_min,
+                    clean_bbox_quantile_max=args.g3dgs_clean_bbox_quantile_max,
+                    clean_bbox_padding_ratio=args.g3dgs_clean_bbox_padding_ratio,
+                    clean_cluster_filter=args.g3dgs_clean_cluster_filter,
+                    clean_cluster_eps=args.g3dgs_clean_cluster_eps,
+                    clean_cluster_eps_ratio=args.g3dgs_clean_cluster_eps_ratio,
+                    clean_cluster_min_samples=args.g3dgs_clean_cluster_min_samples,
+                    clean_cluster_min_points=args.g3dgs_clean_cluster_min_points,
+                    clean_cluster_min_ratio=args.g3dgs_clean_cluster_min_ratio,
+                    clean_cluster_keep_largest=args.g3dgs_clean_cluster_keep_largest,
+                    clean_strict_min_keep_ratio=args.g3dgs_clean_strict_min_keep_ratio,
                     clean_preserve_background_planes=args.g3dgs_clean_preserve_background_planes,
                     clean_background_up_axis=args.g3dgs_clean_background_up_axis,
                     clean_background_max_planes=args.g3dgs_clean_background_max_planes,
@@ -39523,6 +39945,57 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
             append_pipeline_step(steps, "fuse_masks", "completed")
         else:
             append_pipeline_step(steps, "fuse_masks", "skipped", "--skip-fuse-masks")
+
+        if not args.skip_fuse_masks and args.auto_merge_object_masks:
+            merge_output = project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "object_merge_suggestions.json"
+            merge_markdown = project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "object_merge_suggestions.md"
+            cmd_suggest_object_mask_merges(
+                argparse.Namespace(
+                    project_root=project_root,
+                    output=merge_output,
+                    markdown_output=merge_markdown,
+                    no_markdown=False,
+                    max_gap_ratio=args.object_merge_max_gap_ratio,
+                    min_iou=args.object_merge_min_iou,
+                    min_score=args.object_merge_min_score,
+                    component_min_score=args.object_merge_component_min_score,
+                    max_component_size=args.object_merge_max_component_size,
+                    min_points=args.object_merge_min_points,
+                    max_suggestions=args.object_merge_max_suggestions,
+                    max_components=args.object_merge_max_components,
+                    fail_on_suggestions=False,
+                    json=False,
+                    print_max=0,
+                )
+            )
+            manifest = load_manifest(project_root)
+            merge_report = read_json(merge_output)
+            if args.object_merge_apply:
+                apply_report = auto_merge_object_mask_components(
+                    project_root,
+                    merge_report,
+                    remove_sources=args.object_merge_remove_sources,
+                    max_components=args.object_merge_apply_max_components,
+                    min_component_score=args.object_merge_apply_min_component_score,
+                )
+                apply_path = project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "object_auto_merge_report.json"
+                write_json(apply_path, apply_report)
+                manifest = load_manifest(project_root)
+                manifest.setdefault("artifacts", {})["object_auto_merge_report"] = str(apply_path)
+                manifest.setdefault("external_stages", {})["object_mask_auto_merge"] = {
+                    "status": apply_report["status"],
+                    "merged_count": apply_report["merged_count"],
+                    "failed_count": apply_report["failed_count"],
+                    "report": str(apply_path),
+                }
+                save_manifest(project_root, manifest)
+                append_pipeline_step(steps, "auto_merge_object_masks", apply_report["status"], str(apply_path))
+            else:
+                append_pipeline_step(steps, "auto_merge_object_masks", "suggested", str(merge_output))
+        elif args.skip_fuse_masks:
+            append_pipeline_step(steps, "auto_merge_object_masks", "skipped", "fuse masks skipped")
+        else:
+            append_pipeline_step(steps, "auto_merge_object_masks", "skipped", "--no-auto-merge-object-masks")
 
         if args.infer_background_plane_masks:
             cmd_infer_background_plane_masks(
@@ -40404,6 +40877,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-mode", choices=["copy", "symlink", "none"], default="copy")
     p.add_argument("--use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model already imported by run-colmap, preserving TRACK[] for filtering.")
     p.add_argument("--prefer-dense-colmap-init", action=argparse.BooleanOptionalAction, default=True, help="When COLMAP dense fused.ply exists, use it as points3D.txt initialization for 3DGS while keeping sparse cameras/images.")
+    p.add_argument("--clean-init-point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Clean dense/fused initialization point cloud before writing GraphDECO points3D.txt.")
+    p.add_argument("--init-clean-quantile-min", type=float, default=0.005)
+    p.add_argument("--init-clean-quantile-max", type=float, default=0.995)
+    p.add_argument("--init-clean-padding-ratio", type=float, default=0.08)
+    p.add_argument("--init-clean-min-keep-ratio", type=float, default=0.50)
+    p.add_argument("--init-clean-keep-largest-cluster", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--init-clean-dbscan-eps", type=float, default=0.18)
+    p.add_argument("--init-clean-dbscan-min-points", type=int, default=20)
     p.add_argument("--filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before 3DGS training by reprojection error and track length.")
     p.add_argument("--sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
@@ -40414,6 +40895,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clean-min-opacity", type=float, default=0.01)
     p.add_argument("--clean-low-opacity", type=float, default=0.08)
     p.add_argument("--clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--clean-strict-scene-filter", action=argparse.BooleanOptionalAction, default=True, help="Also remove scene-level detached 3DGS clusters using COLMAP dense bbox and DBSCAN, writing *_clean_strict.ply.")
+    p.add_argument("--clean-reference-point-cloud", type=Path, help="Reference point cloud for strict scene filter. Defaults to COLMAP dense fused.ply when available.")
+    p.add_argument("--clean-bbox-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--clean-bbox-quantile-min", type=float, default=0.005)
+    p.add_argument("--clean-bbox-quantile-max", type=float, default=0.995)
+    p.add_argument("--clean-bbox-padding-ratio", type=float, default=0.12)
+    p.add_argument("--clean-cluster-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--clean-cluster-eps", type=float, default=0.0, help="Absolute DBSCAN eps; 0 uses bbox diagonal * --clean-cluster-eps-ratio.")
+    p.add_argument("--clean-cluster-eps-ratio", type=float, default=0.015)
+    p.add_argument("--clean-cluster-min-samples", type=int, default=20)
+    p.add_argument("--clean-cluster-min-points", type=int, default=300)
+    p.add_argument("--clean-cluster-min-ratio", type=float, default=0.001)
+    p.add_argument("--clean-cluster-keep-largest", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--clean-strict-min-keep-ratio", type=float, default=0.50)
     p.add_argument("--clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--clean-background-up-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--clean-background-max-planes", type=int, default=8)
@@ -40443,6 +40938,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-opacity", type=float, default=0.01)
     p.add_argument("--low-opacity", type=float, default=0.08)
     p.add_argument("--remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--strict-scene-filter", action=argparse.BooleanOptionalAction, default=False, help="Remove detached scene-level clusters using a reference point cloud bbox and DBSCAN.")
+    p.add_argument("--reference-point-cloud", type=Path, help="Reference point cloud for strict scene filtering, usually COLMAP dense fused.ply.")
+    p.add_argument("--bbox-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--bbox-quantile-min", type=float, default=0.005)
+    p.add_argument("--bbox-quantile-max", type=float, default=0.995)
+    p.add_argument("--bbox-padding-ratio", type=float, default=0.12)
+    p.add_argument("--cluster-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--cluster-eps", type=float, default=0.0, help="Absolute DBSCAN eps; 0 uses bbox diagonal * --cluster-eps-ratio.")
+    p.add_argument("--cluster-eps-ratio", type=float, default=0.015)
+    p.add_argument("--cluster-min-samples", type=int, default=20)
+    p.add_argument("--cluster-min-points", type=int, default=300)
+    p.add_argument("--cluster-min-ratio", type=float, default=0.001)
+    p.add_argument("--cluster-keep-largest", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--strict-min-keep-ratio", type=float, default=0.50)
     p.add_argument("--preserve-background-planes", action=argparse.BooleanOptionalAction, default=False, help="Protect large RANSAC floor/wall/ceiling planes from floater removal.")
     p.add_argument("--background-up-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--background-max-planes", type=int, default=8)
@@ -42222,6 +42731,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-prepare-only", action="store_true")
     p.add_argument("--g3dgs-use-existing-colmap-sparse", action=argparse.BooleanOptionalAction, default=True, help="Prefer the real COLMAP sparse text model for 3DGS source preparation.")
     p.add_argument("--g3dgs-prefer-dense-colmap-init", action=argparse.BooleanOptionalAction, default=True, help="Use COLMAP dense fused.ply for GraphDECO 3DGS initialization when available.")
+    p.add_argument("--g3dgs-clean-init-point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Clean dense/fused init point cloud before writing GraphDECO points3D.txt.")
+    p.add_argument("--g3dgs-init-clean-quantile-min", type=float, default=0.005)
+    p.add_argument("--g3dgs-init-clean-quantile-max", type=float, default=0.995)
+    p.add_argument("--g3dgs-init-clean-padding-ratio", type=float, default=0.08)
+    p.add_argument("--g3dgs-init-clean-min-keep-ratio", type=float, default=0.50)
+    p.add_argument("--g3dgs-init-clean-keep-largest-cluster", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--g3dgs-init-clean-dbscan-eps", type=float, default=0.18)
+    p.add_argument("--g3dgs-init-clean-dbscan-min-points", type=int, default=20)
     p.add_argument("--g3dgs-filter-sparse-points", action=argparse.BooleanOptionalAction, default=True, help="Filter COLMAP points3D.txt before GraphDECO/full 3DGS training.")
     p.add_argument("--g3dgs-sparse-max-reprojection-error", type=float, default=DEFAULT_3DGS_SPARSE_MAX_REPROJECTION_ERROR)
     p.add_argument("--g3dgs-sparse-min-track-length", type=int, default=DEFAULT_3DGS_SPARSE_MIN_TRACK_LENGTH)
@@ -42232,6 +42749,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-clean-min-opacity", type=float, default=0.01)
     p.add_argument("--g3dgs-clean-low-opacity", type=float, default=0.08)
     p.add_argument("--g3dgs-clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--g3dgs-clean-strict-scene-filter", action=argparse.BooleanOptionalAction, default=True, help="Use COLMAP dense bbox + DBSCAN to remove detached 3DGS floater clusters and register *_clean_strict.ply.")
+    p.add_argument("--g3dgs-clean-reference-point-cloud", type=Path, help="Strict clean reference point cloud. Defaults to COLMAP dense fused.ply.")
+    p.add_argument("--g3dgs-clean-bbox-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--g3dgs-clean-bbox-quantile-min", type=float, default=0.005)
+    p.add_argument("--g3dgs-clean-bbox-quantile-max", type=float, default=0.995)
+    p.add_argument("--g3dgs-clean-bbox-padding-ratio", type=float, default=0.12)
+    p.add_argument("--g3dgs-clean-cluster-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--g3dgs-clean-cluster-eps", type=float, default=0.0)
+    p.add_argument("--g3dgs-clean-cluster-eps-ratio", type=float, default=0.015)
+    p.add_argument("--g3dgs-clean-cluster-min-samples", type=int, default=20)
+    p.add_argument("--g3dgs-clean-cluster-min-points", type=int, default=300)
+    p.add_argument("--g3dgs-clean-cluster-min-ratio", type=float, default=0.001)
+    p.add_argument("--g3dgs-clean-cluster-keep-largest", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--g3dgs-clean-strict-min-keep-ratio", type=float, default=0.50)
     p.add_argument("--g3dgs-clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--g3dgs-clean-background-up-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--g3dgs-clean-background-max-planes", type=int, default=8)
@@ -42377,6 +42908,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--background-plane-include-other-planes", action="store_true")
     p.add_argument("--background-plane-replace-existing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--background-plane-seed", type=int, default=7)
+    p.add_argument("--auto-merge-object-masks", action=argparse.BooleanOptionalAction, default=True, help="After 3D mask fusion, conservatively merge high-confidence duplicated object fragments before semantic export.")
+    p.add_argument("--object-merge-apply", action=argparse.BooleanOptionalAction, default=True, help="Apply non-review merge components automatically. Disable to only write suggestions.")
+    p.add_argument("--object-merge-remove-sources", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--object-merge-max-gap-ratio", type=float, default=0.35)
+    p.add_argument("--object-merge-min-iou", type=float, default=0.01)
+    p.add_argument("--object-merge-min-score", type=float, default=0.45)
+    p.add_argument("--object-merge-component-min-score", type=float, default=0.70)
+    p.add_argument("--object-merge-max-component-size", type=int, default=4)
+    p.add_argument("--object-merge-min-points", type=int, default=30)
+    p.add_argument("--object-merge-max-suggestions", type=int)
+    p.add_argument("--object-merge-max-components", type=int)
+    p.add_argument("--object-merge-apply-max-components", type=int, default=4)
+    p.add_argument("--object-merge-apply-min-component-score", type=float, default=0.70)
     p.add_argument("--skip-export-splat-masks", action="store_true")
     p.add_argument("--backproject-gaussian-probabilities", action="store_true", help="After export-splat-masks, run SVLGaussian-style ray-to-Gaussian semantic probability back-projection.")
     p.add_argument("--gaussian-backproject-top-n", type=int, default=8)
@@ -42476,7 +43020,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--create-placeholder-meshes", action="store_true", help="Smoke-test only: create trivial OBJ meshes instead of calling a mesh model.")
     p.add_argument("--reconstruct-mask-meshes", action="store_true", help="Reconstruct object meshes from fused 3D mask point clouds instead of waiting for image-blaster/FAL output.")
     p.add_argument("--mask-mesh-method", choices=["auto", "alpha_shape", "ball_pivoting", "convex_hull", "bbox"], default="auto")
-    p.add_argument("--mask-mesh-format", choices=["obj", "ply", "stl"], default="obj")
+    p.add_argument("--mask-mesh-format", choices=["obj", "ply", "stl"], default="ply")
     p.add_argument("--mask-mesh-min-points", type=int, default=4)
     p.add_argument("--mask-mesh-min-extent", type=float, default=0.03)
     p.add_argument("--mask-mesh-bbox-padding-ratio", type=float, default=0.05)
@@ -42498,7 +43042,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-import-meshes", action="store_true")
     p.add_argument("--skip-missing-meshes", action="store_true")
     p.add_argument("--skip-simulator-assets", action="store_true")
-    p.add_argument("--skip-simulator-adapters", action="store_true")
+    p.add_argument("--skip-simulator-adapters", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--skip-simulator-physics-quality-report", action="store_true")
     p.add_argument("--simulator-format", choices=["mujoco", "isaac", "unity"], nargs="+", default=["mujoco"], help="Adapter formats exported after simulator assets.")
     p.add_argument("--default-mass", type=float, default=1.0, help="Fallback MuJoCo geom mass for dynamic adapter bodies.")

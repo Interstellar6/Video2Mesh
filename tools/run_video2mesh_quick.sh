@@ -168,6 +168,17 @@ PIXEL_STRIDE="${PIXEL_STRIDE:-3}"
 MAX_PIXELS_PER_MASK="${MAX_PIXELS_PER_MASK:-5000}"
 TOP_K="${TOP_K:-4}"
 MASK_MESH_METHOD="${MASK_MESH_METHOD:-auto}"
+MASK_MESH_FORMAT="${MASK_MESH_FORMAT:-ply}"
+RUN_SIMULATOR_ADAPTERS="${RUN_SIMULATOR_ADAPTERS:-0}"
+BACKGROUND_PLANE_INCLUDE_OTHER_PLANES="${BACKGROUND_PLANE_INCLUDE_OTHER_PLANES:-1}"
+AUTO_MERGE_OBJECT_MASKS="${AUTO_MERGE_OBJECT_MASKS:-1}"
+OBJECT_MERGE_APPLY="${OBJECT_MERGE_APPLY:-1}"
+OBJECT_MERGE_MAX_COMPONENTS="${OBJECT_MERGE_MAX_COMPONENTS:-4}"
+OBJECT_MERGE_MIN_COMPONENT_SCORE="${OBJECT_MERGE_MIN_COMPONENT_SCORE:-0.70}"
+STRICT_3DGS_CLEAN="${STRICT_3DGS_CLEAN:-1}"
+STRICT_3DGS_BBOX_PADDING_RATIO="${STRICT_3DGS_BBOX_PADDING_RATIO:-0.12}"
+STRICT_3DGS_CLUSTER_EPS_RATIO="${STRICT_3DGS_CLUSTER_EPS_RATIO:-0.015}"
+STRICT_3DGS_CLUSTER_MIN_POINTS="${STRICT_3DGS_CLUSTER_MIN_POINTS:-300}"
 RECONSTRUCT_SCENE_MESHES="${RECONSTRUCT_SCENE_MESHES:-1}"
 TRANSFER_SCENE_MESH_SEMANTICS="${TRANSFER_SCENE_MESH_SEMANTICS:-1}"
 SPLIT_SCENE_MESH_BY_SEMANTICS="${SPLIT_SCENE_MESH_BY_SEMANTICS:-1}"
@@ -286,6 +297,7 @@ echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] reconstruction: colmap=${RUN_COLMAP} mast3r=${RUN_MAST3R} max_frames=${MAX_FRAMES} every=${EXTRACT_EVERY}" | tee -a "$LOG"
 echo "[Video2Mesh quick] scene_mesh: reconstruct=${RECONSTRUCT_SCENE_MESHES} transfer=${TRANSFER_SCENE_MESH_SEMANTICS} split=${SPLIT_SCENE_MESH_BY_SEMANTICS} route=${SCENE_MESH_SEMANTIC_ROUTE}" | tee -a "$LOG"
+echo "[Video2Mesh quick] defaults: strict_3dgs_clean=${STRICT_3DGS_CLEAN} auto_merge=${AUTO_MERGE_OBJECT_MASKS}/${OBJECT_MERGE_APPLY} mask_mesh_format=${MASK_MESH_FORMAT} simulator_adapters=${RUN_SIMULATOR_ADAPTERS}" | tee -a "$LOG"
 
 g3dgs_args=()
 if [[ "$GS_BACKEND" == "graphdeco" ]]; then
@@ -293,8 +305,19 @@ if [[ "$GS_BACKEND" == "graphdeco" ]]; then
     --prepare-3dgs-source
     --g3dgs-output-path scene/reconstruction/3dgs_graphdeco
     --g3dgs-work-dir external/graphdeco_3dgs
+    --g3dgs-clean-init-point-cloud
     --g3dgs-command-template "cd ${GRAPHDECO_ROOT} && ${GRAPHDECO_PYTHON} train.py -s {source_path} -m {output_path} --iterations ${GRAPHDECO_ITERATIONS} --save_iterations ${GRAPHDECO_SAVE_ITERATIONS} --test_iterations ${GRAPHDECO_TEST_ITERATIONS} --resolution ${GRAPHDECO_RESOLUTION} --images images --sh_degree ${GRAPHDECO_SH_DEGREE} --densify_until_iter ${GRAPHDECO_DENSIFY_UNTIL_ITER} --densify_from_iter ${GRAPHDECO_DENSIFY_FROM_ITER} --densification_interval ${GRAPHDECO_DENSIFICATION_INTERVAL} --densify_grad_threshold ${GRAPHDECO_DENSIFY_GRAD_THRESHOLD} --opacity_reset_interval ${GRAPHDECO_OPACITY_RESET_INTERVAL} ${GRAPHDECO_EXTRA_ARGS} --disable_viewer"
   )
+  if [[ "$STRICT_3DGS_CLEAN" == "1" || "$STRICT_3DGS_CLEAN" == "true" ]]; then
+    g3dgs_args+=(
+      --g3dgs-clean-strict-scene-filter
+      --g3dgs-clean-bbox-padding-ratio "$STRICT_3DGS_BBOX_PADDING_RATIO"
+      --g3dgs-clean-cluster-eps-ratio "$STRICT_3DGS_CLUSTER_EPS_RATIO"
+      --g3dgs-clean-cluster-min-points "$STRICT_3DGS_CLUSTER_MIN_POINTS"
+    )
+  else
+    g3dgs_args+=(--no-g3dgs-clean-strict-scene-filter)
+  fi
 elif [[ "$GS_BACKEND" == "minimal" ]]; then
   g3dgs_args=(
     --train-gsplat
@@ -381,6 +404,34 @@ if [[ "$SPLIT_SCENE_MESH_BY_SEMANTICS" == "1" || "$SPLIT_SCENE_MESH_BY_SEMANTICS
   )
 fi
 
+background_plane_args=()
+if [[ "$BACKGROUND_PLANE_INCLUDE_OTHER_PLANES" == "1" || "$BACKGROUND_PLANE_INCLUDE_OTHER_PLANES" == "true" ]]; then
+  background_plane_args+=(--background-plane-include-other-planes)
+fi
+
+object_merge_args=()
+if [[ "$AUTO_MERGE_OBJECT_MASKS" == "1" || "$AUTO_MERGE_OBJECT_MASKS" == "true" ]]; then
+  object_merge_args+=(
+    --auto-merge-object-masks
+    --object-merge-apply-max-components "$OBJECT_MERGE_MAX_COMPONENTS"
+    --object-merge-apply-min-component-score "$OBJECT_MERGE_MIN_COMPONENT_SCORE"
+  )
+  if [[ "$OBJECT_MERGE_APPLY" == "1" || "$OBJECT_MERGE_APPLY" == "true" ]]; then
+    object_merge_args+=(--object-merge-apply)
+  else
+    object_merge_args+=(--no-object-merge-apply)
+  fi
+else
+  object_merge_args+=(--no-auto-merge-object-masks)
+fi
+
+simulator_adapter_args=()
+if [[ "$RUN_SIMULATOR_ADAPTERS" == "1" || "$RUN_SIMULATOR_ADAPTERS" == "true" ]]; then
+  simulator_adapter_args+=(--no-skip-simulator-adapters)
+else
+  simulator_adapter_args+=(--skip-simulator-adapters)
+fi
+
 "$V2M_PYTHON" -B -m video2mesh.cli run-pipeline \
   --project-root "$PROJECT_ROOT" \
   --scene-id "$SCENE_ID" \
@@ -438,6 +489,8 @@ fi
   --infer-background-plane-masks \
   --background-plane-max-planes 8 \
   --background-plane-min-points 300 \
+  "${background_plane_args[@]}" \
+  "${object_merge_args[@]}" \
   --transfer-mode nearest \
   --backproject-gaussian-probabilities \
   --gaussian-backproject-pixel-stride "$PIXEL_STRIDE" \
@@ -454,9 +507,11 @@ fi
   --frame-svlgaussian-visibility-window 3 \
   --reconstruct-mask-meshes \
   --mask-mesh-method "$MASK_MESH_METHOD" \
+  --mask-mesh-format "$MASK_MESH_FORMAT" \
   --skip-failed-mask-meshes \
   --skip-export-image-blaster \
   --simulator-format mujoco unity \
+  "${simulator_adapter_args[@]}" \
   --collision-proxy bbox \
   --use-collision-proxy \
   --collider box \

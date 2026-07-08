@@ -23,16 +23,23 @@ Current default route:
 ```text
 video
   -> COLMAP poses and full point cloud
+  -> COLMAP dense fused.ply cleaned as GraphDECO init
   -> GraphDECO 3DGS
+  -> strict 3DGS floater cleanup: COLMAP dense bbox + DBSCAN cluster filter
   -> GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback
   -> SAM2 masks
   -> 2D-to-3D semantic fusion
+  -> conservative object-fragment merge suggestions/applied small components
   -> COLMAP dense Delaunay scene collider mesh
   -> mesh semantic transfer and semantic object mesh splitting
-  -> object mesh / completion jobs
+  -> per-object PLY mesh reconstruction / completion jobs
   -> collider and physics proxies
-  -> MuJoCo / Unity / Isaac assets
+  -> simulator asset bundle
 ```
+
+Simulator adapters are skipped by default in the quick pipeline while mesh and
+collider quality is still being tuned. Re-enable them explicitly with
+`RUN_SIMULATOR_ADAPTERS=1`.
 
 For commands, QA and research decisions, start here:
 
