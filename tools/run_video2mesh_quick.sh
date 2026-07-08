@@ -39,6 +39,7 @@ Optional environment overrides:
   GRAPHDECO_SH_DEGREE=3
   GRAPHDECO_EXTRA_ARGS=""
   STRICT_3DGS_PRESERVE_BACKGROUND_PLANES=1
+  GAUSSIAN_BACKPROJECT=0|1
   PROMPT_DISCOVERY=groundingdino|auto-prompts
   GROUNDINGDINO_ROOT=/root/autodl-tmp/workspace/GroundingDINO
   GROUNDINGDINO_CHECKPOINT=/root/autodl-tmp/checkpoints/groundingdino/groundingdino_swint_ogc.pth
@@ -187,6 +188,7 @@ SPLIT_SCENE_MESH_BY_SEMANTICS="${SPLIT_SCENE_MESH_BY_SEMANTICS:-1}"
 SCENE_MESH_SEMANTIC_ROUTE="${SCENE_MESH_SEMANTIC_ROUTE:-local}"
 SCENE_MESH_SEMANTIC_MAX_POINTS="${SCENE_MESH_SEMANTIC_MAX_POINTS:-250000}"
 SCENE_MESH_OBJECT_SPLITS_MIN_FACES="${SCENE_MESH_OBJECT_SPLITS_MIN_FACES:-20}"
+GAUSSIAN_BACKPROJECT="${GAUSSIAN_BACKPROJECT:-0}"
 
 PROMPT_DISCOVERY="${PROMPT_DISCOVERY:-groundingdino}"
 prompt_discovery_args=()
@@ -299,7 +301,7 @@ echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] reconstruction: colmap=${RUN_COLMAP} mast3r=${RUN_MAST3R} max_frames=${MAX_FRAMES} every=${EXTRACT_EVERY}" | tee -a "$LOG"
 echo "[Video2Mesh quick] scene_mesh: reconstruct=${RECONSTRUCT_SCENE_MESHES} transfer=${TRANSFER_SCENE_MESH_SEMANTICS} split=${SPLIT_SCENE_MESH_BY_SEMANTICS} route=${SCENE_MESH_SEMANTIC_ROUTE}" | tee -a "$LOG"
-echo "[Video2Mesh quick] defaults: strict_3dgs_clean=${STRICT_3DGS_CLEAN} auto_merge=${AUTO_MERGE_OBJECT_MASKS}/${OBJECT_MERGE_APPLY} mask_mesh_format=${MASK_MESH_FORMAT} simulator_adapters=${RUN_SIMULATOR_ADAPTERS}" | tee -a "$LOG"
+echo "[Video2Mesh quick] defaults: strict_3dgs_clean=${STRICT_3DGS_CLEAN} auto_merge=${AUTO_MERGE_OBJECT_MASKS}/${OBJECT_MERGE_APPLY} gaussian_backproject=${GAUSSIAN_BACKPROJECT} mask_mesh_format=${MASK_MESH_FORMAT} simulator_adapters=${RUN_SIMULATOR_ADAPTERS}" | tee -a "$LOG"
 
 g3dgs_args=()
 if [[ "$GS_BACKEND" == "graphdeco" ]]; then
@@ -439,6 +441,16 @@ else
   simulator_adapter_args+=(--skip-simulator-adapters)
 fi
 
+gaussian_backproject_args=()
+if [[ "$GAUSSIAN_BACKPROJECT" == "1" || "$GAUSSIAN_BACKPROJECT" == "true" ]]; then
+  gaussian_backproject_args+=(
+    --backproject-gaussian-probabilities
+    --gaussian-backproject-pixel-stride "$PIXEL_STRIDE"
+    --gaussian-backproject-max-pixels-per-mask "$MAX_PIXELS_PER_MASK"
+    --gaussian-backproject-include-background-structures
+  )
+fi
+
 "$V2M_PYTHON" -B -m video2mesh.cli run-pipeline \
   --project-root "$PROJECT_ROOT" \
   --scene-id "$SCENE_ID" \
@@ -499,10 +511,7 @@ fi
   "${background_plane_args[@]}" \
   "${object_merge_args[@]}" \
   --transfer-mode nearest \
-  --backproject-gaussian-probabilities \
-  --gaussian-backproject-pixel-stride "$PIXEL_STRIDE" \
-  --gaussian-backproject-max-pixels-per-mask "$MAX_PIXELS_PER_MASK" \
-  --gaussian-backproject-include-background-structures \
+  "${gaussian_backproject_args[@]}" \
   --render-semantic-preview \
   --semantic-preview-max-frames 6 \
   --semantic-preview-max-points 20000 \

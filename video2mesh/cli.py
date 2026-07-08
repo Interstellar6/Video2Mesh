@@ -17517,8 +17517,8 @@ def cmd_transfer_mesh_semantics_local(args: argparse.Namespace) -> int:
     )
     mesh_path = resolve_project_cli_path(args.mesh, project_root)
     output_dir = ensure_dir(resolve_project_cli_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "mesh_semantics_local"))
-    output_json = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / f"{mesh_path.stem}_mesh_semantics_local.json"
-    debug_ply = resolve_project_cli_path(args.debug_ply, project_root) if args.debug_ply else output_dir / f"{mesh_path.stem}_semantic_local_debug.ply"
+    output_json = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / "mesh_semantics.json"
+    debug_ply = resolve_project_cli_path(args.debug_ply, project_root) if args.debug_ply else output_dir / "mesh_semantics_debug.ply"
     if not semantic_ply.exists():
         raise FileNotFoundError(f"Missing semantic PLY: {semantic_ply}")
     if not mesh_path.exists():
@@ -33738,6 +33738,7 @@ def simulator_physics_quality_item(
     pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
     mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
     collision_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+    physics_proxy = physics.get("collision_proxy") if isinstance(physics.get("collision_proxy"), dict) else {}
     mesh_path = resolve_existing_path(mesh.get("path"), project_root) if mesh else None
     proxy_path = simulator_collision_proxy_path(obj, physics, project_root)
     bbox_size = numeric_list(pose.get("bbox_size"), 3)

@@ -50,6 +50,12 @@ video
 RUN_SIMULATOR_ADAPTERS=1 bash run.sh dataset/<video>.mp4
 ```
 
+Gaussian probability backprojection 现在也不作为 quick run 默认阻塞项。默认路线直接用 `semantic_splats.ply` 对 scene mesh 做 local multi-sample semantic transfer；需要复现实验性的投影概率融合时再显式打开：
+
+```bash
+GAUSSIAN_BACKPROJECT=1 bash run.sh dataset/<video>.mp4
+```
+
 常用调参：
 
 ```bash

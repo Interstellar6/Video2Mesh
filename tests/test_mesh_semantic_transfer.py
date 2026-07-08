@@ -7,6 +7,7 @@ from video2mesh.cli import (
     build_parser,
     cmd_split_mesh_by_semantics,
     cmd_transfer_mesh_semantics,
+    cmd_transfer_mesh_semantics_local,
     read_triangle_mesh_for_semantic_transfer,
 )
 
@@ -161,6 +162,71 @@ def test_transfer_mesh_semantics_writes_triangle_index_sidecar_for_glb(tmp_path:
     assert payload["face_semantics"][0]["face"] == 0
     assert payload["face_semantics"][1]["face"] == 1
     assert (output_dir / "two_faces_semantic_debug.ply").exists()
+
+
+def test_transfer_mesh_semantics_local_uses_stable_default_sidecar_name(tmp_path: Path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "manifest.json").write_text(
+        json.dumps({"schema_version": 1, "artifacts": {}, "simulator_assets_dir": "simulator_assets"}),
+        encoding="utf-8",
+    )
+    semantic_ply = tmp_path / "semantic.ply"
+    semantic_manifest = tmp_path / "semantic_manifest.json"
+    mesh = tmp_path / "two_faces.glb"
+    output_dir = tmp_path / "mesh_semantics_local"
+    write_semantic_source(semantic_ply)
+    write_tiny_indexed_glb(mesh)
+    semantic_manifest.write_text(
+        json.dumps(
+            {
+                "objects": [
+                    {"semantic_id": 1, "object_id": "left_object", "name": "left", "category": "toy"},
+                    {"semantic_id": 2, "object_id": "right_object", "name": "right", "category": "toy"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cmd_transfer_mesh_semantics_local(
+        Namespace(
+            project_root=project_root,
+            semantic_splats_ply=semantic_ply,
+            semantic_manifest=semantic_manifest,
+            mesh=mesh,
+            output_dir=output_dir,
+            output=None,
+            debug_ply=None,
+            k=2,
+            face_sample_mode="center",
+            max_distance=1.0,
+            max_distance_ratio=None,
+            min_sample_support=1.0,
+            min_neighbor_votes=1,
+            min_face_probability=0.1,
+            min_vote_confidence=0.5,
+            distance_power=2.0,
+            distance_epsilon=1e-5,
+            label_bbox_quantile=0.0,
+            label_bbox_padding_ratio=0.1,
+            bbox_min_probability=0.1,
+            smooth_iterations=0,
+            smooth_keep_probability=0.75,
+            smooth_min_neighbors=2,
+            min_region_faces=0,
+            semantic_max_points=0,
+            semantic_min_points_per_label=1,
+            seed=7,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads((output_dir / "mesh_semantics.json").read_text())
+    assert payload["summary"]["mesh_face_count"] == 2
+    assert (output_dir / "mesh_semantics_debug.ply").exists()
+    manifest = json.loads((project_root / "manifest.json").read_text())
+    assert manifest["artifacts"]["mesh_semantics_local"].endswith("mesh_semantics.json")
 
 
 def test_split_mesh_by_semantics_exports_scene_space_object_meshes(tmp_path: Path):

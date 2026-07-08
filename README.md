@@ -29,6 +29,7 @@ video
   -> GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback
   -> SAM2 masks
   -> 2D-to-3D semantic fusion
+  -> semantic 3DGS / SuperSplat export
   -> conservative object-fragment merge suggestions/applied small components
   -> COLMAP dense Delaunay scene collider mesh
   -> mesh semantic transfer and semantic object mesh splitting
@@ -40,6 +41,10 @@ video
 Simulator adapters are skipped by default in the quick pipeline while mesh and
 collider quality is still being tuned. Re-enable them explicitly with
 `RUN_SIMULATOR_ADAPTERS=1`.
+
+The slower Gaussian probability backprojection route is also optional now; the
+default route uses semantic splats directly for mesh semantic transfer. Re-enable
+the projected probability experiment with `GAUSSIAN_BACKPROJECT=1`.
 
 For commands, QA and research decisions, start here:
 
