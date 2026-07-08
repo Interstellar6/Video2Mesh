@@ -1347,12 +1347,14 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert g3dgs.clean_init_point_cloud is True
     assert g3dgs.clean_3dgs_floaters is True
     assert g3dgs.clean_strict_scene_filter is True
+    assert g3dgs.clean_preserve_background_planes is True
     assert g3dgs.clean_max_elongation == pytest.approx(25.0)
     pipeline = parser.parse_args(["run-pipeline", "--project-root", "proj"])
     assert pipeline.g3dgs_prefer_dense_colmap_init is True
     assert pipeline.g3dgs_clean_init_point_cloud is True
     assert pipeline.g3dgs_clean_3dgs_floaters is True
     assert pipeline.g3dgs_clean_strict_scene_filter is True
+    assert pipeline.g3dgs_clean_preserve_background_planes is True
     assert pipeline.g3dgs_clean_max_elongation == pytest.approx(25.0)
     assert pipeline.auto_merge_object_masks is True
     assert pipeline.object_merge_apply is True
@@ -1384,6 +1386,7 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert full_scene_mesh.scene_mesh_semantic_route == "projected-splats"
     assert clean.func.__name__ == "cmd_clean_3dgs_floaters"
     assert clean.knn == 24
+    assert clean.preserve_background_planes is True
     assert clean_cloud.func.__name__ == "cmd_clean_point_cloud_outliers"
     assert clean_cloud.quantile_min == pytest.approx(0.001)
     assert clean_cloud.quantile_max == pytest.approx(0.999)

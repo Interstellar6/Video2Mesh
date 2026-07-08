@@ -38,6 +38,7 @@ Optional environment overrides:
   GRAPHDECO_OPACITY_RESET_INTERVAL=3000
   GRAPHDECO_SH_DEGREE=3
   GRAPHDECO_EXTRA_ARGS=""
+  STRICT_3DGS_PRESERVE_BACKGROUND_PLANES=1
   PROMPT_DISCOVERY=groundingdino|auto-prompts
   GROUNDINGDINO_ROOT=/root/autodl-tmp/workspace/GroundingDINO
   GROUNDINGDINO_CHECKPOINT=/root/autodl-tmp/checkpoints/groundingdino/groundingdino_swint_ogc.pth
@@ -179,6 +180,7 @@ STRICT_3DGS_CLEAN="${STRICT_3DGS_CLEAN:-1}"
 STRICT_3DGS_BBOX_PADDING_RATIO="${STRICT_3DGS_BBOX_PADDING_RATIO:-0.12}"
 STRICT_3DGS_CLUSTER_EPS_RATIO="${STRICT_3DGS_CLUSTER_EPS_RATIO:-0.015}"
 STRICT_3DGS_CLUSTER_MIN_POINTS="${STRICT_3DGS_CLUSTER_MIN_POINTS:-300}"
+STRICT_3DGS_PRESERVE_BACKGROUND_PLANES="${STRICT_3DGS_PRESERVE_BACKGROUND_PLANES:-1}"
 RECONSTRUCT_SCENE_MESHES="${RECONSTRUCT_SCENE_MESHES:-1}"
 TRANSFER_SCENE_MESH_SEMANTICS="${TRANSFER_SCENE_MESH_SEMANTICS:-1}"
 SPLIT_SCENE_MESH_BY_SEMANTICS="${SPLIT_SCENE_MESH_BY_SEMANTICS:-1}"
@@ -315,6 +317,11 @@ if [[ "$GS_BACKEND" == "graphdeco" ]]; then
       --g3dgs-clean-cluster-eps-ratio "$STRICT_3DGS_CLUSTER_EPS_RATIO"
       --g3dgs-clean-cluster-min-points "$STRICT_3DGS_CLUSTER_MIN_POINTS"
     )
+    if [[ "$STRICT_3DGS_PRESERVE_BACKGROUND_PLANES" == "1" || "$STRICT_3DGS_PRESERVE_BACKGROUND_PLANES" == "true" ]]; then
+      g3dgs_args+=(--g3dgs-clean-preserve-background-planes)
+    else
+      g3dgs_args+=(--no-g3dgs-clean-preserve-background-planes)
+    fi
   else
     g3dgs_args+=(--no-g3dgs-clean-strict-scene-filter)
   fi

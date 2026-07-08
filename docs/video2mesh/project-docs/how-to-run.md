@@ -56,6 +56,9 @@ RUN_SIMULATOR_ADAPTERS=1 bash run.sh dataset/<video>.mp4
 # 关闭 strict 3DGS cluster clean，仅用于对比
 STRICT_3DGS_CLEAN=0 bash run.sh dataset/<video>.mp4
 
+# 关闭 strict clean 中的背景平面保护，仅用于定位是否误保留了大平面噪声
+STRICT_3DGS_PRESERVE_BACKGROUND_PLANES=0 bash run.sh dataset/<video>.mp4
+
 # 背景墙面被 RANSAC 分到 other_structure 时，默认先导出；可关闭
 BACKGROUND_PLANE_INCLUDE_OTHER_PLANES=0 bash run.sh dataset/<video>.mp4
 
@@ -96,5 +99,6 @@ exports/<run>/
 ## 近期 bedroom_4 经验
 
 - `scene_3dgs_supersplat.ply` 约 118 MB 不等于点数极少；这类 viewer PLY 是压成 SuperSplat 兼容字段后的可视化副本。质量差的主因更常见是 Gaussian scale/rotation 不健康、细长低透明光斑和 detached dense floater cluster，而不是单纯文件体积。
-- 普通 KNN/MAD 只能删孤立散点；右下角那种“自己内部很密、但离主体很远”的小簇需要 strict cluster-level clean。
+- 普通 KNN/MAD 只能删孤立散点；右下角那种“自己内部很密、但离主体很远”的小簇需要 strict cluster-level clean。当前默认的 strict clean 会用 COLMAP dense fused.ply 的分位 bbox + DBSCAN 删除 detached cluster，同时保护大平面背景。
+- 在 `bedroom_4_full_pipeline_valid_1280_20260708_160328` 上复测，raw 3DGS 为 604,781 个 Gaussian，普通 clean 保留 475,771 个；strict bbox+DBSCAN 标记 5,699 个 detached/bbox 候选点。打开背景平面保护后，最终保留 484,165 个，并救回 9,326 个大平面点，避免再次把墙面/地面结构误删。
 - 左墙缺失通常来自背景平面分类过严：RANSAC 找到了平面，但被标成 `other_structure` 后没有导出。quick run 现在默认打开 `BACKGROUND_PLANE_INCLUDE_OTHER_PLANES=1`，先把这些结构保留下来，再由语义/人工修正。

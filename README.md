@@ -25,7 +25,7 @@ video
   -> COLMAP poses and full point cloud
   -> COLMAP dense fused.ply cleaned as GraphDECO init
   -> GraphDECO 3DGS
-  -> strict 3DGS floater cleanup: COLMAP dense bbox + DBSCAN cluster filter
+  -> strict 3DGS floater cleanup: COLMAP dense bbox + DBSCAN cluster filter + background plane protection
   -> GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback
   -> SAM2 masks
   -> 2D-to-3D semantic fusion

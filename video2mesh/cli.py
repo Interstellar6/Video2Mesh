@@ -4028,7 +4028,7 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
             cluster_min_ratio=float(getattr(args, "clean_cluster_min_ratio", 0.001)),
             cluster_keep_largest=bool(getattr(args, "clean_cluster_keep_largest", True)),
             strict_min_keep_ratio=float(getattr(args, "clean_strict_min_keep_ratio", 0.50)),
-            preserve_background_planes=bool(getattr(args, "clean_preserve_background_planes", False)),
+            preserve_background_planes=bool(getattr(args, "clean_preserve_background_planes", True)),
             background_up_axis=str(getattr(args, "clean_background_up_axis", "y")),
             background_max_planes=int(getattr(args, "clean_background_max_planes", 8)),
             background_min_points=int(getattr(args, "clean_background_min_points", 300)),
@@ -40909,7 +40909,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clean-cluster-min-ratio", type=float, default=0.001)
     p.add_argument("--clean-cluster-keep-largest", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--clean-strict-min-keep-ratio", type=float, default=0.50)
-    p.add_argument("--clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=True, help="Protect large RANSAC floor/wall/ceiling planes while cleaning 3DGS floaters.")
     p.add_argument("--clean-background-up-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--clean-background-max-planes", type=int, default=8)
     p.add_argument("--clean-background-min-points", type=int, default=300)
@@ -40952,7 +40952,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cluster-min-ratio", type=float, default=0.001)
     p.add_argument("--cluster-keep-largest", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--strict-min-keep-ratio", type=float, default=0.50)
-    p.add_argument("--preserve-background-planes", action=argparse.BooleanOptionalAction, default=False, help="Protect large RANSAC floor/wall/ceiling planes from floater removal.")
+    p.add_argument("--preserve-background-planes", action=argparse.BooleanOptionalAction, default=True, help="Protect large RANSAC floor/wall/ceiling planes from floater removal.")
     p.add_argument("--background-up-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--background-max-planes", type=int, default=8)
     p.add_argument("--background-min-points", type=int, default=300)
@@ -42763,7 +42763,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-clean-cluster-min-ratio", type=float, default=0.001)
     p.add_argument("--g3dgs-clean-cluster-keep-largest", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--g3dgs-clean-strict-min-keep-ratio", type=float, default=0.50)
-    p.add_argument("--g3dgs-clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--g3dgs-clean-preserve-background-planes", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--g3dgs-clean-background-up-axis", choices=["x", "y", "z"], default="y")
     p.add_argument("--g3dgs-clean-background-max-planes", type=int, default=8)
     p.add_argument("--g3dgs-clean-background-min-points", type=int, default=300)
