@@ -7,7 +7,8 @@ Usage:
   bash tools/run_video2mesh_quick.sh /path/to/video.mp4
 
 Convention-over-configuration quick entrypoint for the full Video2Mesh baseline:
-video -> dense real frames -> COLMAP sparse point cloud/poses -> GraphDECO 3DGS -> SAM2 masks ->
+video -> dense real frames -> COLMAP sparse point cloud/poses -> GraphDECO 3DGS ->
+GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback -> SAM2 masks ->
 3D semantic masks/probabilities -> SVLGaussian frame selection -> coarse meshes ->
 simulator assets and QA reports.
 The default quick route now also builds a COLMAP dense Delaunay scene collider,
@@ -37,6 +38,11 @@ Optional environment overrides:
   GRAPHDECO_OPACITY_RESET_INTERVAL=3000
   GRAPHDECO_SH_DEGREE=3
   GRAPHDECO_EXTRA_ARGS=""
+  PROMPT_DISCOVERY=groundingdino|auto-prompts
+  GROUNDINGDINO_ROOT=/root/autodl-tmp/workspace/GroundingDINO
+  GROUNDINGDINO_CHECKPOINT=/root/autodl-tmp/checkpoints/groundingdino/groundingdino_swint_ogc.pth
+  GROUNDINGDINO_CONFIG=/path/to/GroundingDINO_SwinT_OGC.py
+  OBJECT_PROMPT_QUERIES="bed,chair,table,window,curtain,door,lamp,plant,nightstand"
   MAX_FRAMES=200
   START_SEC=
   END_SEC=
@@ -104,6 +110,11 @@ SAM_CHECKPOINT="${SAM_CHECKPOINT:-/root/autodl-tmp/checkpoints/sam/sam_vit_b_01e
 SAM_MODEL_TYPE="${SAM_MODEL_TYPE:-vit_b}"
 GRAPHDECO_ROOT="${GRAPHDECO_ROOT:-/root/autodl-tmp/workspace/gaussian-splatting}"
 GRAPHDECO_PYTHON="${GRAPHDECO_PYTHON:-$V2M_PYTHON}"
+GROUNDINGDINO_ROOT="${GROUNDINGDINO_ROOT:-/root/autodl-tmp/workspace/GroundingDINO}"
+GROUNDINGDINO_CHECKPOINT="${GROUNDINGDINO_CHECKPOINT:-/root/autodl-tmp/checkpoints/groundingdino/groundingdino_swint_ogc.pth}"
+GROUNDINGDINO_CONFIG="${GROUNDINGDINO_CONFIG:-}"
+GROUNDINGDINO_DEVICE="${GROUNDINGDINO_DEVICE:-auto}"
+OBJECT_PROMPT_QUERIES="${OBJECT_PROMPT_QUERIES:-}"
 
 RUN_MAST3R="${RUN_MAST3R:-0}"
 RUN_COLMAP="${RUN_COLMAP:-1}"
@@ -164,6 +175,67 @@ SCENE_MESH_SEMANTIC_ROUTE="${SCENE_MESH_SEMANTIC_ROUTE:-local}"
 SCENE_MESH_SEMANTIC_MAX_POINTS="${SCENE_MESH_SEMANTIC_MAX_POINTS:-250000}"
 SCENE_MESH_OBJECT_SPLITS_MIN_FACES="${SCENE_MESH_OBJECT_SPLITS_MIN_FACES:-20}"
 
+PROMPT_DISCOVERY="${PROMPT_DISCOVERY:-groundingdino}"
+prompt_discovery_args=()
+prompt_discovery_label=""
+groundingdino_fallback_reason=""
+case "$PROMPT_DISCOVERY" in
+  groundingdino)
+    groundingdino_config_args=()
+    if [[ -n "$GROUNDINGDINO_CONFIG" ]]; then
+      if [[ -f "$GROUNDINGDINO_CONFIG" ]]; then
+        groundingdino_config_args=(--groundingdino-config "$GROUNDINGDINO_CONFIG")
+      else
+        groundingdino_fallback_reason="GroundingDINO config not found: $GROUNDINGDINO_CONFIG"
+      fi
+    fi
+    if [[ -z "$groundingdino_fallback_reason" && ! -f "$GROUNDINGDINO_CHECKPOINT" ]]; then
+      groundingdino_fallback_reason="GroundingDINO checkpoint not found: $GROUNDINGDINO_CHECKPOINT"
+    fi
+    if [[ -z "$groundingdino_fallback_reason" && ! -d "$GROUNDINGDINO_ROOT" && -z "$GROUNDINGDINO_CONFIG" ]]; then
+      groundingdino_fallback_reason="GroundingDINO root not found and no config was provided: $GROUNDINGDINO_ROOT"
+    fi
+    if [[ -z "$groundingdino_fallback_reason" ]]; then
+      gdino_pythonpath="${PYTHONPATH:-}"
+      if [[ -d "$GROUNDINGDINO_ROOT" ]]; then
+        gdino_pythonpath="${GROUNDINGDINO_ROOT}:${gdino_pythonpath}"
+      fi
+      if ! PYTHONPATH="$gdino_pythonpath" "$V2M_PYTHON" - <<'PY' >/dev/null 2>&1
+import groundingdino  # noqa: F401
+PY
+      then
+        groundingdino_fallback_reason="GroundingDINO is not importable in $V2M_PYTHON"
+      fi
+    fi
+    if [[ -z "$groundingdino_fallback_reason" ]]; then
+      prompt_discovery_args=(--discover-object-prompts)
+      if [[ -d "$GROUNDINGDINO_ROOT" ]]; then
+        prompt_discovery_args+=(--groundingdino-root "$GROUNDINGDINO_ROOT")
+      fi
+      prompt_discovery_args+=(
+        "${groundingdino_config_args[@]}"
+        --groundingdino-checkpoint "$GROUNDINGDINO_CHECKPOINT"
+        --groundingdino-device "$GROUNDINGDINO_DEVICE"
+      )
+      if [[ -n "$OBJECT_PROMPT_QUERIES" ]]; then
+        prompt_discovery_args+=(--object-prompt-queries "$OBJECT_PROMPT_QUERIES")
+      fi
+      prompt_discovery_label="groundingdino"
+    else
+      prompt_discovery_args=(--auto-prompts)
+      prompt_discovery_label="auto-prompts-fallback"
+    fi
+    ;;
+  auto-prompts|auto_prompt|auto)
+    prompt_discovery_args=(--auto-prompts)
+    prompt_discovery_label="auto-prompts"
+    ;;
+  *)
+    echo "[Video2Mesh quick] Unknown PROMPT_DISCOVERY: $PROMPT_DISCOVERY" >&2
+    exit 2
+    ;;
+esac
+
 AUTO_PROMPT_METHOD="${AUTO_PROMPT_METHOD:-sam}"
 if [[ "$AUTO_PROMPT_METHOD" == "sam" && ! -f "$SAM_CHECKPOINT" ]]; then
   echo "[Video2Mesh quick] SAM checkpoint not found, falling back to OpenCV auto prompts: $SAM_CHECKPOINT" >&2
@@ -205,6 +277,10 @@ echo "[Video2Mesh quick] video: $VIDEO_INPUT" | tee -a "$LOG"
 echo "[Video2Mesh quick] project: $PROJECT_ROOT" | tee -a "$LOG"
 echo "[Video2Mesh quick] scene_id: $SCENE_ID" | tee -a "$LOG"
 echo "[Video2Mesh quick] python: $V2M_PYTHON" | tee -a "$LOG"
+echo "[Video2Mesh quick] prompt_discovery: $prompt_discovery_label" | tee -a "$LOG"
+if [[ -n "$groundingdino_fallback_reason" ]]; then
+  echo "[Video2Mesh quick] prompt_discovery_fallback_reason: $groundingdino_fallback_reason" | tee -a "$LOG"
+fi
 echo "[Video2Mesh quick] auto_prompt_method: $AUTO_PROMPT_METHOD" | tee -a "$LOG"
 echo "[Video2Mesh quick] mask_backend: $MASK_BACKEND" | tee -a "$LOG"
 echo "[Video2Mesh quick] gs_backend: $GS_BACKEND" | tee -a "$LOG"
@@ -331,7 +407,7 @@ fi
   --preview-max-frames 6 \
   --preview-width "$GSPLAT_WIDTH" \
   --preview-height "$GSPLAT_HEIGHT" \
-  --auto-prompts \
+  "${prompt_discovery_args[@]}" \
   --auto-prompt-method "$AUTO_PROMPT_METHOD" \
   --auto-prompt-frame-index "$AUTO_PROMPT_FRAME_INDEX" \
   --auto-prompt-max-objects "$AUTO_PROMPT_MAX_OBJECTS" \
