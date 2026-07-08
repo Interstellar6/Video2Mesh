@@ -28,10 +28,10 @@ video
   -> 清理 dense fused.ply 后作为 GraphDECO 3DGS 初始化点云
   -> GraphDECO 30k 训练
   -> point_cloud_clean_strict.ply
-     - KNN/MAD 普通离群点
-     - 低透明细长 Gaussian
      - COLMAP dense 分位 bbox
      - DBSCAN detached cluster 过滤
+     - 背景平面保护
+     - 默认不启用 KNN/MAD 稀疏点删除或低透明细长 Gaussian 删除
   -> GroundingDINO bbox prompts
      - GroundingDINO 缺权重/环境时 fallback 到 auto-prompts
   -> SAM2/2D mask tracking
@@ -64,6 +64,10 @@ STRICT_3DGS_CLEAN=0 bash run.sh dataset/<video>.mp4
 
 # 关闭 strict clean 中的背景平面保护，仅用于定位是否误保留了大平面噪声
 STRICT_3DGS_PRESERVE_BACKGROUND_PLANES=0 bash run.sh dataset/<video>.mp4
+
+# 重新启用 KNN/MAD 或细长 Gaussian 过滤，仅用于对比噪声清理；默认关闭以保护墙/地板
+STRICT_3DGS_GEOMETRIC_OUTLIERS=1 bash run.sh dataset/<video>.mp4
+STRICT_3DGS_ELONGATION_FILTER=1 bash run.sh dataset/<video>.mp4
 
 # 背景墙面被 RANSAC 分到 other_structure 时，默认先导出；可关闭
 BACKGROUND_PLANE_INCLUDE_OTHER_PLANES=0 bash run.sh dataset/<video>.mp4
@@ -105,6 +109,6 @@ exports/<run>/
 ## 近期 bedroom_4 经验
 
 - `scene_3dgs_supersplat.ply` 约 118 MB 不等于点数极少；这类 viewer PLY 是压成 SuperSplat 兼容字段后的可视化副本。质量差的主因更常见是 Gaussian scale/rotation 不健康、细长低透明光斑和 detached dense floater cluster，而不是单纯文件体积。
-- 普通 KNN/MAD 只能删孤立散点；右下角那种“自己内部很密、但离主体很远”的小簇需要 strict cluster-level clean。当前默认的 strict clean 会用 COLMAP dense fused.ply 的分位 bbox + DBSCAN 删除 detached cluster，同时保护大平面背景。
-- 在 `bedroom_4_full_pipeline_valid_1280_20260708_160328` 上复测，raw 3DGS 为 604,781 个 Gaussian，普通 clean 保留 475,771 个；strict bbox+DBSCAN 标记 5,699 个 detached/bbox 候选点。打开背景平面保护后，最终保留 484,165 个，并救回 9,326 个大平面点，避免再次把墙面/地面结构误删。
+- 普通 KNN/MAD 只能删孤立散点；右下角那种“自己内部很密、但离主体很远”的小簇需要 strict cluster-level clean。当前默认的 strict clean 会用 COLMAP dense fused.ply 的分位 bbox + DBSCAN 删除 detached cluster，同时保护大平面背景；KNN/MAD 稀疏点删除和低透明细长 Gaussian 删除默认关闭，因为它们在 bedroom_4 上会误删墙面/地板。
+- 在 `bedroom_4_mil8_cuda_gpu0_20260708_213645` 上复测，raw 3DGS 为 965,577 个 Gaussian。旧 strict clean 保留 746,464 个，其中 `elongated & weak` 删除 140,174 个；关闭细长过滤后保留 890,394 个；最终 scene-only clean 只保留 COLMAP bbox + DBSCAN detached cluster + 背景平面保护，保留 963,296 个，仅删除 2,281 个场景外/小簇点。
 - 左墙缺失通常来自背景平面分类过严：RANSAC 找到了平面，但被标成 `other_structure` 后没有导出。quick run 现在默认打开 `BACKGROUND_PLANE_INCLUDE_OTHER_PLANES=1`，先把这些结构保留下来，再由语义/人工修正。

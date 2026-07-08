@@ -25,7 +25,7 @@ video
   -> COLMAP poses and full point cloud
   -> COLMAP dense fused.ply cleaned as GraphDECO init
   -> GraphDECO 3DGS
-  -> strict 3DGS floater cleanup: COLMAP dense bbox + DBSCAN cluster filter + background plane protection
+  -> scene-only 3DGS cleanup: COLMAP dense bbox + DBSCAN detached-cluster filter + background plane protection
   -> GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback
   -> SAM2 masks
   -> 2D-to-3D semantic fusion
@@ -45,6 +45,12 @@ collider quality is still being tuned. Re-enable them explicitly with
 The slower Gaussian probability backprojection route is also optional now; the
 default route uses semantic splats directly for mesh semantic transfer. Re-enable
 the projected probability experiment with `GAUSSIAN_BACKPROJECT=1`.
+
+The default 3DGS cleanup is intentionally conservative for room-scale scenes:
+it does not remove KNN/MAD sparse points or low-opacity elongated Gaussians by
+default, because those rules removed real walls and floors in bedroom scans.
+Use `STRICT_3DGS_GEOMETRIC_OUTLIERS=1` or `STRICT_3DGS_ELONGATION_FILTER=1`
+only for debugging a noisy visual layer.
 
 For commands, QA and research decisions, start here:
 

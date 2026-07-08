@@ -3353,6 +3353,8 @@ def clean_3dgs_floaters(
     min_opacity: float,
     low_opacity: float,
     remove_low_opacity: bool,
+    geometric_outliers: bool = False,
+    elongation_filter: bool = False,
     strict_scene_filter: bool = False,
     reference_point_cloud: Path | None = None,
     bbox_filter: bool = True,
@@ -3394,8 +3396,12 @@ def clean_3dgs_floaters(
         raise ValueError(f"No Gaussian vertices found: {input_ply}")
 
     neighbor_count = min(max(1, int(knn)), max(1, count - 1))
-    mean_neighbor_distance = np.zeros(count, dtype=np.float64)
-    if count > 1:
+    geometric_outlier = np.zeros(count, dtype=bool)
+    median_distance = 0.0
+    mad = 0.0
+    distance_threshold = float("inf")
+    if geometric_outliers and count > 1:
+        mean_neighbor_distance = np.zeros(count, dtype=np.float64)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(means)
         tree = o3d.geometry.KDTreeFlann(pcd)
@@ -3403,15 +3409,15 @@ def clean_3dgs_floaters(
             _found, _indices, distances2 = tree.search_knn_vector_3d(pcd.points[idx], neighbor_count + 1)
             values = np.sqrt(np.asarray(distances2[1:], dtype=np.float64)) if len(distances2) > 1 else np.asarray([], dtype=np.float64)
             mean_neighbor_distance[idx] = float(values.mean()) if values.size else 0.0
-    median_distance = float(np.median(mean_neighbor_distance))
-    mad = float(np.median(np.abs(mean_neighbor_distance - median_distance)))
-    robust_sigma = 1.4826 * mad if mad > 0 else float(np.std(mean_neighbor_distance))
-    distance_threshold = median_distance + float(outlier_mad) * max(robust_sigma, 1e-12)
-    geometric_outlier = mean_neighbor_distance > distance_threshold
+        median_distance = float(np.median(mean_neighbor_distance))
+        mad = float(np.median(np.abs(mean_neighbor_distance - median_distance)))
+        robust_sigma = 1.4826 * mad if mad > 0 else float(np.std(mean_neighbor_distance))
+        distance_threshold = median_distance + float(outlier_mad) * max(robust_sigma, 1e-12)
+        geometric_outlier = mean_neighbor_distance > distance_threshold
 
     scale_abs = np.maximum(np.abs(scales[:, :3]), 1e-12)
     elongation = scale_abs.max(axis=1) / scale_abs.min(axis=1)
-    elongated = elongation > float(max_elongation)
+    elongated = (elongation > float(max_elongation)) if elongation_filter else np.zeros(count, dtype=bool)
     transparent = opacities < float(min_opacity)
     weak = opacities < float(low_opacity)
     remove = geometric_outlier | (elongated & weak)
@@ -3482,6 +3488,8 @@ def clean_3dgs_floaters(
             "min_opacity": float(min_opacity),
             "low_opacity": float(low_opacity),
             "remove_low_opacity": bool(remove_low_opacity),
+            "geometric_outliers": bool(geometric_outliers),
+            "elongation_filter": bool(elongation_filter),
             "strict_scene_filter": bool(strict_scene_filter),
             "reference_point_cloud": str(reference_point_cloud) if reference_point_cloud else None,
             "bbox_filter": bool(bbox_filter),
@@ -3501,12 +3509,14 @@ def clean_3dgs_floaters(
         "strict_scene_filter": strict_scene_report,
         "background_plane_protection": background_plane_report,
         "geometry_outlier": {
+            "enabled": bool(geometric_outliers),
             "removed_count": int(geometric_outlier.sum()),
             "median_mean_neighbor_distance": median_distance,
             "mad": mad,
             "threshold": distance_threshold,
         },
         "elongated_low_opacity": {
+            "enabled": bool(elongation_filter),
             "removed_count": int((elongated & weak).sum()),
             "max_elongation_observed": float(np.max(elongation)) if elongation.size else 0.0,
         },
@@ -3539,6 +3549,8 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
         min_opacity=float(args.min_opacity),
         low_opacity=float(args.low_opacity),
         remove_low_opacity=bool(args.remove_low_opacity),
+        geometric_outliers=bool(getattr(args, "geometric_outliers", False)),
+        elongation_filter=bool(getattr(args, "elongation_filter", False)),
         strict_scene_filter=bool(getattr(args, "strict_scene_filter", False)),
         reference_point_cloud=reference_point_cloud,
         bbox_filter=bool(getattr(args, "bbox_filter", True)),
@@ -4014,6 +4026,8 @@ def cmd_run_3dgs(args: argparse.Namespace) -> int:
             min_opacity=float(args.clean_min_opacity),
             low_opacity=float(args.clean_low_opacity),
             remove_low_opacity=bool(args.clean_remove_low_opacity),
+            geometric_outliers=bool(getattr(args, "clean_geometric_outliers", False)),
+            elongation_filter=bool(getattr(args, "clean_elongation_filter", False)),
             strict_scene_filter=strict_enabled,
             reference_point_cloud=reference_point_cloud,
             bbox_filter=bool(getattr(args, "clean_bbox_filter", True)),
@@ -39722,6 +39736,8 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     clean_min_opacity=args.g3dgs_clean_min_opacity,
                     clean_low_opacity=args.g3dgs_clean_low_opacity,
                     clean_remove_low_opacity=args.g3dgs_clean_remove_low_opacity,
+                    clean_geometric_outliers=args.g3dgs_clean_geometric_outliers,
+                    clean_elongation_filter=args.g3dgs_clean_elongation_filter,
                     clean_strict_scene_filter=args.g3dgs_clean_strict_scene_filter,
                     clean_reference_point_cloud=args.g3dgs_clean_reference_point_cloud,
                     clean_bbox_filter=args.g3dgs_clean_bbox_filter,
@@ -40896,6 +40912,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clean-min-opacity", type=float, default=0.01)
     p.add_argument("--clean-low-opacity", type=float, default=0.08)
     p.add_argument("--clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--clean-geometric-outliers", action=argparse.BooleanOptionalAction, default=False, help="Enable KNN/MAD center-density outlier removal. Disabled by default to preserve sparse walls/floors.")
+    p.add_argument("--clean-elongation-filter", action=argparse.BooleanOptionalAction, default=False, help="Enable low-opacity elongated Gaussian removal. Disabled by default to preserve background planes.")
     p.add_argument("--clean-strict-scene-filter", action=argparse.BooleanOptionalAction, default=True, help="Also remove scene-level detached 3DGS clusters using COLMAP dense bbox and DBSCAN, writing *_clean_strict.ply.")
     p.add_argument("--clean-reference-point-cloud", type=Path, help="Reference point cloud for strict scene filter. Defaults to COLMAP dense fused.ply when available.")
     p.add_argument("--clean-bbox-filter", action=argparse.BooleanOptionalAction, default=True)
@@ -40939,6 +40957,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-opacity", type=float, default=0.01)
     p.add_argument("--low-opacity", type=float, default=0.08)
     p.add_argument("--remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--geometric-outliers", action=argparse.BooleanOptionalAction, default=False, help="Enable KNN/MAD center-density outlier removal. Disabled by default to preserve sparse walls/floors.")
+    p.add_argument("--elongation-filter", action=argparse.BooleanOptionalAction, default=False, help="Enable low-opacity elongated Gaussian removal. Disabled by default to preserve background planes.")
     p.add_argument("--strict-scene-filter", action=argparse.BooleanOptionalAction, default=False, help="Remove detached scene-level clusters using a reference point cloud bbox and DBSCAN.")
     p.add_argument("--reference-point-cloud", type=Path, help="Reference point cloud for strict scene filtering, usually COLMAP dense fused.ply.")
     p.add_argument("--bbox-filter", action=argparse.BooleanOptionalAction, default=True)
@@ -42750,6 +42770,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--g3dgs-clean-min-opacity", type=float, default=0.01)
     p.add_argument("--g3dgs-clean-low-opacity", type=float, default=0.08)
     p.add_argument("--g3dgs-clean-remove-low-opacity", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--g3dgs-clean-geometric-outliers", action=argparse.BooleanOptionalAction, default=False, help="Enable KNN/MAD center-density outlier removal. Disabled by default to preserve sparse walls/floors.")
+    p.add_argument("--g3dgs-clean-elongation-filter", action=argparse.BooleanOptionalAction, default=False, help="Enable low-opacity elongated Gaussian removal. Disabled by default to preserve background planes.")
     p.add_argument("--g3dgs-clean-strict-scene-filter", action=argparse.BooleanOptionalAction, default=True, help="Use COLMAP dense bbox + DBSCAN to remove detached 3DGS floater clusters and register *_clean_strict.ply.")
     p.add_argument("--g3dgs-clean-reference-point-cloud", type=Path, help="Strict clean reference point cloud. Defaults to COLMAP dense fused.ply.")
     p.add_argument("--g3dgs-clean-bbox-filter", action=argparse.BooleanOptionalAction, default=True)

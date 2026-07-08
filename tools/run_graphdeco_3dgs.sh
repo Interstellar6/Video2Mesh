@@ -30,6 +30,8 @@ Optional environment overrides:
   CLEAN_MAX_ELONGATION=25
   CLEAN_MIN_OPACITY=0.01
   CLEAN_LOW_OPACITY=0.08
+  CLEAN_GEOMETRIC_OUTLIERS=0
+  CLEAN_ELONGATION_FILTER=0
   STRICT_3DGS_CLEAN=1
   STRICT_REFERENCE_POINT_CLOUD=/path/to/external/colmap/dense/fused.ply
   STRICT_BBOX_PADDING_RATIO=0.12
@@ -73,6 +75,8 @@ CLEAN_OUTLIER_MAD="${CLEAN_OUTLIER_MAD:-2.5}"
 CLEAN_MAX_ELONGATION="${CLEAN_MAX_ELONGATION:-25}"
 CLEAN_MIN_OPACITY="${CLEAN_MIN_OPACITY:-0.01}"
 CLEAN_LOW_OPACITY="${CLEAN_LOW_OPACITY:-0.08}"
+CLEAN_GEOMETRIC_OUTLIERS="${CLEAN_GEOMETRIC_OUTLIERS:-0}"
+CLEAN_ELONGATION_FILTER="${CLEAN_ELONGATION_FILTER:-0}"
 STRICT_3DGS_CLEAN="${STRICT_3DGS_CLEAN:-1}"
 STRICT_REFERENCE_POINT_CLOUD="${STRICT_REFERENCE_POINT_CLOUD:-$PROJECT_ROOT/external/colmap/dense/fused.ply}"
 STRICT_BBOX_PADDING_RATIO="${STRICT_BBOX_PADDING_RATIO:-0.12}"
@@ -207,6 +211,16 @@ if [[ "$CLEAN_3DGS_FLOATERS" == "1" ]]; then
     if [[ -n "$STRICT_REFERENCE_POINT_CLOUD" && -f "$STRICT_REFERENCE_POINT_CLOUD" ]]; then
       clean_args+=(--reference-point-cloud "$STRICT_REFERENCE_POINT_CLOUD")
     fi
+  fi
+  if [[ "$CLEAN_GEOMETRIC_OUTLIERS" == "1" || "$CLEAN_GEOMETRIC_OUTLIERS" == "true" ]]; then
+    clean_args+=(--geometric-outliers)
+  else
+    clean_args+=(--no-geometric-outliers)
+  fi
+  if [[ "$CLEAN_ELONGATION_FILTER" == "1" || "$CLEAN_ELONGATION_FILTER" == "true" ]]; then
+    clean_args+=(--elongation-filter)
+  else
+    clean_args+=(--no-elongation-filter)
   fi
   "$V2M_PYTHON" -B -m video2mesh.cli clean-3dgs-floaters \
     --project-root "$PROJECT_ROOT" \
