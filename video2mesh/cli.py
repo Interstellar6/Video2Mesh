@@ -10,6 +10,7 @@ onto a point cloud, select object frames, and export image-blaster assets.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import nullcontext
 import html
 import importlib.util
@@ -23,11 +24,13 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import zlib
 from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -13295,6 +13298,24 @@ def resolve_project_path(value: str | Path, project_root: Path) -> Path:
     return path if path.is_absolute() else project_root / path
 
 
+def manifest_optional_scene_asset(
+    project_root: Path,
+    manifest: dict[str, Any],
+    scene_key: str,
+    artifact_keys: tuple[str, ...] = (),
+) -> str | None:
+    scene = manifest.get("scene") if isinstance(manifest.get("scene"), dict) else {}
+    value = scene.get(scene_key)
+    if value not in (None, ""):
+        return str(resolve_project_path(value, project_root))
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    for artifact_key in artifact_keys:
+        value = artifacts.get(artifact_key)
+        if value not in (None, ""):
+            return str(resolve_project_path(value, project_root))
+    return None
+
+
 def infer_mask_source_ply(project_root: Path, manifest: dict[str, Any], mask_3d_dir: Path, explicit: Path | None) -> Path:
     if explicit is not None:
         return explicit.resolve()
@@ -18021,6 +18042,537 @@ def cmd_reconstruct_scene_meshes(args: argparse.Namespace) -> int:
     return 0
 
 
+def scene_collider_summary(mesh_path: Path) -> dict[str, Any]:
+    summary = summarize_triangle_mesh(mesh_path)
+    if summary.get("readable"):
+        return summary
+    try:
+        vertices, triangles, reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+        bbox = bbox_for_points(vertices)
+        summary.update(
+            {
+                "readable": True,
+                "parser": reader,
+                "vertex_count": int(vertices.shape[0]),
+                "triangle_count": int(triangles.shape[0]),
+                "bbox": bbox,
+                "bbox_diagonal": vector_diagonal(bbox.get("size") if isinstance(bbox, dict) else None),
+            }
+        )
+    except Exception as exc:
+        summary.setdefault("error", str(exc))
+    return summary
+
+
+def write_obj_triangle_mesh_from_arrays(output: Path, vertices: Any, triangles: Any) -> dict[str, Any]:
+    np = import_numpy()
+    vertices_np = np.asarray(vertices, dtype=np.float64)
+    triangles_np = np.asarray(triangles, dtype=np.int64)
+    if vertices_np.ndim != 2 or vertices_np.shape[1] != 3 or vertices_np.shape[0] == 0:
+        raise RuntimeError("Scene collider conversion requires a non-empty Vx3 vertex array.")
+    if triangles_np.ndim != 2 or triangles_np.shape[1] != 3 or triangles_np.shape[0] == 0:
+        raise RuntimeError("Scene collider conversion requires a non-empty Tx3 triangle array.")
+    ensure_dir(output.parent)
+    with output.open("w", encoding="utf-8") as f:
+        f.write("# Video2Mesh SimFoundry scene static collider\n")
+        for vertex in vertices_np:
+            f.write(f"v {float(vertex[0]):.8f} {float(vertex[1]):.8f} {float(vertex[2]):.8f}\n")
+        for triangle in triangles_np:
+            a, b, c = [int(value) + 1 for value in triangle[:3]]
+            f.write(f"f {a} {b} {c}\n")
+    return summarize_triangle_mesh(output)
+
+
+def triangle_fan(indices: list[int]) -> list[list[int]]:
+    if len(indices) < 3:
+        return []
+    base = int(indices[0])
+    return [[base, int(indices[idx]), int(indices[idx + 1])] for idx in range(1, len(indices) - 1)]
+
+
+def read_ply_triangle_mesh_lists(path: Path) -> tuple[list[list[float]], list[list[int]], str]:
+    header = parse_ply_header(path)
+    ply_format = str(header.get("format") or "")
+    elements = header.get("elements") if isinstance(header.get("elements"), list) else []
+    vertex_element = next((element for element in elements if element.get("name") == "vertex"), None)
+    face_element = next((element for element in elements if element.get("name") == "face"), None)
+    if vertex_element is None or face_element is None:
+        raise RuntimeError(f"PLY mesh must include vertex and face elements: {path}")
+    vertex_props = vertex_element.get("properties") if isinstance(vertex_element.get("properties"), list) else []
+    vertex_names = [str(prop.get("name")) for prop in vertex_props if isinstance(prop, dict)]
+    if not {"x", "y", "z"}.issubset(set(vertex_names)):
+        raise RuntimeError(f"PLY mesh vertices must include x/y/z: {path}")
+    x_col, y_col, z_col = vertex_names.index("x"), vertex_names.index("y"), vertex_names.index("z")
+    vertex_count = int(vertex_element.get("count") or 0)
+    face_count = int(face_element.get("count") or 0)
+    vertices: list[list[float]] = []
+    triangles: list[list[int]] = []
+    if ply_format == "ascii":
+        with path.open("rb") as f:
+            f.seek(int(header["data_offset"]))
+            for _ in range(vertex_count):
+                raw_line = f.readline()
+                if not raw_line:
+                    raise RuntimeError(f"PLY ended before all vertices were read: {path}")
+                row = raw_line.decode("ascii", errors="ignore").strip().split()
+                if len(row) <= max(x_col, y_col, z_col):
+                    raise RuntimeError(f"PLY vertex row has too few values: {path}")
+                vertices.append([float(row[x_col]), float(row[y_col]), float(row[z_col])])
+            for _ in range(face_count):
+                raw_line = f.readline()
+                if not raw_line:
+                    raise RuntimeError(f"PLY ended before all faces were read: {path}")
+                row = raw_line.decode("ascii", errors="ignore").strip().split()
+                if not row:
+                    continue
+                count = int(float(row[0]))
+                triangles.extend(triangle_fan([int(float(value)) for value in row[1 : 1 + count]]))
+        reader = "light_ascii_ply_to_obj"
+    elif ply_format in {"binary_little_endian", "binary_big_endian"}:
+        byte_order = "<" if ply_format == "binary_little_endian" else ">"
+        vertex_props = vertex_element.get("properties") if isinstance(vertex_element.get("properties"), list) else []
+        face_props = face_element.get("properties") if isinstance(face_element.get("properties"), list) else []
+        with path.open("rb") as f:
+            f.seek(int(header["data_offset"]))
+            for _ in range(vertex_count):
+                xyz: dict[str, float] = {}
+                for prop in vertex_props:
+                    if prop.get("kind") != "scalar":
+                        raise RuntimeError(f"PLY vertex list properties are not supported: {path}")
+                    prop_type = str(prop.get("type"))
+                    value_fmt = ply_struct_format(prop_type, byte_order)
+                    raw_value = f.read(struct.calcsize(value_fmt))
+                    if len(raw_value) != struct.calcsize(value_fmt):
+                        raise RuntimeError(f"PLY ended while reading binary vertex rows: {path}")
+                    name = str(prop.get("name"))
+                    if name in {"x", "y", "z"}:
+                        xyz[name] = float(struct.unpack(value_fmt, raw_value)[0])
+                vertices.append([xyz["x"], xyz["y"], xyz["z"]])
+            for _ in range(face_count):
+                face_indices: list[int] | None = None
+                for prop in face_props:
+                    if prop.get("kind") == "scalar":
+                        value_fmt = ply_struct_format(str(prop.get("type")), byte_order)
+                        raw_value = f.read(struct.calcsize(value_fmt))
+                        if len(raw_value) != struct.calcsize(value_fmt):
+                            raise RuntimeError(f"PLY ended while reading binary face scalar properties: {path}")
+                        continue
+                    count_fmt = ply_struct_format(str(prop.get("count_type")), byte_order)
+                    count_raw = f.read(struct.calcsize(count_fmt))
+                    if len(count_raw) != struct.calcsize(count_fmt):
+                        raise RuntimeError(f"PLY ended while reading binary face list count: {path}")
+                    count = int(struct.unpack(count_fmt, count_raw)[0])
+                    value_fmt = ply_struct_format(str(prop.get("value_type")), byte_order)
+                    value_size = struct.calcsize(value_fmt)
+                    raw_values = f.read(value_size * count)
+                    if len(raw_values) != value_size * count:
+                        raise RuntimeError(f"PLY ended while reading binary face list values: {path}")
+                    values = [int(item[0]) for item in struct.iter_unpack(value_fmt, raw_values)]
+                    if str(prop.get("name")) in {"vertex_indices", "vertex_index"} and face_indices is None:
+                        face_indices = values
+                if face_indices is None:
+                    raise RuntimeError(f"PLY face element has no vertex_indices list: {path}")
+                triangles.extend(triangle_fan(face_indices))
+        reader = f"light_{ply_format}_ply_to_obj"
+    else:
+        raise RuntimeError(f"Unsupported PLY format {ply_format!r}: {path}")
+    if not vertices or not triangles:
+        raise RuntimeError(f"PLY mesh has no usable vertices/triangles: {path}")
+    return vertices, triangles, reader
+
+
+def write_obj_triangle_mesh_from_lists(output: Path, vertices: list[list[float]], triangles: list[list[int]]) -> dict[str, Any]:
+    if not vertices or not triangles:
+        raise RuntimeError("Scene collider conversion requires non-empty vertices and triangles.")
+    ensure_dir(output.parent)
+    with output.open("w", encoding="utf-8") as f:
+        f.write("# Video2Mesh SimFoundry scene static collider\n")
+        for vertex in vertices:
+            x, y, z = [float(value) for value in vertex[:3]]
+            f.write(f"v {x:.8f} {y:.8f} {z:.8f}\n")
+        for triangle in triangles:
+            a, b, c = [int(value) + 1 for value in triangle[:3]]
+            f.write(f"f {a} {b} {c}\n")
+    return summarize_triangle_mesh(output)
+
+
+def materialize_scene_collider_mesh(source_mesh: Path, collider_output: Path, mode: str) -> tuple[Path, dict[str, Any]]:
+    source_suffix = source_mesh.suffix.lower()
+    output_suffix = collider_output.suffix.lower()
+    if output_suffix == source_suffix:
+        copied = copy_or_link(source_mesh, collider_output, mode)
+        return copied, {
+            "method": mode,
+            "source_format": source_suffix.lstrip("."),
+            "output_format": output_suffix.lstrip("."),
+            "source_mesh": str(source_mesh),
+            "output_mesh": str(copied),
+        }
+    if output_suffix != ".obj":
+        raise ValueError(
+            f"Cannot convert scene collider from {source_suffix or 'unknown'} to {output_suffix or 'unknown'} yet. "
+            "Use --collider-format source or choose an .obj --collider-output."
+        )
+    if source_suffix == ".ply":
+        vertices_list, triangles_list, reader = read_ply_triangle_mesh_lists(source_mesh)
+        summary = write_obj_triangle_mesh_from_lists(collider_output, vertices_list, triangles_list)
+        return collider_output, {
+            "method": "triangle_mesh_to_obj",
+            "source_format": source_suffix.lstrip("."),
+            "output_format": "obj",
+            "source_mesh": str(source_mesh),
+            "output_mesh": str(collider_output),
+            "reader": reader,
+            "summary": summary,
+        }
+    try:
+        vertices, triangles, reader = read_triangle_mesh_for_semantic_transfer(source_mesh)
+        summary = write_obj_triangle_mesh_from_arrays(collider_output, vertices, triangles)
+    except Exception as exc:
+        if source_suffix != ".ply":
+            raise
+        vertices_list, triangles_list, reader = read_ply_triangle_mesh_lists(source_mesh)
+        summary = write_obj_triangle_mesh_from_lists(collider_output, vertices_list, triangles_list)
+        summary["conversion_fallback_reason"] = str(exc)
+    return collider_output, {
+        "method": "triangle_mesh_to_obj",
+        "source_format": source_suffix.lstrip("."),
+        "output_format": "obj",
+        "source_mesh": str(source_mesh),
+        "output_mesh": str(collider_output),
+        "reader": reader,
+        "summary": summary,
+    }
+
+
+def scene_collider_qa(summary: dict[str, Any], min_vertices: int, min_triangles: int) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not summary.get("exists"):
+        issues.append({"severity": "required", "name": "missing_mesh", "detail": "Scene collider mesh path does not exist."})
+    if not summary.get("readable"):
+        issues.append({"severity": "required", "name": "unreadable_mesh", "detail": str(summary.get("error") or "Scene collider mesh could not be read.")})
+    vertex_count = int(summary.get("vertex_count") or 0)
+    triangle_count = int(summary.get("triangle_count") or summary.get("face_count") or 0)
+    if vertex_count < int(min_vertices):
+        issues.append({"severity": "warning", "name": "low_vertex_count", "detail": f"Scene collider has {vertex_count} vertices.", "value": vertex_count, "threshold": int(min_vertices)})
+    if triangle_count < int(min_triangles):
+        issues.append({"severity": "required", "name": "low_triangle_count", "detail": f"Scene collider has {triangle_count} triangles.", "value": triangle_count, "threshold": int(min_triangles)})
+    if not isinstance(summary.get("bbox"), dict):
+        issues.append({"severity": "warning", "name": "missing_bbox", "detail": "Could not compute scene collider bbox."})
+    if summary.get("is_watertight") is False:
+        issues.append({"severity": "warning", "name": "not_watertight", "detail": "Static scene collider is not watertight; this can still be acceptable for terrain/walls but should be inspected."})
+    if summary.get("is_edge_manifold") is False or summary.get("is_vertex_manifold") is False:
+        issues.append({"severity": "warning", "name": "not_manifold", "detail": "Scene collider is not fully manifold; downstream convex decomposition may need cleanup."})
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "status": "fail" if required else "warning" if warnings else "pass",
+        "required_issue_count": len(required),
+        "warning_count": len(warnings),
+        "issues": issues,
+    }
+
+
+def merge_bundle_with_scene_collider_record(bundle: dict[str, Any], collider_record: dict[str, Any]) -> dict[str, Any]:
+    scene_assets = bundle.setdefault("scene_assets", {})
+    if isinstance(scene_assets, dict):
+        scene_assets["scene_static_collider_mesh"] = collider_record["path"]
+        scene_assets["scene_static_collider_format"] = collider_record["format"]
+        scene_assets["scene_static_collider_role"] = "static_collision_only"
+    colliders = bundle.get("static_colliders")
+    if not isinstance(colliders, list):
+        colliders = []
+    colliders = [item for item in colliders if not (isinstance(item, dict) and item.get("id") == collider_record["id"])]
+    colliders.append(collider_record)
+    bundle["static_colliders"] = colliders
+    bundle.setdefault("notes", [])
+    if isinstance(bundle["notes"], list):
+        bundle["notes"].append("Scene-level static collider registered by prepare-simfoundry-collider-scene.")
+    return bundle
+
+
+def update_bundle_with_scene_collider(bundle_path: Path, collider_record: dict[str, Any]) -> bool:
+    if not bundle_path.exists():
+        return False
+    bundle = read_json(bundle_path)
+    bundle = merge_bundle_with_scene_collider_record(bundle, collider_record)
+    write_json(bundle_path, bundle)
+    return True
+
+
+def build_simfoundry_collider_only_bundle(
+    project_root: Path,
+    manifest: dict[str, Any],
+    collider_record: dict[str, Any],
+    source_mesh: Path,
+) -> dict[str, Any]:
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "scene_id": manifest.get("scene_id"),
+        "project_root": str(project_root),
+        "coordinate_system": {
+            "frame": "video2mesh_scene",
+            "scale_to_meters": 1.0,
+            "scale_calibrated": False,
+            "up_axis": "unknown",
+            "notes": "First-stage collider-only bundle. Scale/up-axis are inherited from reconstruction and must be calibrated before physics-critical simulation.",
+        },
+        "scene_assets": {
+            "point_cloud": str(source_mesh),
+            "scene_static_collider_mesh": collider_record["path"],
+            "scene_static_collider_format": collider_record["format"],
+            "scene_static_collider_role": "static_collision_only",
+        },
+        "static_colliders": [collider_record],
+        "objects": [],
+        "missing_mesh_objects": [],
+        "notes": [
+            "This bundle intentionally contains only the static scene collider for the first SimFoundry replica step.",
+            "Use the full object simulator asset export only after the collider scene is inspected and scale/up-axis are calibrated.",
+        ],
+    }
+
+
+def manifest_scene_collider_record(project_root: Path, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    sidecar_path = resolve_existing_path(artifacts.get("simfoundry_collider_scene_manifest"), project_root)
+    if sidecar_path and sidecar_path.exists():
+        sidecar = safe_read_json(sidecar_path)
+        collider = sidecar.get("collider") if isinstance(sidecar, dict) else None
+        if isinstance(collider, dict) and collider.get("path"):
+            return collider
+
+    collider_path = resolve_existing_path(
+        artifacts.get("simfoundry_scene_static_collider_mesh")
+        or artifacts.get("scene_static_collider_mesh")
+        or artifacts.get("scene_collider_mesh"),
+        project_root,
+    )
+    if not collider_path or not collider_path.exists():
+        return None
+    stats = scene_collider_summary(collider_path)
+    return {
+        "id": "scene_static",
+        "role": "static_scene_collider",
+        "path": str(collider_path),
+        "format": collider_path.suffix.lower().lstrip("."),
+        "body_type": "static",
+        "collider": "mesh",
+        "coordinate_frame": "video2mesh_scene",
+        "source": "manifest_scene_static_collider",
+        "stats": stats,
+        "qa_status": "pass" if stats.get("readable") else "unknown",
+        "physics": {
+            "body_type": "static",
+            "collider": "mesh",
+            "material": {
+                "name": "static_scene",
+                "friction": [0.9, 0.02, 0.001],
+                "restitution": 0.02,
+                "source": "video2mesh_default_static_scene",
+            },
+        },
+        "notes": "Scene-level static collider restored from project manifest during simulator asset export.",
+    }
+
+
+def write_simfoundry_collider_runbook(path: Path, payload: dict[str, Any]) -> None:
+    collider_path = payload.get("collider_mesh")
+    source_path = payload.get("source_mesh")
+    qa_status = payload.get("qa", {}).get("status") if isinstance(payload.get("qa"), dict) else "unknown"
+    text = "\n".join(
+        [
+            "# SimFoundry Collider Scene Stage",
+            "",
+            "This is the first executable slice of the SimFoundry-style replica branch.",
+            "It only prepares the static scene collider; object meshes, VLM physics, image editing, digital cousins, and policy training stay deferred.",
+            "",
+            "## Output",
+            "",
+            f"- Collider mesh: `{collider_path}`",
+            f"- Source mesh: `{source_path}`",
+            f"- QA status: `{qa_status}`",
+            "",
+            "## Continue",
+            "",
+            "After this collider is visually inspected and scale-calibrated, continue with object mesh import, simulator asset export, and target simulator adapters.",
+            "",
+            "```bash",
+            "python -m video2mesh.cli export-simulator-assets --project-root <project> --copy-meshes --collision-proxy bbox",
+            "python -m video2mesh.cli export-simulator-adapter --project-root <project> --format mujoco unity isaac",
+            "```",
+            "",
+        ]
+    )
+    ensure_dir(path.parent)
+    path.write_text(text, encoding="utf-8")
+
+
+def cmd_prepare_simfoundry_collider_scene(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    if args.reconstruct:
+        reconstruct_output_dir = args.reconstruction_output_dir or (
+            project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "scene_meshes" / "colmap_delaunay_dense"
+        )
+        cmd_reconstruct_scene_meshes(
+            argparse.Namespace(
+                project_root=project_root,
+                method=args.method,
+                colmap_dense_workspace=args.colmap_dense_workspace,
+                output_dir=reconstruct_output_dir,
+                output=args.reconstruction_output,
+                colmap_binary=args.colmap_binary,
+                overwrite=args.overwrite,
+                copy_input_point_cloud=args.copy_input_point_cloud,
+                mode=args.mode,
+            )
+        )
+        manifest = load_manifest(project_root)
+
+    source_mesh = resolve_scene_mesh_path(project_root, manifest, args.scene_mesh)
+    if not source_mesh.exists():
+        raise FileNotFoundError(
+            f"Missing scene collider mesh: {source_mesh}. Pass --scene-mesh or run with --reconstruct and a COLMAP dense workspace."
+        )
+
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_collider_scene"
+    )
+    collider_output = (
+        resolve_project_cli_path(args.collider_output, project_root)
+        if args.collider_output
+        else project_root
+        / manifest.get("simulator_assets_dir", "simulator_assets")
+        / "colliders"
+        / f"scene_static_collider{source_mesh.suffix.lower() if args.collider_format == 'source' else '.' + args.collider_format}"
+    )
+    collider_mesh, collider_materialization = materialize_scene_collider_mesh(source_mesh, collider_output, args.mode)
+    stats = scene_collider_summary(collider_mesh)
+    qa = scene_collider_qa(stats, args.min_vertices, args.min_triangles)
+    source_report = resolve_existing_path(manifest.get("artifacts", {}).get("scene_mesh_reconstruction"), project_root)
+    collider_record = {
+        "id": "scene_static",
+        "role": "static_scene_collider",
+        "path": str(collider_mesh),
+        "format": collider_mesh.suffix.lower().lstrip("."),
+        "body_type": "static",
+        "collider": "mesh",
+        "coordinate_frame": "video2mesh_scene",
+        "source": "colmap_delaunay" if args.reconstruct or source_report else "existing_scene_mesh",
+        "source_mesh": str(source_mesh),
+        "source_report": str(source_report) if source_report and source_report.exists() else None,
+        "materialization": collider_materialization,
+        "stats": stats,
+        "qa_status": qa["status"],
+        "physics": {
+            "body_type": "static",
+            "collider": "mesh",
+            "material": {
+                "name": "static_scene",
+                "friction": [0.9, 0.02, 0.001],
+                "restitution": 0.02,
+                "source": "video2mesh_default_static_scene",
+            },
+        },
+        "notes": "Scene-level static collider prepared for simulator import. It is collision geometry, not the 3DGS visual layer.",
+    }
+    bundle_path = simulator_bundle_path(project_root, manifest, None)
+    existing_bundle_before = bundle_path.exists()
+    bundle_updated = bool(args.update_bundle and update_bundle_with_scene_collider(bundle_path, collider_record))
+    collider_only_bundle_path = (
+        resolve_project_cli_path(args.collider_only_bundle_output, project_root)
+        if args.collider_only_bundle_output
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simulator_asset_bundle.collider_only.json"
+    )
+    collider_only_bundle_written = False
+    if args.write_collider_only_bundle:
+        write_json(collider_only_bundle_path, build_simfoundry_collider_only_bundle(project_root, manifest, collider_record, source_mesh))
+        collider_only_bundle_written = True
+    runbook_path = output_dir / "README.md"
+    manifest_path = output_dir / "collider_scene_manifest.json"
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_collider_scene",
+        "scene_id": manifest.get("scene_id"),
+        "project_root": str(project_root),
+        "output_dir": str(output_dir),
+        "source_mesh": str(source_mesh),
+        "collider_mesh": str(collider_mesh),
+        "source_report": str(source_report) if source_report and source_report.exists() else None,
+        "method": "colmap_delaunay" if args.reconstruct or source_report else "existing_scene_mesh",
+        "materialization": collider_materialization,
+        "coordinate_system": {
+            "frame": "video2mesh_scene",
+            "role": "static collision geometry",
+            "scale_to_meters": "inherits simulator bundle or later scale calibration",
+        },
+        "simfoundry_mapping": {
+            "covered": ["static scene collider", "scene mesh reconstruction report", "collider QA sidecar"],
+            "deferred": ["object visual meshes", "object colliders", "VLM physics", "image editing", "digital cousins", "policy learning"],
+            "reason": "Current scope is first-stage collider scene generation only.",
+        },
+        "collider": collider_record,
+        "qa": qa,
+        "bundle": str(bundle_path) if bundle_path.exists() else str(collider_only_bundle_path) if collider_only_bundle_written else None,
+        "bundle_updated": bundle_updated,
+        "collider_only_bundle": str(collider_only_bundle_path) if collider_only_bundle_written else None,
+        "collider_only_bundle_written": collider_only_bundle_written,
+        "runbook": str(runbook_path),
+        "next_steps": [
+            "Inspect the collider mesh against the visual reconstruction.",
+            "Calibrate scale/up-axis before physics-critical simulation.",
+            "Then export object simulator assets and MuJoCo/Unity/Isaac adapters.",
+        ],
+    }
+    write_json(manifest_path, payload)
+    write_simfoundry_collider_runbook(runbook_path, payload)
+    artifacts = manifest.setdefault("artifacts", {})
+    artifacts["simfoundry_collider_scene_manifest"] = str(manifest_path)
+    artifacts["simfoundry_collider_scene_runbook"] = str(runbook_path)
+    artifacts["simfoundry_scene_static_collider_mesh"] = str(collider_mesh)
+    artifacts["scene_static_collider_mesh"] = str(collider_mesh)
+    artifacts["scene_collider_mesh"] = str(collider_mesh)
+    if collider_only_bundle_written:
+        artifacts["simfoundry_collider_only_bundle"] = str(collider_only_bundle_path)
+        if not existing_bundle_before:
+            artifacts["simulator_asset_bundle"] = str(collider_only_bundle_path)
+    if collider_mesh.suffix.lower() == ".ply":
+        artifacts["scene_mesh_ply"] = str(collider_mesh)
+        artifacts["scene_collider_mesh_ply"] = str(collider_mesh)
+    manifest.setdefault("external_stages", {})["simfoundry_collider_scene"] = {
+        "status": qa["status"],
+        "notes": "Prepared first-stage SimFoundry-style static scene collider only.",
+        "source_mesh": str(source_mesh),
+        "collider_mesh": str(collider_mesh),
+        "manifest": str(manifest_path),
+        "bundle_updated": bundle_updated,
+        "collider_only_bundle": str(collider_only_bundle_path) if collider_only_bundle_written else None,
+        "collider_only_bundle_written": collider_only_bundle_written,
+        "summary": {
+            "vertex_count": int(stats.get("vertex_count") or 0),
+            "triangle_count": int(stats.get("triangle_count") or stats.get("face_count") or 0),
+            "qa_status": qa["status"],
+            "required_issue_count": qa["required_issue_count"],
+            "warning_count": qa["warning_count"],
+        },
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Prepared SimFoundry collider scene: {manifest_path}")
+        print(f"Collider mesh: {collider_mesh}")
+        print(f"QA: {qa['status']} required={qa['required_issue_count']} warnings={qa['warning_count']}")
+        if bundle_updated:
+            print(f"Updated simulator bundle: {bundle_path}")
+        if collider_only_bundle_written:
+            print(f"Collider-only simulator bundle: {collider_only_bundle_path}")
+    return 1 if args.fail_on_fail and qa["status"] == "fail" else 0
+
+
 def cmd_transfer_mesh_semantics_ray(args: argparse.Namespace) -> int:
     np = import_numpy()
     project_root = args.project_root.resolve()
@@ -18873,7 +19425,6 @@ def summarize_triangle_mesh(path: Path | None) -> dict[str, Any]:
 
 
 def mesh_alignment_summary(mask_bbox: dict[str, Any], mesh_summary: dict[str, Any]) -> dict[str, Any]:
-    np = import_numpy()
     mesh_bbox = mesh_summary.get("bbox") if isinstance(mesh_summary.get("bbox"), dict) else {}
     mask_center = mask_bbox.get("center") if isinstance(mask_bbox, dict) else None
     mask_size = mask_bbox.get("size") if isinstance(mask_bbox, dict) else None
@@ -18887,23 +19438,22 @@ def mesh_alignment_summary(mask_bbox: dict[str, Any], mesh_summary: dict[str, An
         result["status"] = "missing_bbox"
         return result
 
-    mask_center_np = np.asarray(mask_center, dtype=np.float64)
-    mesh_center_np = np.asarray(mesh_center, dtype=np.float64)
-    mask_size_np = np.asarray(mask_size, dtype=np.float64)
-    mesh_size_np = np.asarray(mesh_size, dtype=np.float64)
-    center_delta = mesh_center_np - mask_center_np
-    denom = np.maximum(mask_size_np, 1e-9)
-    size_ratio = mesh_size_np / denom
-    mask_diag = float(np.linalg.norm(mask_size_np))
-    mesh_diag = float(np.linalg.norm(mesh_size_np))
-    center_distance = float(np.linalg.norm(center_delta))
+    mask_center_values = [float(value) for value in mask_center[:3]]
+    mesh_center_values = [float(value) for value in mesh_center[:3]]
+    mask_size_values = [float(value) for value in mask_size[:3]]
+    mesh_size_values = [float(value) for value in mesh_size[:3]]
+    center_delta = [mesh_center_values[idx] - mask_center_values[idx] for idx in range(3)]
+    size_ratio = [mesh_size_values[idx] / max(mask_size_values[idx], 1e-9) for idx in range(3)]
+    mask_diag = vector_diagonal(mask_size_values) or 0.0
+    mesh_diag = vector_diagonal(mesh_size_values) or 0.0
+    center_distance = vector_diagonal(center_delta) or 0.0
     result.update(
         {
             "status": "ok",
-            "center_delta": center_delta.tolist(),
+            "center_delta": center_delta,
             "center_distance": center_distance,
             "center_distance_over_mask_diagonal": float(center_distance / max(mask_diag, 1e-9)),
-            "size_ratio": size_ratio.tolist(),
+            "size_ratio": size_ratio,
             "mask_diagonal": mask_diag,
             "mesh_diagonal": mesh_diag,
             "mesh_to_mask_diagonal_ratio": float(mesh_diag / max(mask_diag, 1e-9)),
@@ -19043,6 +19593,15 @@ def write_bbox_obj_mesh(path: Path, size: list[float]) -> None:
             f.write(f"f {face[0]} {face[1]} {face[2]}\n")
 
 
+def write_centered_bbox_obj_mesh(path: Path, center: list[float], size: list[float]) -> None:
+    cx, cy, cz = [float(value) for value in (center[:3] + [0.0, 0.0, 0.0])[:3]]
+    sx, sy, sz = [max(abs(float(value)), 1e-4) for value in size[:3]]
+    hx, hy, hz = sx * 0.5, sy * 0.5, sz * 0.5
+    mins = [cx - hx, cy - hy, cz - hz]
+    maxs = [cx + hx, cy + hy, cz + hz]
+    write_scene_bbox_obj_mesh(path, mins, maxs)
+
+
 def write_scene_bbox_obj_mesh(path: Path, bbox_min: list[float], bbox_max: list[float]) -> dict[str, Any]:
     mins = [float(value) for value in bbox_min[:3]]
     maxs = [float(value) for value in bbox_max[:3]]
@@ -19134,6 +19693,1085 @@ def create_bbox_collision_proxy(
         "generator": generator,
         "notes": "Object-local axis-aligned box collision proxy generated from the fused 3D mask bbox.",
     }
+
+
+def object_visual_mesh_path(obj: dict[str, Any], project_root: Path) -> Path | None:
+    mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
+    for key in ("path", "mesh_path", "asset_path", "visual_mesh"):
+        value = mesh.get(key) if isinstance(mesh, dict) else None
+        if value:
+            resolved = resolve_existing_path(str(value), project_root) or Path(str(value))
+            if resolved.exists():
+                return resolved
+    for key in ("visual_mesh", "mesh_path", "asset_path"):
+        value = obj.get(key)
+        if value:
+            resolved = resolve_existing_path(str(value), project_root) or Path(str(value))
+            if resolved.exists():
+                return resolved
+    return None
+
+
+def simfoundry_command_attempt(
+    *,
+    method: str,
+    executable: str | None,
+    command_template: str | None,
+    input_mesh: Path,
+    output_mesh: Path,
+    output_dir: Path,
+    object_id: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if not input_mesh.exists():
+        return {"method": method, "status": "skipped", "reason": "missing_input_mesh", "input_mesh": str(input_mesh)}
+    command: list[str] | None = None
+    if command_template:
+        values = {
+            "input_mesh": shlex.quote(str(input_mesh)),
+            "output_mesh": shlex.quote(str(output_mesh)),
+            "output_dir": shlex.quote(str(output_dir)),
+            "object_id": shlex.quote(object_id),
+        }
+        rendered = command_template.format(**values)
+        command = ["/bin/sh", "-lc", rendered]
+    else:
+        exe = executable or method
+        resolved_exe = shutil.which(exe)
+        if not resolved_exe:
+            return {
+                "method": method,
+                "status": "runtime_unavailable",
+                "reason": f"{exe} executable not found",
+                "executable": exe,
+                "input_mesh": str(input_mesh),
+                "expected_output": str(output_mesh),
+            }
+        command = [resolved_exe, str(input_mesh), str(output_mesh)]
+    ensure_dir(output_mesh.parent)
+    log_path = output_dir / f"{object_id}_{method}.log"
+    started_at = int(time.time())
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            log_file.write("$ " + " ".join(shlex.quote(str(part)) for part in command) + "\n")
+            log_file.flush()
+            completed = subprocess.run(
+                command,
+                cwd=str(output_dir),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=int(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else None,
+            )
+        output_summary = summarize_triangle_mesh(output_mesh) if output_mesh.exists() else {"exists": False, "readable": False}
+        ok = completed.returncode == 0 and output_summary.get("exists") and output_summary.get("readable")
+        return {
+            "method": method,
+            "status": "success" if ok else "failed",
+            "returncode": int(completed.returncode),
+            "command": command,
+            "log": str(log_path),
+            "input_mesh": str(input_mesh),
+            "output_mesh": str(output_mesh),
+            "output_summary": output_summary,
+            "started_at": started_at,
+            "finished_at": int(time.time()),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "method": method,
+            "status": "timeout",
+            "timeout_seconds": int(timeout_seconds),
+            "command": command,
+            "log": str(log_path),
+            "input_mesh": str(input_mesh),
+            "output_mesh": str(output_mesh),
+            "started_at": started_at,
+            "finished_at": int(time.time()),
+        }
+
+
+def build_simfoundry_collider_proxy(
+    *,
+    obj: dict[str, Any],
+    object_id: str,
+    project_root: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    bbox_size = bundle_object_bbox_size(obj)
+    visual_mesh = object_visual_mesh_path(obj, project_root)
+    methods = [item.strip().lower() for item in str(args.methods).split(",") if item.strip()]
+    if not methods:
+        methods = ["coacd", "vhacd", "bbox"]
+    attempts: list[dict[str, Any]] = []
+    selected_method = ""
+    proxy: dict[str, Any] | None = None
+    object_output_dir = ensure_dir(output_dir / "objects" / object_id)
+
+    for method in methods:
+        if method == "bbox":
+            if not bbox_size:
+                attempts.append({"method": "bbox", "status": "skipped", "reason": "missing_bbox_size_or_mesh_bbox"})
+                continue
+            proxy_path = object_output_dir / f"{object_id}_bbox_collider.obj"
+            proxy = create_bbox_collision_proxy(proxy_path, bbox_size, object_id, write_ascii=bool(args.ascii))
+            proxy.update(
+                {
+                    "schema_version": DEFAULT_SCHEMA_VERSION,
+                    "role": "object_collision_proxy",
+                    "provider": args.provider,
+                    "simfoundry_stage": "collider_build",
+                    "body_type": args.body_type,
+                    "source_object_id": object_id,
+                    "builder_method": "bbox",
+                    "fallback": bool(attempts),
+                }
+            )
+            attempts.append({"method": "bbox", "status": "success", "output_mesh": proxy.get("path"), "summary": proxy.get("summary")})
+            selected_method = "bbox"
+            break
+        if method not in {"coacd", "vhacd"}:
+            attempts.append({"method": method, "status": "skipped", "reason": "unsupported_method"})
+            continue
+        if not visual_mesh:
+            attempts.append({"method": method, "status": "skipped", "reason": "missing_visual_mesh"})
+            continue
+        command_template = args.coacd_command_template if method == "coacd" else args.vhacd_command_template
+        executable = args.coacd_binary if method == "coacd" else args.vhacd_binary
+        proxy_path = object_output_dir / f"{object_id}_{method}_collider.obj"
+        attempt = simfoundry_command_attempt(
+            method=method,
+            executable=executable,
+            command_template=command_template,
+            input_mesh=visual_mesh,
+            output_mesh=proxy_path,
+            output_dir=object_output_dir,
+            object_id=object_id,
+            timeout_seconds=int(args.timeout_seconds),
+        )
+        attempts.append(attempt)
+        if attempt.get("status") == "success":
+            summary = attempt.get("output_summary") if isinstance(attempt.get("output_summary"), dict) else summarize_triangle_mesh(proxy_path)
+            proxy = {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "type": method,
+                "shape": "convex_hull",
+                "path": str(proxy_path),
+                "format": proxy_path.suffix.lower().lstrip("."),
+                "coordinate_frame": "object_local",
+                "source": method,
+                "object_id": object_id,
+                "source_mesh": str(visual_mesh),
+                "summary": summary,
+                "generator": method,
+                "role": "object_collision_proxy",
+                "provider": args.provider,
+                "simfoundry_stage": "collider_build",
+                "body_type": args.body_type,
+                "source_object_id": object_id,
+                "builder_method": method,
+                "fallback": False,
+                "notes": f"Object-local convex decomposition collider generated by {method}.",
+            }
+            selected_method = method
+            break
+
+    report = {
+        "object_id": object_id,
+        "visual_mesh": str(visual_mesh) if visual_mesh else None,
+        "bbox_size": bbox_size,
+        "methods": methods,
+        "attempts": attempts,
+        "selected_method": selected_method,
+        "status": "success" if proxy else "failed",
+        "proxy": proxy,
+    }
+    return proxy, report
+
+
+def cmd_build_simfoundry_object_colliders(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    objects = [obj for obj in bundle.get("objects", []) if isinstance(obj, dict)]
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_collider_build"
+    )
+
+    built: dict[str, Any] = {}
+    skipped: dict[str, Any] = {}
+    updated_object_assets = 0
+    fallback_count = 0
+    failed_count = 0
+    for obj in objects:
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        asset_role = str(obj.get("asset_role") or "object")
+        if asset_role == "background_structure" and not args.include_background:
+            skipped[object_id] = {"reason": "background_structure", "asset_role": asset_role}
+            continue
+        existing_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else None
+        if existing_proxy and not args.overwrite:
+            skipped[object_id] = {"reason": "collision_proxy_exists", "path": existing_proxy.get("path")}
+            continue
+        proxy, report = build_simfoundry_collider_proxy(
+            obj=obj,
+            object_id=object_id,
+            project_root=project_root,
+            output_dir=output_dir,
+            args=args,
+        )
+        report_path = output_dir / "objects" / object_id / "collider_build_report.json"
+        write_json(report_path, report)
+        if not proxy:
+            failed_count += 1
+            skipped[object_id] = {"reason": "collider_build_failed", "report": str(report_path), "attempts": report.get("attempts", [])}
+            continue
+        obj["collision_proxy"] = proxy
+        if proxy.get("fallback"):
+            fallback_count += 1
+        bbox_size = report.get("bbox_size") if isinstance(report.get("bbox_size"), list) else bundle_object_bbox_size(obj) or [0.05, 0.05, 0.05]
+        existing_physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        defaults = simfoundry_object_physics_defaults(obj, bbox_size, args)
+        defaults["source"] = args.provider
+        defaults["collider"] = str(proxy.get("shape") or defaults.get("collider") or "box")
+        defaults["collision_shape"] = defaults["collider"]
+        obj["physics"] = merge_simfoundry_object_physics(existing_physics, defaults, proxy)
+        quality = obj.setdefault("quality", {})
+        if isinstance(quality, dict):
+            quality["collision_proxy"] = proxy.get("summary")
+            quality["collider_build_report"] = str(report_path)
+        if update_object_asset_json_with_collider(obj, project_root):
+            updated_object_assets += 1
+        built[object_id] = {
+            "object_id": object_id,
+            "asset_role": asset_role,
+            "category": obj.get("category"),
+            "path": proxy.get("path"),
+            "shape": proxy.get("shape"),
+            "selected_method": report.get("selected_method"),
+            "fallback": bool(proxy.get("fallback")),
+            "report": str(report_path),
+            "attempt_count": len(report.get("attempts", [])),
+            "physics_source": (obj.get("physics") or {}).get("source"),
+        }
+
+    bundle.setdefault("notes", [])
+    if isinstance(bundle["notes"], list):
+        bundle["notes"].append("SimFoundry-style object colliders built by build-simfoundry-object-colliders.")
+    bundle["objects"] = objects
+    write_json(bundle_path, bundle)
+
+    manifest_path = output_dir / "collider_build_manifest.json"
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_collider_build",
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "project_root": str(project_root),
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "provider": args.provider,
+        "methods": [item.strip().lower() for item in str(args.methods).split(",") if item.strip()],
+        "built": built,
+        "skipped": skipped,
+        "summary": {
+            "object_count": len(objects),
+            "built_count": len(built),
+            "skipped_count": len(skipped),
+            "failed_count": failed_count,
+            "fallback_count": fallback_count,
+            "updated_object_asset_json_count": updated_object_assets,
+        },
+        "simfoundry_mapping": {
+            "covered": ["CoACD/V-HACD command hooks", "bbox fallback collider", "bundle collision_proxy records", "collider build reports"],
+            "deferred": ["native Python CoACD binding integration", "compound collider part metadata", "articulated joint collider generation"],
+        },
+    }
+    write_json(manifest_path, payload)
+    manifest.setdefault("artifacts", {})["simfoundry_collider_build_manifest"] = str(manifest_path)
+    manifest["artifacts"]["simfoundry_collider_build_dir"] = str(output_dir)
+    manifest.setdefault("external_stages", {})["simfoundry_collider_build"] = {
+        "status": "completed" if built else "empty",
+        "notes": "Built SimFoundry-style object colliders using CoACD/V-HACD hooks with bbox fallback.",
+        "source_bundle": str(bundle_path),
+        "manifest": str(manifest_path),
+        "built_count": len(built),
+        "skipped_count": len(skipped),
+        "fallback_count": fallback_count,
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Built SimFoundry object colliders: {manifest_path}")
+        print(f"Built: {len(built)}; fallback: {fallback_count}; skipped: {len(skipped)}; bundle: {bundle_path}")
+    if args.fail_on_fallback and fallback_count:
+        return 1
+    if args.fail_on_empty and not built:
+        return 1
+    if args.fail_on_failed and failed_count:
+        return 1
+    return 0
+
+
+def bundle_object_bbox_size(obj: dict[str, Any]) -> list[float] | None:
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    bbox_size = pose.get("bbox_size")
+    if isinstance(bbox_size, (list, tuple)) and len(bbox_size) >= 3:
+        try:
+            values = [max(abs(float(value)), 1e-4) for value in bbox_size[:3]]
+            if any(value > 1e-4 for value in values):
+                return values
+        except Exception:
+            pass
+    mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
+    mesh_path = Path(str(mesh.get("path") or "")) if mesh.get("path") else None
+    if mesh_path and mesh_path.exists():
+        summary = summarize_triangle_mesh(mesh_path)
+        bbox = summary.get("bbox") if isinstance(summary.get("bbox"), dict) else {}
+        size = bbox.get("size") if isinstance(bbox, dict) else None
+        if isinstance(size, (list, tuple)) and len(size) >= 3:
+            try:
+                values = [max(abs(float(value)), 1e-4) for value in size[:3]]
+                if any(value > 1e-4 for value in values):
+                    return values
+            except Exception:
+                pass
+    return None
+
+
+def simfoundry_object_physics_defaults(obj: dict[str, Any], bbox_size: list[float], args: argparse.Namespace) -> dict[str, Any]:
+    volume = max(float(bbox_size[0]) * float(bbox_size[1]) * float(bbox_size[2]), 0.0)
+    estimated_mass = volume * float(args.default_density_kg_m3)
+    mass = min(max(estimated_mass, float(args.min_mass_kg)), float(args.max_mass_kg))
+    return {
+        "body_type": args.body_type,
+        "collider": "box",
+        "collision_shape": "box",
+        "mass_kg": mass,
+        "material": {
+            "name": args.default_material,
+            "friction": [float(args.friction), float(args.torsional_friction), float(args.rolling_friction)],
+            "restitution": float(args.restitution),
+        },
+        "estimated": True,
+        "source": args.provider,
+        "estimation": {
+            "method": "simfoundry_bbox_volume_density",
+            "bbox_size_m": [float(value) for value in bbox_size[:3]],
+            "bbox_volume_m3": volume,
+            "density_kg_m3": float(args.default_density_kg_m3),
+            "mass_clamp_kg": [float(args.min_mass_kg), float(args.max_mass_kg)],
+        },
+        "notes": "SimFoundry-style default physics for a generated object collider; replace with measured/manual values before physics-critical use.",
+    }
+
+
+def merge_simfoundry_object_physics(existing: dict[str, Any], defaults: dict[str, Any], proxy: dict[str, Any]) -> dict[str, Any]:
+    physics = merge_physics_dict(defaults, existing, overwrite=True)
+    proxy_shape = str(proxy.get("shape") or "box")
+    physics["collider"] = proxy_shape
+    physics["collision_shape"] = proxy_shape
+    physics["collision_proxy"] = {
+        "type": proxy.get("type"),
+        "shape": proxy_shape,
+        "path": proxy.get("path"),
+        "coordinate_frame": proxy.get("coordinate_frame"),
+        "source": proxy.get("source"),
+    }
+    if existing.get("source") or existing.get("mass_kg") not in (None, "", 0):
+        physics["estimated"] = bool(existing.get("estimated", False))
+    return physics
+
+
+def update_object_asset_json_with_collider(obj: dict[str, Any], project_root: Path) -> bool:
+    object_asset_path = resolve_existing_path(obj.get("object_asset_json"), project_root)
+    if not object_asset_path or not object_asset_path.exists():
+        return False
+    object_asset = read_json(object_asset_path)
+    object_asset["collision_proxy"] = obj.get("collision_proxy")
+    object_asset["physics"] = obj.get("physics")
+    quality = object_asset.setdefault("quality", {})
+    if isinstance(quality, dict):
+        quality["collision_proxy"] = (obj.get("collision_proxy") or {}).get("summary")
+    write_json(object_asset_path, object_asset)
+    return True
+
+
+def cmd_prepare_simfoundry_object_colliders(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    objects = [obj for obj in bundle.get("objects", []) if isinstance(obj, dict)]
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_object_colliders"
+    )
+    collider_root = ensure_dir(
+        resolve_project_cli_path(args.collider_root, project_root)
+        if args.collider_root
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "colliders" / "objects"
+    )
+
+    generated: dict[str, Any] = {}
+    skipped: dict[str, Any] = {}
+    updated_object_assets = 0
+    for obj in objects:
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        asset_role = str(obj.get("asset_role") or "object")
+        if asset_role == "background_structure" and not args.include_background:
+            skipped[object_id] = {"reason": "background_structure", "asset_role": asset_role}
+            continue
+        existing_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else None
+        if existing_proxy and not args.overwrite:
+            skipped[object_id] = {"reason": "collision_proxy_exists", "path": existing_proxy.get("path")}
+            continue
+        bbox_size = bundle_object_bbox_size(obj)
+        if not bbox_size:
+            skipped[object_id] = {"reason": "missing_bbox_size_or_mesh_bbox"}
+            continue
+
+        object_dir = ensure_dir(collider_root / object_id)
+        proxy = create_bbox_collision_proxy(
+            object_dir / f"{object_id}_bbox_collider.obj",
+            bbox_size,
+            object_id,
+            write_ascii=bool(args.ascii),
+        )
+        proxy.update(
+            {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "role": "object_collision_proxy",
+                "provider": args.provider,
+                "simfoundry_stage": "object_colliders",
+                "body_type": args.body_type,
+                "source_object_id": object_id,
+            }
+        )
+        obj["collision_proxy"] = proxy
+        existing_physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        defaults = simfoundry_object_physics_defaults(obj, bbox_size, args)
+        obj["physics"] = merge_simfoundry_object_physics(existing_physics, defaults, proxy)
+        quality = obj.setdefault("quality", {})
+        if isinstance(quality, dict):
+            quality["collision_proxy"] = proxy.get("summary")
+        if update_object_asset_json_with_collider(obj, project_root):
+            updated_object_assets += 1
+
+        sidecar_path = output_dir / "objects" / object_id / "object_collider_manifest.json"
+        sidecar = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_object_collider",
+            "object_id": object_id,
+            "asset_role": asset_role,
+            "category": obj.get("category"),
+            "proxy": proxy,
+            "physics": obj.get("physics"),
+            "source_bundle": str(bundle_path),
+            "notes": "Object-level bbox collider sidecar for the SimFoundry-style replica branch.",
+        }
+        write_json(sidecar_path, sidecar)
+        generated[object_id] = {
+            "object_id": object_id,
+            "asset_role": asset_role,
+            "category": obj.get("category"),
+            "path": proxy.get("path"),
+            "shape": proxy.get("shape"),
+            "bbox_size": bbox_size,
+            "sidecar": str(sidecar_path),
+            "physics_source": (obj.get("physics") or {}).get("source"),
+        }
+
+    bundle.setdefault("notes", [])
+    if isinstance(bundle["notes"], list):
+        bundle["notes"].append("Object-level collision proxies registered by prepare-simfoundry-object-colliders.")
+    bundle["objects"] = objects
+    write_json(bundle_path, bundle)
+
+    manifest_path = output_dir / "object_collider_manifest.json"
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_object_colliders",
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "project_root": str(project_root),
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "collider_root": str(collider_root),
+        "provider": args.provider,
+        "generated": generated,
+        "skipped": skipped,
+        "summary": {
+            "object_count": len(objects),
+            "generated_count": len(generated),
+            "skipped_count": len(skipped),
+            "updated_object_asset_json_count": updated_object_assets,
+        },
+        "simfoundry_mapping": {
+            "covered": ["object bbox collision proxies", "bundle collision_proxy records", "default physics provenance"],
+            "deferred": ["CoACD/V-HACD convex decomposition", "articulated joints", "VLM material/mass inference", "physics settling"],
+        },
+    }
+    write_json(manifest_path, payload)
+    manifest.setdefault("artifacts", {})["simfoundry_object_colliders_manifest"] = str(manifest_path)
+    manifest["artifacts"]["simfoundry_object_colliders_dir"] = str(output_dir)
+    manifest.setdefault("external_stages", {})["simfoundry_object_colliders"] = {
+        "status": "completed" if generated else "empty",
+        "notes": "Prepared SimFoundry-style object-level bbox collision proxies from simulator_asset_bundle.json.",
+        "source_bundle": str(bundle_path),
+        "manifest": str(manifest_path),
+        "generated_count": len(generated),
+        "skipped_count": len(skipped),
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Prepared SimFoundry object colliders: {manifest_path}")
+        print(f"Generated: {len(generated)}; skipped: {len(skipped)}; bundle: {bundle_path}")
+    return 1 if args.fail_on_empty and not generated else 0
+
+
+def bbox_record_from_center_size(center: list[float], size: list[float]) -> dict[str, Any]:
+    center_values = [float(value) for value in center[:3]]
+    size_values = [max(float(value), 1e-4) for value in size[:3]]
+    mins = [center_values[idx] - size_values[idx] * 0.5 for idx in range(3)]
+    maxs = [center_values[idx] + size_values[idx] * 0.5 for idx in range(3)]
+    return {"min": mins, "max": maxs, "center": center_values, "size": size_values}
+
+
+def read_mesh_vertices_for_tight_bbox(mesh_path: Path) -> tuple[Any, str]:
+    reader_error: str | None = None
+    try:
+        vertices, _triangles, reader = read_triangle_mesh_for_semantic_transfer(mesh_path)
+        return vertices, reader
+    except Exception as exc:
+        reader_error = str(exc)
+        if mesh_path.suffix.lower() not in {".obj", ".ply"}:
+            raise
+    if mesh_path.suffix.lower() == ".obj":
+        vertices: list[list[float]] = []
+        with mesh_path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if not line.startswith("v "):
+                    continue
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                try:
+                    vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                except Exception:
+                    continue
+        if vertices:
+            return vertices, "light_obj_vertices"
+    if mesh_path.suffix.lower() == ".ply":
+        header = parse_ply_header(mesh_path)
+        if header.get("format") == "ascii":
+            vertex_element = next((element for element in header.get("elements", []) if element.get("name") == "vertex"), None)
+            if vertex_element is None:
+                raise RuntimeError(f"PLY mesh has no vertex element: {mesh_path}")
+            vertex_props = vertex_element.get("properties", [])
+            names = [str(prop.get("name")) for prop in vertex_props]
+            if not {"x", "y", "z"}.issubset(set(names)):
+                raise RuntimeError(f"PLY mesh vertices must include x/y/z: {mesh_path}")
+            indices = [names.index("x"), names.index("y"), names.index("z")]
+            vertices = []
+            with mesh_path.open("rb") as f:
+                f.seek(int(header["data_offset"]))
+                for _ in range(int(vertex_element.get("count", 0))):
+                    row = f.readline().decode("ascii", errors="ignore").strip().split()
+                    if len(row) <= max(indices):
+                        continue
+                    vertices.append([float(row[idx]) for idx in indices])
+            if vertices:
+                return vertices, "light_ascii_ply_vertices"
+    detail = f"; original reader error: {reader_error}" if reader_error else ""
+    raise RuntimeError(f"Could not read mesh vertices with lightweight fallback: {mesh_path}{detail}")
+
+
+def quantile_bounds_from_point_records(points: Any, q_min: float, q_max: float, padding_ratio: float) -> tuple[list[float], list[float]]:
+    try:
+        bounds = quantile_bounds_from_points(points, q_min, q_max, padding_ratio)
+        if bounds is None:
+            raise RuntimeError("empty point set")
+        lower, upper = bounds
+        return [float(value) for value in lower.tolist()], [float(value) for value in upper.tolist()]
+    except RuntimeError as exc:
+        if "requires numpy" not in str(exc).lower():
+            raise
+    rows = [[float(row[0]), float(row[1]), float(row[2])] for row in points if len(row) >= 3]
+    if not rows:
+        raise RuntimeError("empty point set")
+    low_q = max(0.0, min(1.0, float(q_min)))
+    high_q = max(low_q, min(1.0, float(q_max)))
+
+    def sample_quantile(values: list[float], q_value: float) -> float:
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        pos = q_value * (len(ordered) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return ordered[lo]
+        weight = pos - lo
+        return ordered[lo] * (1.0 - weight) + ordered[hi] * weight
+
+    mins = [sample_quantile([row[axis] for row in rows], low_q) for axis in range(3)]
+    maxs = [sample_quantile([row[axis] for row in rows], high_q) for axis in range(3)]
+    extents = [max(maxs[idx] - mins[idx], 1e-8) for idx in range(3)]
+    padding = [extent * max(0.0, float(padding_ratio)) for extent in extents]
+    return [mins[idx] - padding[idx] for idx in range(3)], [maxs[idx] + padding[idx] for idx in range(3)]
+
+
+def simfoundry_mesh_quantile_bbox_proxy(
+    *,
+    obj: dict[str, Any],
+    object_id: str,
+    mesh_path: Path,
+    proxy_path: Path,
+    q_min: float,
+    q_max: float,
+    padding_ratio: float,
+    provider: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    vertices, reader = read_mesh_vertices_for_tight_bbox(mesh_path)
+    lower, upper = quantile_bounds_from_point_records(vertices, q_min, q_max, padding_ratio)
+    local_size = [max(float(upper[idx]) - float(lower[idx]), 1e-4) for idx in range(3)]
+    local_center = [(float(lower[idx]) + float(upper[idx])) * 0.5 for idx in range(3)]
+    write_centered_bbox_obj_mesh(proxy_path, local_center, local_size)
+    summary = summarize_triangle_mesh(proxy_path)
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    source_position = pose.get("position") if isinstance(pose.get("position"), list) else [0.0, 0.0, 0.0]
+    source_center = [float(value) for value in (source_position[:3] + [0.0, 0.0, 0.0])[:3]]
+    world_center = [source_center[idx] + local_center[idx] for idx in range(3)]
+    proxy = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "type": "bbox",
+        "shape": "box",
+        "path": str(proxy_path),
+        "format": proxy_path.suffix.lower().lstrip("."),
+        "coordinate_frame": "object_local",
+        "center": local_center,
+        "bbox_size": local_size,
+        "source": "mesh_quantile_bbox",
+        "source_mesh": str(mesh_path),
+        "mesh_reader": reader,
+        "object_id": object_id,
+        "role": "object_collision_proxy",
+        "provider": provider,
+        "simfoundry_stage": "tight_collider_variant",
+        "summary": summary,
+        "quantiles": {
+            "min": float(q_min),
+            "max": float(q_max),
+            "padding_ratio": float(padding_ratio),
+            "vertex_count": int(getattr(vertices, "shape", [len(vertices)])[0]),
+        },
+        "notes": "Object-local axis-aligned box collision proxy fitted to robust visual-mesh quantiles.",
+    }
+    fit_report = {
+        "object_id": object_id,
+        "source_mesh": str(mesh_path),
+        "mesh_reader": reader,
+        "source_pose_position": source_center,
+        "local_center": local_center,
+        "local_size": local_size,
+        "world_center": world_center,
+        "world_bbox": bbox_record_from_center_size(world_center, local_size),
+        "proxy": proxy,
+    }
+    return proxy, fit_report
+
+
+def simfoundry_has_reviewed_collision_proxy(obj: dict[str, Any]) -> bool:
+    repair = obj.get("simfoundry_structural_repair") if isinstance(obj.get("simfoundry_structural_repair"), dict) else {}
+    proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+    physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+    physics_proxy = physics.get("collision_proxy") if isinstance(physics.get("collision_proxy"), dict) else {}
+    sources = {
+        str(proxy.get("source") or ""),
+        str(physics_proxy.get("source") or ""),
+    }
+    return bool(repair) and "simfoundry_structural_repair_review_patch" in sources
+
+
+def simfoundry_bbox_shrink_report(original_obj: dict[str, Any], updated_obj: dict[str, Any]) -> dict[str, Any]:
+    original_bbox = scene_relation_bbox_from_object(original_obj)
+    updated_bbox = scene_relation_bbox_from_object(updated_obj)
+    report: dict[str, Any] = {
+        "object_id": slugify(str(updated_obj.get("object_id") or updated_obj.get("name") or "object")),
+        "original_bbox": original_bbox,
+        "tight_bbox": updated_bbox,
+    }
+    if original_bbox and updated_bbox:
+        original_size = [max(float(value), 1e-9) for value in original_bbox["size"][:3]]
+        tight_size = [max(float(value), 1e-9) for value in updated_bbox["size"][:3]]
+        original_volume = bbox_volume(original_bbox)
+        tight_volume = bbox_volume(updated_bbox)
+        report.update(
+            {
+                "size_ratio": [tight_size[idx] / original_size[idx] for idx in range(3)],
+                "volume_ratio": float(tight_volume / max(original_volume, 1e-12)),
+                "center_delta": [
+                    float(updated_bbox["center"][idx]) - float(original_bbox["center"][idx])
+                    for idx in range(3)
+                ],
+            }
+        )
+    return report
+
+
+def generate_simfoundry_tight_collider_variant(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    output_dir: Path,
+    output_bundle: Path | None,
+    q_min: float,
+    q_max: float,
+    padding_ratio: float,
+    include_background: bool,
+    provider: str,
+    up_axis: str | None,
+    up_direction: str,
+    max_support_gap: float,
+    min_support_overlap: float,
+    max_penetration_depth: float,
+    max_overlap_volume_ratio: float,
+    require_support: bool,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run export-simulator-assets before preparing a tight collider variant.",
+                source="prepare-simfoundry-tight-collider-variant",
+                path=str(bundle_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_tight_collider_variant",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "status": "fail",
+            "ok": False,
+            "bundle": str(bundle_path),
+            "variant_bundle": None,
+            "objects": {},
+            "issues": issues,
+            "summary": {"object_count": 0, "updated_count": 0, "required_issue_count": 1, "warning_count": 0},
+        }
+
+    source_bundle = read_json(bundle_path)
+    variant_bundle = copy.deepcopy(source_bundle)
+    objects = [obj for obj in variant_bundle.get("objects", []) if isinstance(obj, dict)]
+    source_objects = [obj for obj in source_bundle.get("objects", []) if isinstance(obj, dict)]
+    source_by_id = {slugify(str(obj.get("object_id") or obj.get("name") or "object")): obj for obj in source_objects}
+    output_dir = ensure_dir(output_dir)
+    proxy_root = ensure_dir(output_dir / "colliders" / "objects")
+    variant_bundle_path = output_bundle.resolve() if output_bundle else output_dir / "simulator_asset_bundle.tight_collider.json"
+
+    updated: dict[str, Any] = {}
+    preserved: dict[str, Any] = {}
+    skipped: dict[str, Any] = {}
+    for obj in objects:
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        asset_role = str(obj.get("asset_role") or "object")
+        if asset_role == "background_structure" and not include_background:
+            skipped[object_id] = {"reason": "background_structure", "asset_role": asset_role}
+            continue
+        if simfoundry_has_reviewed_collision_proxy(obj):
+            preserved[object_id] = {
+                "reason": "reviewed_structural_repair_collision_proxy",
+                "asset_role": asset_role,
+                "category": obj.get("category"),
+                "collision_proxy": obj.get("collision_proxy"),
+                "source_stage": "simfoundry_structural_repair_import",
+            }
+            continue
+        mesh_path = object_visual_mesh_path(obj, project_root)
+        if not mesh_path:
+            skipped[object_id] = {"reason": "missing_object_mesh", "asset_role": asset_role}
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "missing_tight_collider_mesh",
+                    "Object has no readable visual mesh for mesh-quantile bbox fitting.",
+                    source="prepare-simfoundry-tight-collider-variant",
+                    object_id=object_id,
+                )
+            )
+            continue
+        proxy_path = proxy_root / object_id / f"{object_id}_tight_bbox_collider.obj"
+        try:
+            proxy, fit_report = simfoundry_mesh_quantile_bbox_proxy(
+                obj=obj,
+                object_id=object_id,
+                mesh_path=mesh_path,
+                proxy_path=proxy_path,
+                q_min=q_min,
+                q_max=q_max,
+                padding_ratio=padding_ratio,
+                provider=provider,
+            )
+        except Exception as exc:
+            skipped[object_id] = {"reason": "tight_collider_fit_failed", "error": str(exc), "mesh": str(mesh_path)}
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "tight_collider_fit_failed",
+                    f"Could not fit mesh-quantile bbox collider: {exc}",
+                    source="prepare-simfoundry-tight-collider-variant",
+                    object_id=object_id,
+                    path=str(mesh_path),
+                )
+            )
+            continue
+
+        pose = obj.setdefault("pose", {})
+        if not isinstance(pose, dict):
+            pose = {}
+            obj["pose"] = pose
+        original_pose = copy.deepcopy(pose)
+        original_bbox_3d = copy.deepcopy(obj.get("bbox_3d") if isinstance(obj.get("bbox_3d"), dict) else None)
+        original_pose_bbox_3d = copy.deepcopy(pose.get("bbox_3d") if isinstance(pose.get("bbox_3d"), dict) else None)
+        world_bbox = fit_report["world_bbox"]
+        pose["position"] = world_bbox["center"]
+        pose["bbox_size"] = world_bbox["size"]
+        pose["bbox_3d"] = copy.deepcopy(world_bbox)
+        obj["bbox_3d"] = copy.deepcopy(world_bbox)
+        obj["collision_proxy"] = proxy
+        physics = obj.setdefault("physics", {})
+        if not isinstance(physics, dict):
+            physics = {}
+            obj["physics"] = physics
+        physics["collider"] = "box"
+        physics["collision_shape"] = "box"
+        physics["collision_proxy"] = {
+            "type": proxy.get("type"),
+            "shape": proxy.get("shape"),
+            "path": proxy.get("path"),
+            "coordinate_frame": proxy.get("coordinate_frame"),
+            "center": proxy.get("center"),
+            "bbox_size": proxy.get("bbox_size"),
+            "source": proxy.get("source"),
+            "provider": proxy.get("provider"),
+        }
+        quality = obj.setdefault("quality", {})
+        if isinstance(quality, dict):
+            quality["tight_collision_proxy"] = proxy.get("summary")
+        obj["simfoundry_tight_collider_variant"] = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "source_bundle": str(bundle_path),
+            "source_pose": original_pose,
+            "source_bbox_3d": original_bbox_3d,
+            "source_pose_bbox_3d": original_pose_bbox_3d,
+            "local_center_delta": fit_report["local_center"],
+            "quantiles": proxy.get("quantiles"),
+            "provider": provider,
+        }
+        shrink = simfoundry_bbox_shrink_report(source_by_id.get(object_id, obj), obj)
+        object_report_path = output_dir / "objects" / object_id / "tight_collider_report.json"
+        write_json(
+            object_report_path,
+            {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "stage": "simfoundry_tight_object_collider",
+                "object_id": object_id,
+                "asset_role": asset_role,
+                "category": obj.get("category"),
+                "fit": fit_report,
+                "shrink": shrink,
+                "source_bundle": str(bundle_path),
+            },
+        )
+        updated[object_id] = {
+            "object_id": object_id,
+            "asset_role": asset_role,
+            "category": obj.get("category"),
+            "source_mesh": str(mesh_path),
+            "proxy": proxy,
+            "world_bbox": world_bbox,
+            "shrink": shrink,
+            "report": str(object_report_path),
+        }
+
+    variant_bundle.setdefault("notes", [])
+    if isinstance(variant_bundle["notes"], list):
+        variant_bundle["notes"].append(
+            "SimFoundry tight collider variant: object bboxes and box proxies fitted to robust visual-mesh quantiles before dynamic trials."
+        )
+    variant_bundle["source_bundle"] = str(bundle_path)
+    variant_bundle["simfoundry_tight_collider_variant"] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source_bundle": str(bundle_path),
+        "updated_objects": sorted(updated),
+        "preserved_objects": sorted(preserved),
+        "skipped_objects": sorted(skipped),
+        "output_dir": str(output_dir),
+        "quantile_min": float(q_min),
+        "quantile_max": float(q_max),
+        "padding_ratio": float(padding_ratio),
+        "timestamp": int(time.time()),
+    }
+    write_json(variant_bundle_path, variant_bundle)
+
+    before_stability = generate_simfoundry_scene_stability_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        up_axis=up_axis,
+        up_direction=up_direction,
+        max_support_gap=max_support_gap,
+        min_support_overlap=min_support_overlap,
+        max_penetration_depth=max_penetration_depth,
+        max_overlap_volume_ratio=max_overlap_volume_ratio,
+        require_support=require_support,
+    )
+    after_stability = generate_simfoundry_scene_stability_report(
+        project_root,
+        manifest,
+        bundle_path=variant_bundle_path,
+        up_axis=up_axis,
+        up_direction=up_direction,
+        max_support_gap=max_support_gap,
+        min_support_overlap=min_support_overlap,
+        max_penetration_depth=max_penetration_depth,
+        max_overlap_volume_ratio=max_overlap_volume_ratio,
+        require_support=require_support,
+    )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    after_required = int((after_stability.get("summary") or {}).get("required_issue_count") or 0)
+    status = "fail" if required or after_required else "tight_collider_ready" if updated else "tight_collider_empty"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_tight_collider_variant",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or source_bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required and not after_required,
+        "bundle": str(bundle_path),
+        "variant_bundle": str(variant_bundle_path),
+        "output_dir": str(output_dir),
+        "provider": provider,
+        "parameters": {
+            "quantile_min": float(q_min),
+            "quantile_max": float(q_max),
+            "padding_ratio": float(padding_ratio),
+            "include_background": bool(include_background),
+            "up_direction": normalize_axis_direction(up_direction),
+        },
+        "updated": updated,
+        "preserved": preserved,
+        "skipped": skipped,
+        "stability_before": before_stability,
+        "stability_after": after_stability,
+        "issues": issues,
+        "summary": {
+            "object_count": len(objects),
+            "updated_count": len(updated),
+            "preserved_count": len(preserved),
+            "skipped_count": len(skipped),
+            "required_issue_count": len(required) + after_required,
+            "warning_count": len(warnings) + int((after_stability.get("summary") or {}).get("warning_count") or 0),
+            "before_penetration_count": int((before_stability.get("summary") or {}).get("penetration_count") or 0),
+            "after_penetration_count": int((after_stability.get("summary") or {}).get("penetration_count") or 0),
+        },
+        "notes": "Sidecar bundle only; the source simulator bundle remains unchanged unless --replace-bundle is used.",
+    }
+    report_path = output_dir / "tight_collider_variant_report.json"
+    report["report"] = str(report_path)
+    write_json(report_path, report)
+    return report
+
+
+def cmd_prepare_simfoundry_tight_collider_variant(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if float(args.quantile_max) < float(args.quantile_min):
+        raise ValueError("--quantile-max must be greater than or equal to --quantile-min")
+    output_dir = (
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_tight_collider_variant"
+    )
+    output_bundle = resolve_project_cli_path(args.output_bundle, project_root) if args.output_bundle else None
+    report = generate_simfoundry_tight_collider_variant(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        output_dir=output_dir,
+        output_bundle=output_bundle,
+        q_min=args.quantile_min,
+        q_max=args.quantile_max,
+        padding_ratio=args.padding_ratio,
+        include_background=args.include_background,
+        provider=args.provider,
+        up_axis=args.up_axis,
+        up_direction=args.up_direction,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        max_penetration_depth=args.max_penetration_depth,
+        max_overlap_volume_ratio=args.max_overlap_volume_ratio,
+        require_support=args.require_support,
+    )
+    report_path = Path(str(report.get("report") or output_dir / "tight_collider_variant_report.json"))
+    variant_bundle_path = Path(str(report.get("variant_bundle"))) if report.get("variant_bundle") else None
+
+    manifest.setdefault("artifacts", {})["simfoundry_tight_collider_variant_report"] = str(report_path)
+    if variant_bundle_path:
+        manifest["artifacts"]["simfoundry_tight_collider_variant_bundle"] = str(variant_bundle_path)
+        if args.replace_bundle:
+            manifest["artifacts"]["simulator_asset_bundle"] = str(variant_bundle_path)
+            report["replaced_manifest_bundle"] = True
+            write_json(report_path, report)
+    manifest.setdefault("external_stages", {})["simfoundry_tight_collider_variant"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "variant_bundle": str(variant_bundle_path) if variant_bundle_path else None,
+        "source_bundle": str(bundle_path),
+        "summary": report.get("summary", {}),
+        "replace_bundle": bool(args.replace_bundle),
+        "notes": "Prepared mesh-quantile tight object collider sidecar before SimFoundry-style dynamic trials.",
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry tight collider variant: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"objects={summary.get('object_count')} updated={summary.get('updated_count')} skipped={summary.get('skipped_count')} "
+            f"penetrations={summary.get('before_penetration_count')}->{summary.get('after_penetration_count')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        print(f"Variant bundle: {variant_bundle_path}")
+        print(f"Report: {report_path}")
+
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("updated_count"):
+        return 1
+    return 0
 
 
 def bbox_fit_length(size: Any, mode: str) -> float | None:
@@ -19230,6 +20868,96 @@ def fit_object_local_mesh_to_bbox(
     return exported_summary, fit_summary
 
 
+def static_collider_records_from_bundle(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(raw: dict[str, Any], fallback_id: str) -> None:
+        if not isinstance(raw, dict):
+            return
+        record = dict(raw)
+        collider_id = slugify(str(record.get("id") or record.get("name") or fallback_id), fallback_id)
+        path_value = record.get("path") or record.get("mesh_path") or record.get("asset_path")
+        key = (collider_id, str(path_value or ""))
+        if key in seen:
+            return
+        seen.add(key)
+        record["id"] = collider_id
+        if path_value is not None:
+            record["path"] = str(path_value)
+        if not record.get("format") and path_value:
+            record["format"] = Path(str(path_value)).suffix.lower().lstrip(".")
+        physics = dict(record.get("physics") if isinstance(record.get("physics"), dict) else {})
+        physics.setdefault("body_type", record.get("body_type") or "static")
+        physics.setdefault("collider", record.get("collider") or "mesh")
+        record["physics"] = physics
+        record["body_type"] = physics.get("body_type") or "static"
+        record["collider"] = physics.get("collider") or "mesh"
+        records.append(record)
+
+    for raw in bundle.get("static_colliders", []):
+        add(raw, "scene_static")
+
+    scene_assets = bundle.get("scene_assets") if isinstance(bundle.get("scene_assets"), dict) else {}
+    scene_collider = scene_assets.get("scene_static_collider_mesh") if isinstance(scene_assets, dict) else None
+    if scene_collider:
+        add(
+            {
+                "id": "scene_static",
+                "role": scene_assets.get("scene_static_collider_role") or "static_scene_collider",
+                "path": scene_collider,
+                "format": scene_assets.get("scene_static_collider_format"),
+                "body_type": "static",
+                "collider": "mesh",
+            },
+            "scene_static",
+        )
+    return records
+
+
+def static_collider_qa_record(collider: dict[str, Any], project_root: Path, min_mesh_vertices: int) -> dict[str, Any]:
+    collider_id = slugify(str(collider.get("id") or "scene_static"), "scene_static")
+    path_value = collider.get("path") or collider.get("mesh_path") or collider.get("asset_path")
+    mesh_path = resolve_existing_path(str(path_value), project_root) if path_value else None
+    issues: list[dict[str, Any]] = []
+    if not path_value:
+        append_asset_issue(issues, "required", "missing_static_collider_path", "Static scene collider has no mesh path.", collider_id)
+        mesh_summary = {"exists": False, "readable": False, "error": "missing mesh path"}
+    elif not mesh_path or not mesh_path.exists():
+        append_asset_issue(issues, "required", "missing_static_collider_mesh", "Static scene collider mesh path does not exist.", collider_id)
+        mesh_summary = {"exists": False, "readable": False, "path": str(mesh_path) if mesh_path else str(path_value)}
+    else:
+        mesh_summary = scene_collider_summary(mesh_path)
+        if not mesh_summary.get("readable"):
+            append_asset_issue(issues, "required", "unreadable_static_collider_mesh", str(mesh_summary.get("error", "mesh is not readable")), collider_id)
+        else:
+            vertices = int(mesh_summary.get("vertex_count") or 0)
+            triangles = int(mesh_summary.get("triangle_count") or mesh_summary.get("face_count") or 0)
+            if vertices < int(min_mesh_vertices):
+                append_asset_issue(issues, "warning", "low_static_collider_vertex_count", f"{vertices} vertices.", collider_id, vertices, min_mesh_vertices)
+            if triangles <= 0:
+                append_asset_issue(issues, "required", "static_collider_has_no_triangles", "Static scene collider mesh has no triangles.", collider_id, triangles, ">0")
+
+    physics = collider.get("physics") if isinstance(collider.get("physics"), dict) else {}
+    if (physics.get("body_type") or collider.get("body_type")) != "static":
+        append_asset_issue(issues, "warning", "static_collider_not_static", "Scene-level collider should be exported as a static body.", collider_id)
+    if (physics.get("collider") or collider.get("collider")) in (None, "", "none"):
+        append_asset_issue(issues, "warning", "static_collider_shape_missing", "Scene-level collider shape is unset.", collider_id)
+    material = physics.get("material") if isinstance(physics.get("material"), dict) else {}
+    if material and (not material.get("name") or not isinstance(material.get("friction"), list) or material.get("restitution") is None):
+        append_asset_issue(issues, "warning", "static_collider_material_incomplete", "Static collider material is missing name/friction/restitution.", collider_id)
+
+    return {
+        "collider_id": collider_id,
+        "role": collider.get("role"),
+        "mesh_path": str(mesh_path) if mesh_path else str(path_value or ""),
+        "mesh_summary": mesh_summary,
+        "physics": physics,
+        "issues": issues,
+        "ok": not any(issue.get("severity") == "required" for issue in issues),
+    }
+
+
 def append_asset_issue(issues: list[dict[str, Any]], severity: str, name: str, detail: str, object_id: str | None = None, value: Any = None, threshold: Any = None) -> None:
     issue = {"severity": severity, "name": name, "detail": detail}
     if object_id:
@@ -19255,6 +20983,7 @@ def simulator_asset_qa_report(
     coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
     issues: list[dict[str, Any]] = []
     object_reports: list[dict[str, Any]] = []
+    static_collider_reports: list[dict[str, Any]] = []
     scene_scale = float(coordinate_system.get("scale_to_meters") or 1.0)
     up_axis = str(coordinate_system.get("up_axis") or "unknown").lower()
     scale_calibrated = bool(coordinate_system.get("scale_calibrated") or coordinate_system.get("calibrated"))
@@ -19374,6 +21103,11 @@ def simulator_asset_qa_report(
             }
         )
 
+    for collider in static_collider_records_from_bundle(bundle):
+        collider_report = static_collider_qa_record(collider, project_root, min_mesh_vertices)
+        issues.extend(collider_report["issues"])
+        static_collider_reports.append(collider_report)
+
     required = [issue for issue in issues if issue.get("severity") == "required"]
     warnings = [issue for issue in issues if issue.get("severity") == "warning"]
     return {
@@ -19395,8 +21129,10 @@ def simulator_asset_qa_report(
             "scale_calibrated": scale_calibrated,
         },
         "objects": object_reports,
+        "static_colliders": static_collider_reports,
         "summary": {
             "object_count": len(object_reports),
+            "static_collider_count": len(static_collider_reports),
             "required_issue_count": len(required),
             "warning_count": len(warnings),
         },
@@ -25482,6 +27218,29 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
                     "coordinate_frame": collision_proxy.get("coordinate_frame"),
                     "source": collision_proxy.get("source"),
                 }
+        if args.estimate_physics and isinstance(collision_proxy, dict):
+            bbox_size_for_physics = size if size and any(abs(float(value)) > 0 for value in size) else bundle_object_bbox_size({"pose": {"bbox_size": size}})
+            if bbox_size_for_physics:
+                physics_defaults_args = argparse.Namespace(
+                    body_type="static" if is_background_structure else args.body_type,
+                    default_density_kg_m3=args.default_density_kg_m3,
+                    min_mass_kg=args.min_mass_kg,
+                    max_mass_kg=args.max_mass_kg,
+                    default_material=args.default_material,
+                    friction=args.friction,
+                    torsional_friction=args.torsional_friction,
+                    rolling_friction=args.rolling_friction,
+                    restitution=args.restitution,
+                    provider=args.physics_provider,
+                )
+                defaults = simfoundry_object_physics_defaults(obj, bbox_size_for_physics, physics_defaults_args)
+                if is_background_structure:
+                    defaults["mass_kg"] = None
+                defaults["source"] = args.physics_provider
+                physics = merge_simfoundry_object_physics(physics, defaults, collision_proxy)
+                if is_background_structure:
+                    physics["body_type"] = "static"
+                    physics["mass_kg"] = None
         asset = {
             "schema_version": DEFAULT_SCHEMA_VERSION,
             "object_id": object_id,
@@ -25532,10 +27291,10 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
             "notes": "Scale/up-axis come from reconstruction; calibrate them before physics-critical simulation.",
         },
         "scene_assets": {
-            "frames_dir": str(project_root / manifest["scene"]["frames_dir"]),
-            "camera_info": str(project_root / manifest["scene"]["camera_info"]),
-            "point_cloud": str(project_root / manifest["scene"]["point_cloud"]),
-            "scene_3dgs": str(project_root / manifest["scene"]["scene_3dgs"]),
+            "frames_dir": manifest_optional_scene_asset(project_root, manifest, "frames_dir"),
+            "camera_info": manifest_optional_scene_asset(project_root, manifest, "camera_info", ("camera_info",)),
+            "point_cloud": manifest_optional_scene_asset(project_root, manifest, "point_cloud", ("point_cloud", "scene_mesh_ply")),
+            "scene_3dgs": manifest_optional_scene_asset(project_root, manifest, "scene_3dgs", ("scene_3dgs", "scene_3dgs_ply")),
             "semantic_splats_ply": str(semantic_splats_ply) if semantic_splats_ply else None,
             "semantic_splats_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
         },
@@ -25546,6 +27305,9 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
             "For simulator use, replace placeholder physics fields with task-specific mass, friction, and collision settings.",
         ],
     }
+    scene_collider = manifest_scene_collider_record(project_root, manifest)
+    if scene_collider:
+        bundle = merge_bundle_with_scene_collider_record(bundle, scene_collider)
     write_json(bundle_path, bundle)
     manifest["artifacts"]["simulator_asset_bundle"] = str(bundle_path)
     manifest["external_stages"]["mesh_generation"] = {
@@ -25553,6 +27315,7 @@ def cmd_export_simulator_assets(args: argparse.Namespace) -> int:
         "notes": "Final object-centric simulator asset manifest exported.",
         "object_count": len(object_assets),
         "missing_mesh_objects": missing_meshes,
+        "static_collider_count": len(static_collider_records_from_bundle(bundle)),
     }
     save_manifest(project_root, manifest)
     print(f"Wrote simulator asset bundle: {bundle_path}")
@@ -25647,6 +27410,40 @@ def sort_scale_calibration_candidates(candidates: list[dict[str, Any]], mode: st
     return sorted(candidates, key=lambda item: (-float(item.get("longest_length_current_units") or 0.0), str(item.get("object_id") or "")))
 
 
+def scale_calibration_measurement_recommendations(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    category_scores = {
+        "door": (100, "Use a measured door height or width when the door extent is clean."),
+        "bed": (95, "Use a measured bed width or length if the bed mask is complete."),
+        "floor": (85, "Use a measured room/floor span when the visible floor boundary is reliable."),
+        "wall": (75, "Use a measured wall span only if the wall segment is well isolated."),
+        "window": (70, "Use a measured window height or width when the window frame is clear."),
+        "nightstand": (60, "Use furniture only when a real object dimension is known."),
+        "table": (60, "Use furniture only when a real object dimension is known."),
+        "desk": (60, "Use furniture only when a real object dimension is known."),
+    }
+    recommendations: list[dict[str, Any]] = []
+    for item in candidates:
+        category = str(item.get("category") or "").strip().lower()
+        score, reason = category_scores.get(category, (35, "Lower priority: use only with a verified real-world measurement."))
+        if category in {"plant", "lamp", "curtain", "wall art", "ceiling"}:
+            score = min(score, 25)
+            reason = "Avoid as the primary scale reference unless manually verified; geometry may be partial or deformable."
+        point_count = int(item.get("point_count") or 0)
+        recommendations.append(
+            {
+                "object_id": item.get("object_id"),
+                "category": item.get("category"),
+                "asset_role": item.get("asset_role"),
+                "reference_axis": item.get("recommended_reference_axis"),
+                "scene_axis_length": item.get("longest_length_current_units"),
+                "point_count": point_count,
+                "priority_score": score,
+                "reason": reason,
+            }
+        )
+    return sorted(recommendations, key=lambda item: (-int(item.get("priority_score") or 0), -int(item.get("point_count") or 0), str(item.get("object_id") or "")))
+
+
 def write_scale_calibration_runner(script_path: Path, project_root: Path, bundle_path: Path, default_object: str | None, default_axis: str | None) -> Path:
     reference_object_default = default_object or ""
     reference_axis_default = default_axis or "longest"
@@ -25680,6 +27477,62 @@ def write_scale_calibration_runner(script_path: Path, project_root: Path, bundle
     return script_path
 
 
+def write_scale_calibration_readme(
+    path: Path,
+    *,
+    job_path: Path,
+    template_path: Path,
+    script_path: Path,
+    bundle_path: Path,
+    recommendations: list[dict[str, Any]],
+) -> Path:
+    top_rows = []
+    for item in recommendations[:8]:
+        top_rows.append(
+            "| {object_id} | {category} | {axis} | {length} | {score} | {reason} |".format(
+                object_id=item.get("object_id") or "",
+                category=item.get("category") or "",
+                axis=item.get("reference_axis") or "",
+                length=f"{float(item.get('scene_axis_length') or 0.0):.6g}",
+                score=int(item.get("priority_score") or 0),
+                reason=item.get("reason") or "",
+            )
+        )
+    if not top_rows:
+        top_rows.append("| none | none | none | 0 | 0 | No scale candidates were found. |")
+    lines = [
+        "# Scale Calibration Job",
+        "",
+        "This directory is a measurement template only. It does not modify the simulator bundle.",
+        "",
+        "Do not mark `scale_calibrated=true` until a real reference length is measured in the physical scene or trusted source data.",
+        "",
+        "## Files",
+        "",
+        f"- Job: `{job_path}`",
+        f"- Template: `{template_path}`",
+        f"- Runner: `{script_path}`",
+        f"- Source bundle: `{bundle_path}`",
+        "",
+        "## Recommended References",
+        "",
+        "| object_id | category | axis | scene length | score | note |",
+        "|---|---|---:|---:|---:|---|",
+        *top_rows,
+        "",
+        "## Fill And Run",
+        "",
+        "1. Open `scale_calibration_template.json`.",
+        "2. Fill `selected_reference.object_id`, `selected_reference.reference_axis`, and `selected_reference.reference_length_m`.",
+        "3. Run `run_scale_calibration_example.sh`, or run the `calibrate_command_template` from the template with the measured value.",
+        "4. Re-export adapters and rerun `simfoundry-simulator-smoke-test --require-scale-calibration`.",
+        "",
+        "Until step 2 has a real measurement, keep the bundle in the current uncalibrated state.",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -25710,6 +27563,8 @@ def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
     template_path = output_dir / "scale_calibration_template.json"
     job_path = output_dir / "scale_calibration_job.json"
     script_path = output_dir / "run_scale_calibration_example.sh"
+    readme_path = output_dir / "scale_calibration_readme.md"
+    recommendations = scale_calibration_measurement_recommendations(candidates)
     calibrate_command_template = (
         "python -m video2mesh.cli calibrate-simulator-assets "
         f"--project-root {shell_quote(str(project_root))} "
@@ -25734,6 +27589,7 @@ def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
             "notes": "Choose a reliable object/axis from candidates and enter the measured length in meters.",
         },
         "candidates": candidates,
+        "measurement_recommendations": recommendations,
         "calibrate_command_template": calibrate_command_template,
         "notes": [
             "This is a measurement template only; it does not change the asset bundle.",
@@ -25749,6 +27605,14 @@ def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
         default_candidate.get("object_id"),
         default_candidate.get("recommended_reference_axis"),
     )
+    write_scale_calibration_readme(
+        readme_path,
+        job_path=job_path,
+        template_path=template_path,
+        script_path=script_path,
+        bundle_path=bundle_path,
+        recommendations=recommendations,
+    )
     write_json(
         job_path,
         {
@@ -25759,6 +27623,7 @@ def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
             "source_bundle": str(bundle_path),
             "template": str(template_path),
             "script": str(script_path),
+            "readme": str(readme_path),
             "candidate_count": len(candidates),
             "include_background": bool(args.include_background),
             "current_scale_to_meters": current_scale,
@@ -25774,6 +27639,7 @@ def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
     )
     manifest.setdefault("artifacts", {})["scale_calibration_job"] = str(job_path)
     manifest.setdefault("artifacts", {})["scale_calibration_template"] = str(template_path)
+    manifest.setdefault("artifacts", {})["scale_calibration_readme"] = str(readme_path)
     manifest.setdefault("external_stages", {})["simulator_scale_calibration"] = {
         "status": "scale_calibration_job_prepared",
         "notes": "Prepared candidate reference-object measurement template for simulator scale calibration.",
@@ -25781,6 +27647,7 @@ def cmd_prepare_scale_calibration_jobs(args: argparse.Namespace) -> int:
         "job": str(job_path),
         "template": str(template_path),
         "script": str(script_path),
+        "readme": str(readme_path),
         "candidate_count": len(candidates),
         "include_background": bool(args.include_background),
     }
@@ -25828,6 +27695,7 @@ def physics_defaults_for_asset(obj: dict[str, Any], args: argparse.Namespace) ->
             "restitution": float(args.restitution),
         },
         "estimated": True,
+        "source": args.physics_provider,
         "estimation": {
             "method": "bbox_volume_density" if not is_background_structure else "static_background_structure",
             "bbox_size_m": dimensions,
@@ -25998,6 +27866,293 @@ def cmd_calibrate_simulator_assets(args: argparse.Namespace) -> int:
     return 0
 
 
+def simfoundry_static_object_scene_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    adapter_manifest_path: Path | None,
+    stages: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    bundle = safe_read_json(bundle_path)
+    if not isinstance(bundle, dict):
+        bundle = {}
+        issues.append({"severity": "required", "name": "missing_or_unreadable_bundle", "path": str(bundle_path)})
+
+    raw_objects = bundle.get("objects")
+    objects = [obj for obj in raw_objects if isinstance(obj, dict)] if isinstance(raw_objects, list) else []
+    foreground = [obj for obj in objects if obj.get("asset_role") != "background_structure"]
+    background = [obj for obj in objects if obj.get("asset_role") == "background_structure"]
+    static_colliders = static_collider_records_from_bundle(bundle)
+
+    declared_proxies = []
+    existing_proxies = []
+    for obj in objects:
+        physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        proxy_path = simulator_collision_proxy_path(obj, physics, project_root)
+        if isinstance(obj.get("collision_proxy"), dict) or isinstance(physics.get("collision_proxy"), dict):
+            declared_proxies.append(obj)
+            if proxy_path and proxy_path.exists():
+                existing_proxies.append(obj)
+
+    adapters = safe_read_json(adapter_manifest_path) if adapter_manifest_path else {}
+    adapter_formats = adapters.get("formats") if isinstance(adapters, dict) and isinstance(adapters.get("formats"), dict) else {}
+    ready_adapters = []
+    for name, item in adapter_formats.items():
+        if not isinstance(item, dict):
+            continue
+        adapter_file = resolve_existing_path(item.get("adapter_file"), project_root)
+        if adapter_file and adapter_file.exists():
+            ready_adapters.append(str(name))
+
+    if not objects:
+        issues.append({"severity": "required", "name": "empty_object_bundle", "detail": "No simulator objects were exported."})
+    if not static_colliders:
+        issues.append({"severity": "required", "name": "missing_static_scene_collider", "detail": "Bundle has no static scene collider."})
+    if args.collision_proxy != "none" and len(existing_proxies) < len(objects):
+        issues.append(
+            {
+                "severity": "warning",
+                "name": "missing_some_object_proxies",
+                "detail": f"Existing proxies {len(existing_proxies)} / objects {len(objects)}.",
+            }
+        )
+    if not adapter_formats:
+        issues.append({"severity": "required", "name": "missing_adapters", "detail": "No simulator adapters were exported."})
+    elif len(ready_adapters) != len(adapter_formats):
+        issues.append(
+            {
+                "severity": "required",
+                "name": "missing_adapter_files",
+                "detail": f"ready={sorted(ready_adapters)}, expected={sorted(adapter_formats)}",
+            }
+        )
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_static_object_scene",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "status": "ready" if not required else "issues",
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "adapter_manifest": str(adapter_manifest_path) if adapter_manifest_path else None,
+        "stages": stages,
+        "parameters": {
+            "split_objects": bool(args.split_objects),
+            "prepare_collider": bool(args.prepare_collider),
+            "body_type": args.body_type,
+            "collider": args.collider,
+            "collision_proxy": args.collision_proxy,
+            "scale_to_meters": args.scale_to_meters,
+            "scale_calibrated": bool(args.scale_calibrated),
+            "up_axis": args.up_axis,
+            "formats": args.format,
+        },
+        "summary": {
+            "object_count": len(objects),
+            "foreground_object_count": len(foreground),
+            "background_structure_count": len(background),
+            "static_collider_count": len(static_colliders),
+            "declared_object_proxy_count": len(declared_proxies),
+            "existing_object_proxy_count": len(existing_proxies),
+            "adapter_count": len(adapter_formats),
+            "adapter_ready_count": len(ready_adapters),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "issues": issues,
+        "recommended_next_steps": [
+            "Run simfoundry-simulator-smoke-test with MuJoCo runtime when available.",
+            "Inspect scale/up-axis before physics-critical simulation.",
+            "Then prepare tight colliders, penetration repair, and dynamic gate sidecars.",
+        ],
+    }
+
+
+def cmd_prepare_simfoundry_static_object_scene(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    stages: list[dict[str, Any]] = []
+
+    objects_dir = project_root / manifest.get("objects_dir", "objects")
+    object_records = sorted(objects_dir.glob("*/object.json")) if objects_dir.exists() else []
+    if args.split_objects and (args.refresh_object_splits or not object_records):
+        mesh_path = resolve_project_cli_path(args.mesh, project_root) if args.mesh else resolve_scene_mesh_path(project_root, manifest, args.scene_mesh)
+        semantics_path = resolve_project_cli_path(args.semantics, project_root) if args.semantics else resolve_scene_mesh_semantics_path(project_root, manifest)
+        if semantics_path is None or not semantics_path.exists():
+            raise FileNotFoundError("Missing mesh semantics JSON. Pass --semantics or register artifacts.mesh_semantics_local.")
+        cmd_split_mesh_by_semantics(
+            argparse.Namespace(
+                project_root=project_root,
+                mesh=mesh_path,
+                semantics=semantics_path,
+                output_dir=args.object_mesh_output_dir,
+                min_faces=args.min_faces,
+                min_probability=args.min_probability,
+                include_unknown=args.include_unknown,
+                copy_to_assets=True,
+                register_as_object_meshes=True,
+                mode=args.mode,
+            )
+        )
+        stages.append({"name": "split_mesh_by_semantics", "status": "completed", "mesh": str(mesh_path), "semantics": str(semantics_path)})
+        manifest = load_manifest(project_root)
+    else:
+        stages.append({"name": "split_mesh_by_semantics", "status": "skipped", "reason": "object records already exist or --no-split-objects"})
+
+    if args.prepare_collider:
+        cmd_prepare_simfoundry_collider_scene(
+            argparse.Namespace(
+                project_root=project_root,
+                scene_mesh=args.scene_mesh or args.mesh,
+                reconstruct=False,
+                method="colmap_delaunay",
+                colmap_dense_workspace=None,
+                reconstruction_output_dir=None,
+                reconstruction_output=None,
+                colmap_binary="colmap",
+                overwrite=True,
+                copy_input_point_cloud=True,
+                output_dir=None,
+                collider_output=None,
+                collider_format="obj",
+                mode=args.mode,
+                min_vertices=args.min_vertices,
+                min_triangles=args.min_triangles,
+                update_bundle=True,
+                write_collider_only_bundle=True,
+                collider_only_bundle_output=None,
+                json=False,
+                fail_on_fail=args.fail_on_required,
+            )
+        )
+        stages.append({"name": "prepare_simfoundry_collider_scene", "status": "completed"})
+        manifest = load_manifest(project_root)
+    else:
+        stages.append({"name": "prepare_simfoundry_collider_scene", "status": "skipped", "reason": "--no-prepare-collider"})
+
+    cmd_export_simulator_assets(
+        argparse.Namespace(
+            project_root=project_root,
+            semantic_splats_ply=None,
+            scene_scale=1.0,
+            body_type=args.body_type,
+            collider=args.collider,
+            copy_meshes=True,
+            ascii_meshes=args.ascii_meshes,
+            fit_object_local_meshes_to_bbox=False,
+            fit_axis="diagonal",
+            collision_proxy=args.collision_proxy,
+            use_collision_proxy=True,
+            estimate_physics=args.estimate_physics,
+            physics_provider=args.physics_provider,
+            default_density_kg_m3=args.default_density_kg_m3,
+            min_mass_kg=args.min_mass_kg,
+            max_mass_kg=args.max_mass_kg,
+            default_material=args.default_material,
+            friction=args.friction,
+            torsional_friction=args.torsional_friction,
+            rolling_friction=args.rolling_friction,
+            restitution=args.restitution,
+            mode=args.mode,
+        )
+    )
+    stages.append({"name": "export_simulator_assets", "status": "completed"})
+    manifest = load_manifest(project_root)
+
+    if args.calibrate:
+        cmd_calibrate_simulator_assets(
+            argparse.Namespace(
+                project_root=project_root,
+                bundle=None,
+                scale_to_meters=args.scale_to_meters,
+                scale_calibrated=args.scale_calibrated,
+                reference_object=None,
+                reference_axis="longest",
+                reference_length_m=None,
+                up_axis=args.up_axis,
+                rescale_existing_pose=True,
+                estimate_physics=args.estimate_physics,
+                overwrite_physics=False,
+                body_type=args.body_type,
+                collider=args.collider,
+                default_density_kg_m3=args.default_density_kg_m3,
+                min_mass_kg=args.min_mass_kg,
+                max_mass_kg=args.max_mass_kg,
+                default_material=args.default_material,
+                physics_provider=args.physics_provider,
+                friction=args.friction,
+                torsional_friction=args.torsional_friction,
+                rolling_friction=args.rolling_friction,
+                restitution=args.restitution,
+                notes=args.calibration_notes,
+            )
+        )
+        stages.append({"name": "calibrate_simulator_assets", "status": "completed"})
+        manifest = load_manifest(project_root)
+    else:
+        stages.append({"name": "calibrate_simulator_assets", "status": "skipped", "reason": "--no-calibrate"})
+
+    cmd_export_simulator_adapter(
+        argparse.Namespace(
+            project_root=project_root,
+            bundle=None,
+            format=args.format,
+            output_dir=None,
+            body_type=args.body_type,
+            default_mass=args.default_mass,
+            copy_assets=True,
+            mode=args.mode,
+        )
+    )
+    stages.append({"name": "export_simulator_adapter", "status": "completed", "formats": args.format})
+    manifest = load_manifest(project_root)
+
+    bundle_path = simulator_bundle_path(project_root, manifest, None)
+    adapter_manifest_path = resolve_existing_path(manifest.get("artifacts", {}).get("simulator_adapters"), project_root)
+    report = simfoundry_static_object_scene_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        adapter_manifest_path=adapter_manifest_path,
+        stages=stages,
+        args=args,
+    )
+    output_path = resolve_project_cli_path(args.output, project_root) if args.output else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_static_object_scene" / "static_object_scene_report.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_static_object_scene_report"] = str(output_path)
+    manifest.setdefault("external_stages", {})["simfoundry_static_object_scene"] = {
+        "status": report["status"],
+        "notes": "Prepared SimFoundry-style static object simulator bundle with scene collider, bbox proxies, physics defaults, calibration metadata, and adapters.",
+        "report": str(output_path),
+        "bundle": str(bundle_path),
+        "adapter_manifest": str(adapter_manifest_path) if adapter_manifest_path else None,
+        "summary": report["summary"],
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report["summary"]
+        print(f"Prepared SimFoundry static object scene: {output_path}")
+        print(
+            f"objects={summary['object_count']} foreground={summary['foreground_object_count']} "
+            f"background={summary['background_structure_count']} static_colliders={summary['static_collider_count']} "
+            f"adapters={summary['adapter_ready_count']}/{summary['adapter_count']}"
+        )
+    if args.fail_on_required and report["summary"]["required_issue_count"]:
+        return 1
+    if args.fail_on_empty and report["summary"]["object_count"] == 0:
+        return 1
+    return 0
+
+
 def positive_float_or_none(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -26163,6 +28318,7 @@ def cmd_import_scale_calibration(args: argparse.Namespace) -> int:
             min_mass_kg=args.min_mass_kg,
             max_mass_kg=args.max_mass_kg,
             default_material=args.default_material,
+            physics_provider=args.physics_provider,
             friction=args.friction,
             torsional_friction=args.torsional_friction,
             rolling_friction=args.rolling_friction,
@@ -26428,7 +28584,7 @@ def cmd_import_simulator_physics(args: argparse.Namespace) -> int:
 
 def simulator_bundle_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None = None) -> Path:
     if explicit is not None:
-        return explicit.resolve()
+        return resolve_existing_path(str(explicit), project_root) or resolve_project_cli_path(explicit, project_root)
     bundle = resolve_existing_path(manifest.get("artifacts", {}).get("simulator_asset_bundle"), project_root)
     if bundle and bundle.exists():
         return bundle
@@ -26439,10 +28595,10 @@ def adapter_rel_path(path_value: str | None, base: Path) -> str | None:
     if not path_value:
         return None
     path = Path(path_value)
-    if path.is_absolute():
-        try:
-            return os.path.relpath(path.resolve(), base.resolve())
-        except Exception:
+    try:
+        return os.path.relpath(path.resolve(), base.resolve())
+    except Exception:
+        if path.is_absolute():
             return str(path)
     try:
         return str(path.resolve().relative_to(base.resolve()))
@@ -26471,6 +28627,30 @@ def adapter_mesh_path(mesh_path: str | None, output_root: Path, object_id: str, 
     return str(dst)
 
 
+def adapter_static_collider_records(bundle: dict[str, Any], output_dir: Path, output_root: Path, project_root: Path, args: argparse.Namespace) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for collider in static_collider_records_from_bundle(bundle):
+        collider_id = slugify(str(collider.get("id") or "scene_static"), "scene_static")
+        mesh_path = str(collider.get("path") or collider.get("mesh_path") or collider.get("asset_path") or "")
+        packaged_mesh_path = adapter_mesh_path(mesh_path, output_root, f"static_{collider_id}", args, project_root)
+        records.append(
+            {
+                "collider_id": collider_id,
+                "role": collider.get("role") or "static_scene_collider",
+                "mesh_path": mesh_path,
+                "packaged_mesh_path": packaged_mesh_path,
+                "packaged_mesh_relative": adapter_rel_path(packaged_mesh_path, output_dir) if packaged_mesh_path else None,
+                "mesh_format": collider.get("format") or Path(mesh_path).suffix.lower().lstrip("."),
+                "body_type": "static",
+                "collider": collider.get("collider") or (collider.get("physics") or {}).get("collider") or "mesh",
+                "physics": collider.get("physics"),
+                "stats": collider.get("stats"),
+                "notes": collider.get("notes") or "Static scene collider imported from simulator_asset_bundle.static_colliders.",
+            }
+        )
+    return records
+
+
 def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: Path, project_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     xml_path = output_dir / "scene.xml"
     manifest_path = output_dir / "mujoco_adapter.json"
@@ -26478,6 +28658,23 @@ def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: 
     assets = []
     bodies = []
     objects = []
+    static_colliders = adapter_static_collider_records(bundle, output_dir, output_root, project_root, args)
+    for collider in static_colliders:
+        collider_id = collider["collider_id"]
+        mesh_rel = collider.get("packaged_mesh_relative")
+        if not mesh_rel:
+            continue
+        mesh_name = f"{collider_id}_static_mesh"
+        assets.append(f'    <mesh name="{html.escape(mesh_name)}" file="{html.escape(str(mesh_rel))}"/>')
+        physics = collider.get("physics") if isinstance(collider.get("physics"), dict) else {}
+        material = physics.get("material") if isinstance(physics.get("material"), dict) else {}
+        friction = material.get("friction") if isinstance(material, dict) else None
+        friction_attr = f' friction="{fmt_vec(friction, 3, 1.0)}"' if isinstance(friction, list) else ""
+        bodies.append(
+            f'    <body name="{html.escape(collider_id)}" pos="0 0 0">\n'
+            f'      <geom name="{html.escape(collider_id)}_geom" type="mesh" mesh="{html.escape(mesh_name)}"{friction_attr}/>\n'
+            f'    </body>'
+        )
     for obj in bundle.get("objects", []):
         object_id = slugify(obj.get("object_id", "object"))
         mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else None
@@ -26514,8 +28711,10 @@ def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: 
         if body_type == "dynamic":
             mass = (obj.get("physics") or {}).get("mass_kg") or args.default_mass
             mass_attr = f' mass="{float(mass):.6g}"'
+        freejoint_line = f'      <freejoint name="{html.escape(object_id)}_freejoint"/>\n' if body_type == "dynamic" else ""
         bodies.append(
             f'    <body name="{html.escape(object_id)}" pos="{fmt_vec(position)}">\n'
+            f"{freejoint_line}"
             f'      <geom name="{html.escape(object_id)}_geom" {geom_attrs}{mass_attr}{friction_attr}/>\n'
             f'    </body>'
         )
@@ -26527,6 +28726,7 @@ def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: 
                 "mesh_format": (mesh or {}).get("format"),
                 "pose": pose,
                 "body_type": body_type,
+                "joint": "freejoint" if body_type == "dynamic" else None,
                 "collider": collider,
                 "collision_proxy": obj.get("collision_proxy"),
                 "notes": "MuJoCo mesh import may require OBJ/STL conversion depending on runtime/version.",
@@ -26553,21 +28753,24 @@ def write_mujoco_adapter(bundle: dict[str, Any], output_dir: Path, output_root: 
         "schema_version": DEFAULT_SCHEMA_VERSION,
         "format": "mujoco",
         "adapter_file": str(xml_path),
-        "source_bundle": str(args.bundle) if args.bundle else bundle.get("source_bundle"),
+        "source_bundle": str(getattr(args, "bundle", None)) if getattr(args, "bundle", None) else bundle.get("source_bundle"),
         "objects": objects,
+        "static_colliders": static_colliders,
         "notes": [
             "This is a simulator adapter skeleton generated from Video2Mesh object poses and mesh paths.",
+            "Scene-level static colliders are exported as fixed worldbody mesh geoms; convert mesh formats if the target MuJoCo runtime requires OBJ/STL.",
             "Verify scale, up-axis, collision geometry, material, and mass before physics-critical simulation.",
         ],
     }
     write_json(manifest_path, manifest)
-    return {"adapter_file": str(xml_path), "adapter_manifest": str(manifest_path), "object_count": len(objects)}
+    return {"adapter_file": str(xml_path), "adapter_manifest": str(manifest_path), "object_count": len(objects), "static_collider_count": len(static_colliders)}
 
 
 def write_json_simulator_adapter(format_name: str, bundle: dict[str, Any], output_dir: Path, output_root: Path, project_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     ensure_dir(output_dir)
     out_path = output_dir / f"{format_name}_adapter.json"
     objects = []
+    static_colliders = adapter_static_collider_records(bundle, output_dir, output_root, project_root, args)
     for obj in bundle.get("objects", []):
         object_id = slugify(obj.get("object_id", "object"))
         mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else None
@@ -26605,14 +28808,15 @@ def write_json_simulator_adapter(format_name: str, bundle: dict[str, Any], outpu
         "scene_id": bundle.get("scene_id"),
         "coordinate_system": bundle.get("coordinate_system"),
         "scene_assets": bundle.get("scene_assets"),
+        "static_colliders": static_colliders,
         "objects": objects,
         "import_notes": {
-            "isaac": "Use mesh_path as the source mesh for USD/Isaac import; verify meters, up-axis, collision approximation, and rigid body properties.",
-            "unity": "Use mesh_path as an imported model path or convert to FBX/GLB; create prefabs with position/rotation/scale and semantic metadata.",
+            "isaac": "Use mesh_path/static_colliders as source meshes for USD/Isaac import; verify meters, up-axis, collision approximation, and rigid body properties.",
+            "unity": "Use mesh_path/static_colliders as imported model paths or convert to FBX/GLB; create prefabs with position/rotation/scale and semantic metadata.",
         }.get(format_name, "Generic simulator adapter manifest."),
     }
     write_json(out_path, adapter)
-    return {"adapter_file": str(out_path), "object_count": len(objects)}
+    return {"adapter_file": str(out_path), "object_count": len(objects), "static_collider_count": len(static_colliders)}
 
 
 def cmd_export_simulator_adapter(args: argparse.Namespace) -> int:
@@ -26646,8 +28850,8396 @@ def cmd_export_simulator_adapter(args: argparse.Namespace) -> int:
     save_manifest(project_root, manifest)
     print(f"Simulator adapters: {adapter_manifest_path}")
     for format_name, result in results.items():
-        print(f"- {format_name}: {result.get('adapter_file')} ({result.get('object_count')} object(s))")
+        print(
+            f"- {format_name}: {result.get('adapter_file')} "
+            f"({result.get('object_count')} object(s), {result.get('static_collider_count', 0)} static collider(s))"
+        )
     return 0
+
+
+def export_simulator_adapters_for_bundle(
+    project_root: Path,
+    bundle_path: Path,
+    output_root: Path,
+    *,
+    formats: list[str],
+    body_type: str,
+    default_mass: float,
+    copy_assets: bool,
+    mode: str,
+) -> tuple[Path, dict[str, Any]]:
+    bundle = read_json(bundle_path)
+    bundle["source_bundle"] = str(bundle_path)
+    output_root = ensure_dir(output_root)
+    adapter_args = argparse.Namespace(
+        bundle=bundle_path,
+        body_type=body_type,
+        default_mass=default_mass,
+        copy_assets=copy_assets,
+        mode=mode,
+    )
+    results: dict[str, Any] = {}
+    for format_name in formats:
+        format_dir = ensure_dir(output_root / format_name)
+        if format_name == "mujoco":
+            results[format_name] = write_mujoco_adapter(bundle, format_dir, output_root, project_root, adapter_args)
+        else:
+            results[format_name] = write_json_simulator_adapter(format_name, bundle, format_dir, output_root, project_root, adapter_args)
+
+    adapter_manifest_path = output_root / "simulator_adapters.json"
+    adapter_manifest = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "source_bundle": str(bundle_path),
+        "formats": results,
+        "notes": "Sidecar adapters exported without changing the project's main simulator adapter artifact.",
+    }
+    write_json(adapter_manifest_path, adapter_manifest)
+    return adapter_manifest_path, adapter_manifest
+
+
+def sim_preflight_issue(
+    severity: str,
+    name: str,
+    detail: str,
+    *,
+    source: str | None = None,
+    format_name: str | None = None,
+    object_id: str | None = None,
+    path: str | None = None,
+) -> dict[str, Any]:
+    issue = {"severity": severity, "name": name, "detail": detail}
+    if source:
+        issue["source"] = source
+    if format_name:
+        issue["format"] = format_name
+    if object_id:
+        issue["object_id"] = object_id
+    if path:
+        issue["path"] = path
+    return issue
+
+
+def sim_preflight_existing_path(path_value: Any, project_root: Path) -> Path | None:
+    if path_value in (None, ""):
+        return None
+    return resolve_existing_path(str(path_value), project_root)
+
+
+def sim_preflight_adapter_root(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+    adapter_manifest = resolve_existing_path(manifest.get("artifacts", {}).get("simulator_adapters"), project_root)
+    if adapter_manifest and adapter_manifest.exists():
+        return adapter_manifest.parent
+    return project_root / manifest["simulator_assets_dir"] / "adapters"
+
+
+def sim_preflight_collect_gate_issues(report: dict[str, Any], source: str) -> list[dict[str, Any]]:
+    issues = []
+    for raw in report.get("issues", []):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        item.setdefault("severity", "warning")
+        item.setdefault("name", "gate_issue")
+        item.setdefault("detail", "")
+        item["source"] = source
+        issues.append(item)
+    return issues
+
+
+def sim_preflight_object_proxy_records(bundle: dict[str, Any], project_root: Path) -> list[dict[str, Any]]:
+    records = []
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        object_id = slugify(obj.get("object_id") or "object")
+        physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+        physics_proxy = physics.get("collision_proxy") if isinstance(physics.get("collision_proxy"), dict) else {}
+        proxy_path = simulator_collision_proxy_path(obj, physics, project_root)
+        declared = bool(proxy or physics_proxy)
+        records.append(
+            {
+                "object_id": object_id,
+                "asset_role": obj.get("asset_role", "object"),
+                "declared": declared,
+                "shape": proxy.get("shape") or physics_proxy.get("shape") or physics.get("collision_shape") or physics.get("collider"),
+                "path": str(proxy_path) if proxy_path else str(proxy.get("path") or physics_proxy.get("path") or ""),
+                "exists": bool(proxy_path and proxy_path.exists()),
+            }
+        )
+    return records
+
+
+def sim_preflight_path_issue(
+    path_value: Any,
+    project_root: Path,
+    *,
+    role: str,
+    source: str,
+    severity: str = "required",
+    format_name: str | None = None,
+    object_id: str | None = None,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    if path_value in (None, ""):
+        return None, sim_preflight_issue(
+            severity,
+            f"missing_{role}_path",
+            f"{role} path is missing.",
+            source=source,
+            format_name=format_name,
+            object_id=object_id,
+        )
+    path = sim_preflight_existing_path(path_value, project_root)
+    if not path or not path.exists():
+        return path, sim_preflight_issue(
+            severity,
+            f"missing_{role}",
+            f"{role} file does not exist.",
+            source=source,
+            format_name=format_name,
+            object_id=object_id,
+            path=str(path) if path else str(path_value),
+        )
+    return path, None
+
+
+def sim_preflight_adapter_report(
+    format_name: str,
+    adapter_root: Path,
+    project_root: Path,
+    expected_static_colliders: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    adapter_dir = adapter_root / format_name
+    if format_name == "mujoco":
+        adapter_file = adapter_dir / "scene.xml"
+        adapter_manifest = adapter_dir / "mujoco_adapter.json"
+    else:
+        adapter_file = adapter_dir / f"{format_name}_adapter.json"
+        adapter_manifest = adapter_file
+
+    adapter_file_path, issue = sim_preflight_path_issue(
+        adapter_file,
+        project_root,
+        role=f"{format_name}_adapter",
+        source="simulator_adapter",
+        format_name=format_name,
+    )
+    if issue:
+        issues.append(issue)
+
+    manifest_path, manifest_issue = sim_preflight_path_issue(
+        adapter_manifest,
+        project_root,
+        role=f"{format_name}_adapter_manifest",
+        source="simulator_adapter",
+        format_name=format_name,
+    )
+    if manifest_issue:
+        issues.append(manifest_issue)
+
+    payload = safe_read_json(manifest_path) if manifest_path and manifest_path.exists() else None
+    static_collider_count = 0
+    object_count = 0
+    packaged_static_count = 0
+    packaged_proxy_count = 0
+    if isinstance(payload, dict):
+        static_colliders = payload.get("static_colliders") if isinstance(payload.get("static_colliders"), list) else []
+        objects = payload.get("objects") if isinstance(payload.get("objects"), list) else []
+        static_collider_count = len(static_colliders)
+        object_count = len(objects)
+        if expected_static_colliders and not static_colliders:
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "adapter_missing_static_colliders",
+                    "Adapter manifest has no static_colliders even though the bundle declares scene static colliders.",
+                    source="simulator_adapter",
+                    format_name=format_name,
+                )
+            )
+        for collider in static_colliders:
+            if not isinstance(collider, dict):
+                continue
+            collider_id = slugify(collider.get("collider_id") or collider.get("id") or "scene_static", "scene_static")
+            packaged_path = collider.get("packaged_mesh_path") or collider.get("mesh_path")
+            _, packaged_issue = sim_preflight_path_issue(
+                packaged_path,
+                project_root,
+                role="packaged_static_collider_mesh",
+                source="simulator_adapter",
+                format_name=format_name,
+                object_id=collider_id,
+            )
+            if packaged_issue:
+                issues.append(packaged_issue)
+            else:
+                packaged_static_count += 1
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            object_id = slugify(obj.get("object_id") or "object")
+            proxy_source = obj.get("collision_proxy_path") or ((obj.get("collision_proxy") or {}).get("path") if isinstance(obj.get("collision_proxy"), dict) else None)
+            packaged_proxy = obj.get("packaged_collision_proxy_path")
+            if proxy_source and format_name == "mujoco":
+                proxy_path = sim_preflight_existing_path(proxy_source, project_root)
+                if proxy_path and proxy_path.exists():
+                    packaged_proxy_count += 1
+            elif proxy_source:
+                _, proxy_issue = sim_preflight_path_issue(
+                    packaged_proxy,
+                    project_root,
+                    role="packaged_collision_proxy",
+                    source="simulator_adapter",
+                    format_name=format_name,
+                    object_id=object_id,
+                )
+                if proxy_issue:
+                    issues.append(proxy_issue)
+                else:
+                    packaged_proxy_count += 1
+    elif manifest_path and manifest_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "unreadable_adapter_manifest",
+                "Adapter manifest exists but could not be parsed as JSON.",
+                source="simulator_adapter",
+                format_name=format_name,
+                path=str(manifest_path),
+            )
+        )
+
+    if format_name == "mujoco" and adapter_file_path and adapter_file_path.exists():
+        text = adapter_file_path.read_text(encoding="utf-8", errors="replace")
+        if "<mujoco" not in text:
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "mujoco_xml_missing_root",
+                    "MuJoCo adapter XML does not contain a <mujoco> root tag.",
+                    source="simulator_adapter",
+                    format_name=format_name,
+                    path=str(adapter_file_path),
+                )
+            )
+
+    return (
+        {
+            "format": format_name,
+            "adapter_dir": str(adapter_dir),
+            "adapter_file": str(adapter_file),
+            "adapter_file_exists": bool(adapter_file_path and adapter_file_path.exists()),
+            "adapter_manifest": str(adapter_manifest),
+            "adapter_manifest_exists": bool(manifest_path and manifest_path.exists()),
+            "static_collider_count": static_collider_count,
+            "object_count": object_count,
+            "packaged_static_collider_count": packaged_static_count,
+            "packaged_collision_proxy_count": packaged_proxy_count,
+            "ok": not any(issue.get("severity") == "required" for issue in issues),
+            "issues": issues,
+        },
+        issues,
+    )
+
+
+def sim_preflight_mujoco_runtime(xml_path: Path | None, mode: str, steps: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    result: dict[str, Any] = {
+        "mode": mode,
+        "available": False,
+        "status": "skipped",
+        "xml": str(xml_path) if xml_path else "",
+        "steps": int(max(0, steps)),
+    }
+    if mode == "skip":
+        return result, issues
+    if not xml_path or not xml_path.exists():
+        result["status"] = "missing_xml"
+        if mode == "require":
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "mujoco_runtime_missing_xml",
+                    "MuJoCo runtime smoke was required but scene.xml is missing.",
+                    source="mujoco_runtime",
+                    format_name="mujoco",
+                    path=str(xml_path) if xml_path else "",
+                )
+            )
+        return result, issues
+    if importlib.util.find_spec("mujoco") is None:
+        result["status"] = "unavailable"
+        if mode == "require":
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "mujoco_runtime_unavailable",
+                    "The mujoco Python package is not installed, so XML load/step could not run.",
+                    source="mujoco_runtime",
+                    format_name="mujoco",
+                )
+            )
+        return result, issues
+    try:
+        mujoco = __import__("mujoco")
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+        data = mujoco.MjData(model)
+        for _ in range(int(max(0, steps))):
+            mujoco.mj_step(model, data)
+        result.update(
+            {
+                "available": True,
+                "status": "pass",
+                "nbody": int(model.nbody),
+                "ngeom": int(model.ngeom),
+                "nmesh": int(model.nmesh),
+            }
+        )
+    except Exception as exc:
+        result.update({"available": True, "status": "failed", "error": str(exc)})
+        issues.append(
+            sim_preflight_issue(
+                "required" if mode == "require" else "warning",
+                "mujoco_runtime_failed",
+                f"MuJoCo XML load/step failed: {exc}",
+                source="mujoco_runtime",
+                format_name="mujoco",
+                path=str(xml_path),
+            )
+        )
+    return result, issues
+
+
+def generate_simfoundry_simulator_smoke_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    adapter_root: Path,
+    formats: list[str],
+    min_mesh_vertices: int,
+    require_physics: bool,
+    require_collider: bool,
+    require_scale_calibration: bool,
+    allow_estimated_physics: bool,
+    mujoco_runtime_mode: str,
+    mujoco_steps: int,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run export-simulator-assets before simulator smoke/preflight.",
+                source="simulator_bundle",
+                path=str(bundle_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "fail",
+            "ok": False,
+            "bundle": str(bundle_path),
+            "adapter_root": str(adapter_root),
+            "formats": formats,
+            "summary": {"required_issue_count": 1, "warning_count": 0, "static_collider_count": 0, "object_count": 0},
+            "issues": issues,
+        }
+
+    bundle = read_json(bundle_path)
+    static_colliders = static_collider_records_from_bundle(bundle)
+    static_collider_reports = [static_collider_qa_record(collider, project_root, min_mesh_vertices) for collider in static_colliders]
+    if not static_colliders:
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_scene_static_collider",
+                "Bundle has no static_colliders[] or scene_assets.scene_static_collider_mesh; run prepare-simfoundry-collider-scene first.",
+                source="simulator_bundle",
+            )
+        )
+    for report in static_collider_reports:
+        for raw in report.get("issues", []):
+            item = dict(raw)
+            item["source"] = "static_collider"
+            issues.append(item)
+
+    object_proxy_records = sim_preflight_object_proxy_records(bundle, project_root)
+    for proxy in object_proxy_records:
+        if proxy.get("declared") and not proxy.get("exists"):
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "missing_object_collision_proxy",
+                    "Object declares a collision proxy but the proxy mesh does not exist.",
+                    source="object_collision_proxy",
+                    object_id=str(proxy.get("object_id") or ""),
+                    path=str(proxy.get("path") or ""),
+                )
+            )
+
+    asset_qa = simulator_asset_qa_report(
+        project_root=project_root,
+        manifest=manifest,
+        bundle_path=bundle_path,
+        min_mesh_vertices=min_mesh_vertices,
+        max_center_ratio=0.5,
+        max_size_ratio_delta=1.5,
+        require_physics=require_physics,
+        require_scale_calibration=require_scale_calibration,
+    )
+    physics_quality = generate_simulator_physics_quality_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        require_physics=require_physics,
+        require_collider=require_collider,
+        require_scale_calibration=require_scale_calibration,
+        prefer_proxy_colliders=True,
+        allow_estimated_physics=allow_estimated_physics,
+    )
+    issues.extend(sim_preflight_collect_gate_issues(asset_qa, "qa-simulator-assets"))
+    issues.extend(sim_preflight_collect_gate_issues(physics_quality, "simulator-physics-quality-report"))
+
+    adapter_reports = []
+    for format_name in formats:
+        adapter_report, adapter_issues = sim_preflight_adapter_report(format_name, adapter_root, project_root, len(static_colliders))
+        adapter_reports.append(adapter_report)
+        issues.extend(adapter_issues)
+
+    mujoco_xml = adapter_root / "mujoco" / "scene.xml" if "mujoco" in formats else None
+    mujoco_runtime, mujoco_issues = sim_preflight_mujoco_runtime(mujoco_xml, mujoco_runtime_mode, mujoco_steps)
+    issues.extend(mujoco_issues)
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    runtime_passed = mujoco_runtime.get("status") == "pass"
+    if required:
+        status = "fail"
+        ok = False
+    elif warnings:
+        status = "runtime_pass_with_warnings" if runtime_passed else "structural_pass_with_warnings"
+        ok = True
+    else:
+        status = "runtime_pass" if runtime_passed else "structural_pass"
+        ok = True
+
+    objects = bundle.get("objects") if isinstance(bundle.get("objects"), list) else []
+    foreground_objects = [obj for obj in objects if isinstance(obj, dict) and obj.get("asset_role") != "background_structure"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_simulator_smoke_test",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": ok,
+        "bundle": str(bundle_path),
+        "adapter_root": str(adapter_root),
+        "formats": formats,
+        "thresholds": {
+            "min_mesh_vertices": min_mesh_vertices,
+            "require_physics": require_physics,
+            "require_collider": require_collider,
+            "require_scale_calibration": require_scale_calibration,
+            "allow_estimated_physics": allow_estimated_physics,
+            "mujoco_runtime_mode": mujoco_runtime_mode,
+            "mujoco_steps": mujoco_steps,
+        },
+        "asset_qa": {
+            "status": "pass" if asset_qa.get("ok") else "issues",
+            "summary": asset_qa.get("summary", {}),
+        },
+        "physics_quality": {
+            "status": physics_quality.get("status"),
+            "summary": physics_quality.get("summary", {}),
+        },
+        "static_colliders": static_collider_reports,
+        "object_collision_proxies": object_proxy_records,
+        "adapters": adapter_reports,
+        "mujoco_runtime": mujoco_runtime,
+        "summary": {
+            "object_count": len([obj for obj in objects if isinstance(obj, dict)]),
+            "foreground_object_count": len(foreground_objects),
+            "static_collider_count": len(static_collider_reports),
+            "declared_object_proxy_count": len([item for item in object_proxy_records if item.get("declared")]),
+            "existing_object_proxy_count": len([item for item in object_proxy_records if item.get("declared") and item.get("exists")]),
+            "adapter_count": len(adapter_reports),
+            "adapter_ready_count": len([item for item in adapter_reports if item.get("ok")]),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+            "mujoco_runtime_status": mujoco_runtime.get("status"),
+        },
+        "issues": issues,
+        "recommended_next_steps": [
+            "If this report passes structurally, import the MuJoCo/Unity/Isaac adapter into the target simulator and inspect scale/up-axis.",
+            "Replace bbox proxies with convex decomposition only where the target simulator needs tighter contact geometry.",
+            "Keep visual meshes, static scene collider, object collision proxies, and physics provenance as separate assets.",
+        ],
+    }
+
+
+def cmd_simfoundry_simulator_smoke_test(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    adapter_root = sim_preflight_adapter_root(project_root, manifest, args.adapter_dir)
+    report = generate_simfoundry_simulator_smoke_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        adapter_root=adapter_root,
+        formats=args.format,
+        min_mesh_vertices=args.min_mesh_vertices,
+        require_physics=args.require_physics,
+        require_collider=args.require_collider,
+        require_scale_calibration=args.require_scale_calibration,
+        allow_estimated_physics=args.allow_estimated_physics,
+        mujoco_runtime_mode=args.mujoco_runtime,
+        mujoco_steps=args.mujoco_steps,
+    )
+    output_path = resolve_project_cli_path(args.output, project_root) if args.output else project_root / manifest["simulator_assets_dir"] / "physics" / "sim_preflight_report.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["sim_preflight_report"] = str(output_path)
+    manifest.setdefault("artifacts", {})["simfoundry_simulator_smoke_report"] = str(output_path)
+    manifest.setdefault("external_stages", {})["simfoundry_simulator_smoke_test"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "bundle": str(bundle_path),
+        "adapter_root": str(adapter_root),
+        "formats": args.format,
+        "summary": report.get("summary", {}),
+        "notes": "Structural simulator preflight for the SimFoundry-style collider/object-collider asset path.",
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry simulator smoke: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"static_colliders={summary.get('static_collider_count')} "
+            f"object_proxies={summary.get('existing_object_proxy_count')}/{summary.get('declared_object_proxy_count')} "
+            f"adapters={summary.get('adapter_ready_count')}/{summary.get('adapter_count')} "
+            f"mujoco_runtime={summary.get('mujoco_runtime_status')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        for issue in report.get("issues", [])[: args.max_issues]:
+            object_prefix = f"{issue.get('object_id')}: " if issue.get("object_id") else ""
+            format_prefix = f"{issue.get('format')}: " if issue.get("format") else ""
+            print(f"- [{issue.get('severity')}] {format_prefix}{object_prefix}{issue.get('name')}: {issue.get('detail')}")
+        if len(report.get("issues", [])) > args.max_issues:
+            print(f"- ... {len(report.get('issues', [])) - args.max_issues} more issue(s)")
+        print(f"Report: {output_path}")
+
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_warning and report.get("summary", {}).get("warning_count"):
+        return 1
+    return 0
+
+
+def mujoco_body_pose_records(model: Any, data: Any) -> list[dict[str, Any]]:
+    records = []
+    for body_id in range(1, int(model.nbody)):
+        name = str(model.body(body_id).name or f"body_{body_id}")
+        xpos = [float(value) for value in data.xpos[body_id].tolist()]
+        xquat = [float(value) for value in data.xquat[body_id].tolist()]
+        records.append(
+            {
+                "body_id": body_id,
+                "name": name,
+                "position": xpos,
+                "quaternion_wxyz": xquat,
+            }
+        )
+    return records
+
+
+def settle_pose_delta(initial: list[dict[str, Any]], final: list[dict[str, Any]]) -> dict[str, Any]:
+    initial_by_name = {item.get("name"): item for item in initial}
+    max_translation = 0.0
+    moved: list[dict[str, Any]] = []
+    for item in final:
+        name = item.get("name")
+        before = initial_by_name.get(name)
+        if not before:
+            continue
+        before_pos = before.get("position") if isinstance(before.get("position"), list) else [0.0, 0.0, 0.0]
+        after_pos = item.get("position") if isinstance(item.get("position"), list) else [0.0, 0.0, 0.0]
+        delta = math.sqrt(sum((float(after_pos[idx]) - float(before_pos[idx])) ** 2 for idx in range(min(3, len(before_pos), len(after_pos)))))
+        max_translation = max(max_translation, delta)
+        if delta > 1e-9:
+            moved.append({"name": name, "translation_delta": delta})
+    return {"max_translation_delta": max_translation, "moved_bodies": moved}
+
+
+def generate_simfoundry_settle_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    adapter_root: Path,
+    xml_path: Path | None,
+    steps: int,
+    timestep: float | None,
+    runtime_mode: str,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if xml_path is None:
+        xml_path = adapter_root / "mujoco" / "scene.xml"
+    if not xml_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_mujoco_xml",
+                "MuJoCo scene.xml is required before settling simulator poses.",
+                source="settle-simulator-scene",
+                format_name="mujoco",
+                path=str(xml_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_settle_simulator_scene",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "fail",
+            "ok": False,
+            "runtime": {"mode": runtime_mode, "available": False, "status": "missing_xml"},
+            "mujoco_xml": str(xml_path),
+            "steps": int(steps),
+            "issues": issues,
+            "summary": {"required_issue_count": 1, "warning_count": 0, "body_count": 0, "moved_body_count": 0},
+        }
+    if runtime_mode == "skip":
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_settle_simulator_scene",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "skipped",
+            "ok": True,
+            "runtime": {"mode": runtime_mode, "available": False, "status": "skipped"},
+            "mujoco_xml": str(xml_path),
+            "steps": int(steps),
+            "initial_poses": [],
+            "settled_poses": [],
+            "delta": {"max_translation_delta": 0.0, "moved_bodies": []},
+            "issues": [],
+            "summary": {"required_issue_count": 0, "warning_count": 0, "body_count": 0, "moved_body_count": 0},
+        }
+    if importlib.util.find_spec("mujoco") is None:
+        severity = "required" if runtime_mode == "require" else "warning"
+        issues.append(
+            sim_preflight_issue(
+                severity,
+                "mujoco_runtime_unavailable",
+                "The mujoco Python package is not installed, so stable pose settling could not run.",
+                source="settle-simulator-scene",
+                format_name="mujoco",
+            )
+        )
+        required = [issue for issue in issues if issue.get("severity") == "required"]
+        warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_settle_simulator_scene",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "runtime_unavailable" if not required else "fail",
+            "ok": not required,
+            "runtime": {"mode": runtime_mode, "available": False, "status": "unavailable"},
+            "mujoco_xml": str(xml_path),
+            "steps": int(steps),
+            "initial_poses": [],
+            "settled_poses": [],
+            "delta": {"max_translation_delta": 0.0, "moved_bodies": []},
+            "issues": issues,
+            "summary": {"required_issue_count": len(required), "warning_count": len(warnings), "body_count": 0, "moved_body_count": 0},
+        }
+    try:
+        mujoco = __import__("mujoco")
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+        if timestep is not None and timestep > 0:
+            model.opt.timestep = float(timestep)
+        data = mujoco.MjData(model)
+        initial = mujoco_body_pose_records(model, data)
+        for _ in range(int(max(0, steps))):
+            mujoco.mj_step(model, data)
+        settled = mujoco_body_pose_records(model, data)
+        delta = settle_pose_delta(initial, settled)
+        status = "settled"
+        ok = True
+        runtime = {
+            "mode": runtime_mode,
+            "available": True,
+            "status": "pass",
+            "nbody": int(model.nbody),
+            "ngeom": int(model.ngeom),
+            "nmesh": int(model.nmesh),
+            "timestep": float(model.opt.timestep),
+            "sim_time": float(data.time),
+        }
+    except Exception as exc:
+        issues.append(
+            sim_preflight_issue(
+                "required" if runtime_mode == "require" else "warning",
+                "mujoco_settle_failed",
+                f"MuJoCo settling failed: {exc}",
+                source="settle-simulator-scene",
+                format_name="mujoco",
+                path=str(xml_path),
+            )
+        )
+        initial = []
+        settled = []
+        delta = {"max_translation_delta": 0.0, "moved_bodies": []}
+        status = "fail" if any(issue.get("severity") == "required" for issue in issues) else "settle_failed"
+        ok = not any(issue.get("severity") == "required" for issue in issues)
+        runtime = {"mode": runtime_mode, "available": True, "status": "failed", "error": str(exc)}
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_settle_simulator_scene",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": ok,
+        "runtime": runtime,
+        "mujoco_xml": str(xml_path),
+        "steps": int(steps),
+        "initial_poses": initial,
+        "settled_poses": settled,
+        "delta": delta,
+        "issues": issues,
+        "summary": {
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+            "body_count": len(settled),
+            "moved_body_count": len(delta.get("moved_bodies", [])),
+            "max_translation_delta": delta.get("max_translation_delta", 0.0),
+        },
+    }
+
+
+def cmd_settle_simulator_scene(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    adapter_root = sim_preflight_adapter_root(project_root, manifest, args.adapter_dir)
+    xml_path = resolve_project_cli_path(args.mujoco_xml, project_root) if args.mujoco_xml else adapter_root / "mujoco" / "scene.xml"
+    report = generate_simfoundry_settle_report(
+        project_root,
+        manifest,
+        adapter_root=adapter_root,
+        xml_path=xml_path,
+        steps=args.steps,
+        timestep=args.timestep,
+        runtime_mode=args.mujoco_runtime,
+    )
+    output_path = args.output.resolve() if args.output else project_root / manifest["simulator_assets_dir"] / "physics" / "stable_pose_cache.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["stable_pose_cache"] = str(output_path)
+    manifest.setdefault("artifacts", {})["simfoundry_stable_pose_cache"] = str(output_path)
+    manifest.setdefault("external_stages", {})["simfoundry_settle_simulator_scene"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "mujoco_xml": str(xml_path),
+        "steps": args.steps,
+        "summary": report.get("summary", {}),
+        "notes": "Optional MuJoCo settle/cache pass for SimFoundry-style stable simulator poses.",
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        runtime = report.get("runtime", {})
+        print(f"Simulator settle: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"runtime={runtime.get('status')} bodies={summary.get('body_count')} "
+            f"moved={summary.get('moved_body_count')} max_translation={summary.get('max_translation_delta')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        for issue in report.get("issues", [])[: args.max_issues]:
+            print(f"- [{issue.get('severity')}] {issue.get('name')}: {issue.get('detail')}")
+        if len(report.get("issues", [])) > args.max_issues:
+            print(f"- ... {len(report.get('issues', [])) - args.max_issues} more issue(s)")
+        print(f"Report: {output_path}")
+
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_warning and report.get("summary", {}).get("warning_count"):
+        return 1
+    if args.fail_on_unavailable and report.get("runtime", {}).get("status") in {"unavailable", "skipped"}:
+        return 1
+    return 0
+
+
+def scene_relation_bbox_from_object(obj: dict[str, Any]) -> dict[str, Any] | None:
+    object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    for raw_bbox in (obj.get("bbox_3d"), pose.get("bbox_3d")):
+        if isinstance(raw_bbox, dict):
+            bounds = bbox_min_max_from_record({"bbox_3d": raw_bbox})
+            if bounds:
+                mins, maxs = bounds
+                size = [maxs[idx] - mins[idx] for idx in range(3)]
+                center = [(mins[idx] + maxs[idx]) * 0.5 for idx in range(3)]
+                return {
+                    "object_id": object_id,
+                    "name": obj.get("name", object_id),
+                    "category": obj.get("category", "unknown"),
+                    "asset_role": obj.get("asset_role", "object"),
+                    "min": mins,
+                    "max": maxs,
+                    "center": center,
+                    "size": size,
+                    "source": "bbox_3d",
+                }
+    position = pose.get("position")
+    bbox_size = pose.get("bbox_size")
+    if isinstance(position, (list, tuple)) and isinstance(bbox_size, (list, tuple)) and len(position) >= 3 and len(bbox_size) >= 3:
+        try:
+            center = [float(value) for value in position[:3]]
+            size = [max(0.0, float(value)) for value in bbox_size[:3]]
+            if any(value > 0.0 for value in size):
+                mins = [center[idx] - size[idx] * 0.5 for idx in range(3)]
+                maxs = [center[idx] + size[idx] * 0.5 for idx in range(3)]
+                return {
+                    "object_id": object_id,
+                    "name": obj.get("name", object_id),
+                    "category": obj.get("category", "unknown"),
+                    "asset_role": obj.get("asset_role", "object"),
+                    "min": mins,
+                    "max": maxs,
+                    "center": center,
+                    "size": size,
+                    "source": "pose_bbox_size",
+                }
+        except Exception:
+            return None
+    return None
+
+
+def bbox_axis_overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> float:
+    return max(0.0, min(float(a_max), float(b_max)) - max(float(a_min), float(b_min)))
+
+
+def bbox_volume(bounds: dict[str, Any]) -> float:
+    size = bounds.get("size") if isinstance(bounds.get("size"), list) else []
+    if len(size) < 3:
+        return 0.0
+    volume = 1.0
+    for value in size[:3]:
+        volume *= max(0.0, float(value))
+    return float(volume)
+
+
+def bbox_overlap_metrics(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    overlaps = [
+        bbox_axis_overlap(a["min"][axis], a["max"][axis], b["min"][axis], b["max"][axis])
+        for axis in range(3)
+    ]
+    overlap_volume = overlaps[0] * overlaps[1] * overlaps[2]
+    smaller_volume = min(max(bbox_volume(a), 0.0), max(bbox_volume(b), 0.0))
+    return {
+        "axis_overlap": overlaps,
+        "overlap_volume": overlap_volume,
+        "overlap_over_smaller": float(overlap_volume / smaller_volume) if smaller_volume > 1e-12 else 0.0,
+        "min_axis_overlap": min(overlaps),
+        "has_3d_overlap": all(value > 0.0 for value in overlaps),
+    }
+
+
+def bbox_footprint_overlap_ratio(a: dict[str, Any], b: dict[str, Any], horizontal_axes: list[int]) -> float:
+    overlap_area = 1.0
+    a_area = 1.0
+    b_area = 1.0
+    for axis in horizontal_axes:
+        overlap_area *= bbox_axis_overlap(a["min"][axis], a["max"][axis], b["min"][axis], b["max"][axis])
+        a_area *= max(0.0, float(a["max"][axis]) - float(a["min"][axis]))
+        b_area *= max(0.0, float(b["max"][axis]) - float(b["min"][axis]))
+    smaller = min(a_area, b_area)
+    if smaller <= 1e-9:
+        return 0.0
+    return float(overlap_area / smaller)
+
+
+def relation_record(
+    subject: dict[str, Any],
+    predicate: str,
+    other: dict[str, Any],
+    *,
+    source: str,
+    confidence: float,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "subject": subject["object_id"],
+        "predicate": predicate,
+        "object": other["object_id"],
+        "source": source,
+        "confidence": float(max(0.0, min(1.0, confidence))),
+        "metrics": metrics,
+    }
+
+
+def generate_simfoundry_scene_relations(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    up_axis: str | None,
+    max_support_gap: float,
+    min_support_overlap: float,
+    near_distance: float,
+    include_background_near: bool,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run export-simulator-assets before exporting scene relations.",
+                source="export-scene-relations",
+                path=str(bundle_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_scene_relations",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "status": "fail",
+            "ok": False,
+            "relations": [],
+            "objects": [],
+            "issues": issues,
+            "summary": {"object_count": 0, "relation_count": 0, "required_issue_count": 1, "warning_count": 0},
+        }
+    bundle = read_json(bundle_path)
+    coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
+    axis_name = str(up_axis or coordinate_system.get("up_axis") or "y").lower()
+    up_idx = axis_index(axis_name)
+    horizontal_axes = [idx for idx in [0, 1, 2] if idx != up_idx]
+    raw_objects = [obj for obj in bundle.get("objects", []) if isinstance(obj, dict)]
+    objects = []
+    for obj in raw_objects:
+        record = scene_relation_bbox_from_object(obj)
+        if record:
+            objects.append(record)
+        else:
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "missing_relation_bbox",
+                    "Object has no pose bbox or bbox_3d for scene relation inference.",
+                    source="export-scene-relations",
+                    object_id=slugify(str(obj.get("object_id") or obj.get("name") or "object")),
+                )
+            )
+
+    relations: list[dict[str, Any]] = []
+    support_pairs: set[tuple[str, str]] = set()
+    support_candidates_by_subject: dict[str, list[dict[str, Any]]] = {}
+    for subject in objects:
+        candidates = []
+        for other in objects:
+            if subject["object_id"] == other["object_id"]:
+                continue
+            if float(subject["center"][up_idx]) <= float(other["center"][up_idx]):
+                continue
+            vertical_gap = abs(float(subject["min"][up_idx]) - float(other["max"][up_idx]))
+            overlap_ratio = bbox_footprint_overlap_ratio(subject, other, horizontal_axes)
+            if vertical_gap <= float(max_support_gap) and overlap_ratio >= float(min_support_overlap):
+                confidence = min(0.95, 0.45 + 0.45 * overlap_ratio + 0.10 * max(0.0, 1.0 - vertical_gap / max(1e-8, float(max_support_gap))))
+                candidates.append(
+                    {
+                        "support": other,
+                        "vertical_gap": vertical_gap,
+                        "footprint_overlap_over_smaller": overlap_ratio,
+                        "confidence": confidence,
+                    }
+                )
+        if candidates:
+            candidates.sort(key=lambda item: (-float(item["confidence"]), float(item["vertical_gap"])))
+            best = candidates[0]
+            other = best["support"]
+            metrics = {
+                "up_axis": axis_name,
+                "vertical_gap": best["vertical_gap"],
+                "footprint_overlap_over_smaller": best["footprint_overlap_over_smaller"],
+            }
+            relations.append(
+                relation_record(
+                    subject,
+                    "OnTopOf",
+                    other,
+                    source="bbox_support_inference",
+                    confidence=best["confidence"],
+                    metrics=metrics,
+                )
+            )
+            relations.append(
+                relation_record(
+                    subject,
+                    "SupportedBy",
+                    other,
+                    source="bbox_support_inference",
+                    confidence=best["confidence"],
+                    metrics=metrics,
+                )
+            )
+            support_pairs.add((subject["object_id"], other["object_id"]))
+            support_candidates_by_subject[subject["object_id"]] = [
+                {
+                    "object": item["support"]["object_id"],
+                    "vertical_gap": item["vertical_gap"],
+                    "footprint_overlap_over_smaller": item["footprint_overlap_over_smaller"],
+                    "confidence": item["confidence"],
+                }
+                for item in candidates
+            ]
+
+    for left_index, left in enumerate(objects):
+        for right in objects[left_index + 1 :]:
+            pair = (left["object_id"], right["object_id"])
+            reverse_pair = (right["object_id"], left["object_id"])
+            if pair in support_pairs or reverse_pair in support_pairs:
+                continue
+            if not include_background_near and left.get("asset_role") == "background_structure" and right.get("asset_role") == "background_structure":
+                continue
+            gap = bbox_gap_and_overlap_3d(left["min"], left["max"], right["min"], right["max"])
+            if float(gap["euclidean_gap"]) <= float(near_distance):
+                confidence = min(0.9, 0.35 + 0.55 * max(0.0, 1.0 - float(gap["euclidean_gap"]) / max(1e-8, float(near_distance))))
+                relations.append(
+                    relation_record(
+                        left,
+                        "Near",
+                        right,
+                        source="bbox_near_inference",
+                        confidence=confidence,
+                        metrics={
+                            "euclidean_gap": gap["euclidean_gap"],
+                            "center_distance": gap["center_distance"],
+                            "near_distance_threshold": float(near_distance),
+                        },
+                    )
+                )
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_scene_relations",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else "empty" if not relations else "relations_inferred",
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "coordinate_system": {**coordinate_system, "up_axis": axis_name},
+        "thresholds": {
+            "max_support_gap": float(max_support_gap),
+            "min_support_overlap": float(min_support_overlap),
+            "near_distance": float(near_distance),
+            "include_background_near": bool(include_background_near),
+        },
+        "objects": objects,
+        "relations": relations,
+        "support_candidates": support_candidates_by_subject,
+        "issues": issues,
+        "summary": {
+            "object_count": len(objects),
+            "relation_count": len(relations),
+            "support_relation_count": len([item for item in relations if item.get("predicate") in {"OnTopOf", "SupportedBy"}]),
+            "near_relation_count": len([item for item in relations if item.get("predicate") == "Near"]),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Rule-based bbox relation sidecar for SimFoundry-style task cousins; review before using as task ground truth.",
+    }
+
+
+def cmd_export_scene_relations(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    report = generate_simfoundry_scene_relations(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        up_axis=args.up_axis,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        near_distance=args.near_distance,
+        include_background_near=args.include_background_near,
+    )
+    output_path = args.output.resolve() if args.output else project_root / manifest["simulator_assets_dir"] / "semantic" / "scene_relations.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["scene_relations"] = str(output_path)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_relations"] = str(output_path)
+    manifest.setdefault("external_stages", {})["simfoundry_scene_relations"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "bundle": str(bundle_path),
+        "summary": report.get("summary", {}),
+        "notes": "Rule-based bbox scene relations for SimFoundry-style task cousins.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"Scene relations: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"objects={summary.get('object_count')} relations={summary.get('relation_count')} "
+            f"support={summary.get('support_relation_count')} near={summary.get('near_relation_count')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        print(f"Report: {output_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("relation_count"):
+        return 1
+    return 0
+
+
+def simfoundry_task_object_record(object_id: str, objects_by_id: dict[str, dict[str, Any]], bundle_objects_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    record = objects_by_id.get(object_id) or {}
+    bundle_record = bundle_objects_by_id.get(object_id) or {}
+    return {
+        "object_id": object_id,
+        "name": bundle_record.get("name") or record.get("name") or object_id,
+        "category": bundle_record.get("category") or record.get("category") or "unknown",
+        "asset_role": bundle_record.get("asset_role") or record.get("asset_role") or "object",
+        "pose": bundle_record.get("pose") if isinstance(bundle_record.get("pose"), dict) else {},
+    }
+
+
+def simfoundry_task_label(obj: dict[str, Any]) -> str:
+    name = str(obj.get("name") or "").strip()
+    category = str(obj.get("category") or "").strip()
+    object_id = str(obj.get("object_id") or "object")
+    if name and name != object_id:
+        return name
+    if category and category.lower() != "unknown":
+        return category
+    return object_id.replace("_", " ")
+
+
+def simfoundry_task_spec_from_relation(
+    relation: dict[str, Any],
+    *,
+    task_type: str,
+    subject: dict[str, Any],
+    target: dict[str, Any],
+    relations_path: Path | None,
+    bundle_path: Path,
+    thresholds: dict[str, Any],
+) -> dict[str, Any]:
+    subject_id = str(subject["object_id"])
+    target_id = str(target["object_id"])
+    predicate = "OnTopOf" if task_type == "place_on" else str(relation.get("predicate") or "Near")
+    verb = "place_on" if task_type == "place_on" else "move_near"
+    task_id = slugify(f"{verb}_{subject_id}_{target_id}", fallback=f"{verb}-task")
+    subject_label = simfoundry_task_label(subject)
+    target_label = simfoundry_task_label(target)
+    instruction = (
+        f"Place {subject_label} on {target_label}."
+        if task_type == "place_on"
+        else f"Move {subject_label} near {target_label}."
+    )
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "task_id": task_id,
+        "task_family": "simfoundry_task_cousin_candidate",
+        "task_type": task_type,
+        "title": instruction.rstrip("."),
+        "instruction": instruction,
+        "objects": {
+            "manipulated": subject,
+            "target": target,
+        },
+        "goal_predicates": [
+            {
+                "subject": subject_id,
+                "predicate": predicate,
+                "object": target_id,
+                "source": "scene_relation_candidate",
+            }
+        ],
+        "initialization": {
+            "requires_pose_sampling": True,
+            "notes": "The source relation may already hold in the reconstructed scene; a task factory should sample or reset an initial pose before policy evaluation.",
+        },
+        "success_check": {
+            "type": "simulator_or_bbox_predicate",
+            "predicate": predicate,
+            "thresholds": thresholds,
+            "notes": "Use simulator contacts/stability when available; bbox checks are only a fallback preflight.",
+        },
+        "source_relation": relation,
+        "provenance": {
+            "source_stage": "simfoundry_scene_relations",
+            "relations_report": str(relations_path) if relations_path else None,
+            "bundle": str(bundle_path),
+            "generation": "rule_based_bbox_task_spec",
+        },
+        "confidence": float(relation.get("confidence") or 0.0),
+        "review_status": "needs_human_or_vlm_review",
+        "simulator_targets": ["mujoco", "unity", "isaac"],
+        "limits": [
+            "Generated from geometric relations, not human-authored task truth.",
+            "Requires scale/up-axis verification before physics-critical use.",
+        ],
+    }
+
+
+def generate_simfoundry_task_specs(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    relations_path: Path | None,
+    relations_report: dict[str, Any] | None,
+    min_confidence: float,
+    include_near: bool,
+    include_background_subjects: bool,
+    max_tasks: int,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not isinstance(relations_report, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_scene_relations",
+                "Run export-scene-relations before exporting SimFoundry task specs.",
+                source="export-simfoundry-task-specs",
+                path=str(relations_path) if relations_path else None,
+            )
+        )
+        relations_report = {}
+    relation_issues = relations_report.get("issues") if isinstance(relations_report.get("issues"), list) else []
+    for issue in relation_issues:
+        if isinstance(issue, dict) and issue.get("severity") == "required":
+            issues.append({**issue, "source": "export-simfoundry-task-specs"})
+
+    bundle = safe_read_json(bundle_path) if bundle_path.exists() else None
+    if not isinstance(bundle, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Task specs need simulator_asset_bundle.json object metadata.",
+                source="export-simfoundry-task-specs",
+                path=str(bundle_path),
+            )
+        )
+        bundle = {}
+    bundle_objects_by_id = {
+        slugify(str(obj.get("object_id") or obj.get("name") or "object")): obj
+        for obj in bundle.get("objects", [])
+        if isinstance(obj, dict)
+    }
+    objects_by_id = {
+        slugify(str(obj.get("object_id") or obj.get("name") or "object")): obj
+        for obj in relations_report.get("objects", [])
+        if isinstance(obj, dict)
+    }
+    thresholds = relations_report.get("thresholds") if isinstance(relations_report.get("thresholds"), dict) else {}
+    skipped: list[dict[str, Any]] = []
+    specs: list[dict[str, Any]] = []
+    used_task_ids: set[str] = set()
+    for relation in relations_report.get("relations", []):
+        if not isinstance(relation, dict):
+            continue
+        predicate = str(relation.get("predicate") or "")
+        confidence = float(relation.get("confidence") or 0.0)
+        subject_id = slugify(str(relation.get("subject") or ""))
+        target_id = slugify(str(relation.get("object") or ""))
+        if confidence < float(min_confidence):
+            skipped.append({"relation": relation, "reason": "below_min_confidence", "min_confidence": float(min_confidence)})
+            continue
+        if predicate == "SupportedBy":
+            skipped.append({"relation": relation, "reason": "duplicate_support_predicate"})
+            continue
+        if predicate not in {"OnTopOf", "Near"}:
+            skipped.append({"relation": relation, "reason": "unsupported_predicate"})
+            continue
+        if predicate == "Near" and not include_near:
+            skipped.append({"relation": relation, "reason": "near_tasks_disabled"})
+            continue
+        if not subject_id or not target_id:
+            skipped.append({"relation": relation, "reason": "missing_relation_endpoint"})
+            continue
+        subject = simfoundry_task_object_record(subject_id, objects_by_id, bundle_objects_by_id)
+        target = simfoundry_task_object_record(target_id, objects_by_id, bundle_objects_by_id)
+        if subject.get("asset_role") == "background_structure" and not include_background_subjects:
+            skipped.append({"relation": relation, "reason": "background_subject"})
+            continue
+        task_type = "place_on" if predicate == "OnTopOf" else "move_near"
+        spec = simfoundry_task_spec_from_relation(
+            relation,
+            task_type=task_type,
+            subject=subject,
+            target=target,
+            relations_path=relations_path,
+            bundle_path=bundle_path,
+            thresholds=thresholds,
+        )
+        base_task_id = str(spec["task_id"])
+        task_id = base_task_id
+        suffix = 2
+        while task_id in used_task_ids:
+            task_id = f"{base_task_id}_{suffix}"
+            suffix += 1
+        spec["task_id"] = task_id
+        used_task_ids.add(task_id)
+        specs.append(spec)
+        if max_tasks > 0 and len(specs) >= int(max_tasks):
+            break
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    task_type_counts: dict[str, int] = {}
+    for spec in specs:
+        task_type = str(spec.get("task_type") or "unknown")
+        task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_specs",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or relations_report.get("scene_id") or bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else "empty" if not specs else "task_specs_exported",
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "relations_report": str(relations_path) if relations_path else None,
+        "parameters": {
+            "min_confidence": float(min_confidence),
+            "include_near": bool(include_near),
+            "include_background_subjects": bool(include_background_subjects),
+            "max_tasks": int(max_tasks),
+        },
+        "tasks": specs,
+        "skipped_relations": skipped,
+        "issues": issues,
+        "summary": {
+            "relation_count": len(relations_report.get("relations", []) if isinstance(relations_report.get("relations"), list) else []),
+            "task_count": len(specs),
+            "task_type_counts": task_type_counts,
+            "skipped_relation_count": len(skipped),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Task cousin candidate specs generated from bbox scene relations. Review with a human or VLM before treating them as benchmark tasks.",
+    }
+
+
+def cmd_export_simfoundry_task_specs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    relations_path = (
+        resolve_project_cli_path(args.relations, project_root)
+        if args.relations
+        else resolve_existing_path(manifest.get("artifacts", {}).get("scene_relations") or manifest.get("artifacts", {}).get("simfoundry_scene_relations"), project_root)
+    )
+    if relations_path is None:
+        relations_path = project_root / manifest["simulator_assets_dir"] / "semantic" / "scene_relations.json"
+    if args.refresh_relations or not relations_path.exists():
+        relations_report = generate_simfoundry_scene_relations(
+            project_root,
+            manifest,
+            bundle_path=bundle_path,
+            up_axis=args.up_axis,
+            max_support_gap=args.max_support_gap,
+            min_support_overlap=args.min_support_overlap,
+            near_distance=args.near_distance,
+            include_background_near=args.include_background_near,
+        )
+        write_json(relations_path, relations_report)
+        manifest.setdefault("artifacts", {})["scene_relations"] = str(relations_path)
+        manifest.setdefault("artifacts", {})["simfoundry_scene_relations"] = str(relations_path)
+        manifest.setdefault("external_stages", {})["simfoundry_scene_relations"] = {
+            "status": relations_report.get("status"),
+            "report": str(relations_path),
+            "bundle": str(bundle_path),
+            "summary": relations_report.get("summary", {}),
+            "notes": "Rule-based bbox scene relations refreshed while exporting SimFoundry task specs.",
+        }
+    else:
+        relations_report = safe_read_json(relations_path)
+
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "task_specs"
+    )
+    specs_dir = ensure_dir(output_dir / "specs")
+    report = generate_simfoundry_task_specs(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        relations_path=relations_path,
+        relations_report=relations_report if isinstance(relations_report, dict) else None,
+        min_confidence=args.min_confidence,
+        include_near=args.include_near,
+        include_background_subjects=args.include_background_subjects,
+        max_tasks=args.max_tasks,
+    )
+    task_index = []
+    for spec in report.get("tasks", []):
+        if not isinstance(spec, dict):
+            continue
+        task_path = specs_dir / f"{slugify(str(spec.get('task_id') or 'task'))}.json"
+        spec["task_spec_path"] = str(task_path)
+        write_json(task_path, spec)
+        task_index.append(
+            {
+                "task_id": spec.get("task_id"),
+                "task_type": spec.get("task_type"),
+                "instruction": spec.get("instruction"),
+                "path": str(task_path),
+                "confidence": spec.get("confidence"),
+                "review_status": spec.get("review_status"),
+            }
+        )
+    report["task_index"] = task_index
+    report["output_dir"] = str(output_dir)
+    report["specs_dir"] = str(specs_dir)
+    manifest_path = args.output.resolve() if args.output else output_dir / "task_specs_manifest.json"
+    write_json(manifest_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_task_specs"] = str(manifest_path)
+    manifest.setdefault("artifacts", {})["simfoundry_task_specs_dir"] = str(output_dir)
+    manifest.setdefault("external_stages", {})["simfoundry_task_specs"] = {
+        "status": report.get("status"),
+        "report": str(manifest_path),
+        "bundle": str(bundle_path),
+        "relations_report": str(relations_path),
+        "summary": report.get("summary", {}),
+        "notes": "Rule-based task cousin candidate specs derived from scene relations; review before policy evaluation.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry task specs: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"relations={summary.get('relation_count')} tasks={summary.get('task_count')} "
+            f"skipped={summary.get('skipped_relation_count')} required={summary.get('required_issue_count')} "
+            f"warnings={summary.get('warning_count')}"
+        )
+        print(f"Manifest: {manifest_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("task_count"):
+        return 1
+    return 0
+
+
+def simfoundry_task_specs_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_task_specs"), project_root)
+    if existing:
+        return existing
+    return project_root / manifest["simulator_assets_dir"] / "task_specs" / "task_specs_manifest.json"
+
+
+def simfoundry_task_spec_records(task_specs_payload: dict[str, Any], project_root: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    tasks = task_specs_payload.get("tasks") if isinstance(task_specs_payload.get("tasks"), list) else []
+    for task in tasks:
+        if isinstance(task, dict):
+            records.append(task)
+    if records:
+        return records
+    for item in task_specs_payload.get("task_index", []) if isinstance(task_specs_payload.get("task_index"), list) else []:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        task_path = resolve_project_path(str(item["path"]), project_root)
+        task = safe_read_json(task_path)
+        if isinstance(task, dict):
+            records.append(task)
+    return records
+
+
+def simfoundry_evaluate_task_predicate(
+    predicate: dict[str, Any],
+    *,
+    objects_by_id: dict[str, dict[str, Any]],
+    up_axis: str,
+    max_support_gap: float,
+    min_support_overlap: float,
+    near_distance: float,
+) -> dict[str, Any]:
+    subject_id = slugify(str(predicate.get("subject") or ""))
+    object_id = slugify(str(predicate.get("object") or ""))
+    predicate_name = str(predicate.get("predicate") or "")
+    subject = objects_by_id.get(subject_id)
+    other = objects_by_id.get(object_id)
+    if subject is None or other is None:
+        missing = [item for item, record in [(subject_id, subject), (object_id, other)] if record is None]
+        return {
+            "subject": subject_id,
+            "predicate": predicate_name,
+            "object": object_id,
+            "status": "unknown",
+            "satisfied": None,
+            "reason": "missing_object_bbox",
+            "missing_objects": missing,
+        }
+    up_idx = axis_index(up_axis)
+    horizontal_axes = [idx for idx in [0, 1, 2] if idx != up_idx]
+    if predicate_name in {"OnTopOf", "SupportedBy"}:
+        vertical_gap = float(subject["min"][up_idx]) - float(other["max"][up_idx])
+        overlap_ratio = bbox_footprint_overlap_ratio(subject, other, horizontal_axes)
+        satisfied = abs(vertical_gap) <= float(max_support_gap) and overlap_ratio >= float(min_support_overlap) and float(subject["center"][up_idx]) > float(other["center"][up_idx])
+        return {
+            "subject": subject_id,
+            "predicate": predicate_name,
+            "object": object_id,
+            "status": "satisfied" if satisfied else "not_satisfied",
+            "satisfied": bool(satisfied),
+            "metrics": {
+                "up_axis": up_axis,
+                "vertical_gap": vertical_gap,
+                "abs_vertical_gap": abs(vertical_gap),
+                "footprint_overlap_over_smaller": overlap_ratio,
+                "max_support_gap": float(max_support_gap),
+                "min_support_overlap": float(min_support_overlap),
+            },
+        }
+    if predicate_name == "Near":
+        gap = bbox_gap_and_overlap_3d(subject["min"], subject["max"], other["min"], other["max"])
+        satisfied = float(gap["euclidean_gap"]) <= float(near_distance)
+        return {
+            "subject": subject_id,
+            "predicate": predicate_name,
+            "object": object_id,
+            "status": "satisfied" if satisfied else "not_satisfied",
+            "satisfied": bool(satisfied),
+            "metrics": {
+                "euclidean_gap": gap["euclidean_gap"],
+                "center_distance": gap["center_distance"],
+                "near_distance": float(near_distance),
+            },
+        }
+    return {
+        "subject": subject_id,
+        "predicate": predicate_name,
+        "object": object_id,
+        "status": "unknown",
+        "satisfied": None,
+        "reason": "unsupported_predicate",
+    }
+
+
+def generate_simfoundry_task_verification(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    task_specs_path: Path,
+    up_axis: str | None,
+    max_support_gap: float,
+    min_support_overlap: float,
+    near_distance: float,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    bundle = safe_read_json(bundle_path) if bundle_path.exists() else None
+    if not isinstance(bundle, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Task verification needs simulator_asset_bundle.json object metadata.",
+                source="verify-simfoundry-task-specs",
+                path=str(bundle_path),
+            )
+        )
+        bundle = {}
+    task_specs_payload = safe_read_json(task_specs_path) if task_specs_path.exists() else None
+    if not isinstance(task_specs_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_specs",
+                "Run export-simfoundry-task-specs before task verification.",
+                source="verify-simfoundry-task-specs",
+                path=str(task_specs_path),
+            )
+        )
+        task_specs_payload = {}
+    coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
+    axis_name = str(up_axis or coordinate_system.get("up_axis") or "y").lower()
+    raw_objects = [obj for obj in bundle.get("objects", []) if isinstance(obj, dict)]
+    objects_by_id: dict[str, dict[str, Any]] = {}
+    for obj in raw_objects:
+        record = scene_relation_bbox_from_object(obj)
+        if record:
+            objects_by_id[record["object_id"]] = record
+        else:
+            object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "missing_task_verification_bbox",
+                    "Object has no pose bbox or bbox_3d for task predicate verification.",
+                    source="verify-simfoundry-task-specs",
+                    object_id=object_id,
+                )
+            )
+    task_reports: list[dict[str, Any]] = []
+    for task in simfoundry_task_spec_records(task_specs_payload, project_root):
+        task_id = str(task.get("task_id") or "task")
+        predicates = task.get("goal_predicates") if isinstance(task.get("goal_predicates"), list) else []
+        predicate_reports = [
+            simfoundry_evaluate_task_predicate(
+                predicate,
+                objects_by_id=objects_by_id,
+                up_axis=axis_name,
+                max_support_gap=max_support_gap,
+                min_support_overlap=min_support_overlap,
+                near_distance=near_distance,
+            )
+            for predicate in predicates
+            if isinstance(predicate, dict)
+        ]
+        if not predicate_reports:
+            status = "unknown"
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "task_without_goal_predicates",
+                    "Task spec has no goal_predicates to verify.",
+                    source="verify-simfoundry-task-specs",
+                    object_id=task_id,
+                )
+            )
+        elif any(item.get("status") == "unknown" for item in predicate_reports):
+            status = "unknown"
+        elif all(item.get("satisfied") is True for item in predicate_reports):
+            status = "satisfied"
+        else:
+            status = "not_satisfied"
+        task_reports.append(
+            {
+                "task_id": task_id,
+                "task_type": task.get("task_type"),
+                "instruction": task.get("instruction"),
+                "goal_status": status,
+                "goal_predicates": predicate_reports,
+                "review_status": task.get("review_status"),
+                "source_task_spec": task.get("task_spec_path"),
+                "reset_required_before_evaluation": status == "satisfied",
+                "notes": "A satisfied goal means the reconstructed scene already meets the goal predicate; reset/sampling is needed before policy evaluation.",
+            }
+        )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    task_count = len(task_reports)
+    satisfied_count = len([item for item in task_reports if item.get("goal_status") == "satisfied"])
+    unknown_count = len([item for item in task_reports if item.get("goal_status") == "unknown"])
+    not_satisfied_count = len([item for item in task_reports if item.get("goal_status") == "not_satisfied"])
+    status = "fail" if required else "empty" if task_count == 0 else "needs_review" if unknown_count else "verified"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_specs_verification",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or task_specs_payload.get("scene_id") or bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "task_specs": str(task_specs_path),
+        "coordinate_system": {**coordinate_system, "up_axis": axis_name},
+        "thresholds": {
+            "max_support_gap": float(max_support_gap),
+            "min_support_overlap": float(min_support_overlap),
+            "near_distance": float(near_distance),
+        },
+        "tasks": task_reports,
+        "issues": issues,
+        "summary": {
+            "task_count": task_count,
+            "satisfied_task_count": satisfied_count,
+            "not_satisfied_task_count": not_satisfied_count,
+            "unknown_task_count": unknown_count,
+            "reset_required_task_count": len([item for item in task_reports if item.get("reset_required_before_evaluation")]),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Rule-based task predicate verification. It checks whether current reconstructed poses already satisfy candidate task goals; it is not a robot policy evaluation.",
+    }
+
+
+def cmd_verify_simfoundry_task_specs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    task_specs_path = simfoundry_task_specs_path(project_root, manifest, args.task_specs)
+    report = generate_simfoundry_task_verification(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        task_specs_path=task_specs_path,
+        up_axis=args.up_axis,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        near_distance=args.near_distance,
+    )
+    output_path = args.output.resolve() if args.output else task_specs_path.parent / "task_specs_verification.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_task_specs_verification"] = str(output_path)
+    manifest.setdefault("external_stages", {})["simfoundry_task_specs_verification"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "bundle": str(bundle_path),
+        "task_specs": str(task_specs_path),
+        "summary": report.get("summary", {}),
+        "notes": "Rule-based verification of SimFoundry task candidate goal predicates against current simulator bundle poses.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry task verification: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"tasks={summary.get('task_count')} satisfied={summary.get('satisfied_task_count')} "
+            f"not_satisfied={summary.get('not_satisfied_task_count')} unknown={summary.get('unknown_task_count')} "
+            f"reset_required={summary.get('reset_required_task_count')} required={summary.get('required_issue_count')} "
+            f"warnings={summary.get('warning_count')}"
+        )
+        print(f"Report: {output_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_warning and report.get("summary", {}).get("warning_count"):
+        return 1
+    if args.fail_on_unknown and report.get("summary", {}).get("unknown_task_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("task_count"):
+        return 1
+    return 0
+
+
+def simfoundry_task_verification_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None, task_specs_path: Path) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_task_specs_verification"), project_root)
+    if existing:
+        return existing
+    return task_specs_path.parent / "task_specs_verification.json"
+
+
+def simfoundry_translate_bbox_dict(bbox: dict[str, Any], delta: list[float]) -> dict[str, Any]:
+    translated = copy.deepcopy(bbox)
+    for key in ("min", "max", "center"):
+        values = translated.get(key)
+        if isinstance(values, list) and len(values) >= 3:
+            try:
+                translated[key] = [float(values[idx]) + float(delta[idx]) for idx in range(3)] + list(values[3:])
+            except Exception:
+                pass
+    if not isinstance(translated.get("center"), list) and isinstance(translated.get("min"), list) and isinstance(translated.get("max"), list):
+        translated["center"] = [(float(translated["min"][idx]) + float(translated["max"][idx])) * 0.5 for idx in range(3)]
+    return translated
+
+
+def simfoundry_shift_object_pose_and_bbox(obj: dict[str, Any], current_bbox: dict[str, Any], new_center: list[float]) -> dict[str, Any]:
+    original_pose = copy.deepcopy(obj.get("pose") if isinstance(obj.get("pose"), dict) else {})
+    original_bbox = copy.deepcopy(obj.get("bbox_3d") if isinstance(obj.get("bbox_3d"), dict) else None)
+    old_center = [float(value) for value in current_bbox["center"][:3]]
+    delta = [float(new_center[idx]) - old_center[idx] for idx in range(3)]
+    pose = obj.setdefault("pose", {})
+    if isinstance(pose.get("position"), list) and len(pose["position"]) >= 3:
+        pose["position"] = [float(pose["position"][idx]) + delta[idx] for idx in range(3)] + list(pose["position"][3:])
+    else:
+        pose["position"] = [float(value) for value in new_center[:3]]
+    if isinstance(pose.get("bbox_3d"), dict):
+        pose["bbox_3d"] = simfoundry_translate_bbox_dict(pose["bbox_3d"], delta)
+    if isinstance(obj.get("bbox_3d"), dict):
+        obj["bbox_3d"] = simfoundry_translate_bbox_dict(obj["bbox_3d"], delta)
+    obj.setdefault("quality", {})
+    if isinstance(obj["quality"], dict):
+        obj["quality"]["simfoundry_task_reset"] = {
+            "strategy": "bbox_horizontal_offset",
+            "delta": delta,
+            "original_pose": original_pose,
+            "original_bbox_3d": original_bbox,
+        }
+    return {"delta": delta, "original_pose": original_pose, "original_bbox_3d": original_bbox, "candidate_pose": copy.deepcopy(pose)}
+
+
+def simfoundry_task_goal_status(predicate_reports: list[dict[str, Any]]) -> str:
+    if not predicate_reports:
+        return "unknown"
+    if any(item.get("status") == "unknown" for item in predicate_reports):
+        return "unknown"
+    if all(item.get("satisfied") is True for item in predicate_reports):
+        return "satisfied"
+    return "not_satisfied"
+
+
+def simfoundry_bundle_bbox_records(bundle: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for obj in bundle.get("objects", []) if isinstance(bundle.get("objects"), list) else []:
+        if not isinstance(obj, dict):
+            continue
+        record = scene_relation_bbox_from_object(obj)
+        if record:
+            records[record["object_id"]] = record
+    return records
+
+
+def simfoundry_task_primary_predicate(task: dict[str, Any]) -> dict[str, Any] | None:
+    predicates = task.get("goal_predicates") if isinstance(task.get("goal_predicates"), list) else []
+    for predicate in predicates:
+        if isinstance(predicate, dict) and predicate.get("subject") and predicate.get("object"):
+            return predicate
+    return None
+
+
+def simfoundry_reset_candidate_center(
+    predicate: dict[str, Any],
+    subject_bbox: dict[str, Any],
+    target_bbox: dict[str, Any],
+    *,
+    up_axis: str,
+    reset_margin: float,
+    max_support_gap: float,
+    near_distance: float,
+) -> tuple[list[float] | None, dict[str, Any]]:
+    predicate_name = str(predicate.get("predicate") or "")
+    up_idx = axis_index(up_axis)
+    horizontal_axes = [idx for idx in [0, 1, 2] if idx != up_idx]
+    if not horizontal_axes:
+        return None, {"reason": "no_horizontal_axis"}
+    axis = max(
+        horizontal_axes,
+        key=lambda idx: float(subject_bbox["size"][idx]) + float(target_bbox["size"][idx]),
+    )
+    direction = 1.0 if float(subject_bbox["center"][axis]) >= float(target_bbox["center"][axis]) else -1.0
+    base_distance = float(subject_bbox["size"][axis]) * 0.5 + float(target_bbox["size"][axis]) * 0.5
+    if predicate_name in {"OnTopOf", "SupportedBy"}:
+        distance = base_distance + float(reset_margin) + float(max_support_gap)
+        reason = "break_support_footprint_overlap"
+    elif predicate_name == "Near":
+        distance = base_distance + float(reset_margin) + float(near_distance)
+        reason = "break_near_bbox_gap"
+    else:
+        return None, {"reason": "unsupported_predicate_for_reset", "predicate": predicate_name}
+    candidate = [float(value) for value in subject_bbox["center"][:3]]
+    candidate[axis] = float(target_bbox["center"][axis]) + direction * distance
+    return candidate, {
+        "strategy": "bbox_horizontal_offset",
+        "reason": reason,
+        "axis": ["x", "y", "z"][axis],
+        "axis_index": axis,
+        "direction": direction,
+        "distance": distance,
+        "reset_margin": float(reset_margin),
+    }
+
+
+def simfoundry_build_task_reset_candidate(
+    task: dict[str, Any],
+    verification_task: dict[str, Any],
+    bundle: dict[str, Any],
+    *,
+    up_axis: str,
+    reset_margin: float,
+    max_support_gap: float,
+    min_support_overlap: float,
+    near_distance: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    task_id = slugify(str(task.get("task_id") or verification_task.get("task_id") or "task"))
+    predicate = simfoundry_task_primary_predicate(task)
+    if predicate is None:
+        return None, None, sim_preflight_issue(
+            "warning",
+            "task_without_resettable_predicate",
+            "Task has no goal predicate with subject and object for reset sampling.",
+            source="prepare-simfoundry-task-resets",
+            object_id=task_id,
+        )
+    subject_id = slugify(str(predicate.get("subject") or ""))
+    target_id = slugify(str(predicate.get("object") or ""))
+    candidate_bundle = copy.deepcopy(bundle)
+    object_records = {
+        slugify(str(obj.get("object_id") or obj.get("name") or "object")): obj
+        for obj in candidate_bundle.get("objects", [])
+        if isinstance(obj, dict)
+    }
+    subject_obj = object_records.get(subject_id)
+    if subject_obj is None:
+        return None, None, sim_preflight_issue(
+            "warning",
+            "reset_subject_missing",
+            "Manipulated object is missing from simulator bundle.",
+            source="prepare-simfoundry-task-resets",
+            object_id=subject_id,
+        )
+    bbox_records = simfoundry_bundle_bbox_records(candidate_bundle)
+    subject_bbox = bbox_records.get(subject_id)
+    target_bbox = bbox_records.get(target_id)
+    if subject_bbox is None or target_bbox is None:
+        return None, None, sim_preflight_issue(
+            "warning",
+            "reset_bbox_missing",
+            "Task reset needs manipulated and target object bboxes.",
+            source="prepare-simfoundry-task-resets",
+            object_id=",".join([item for item, record in [(subject_id, subject_bbox), (target_id, target_bbox)] if record is None]),
+        )
+    candidate_center, strategy = simfoundry_reset_candidate_center(
+        predicate,
+        subject_bbox,
+        target_bbox,
+        up_axis=up_axis,
+        reset_margin=reset_margin,
+        max_support_gap=max_support_gap,
+        near_distance=near_distance,
+    )
+    if candidate_center is None:
+        return None, None, sim_preflight_issue(
+            "warning",
+            strategy.get("reason", "reset_strategy_unavailable"),
+            "No conservative bbox reset strategy is available for this predicate.",
+            source="prepare-simfoundry-task-resets",
+            object_id=task_id,
+        )
+    pose_delta = simfoundry_shift_object_pose_and_bbox(subject_obj, subject_bbox, candidate_center)
+    candidate_bundle.setdefault("notes", [])
+    if isinstance(candidate_bundle["notes"], list):
+        candidate_bundle["notes"].append(f"Task reset sidecar for {task_id}; generated by prepare-simfoundry-task-resets.")
+    candidate_bundle.setdefault("simfoundry_task_reset", {})
+    if isinstance(candidate_bundle["simfoundry_task_reset"], dict):
+        candidate_bundle["simfoundry_task_reset"].update(
+            {
+                "task_id": task_id,
+                "source_bundle": bundle.get("bundle") or bundle.get("path"),
+                "strategy": strategy,
+                "main_bundle_overwritten": False,
+            }
+        )
+    candidate_objects_by_id = simfoundry_bundle_bbox_records(candidate_bundle)
+    predicates = task.get("goal_predicates") if isinstance(task.get("goal_predicates"), list) else []
+    predicate_reports = [
+        simfoundry_evaluate_task_predicate(
+            item,
+            objects_by_id=candidate_objects_by_id,
+            up_axis=up_axis,
+            max_support_gap=max_support_gap,
+            min_support_overlap=min_support_overlap,
+            near_distance=near_distance,
+        )
+        for item in predicates
+        if isinstance(item, dict)
+    ]
+    candidate_goal_status = simfoundry_task_goal_status(predicate_reports)
+    reset_payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_reset",
+        "task_id": task_id,
+        "task_type": task.get("task_type"),
+        "instruction": task.get("instruction"),
+        "source_task_spec": task.get("task_spec_path"),
+        "source_verification": verification_task,
+        "reset_reason": "goal_already_satisfied",
+        "manipulated_object": subject_id,
+        "target_object": target_id,
+        "predicate": predicate,
+        "strategy": strategy,
+        "original_bbox": subject_bbox,
+        "target_bbox": target_bbox,
+        "candidate_center": candidate_center,
+        "pose_delta": pose_delta,
+        "candidate_goal_status": candidate_goal_status,
+        "candidate_goal_predicates": predicate_reports,
+        "accepted": candidate_goal_status == "not_satisfied",
+        "thresholds": {
+            "up_axis": up_axis,
+            "reset_margin": float(reset_margin),
+            "max_support_gap": float(max_support_gap),
+            "min_support_overlap": float(min_support_overlap),
+            "near_distance": float(near_distance),
+        },
+        "notes": "BBox-based initial-state sidecar. It breaks the already-satisfied goal predicate before policy evaluation; it is not a learned reset sampler.",
+    }
+    if not reset_payload["accepted"]:
+        return reset_payload, candidate_bundle, sim_preflight_issue(
+            "warning",
+            "reset_candidate_not_accepted",
+            "Candidate reset still satisfies the task goal or could not be evaluated.",
+            source="prepare-simfoundry-task-resets",
+            object_id=task_id,
+        )
+    return reset_payload, candidate_bundle, None
+
+
+def generate_simfoundry_task_resets(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    task_specs_path: Path,
+    verification_path: Path,
+    task_specs_payload: dict[str, Any] | None,
+    verification_payload: dict[str, Any] | None,
+    output_dir: Path,
+    reset_margin: float,
+    up_axis: str | None,
+    max_support_gap: float,
+    min_support_overlap: float,
+    near_distance: float,
+    write_sidecar_bundles: bool,
+    max_tasks: int,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    bundle = safe_read_json(bundle_path) if bundle_path.exists() else None
+    if not isinstance(bundle, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Task resets need simulator_asset_bundle.json object metadata.",
+                source="prepare-simfoundry-task-resets",
+                path=str(bundle_path),
+            )
+        )
+        bundle = {}
+    if not isinstance(task_specs_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_specs",
+                "Run export-simfoundry-task-specs before preparing task resets.",
+                source="prepare-simfoundry-task-resets",
+                path=str(task_specs_path),
+            )
+        )
+        task_specs_payload = {}
+    if not isinstance(verification_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_verification",
+                "Run verify-simfoundry-task-specs before preparing task resets.",
+                source="prepare-simfoundry-task-resets",
+                path=str(verification_path),
+            )
+        )
+        verification_payload = {}
+    coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
+    axis_name = str(up_axis or coordinate_system.get("up_axis") or "y").lower()
+    task_records = simfoundry_task_spec_records(task_specs_payload, project_root)
+    verification_by_task_id = {
+        str(item.get("task_id") or "task"): item
+        for item in verification_payload.get("tasks", [])
+        if isinstance(item, dict)
+    }
+    output_dir = ensure_dir(output_dir)
+    resets_dir = ensure_dir(output_dir / "resets")
+    reset_records: list[dict[str, Any]] = []
+    reset_index: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for task in task_records:
+        if max_tasks and len(reset_records) >= int(max_tasks):
+            skipped.append({"task_id": task.get("task_id"), "reason": "max_tasks_reached", "max_tasks": int(max_tasks)})
+            continue
+        task_id = str(task.get("task_id") or "task")
+        verification_task = verification_by_task_id.get(task_id, {})
+        if not verification_task:
+            skipped.append({"task_id": task_id, "reason": "missing_verification_task"})
+            continue
+        if not verification_task.get("reset_required_before_evaluation"):
+            skipped.append({"task_id": task_id, "reason": "reset_not_required", "goal_status": verification_task.get("goal_status")})
+            continue
+        reset_payload, candidate_bundle, candidate_issue = simfoundry_build_task_reset_candidate(
+            task,
+            verification_task,
+            bundle,
+            up_axis=axis_name,
+            reset_margin=reset_margin,
+            max_support_gap=max_support_gap,
+            min_support_overlap=min_support_overlap,
+            near_distance=near_distance,
+        )
+        if candidate_issue:
+            issues.append(candidate_issue)
+        if reset_payload is None or candidate_bundle is None:
+            skipped.append({"task_id": task_id, "reason": candidate_issue.get("name") if candidate_issue else "reset_failed"})
+            continue
+        safe_task_id = slugify(str(reset_payload.get("task_id") or task_id), fallback="task")
+        reset_path = resets_dir / f"{safe_task_id}.json"
+        sidecar_bundle_path = resets_dir / f"simulator_asset_bundle.task_reset.{safe_task_id}.json"
+        reset_payload["reset_spec_path"] = str(reset_path)
+        reset_payload["sidecar_bundle"] = str(sidecar_bundle_path) if write_sidecar_bundles else None
+        reset_payload["main_bundle_overwritten"] = False
+        if write_sidecar_bundles:
+            write_json(sidecar_bundle_path, candidate_bundle)
+        write_json(reset_path, reset_payload)
+        reset_records.append(reset_payload)
+        reset_index.append(
+            {
+                "task_id": reset_payload.get("task_id"),
+                "task_type": reset_payload.get("task_type"),
+                "path": str(reset_path),
+                "sidecar_bundle": str(sidecar_bundle_path) if write_sidecar_bundles else None,
+                "accepted": reset_payload.get("accepted"),
+                "candidate_goal_status": reset_payload.get("candidate_goal_status"),
+                "manipulated_object": reset_payload.get("manipulated_object"),
+                "target_object": reset_payload.get("target_object"),
+            }
+        )
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    accepted_count = len([item for item in reset_records if item.get("accepted")])
+    unresettable_count = len([item for item in reset_records if not item.get("accepted")]) + len(
+        [item for item in issues if item.get("severity") == "warning" and str(item.get("source")) == "prepare-simfoundry-task-resets"]
+    )
+    status = "fail" if required else "empty" if not reset_records else "task_resets_exported" if accepted_count == len(reset_records) else "needs_review"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_resets",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or task_specs_payload.get("scene_id") or bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "task_specs": str(task_specs_path),
+        "verification": str(verification_path),
+        "output_dir": str(output_dir),
+        "resets_dir": str(resets_dir),
+        "coordinate_system": {**coordinate_system, "up_axis": axis_name},
+        "parameters": {
+            "reset_margin": float(reset_margin),
+            "max_support_gap": float(max_support_gap),
+            "min_support_overlap": float(min_support_overlap),
+            "near_distance": float(near_distance),
+            "write_sidecar_bundles": bool(write_sidecar_bundles),
+            "max_tasks": int(max_tasks),
+        },
+        "reset_index": reset_index,
+        "resets": reset_records,
+        "skipped_tasks": skipped,
+        "issues": issues,
+        "summary": {
+            "task_count": len(task_records),
+            "reset_count": len(reset_records),
+            "accepted_reset_count": accepted_count,
+            "unresettable_count": unresettable_count,
+            "skipped_task_count": len(skipped),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Conservative bbox initial-state sidecars for task candidates whose reconstructed scene already satisfies the goal. Main simulator bundle is not overwritten.",
+    }
+
+
+def cmd_prepare_simfoundry_task_resets(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    task_specs_path = simfoundry_task_specs_path(project_root, manifest, args.task_specs)
+    verification_path = simfoundry_task_verification_path(project_root, manifest, args.verification, task_specs_path)
+    if args.refresh_verification or not verification_path.exists():
+        verification_report = generate_simfoundry_task_verification(
+            project_root,
+            manifest,
+            bundle_path=bundle_path,
+            task_specs_path=task_specs_path,
+            up_axis=args.up_axis,
+            max_support_gap=args.max_support_gap,
+            min_support_overlap=args.min_support_overlap,
+            near_distance=args.near_distance,
+        )
+        write_json(verification_path, verification_report)
+        manifest.setdefault("artifacts", {})["simfoundry_task_specs_verification"] = str(verification_path)
+        manifest.setdefault("external_stages", {})["simfoundry_task_specs_verification"] = {
+            "status": verification_report.get("status"),
+            "report": str(verification_path),
+            "bundle": str(bundle_path),
+            "task_specs": str(task_specs_path),
+            "summary": verification_report.get("summary", {}),
+            "notes": "Rule-based verification refreshed while preparing SimFoundry task resets.",
+        }
+    else:
+        verification_report = safe_read_json(verification_path)
+    task_specs_payload = safe_read_json(task_specs_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "task_specs"
+    )
+    report = generate_simfoundry_task_resets(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        task_specs_path=task_specs_path,
+        verification_path=verification_path,
+        task_specs_payload=task_specs_payload if isinstance(task_specs_payload, dict) else None,
+        verification_payload=verification_report if isinstance(verification_report, dict) else None,
+        output_dir=output_dir,
+        reset_margin=args.reset_margin,
+        up_axis=args.up_axis,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        near_distance=args.near_distance,
+        write_sidecar_bundles=args.write_sidecar_bundles,
+        max_tasks=args.max_tasks,
+    )
+    output_path = args.output.resolve() if args.output else output_dir / "task_reset_manifest.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_task_resets"] = str(output_path)
+    manifest.setdefault("artifacts", {})["simfoundry_task_resets_dir"] = str(output_dir / "resets")
+    manifest.setdefault("external_stages", {})["simfoundry_task_resets"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "bundle": str(bundle_path),
+        "task_specs": str(task_specs_path),
+        "verification": str(verification_path),
+        "summary": report.get("summary", {}),
+        "notes": "BBox reset/initial-state sidecars for SimFoundry task candidates; main simulator bundle is not overwritten.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry task resets: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"tasks={summary.get('task_count')} resets={summary.get('reset_count')} "
+            f"accepted={summary.get('accepted_reset_count')} skipped={summary.get('skipped_task_count')} "
+            f"unresettable={summary.get('unresettable_count')} required={summary.get('required_issue_count')} "
+            f"warnings={summary.get('warning_count')}"
+        )
+        print(f"Manifest: {output_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_unresettable and report.get("summary", {}).get("unresettable_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("reset_count"):
+        return 1
+    return 0
+
+
+def simfoundry_task_resets_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None, task_specs_path: Path | None = None) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_task_resets"), project_root)
+    if existing:
+        return existing
+    if task_specs_path is not None:
+        return task_specs_path.parent / "task_reset_manifest.json"
+    return project_root / manifest["simulator_assets_dir"] / "task_specs" / "task_reset_manifest.json"
+
+
+def generate_simfoundry_task_reset_adapters(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    task_resets_path: Path,
+    output_dir: Path,
+    formats: list[str],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    resets_payload = safe_read_json(task_resets_path) if task_resets_path.exists() else None
+    if not isinstance(resets_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_reset_manifest",
+                "Run prepare-simfoundry-task-resets before exporting reset adapters.",
+                source="export-simfoundry-task-reset-adapters",
+                path=str(task_resets_path),
+            )
+        )
+        resets_payload = {}
+    output_dir = ensure_dir(output_dir)
+    reset_adapters: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for item in resets_payload.get("reset_index", []) if isinstance(resets_payload.get("reset_index"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        task_id = slugify(str(item.get("task_id") or "task"), fallback="task")
+        if item.get("accepted") is not True:
+            skipped.append({"task_id": task_id, "reason": "reset_not_accepted"})
+            continue
+        sidecar_bundle_value = item.get("sidecar_bundle")
+        sidecar_bundle = resolve_existing_path(sidecar_bundle_value, project_root) if sidecar_bundle_value else None
+        if not sidecar_bundle or not sidecar_bundle.exists():
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "missing_task_reset_sidecar_bundle",
+                    "Accepted reset does not have a readable sidecar simulator bundle.",
+                    source="export-simfoundry-task-reset-adapters",
+                    object_id=task_id,
+                    path=str(sidecar_bundle_value or ""),
+                )
+            )
+            skipped.append({"task_id": task_id, "reason": "missing_sidecar_bundle"})
+            continue
+        bundle = read_json(sidecar_bundle)
+        bundle["source_bundle"] = str(sidecar_bundle)
+        task_output_root = ensure_dir(output_dir / task_id)
+        format_results: dict[str, Any] = {}
+        for format_name in formats:
+            format_dir = ensure_dir(task_output_root / format_name)
+            if format_name == "mujoco":
+                result = write_mujoco_adapter(bundle, format_dir, task_output_root, project_root, args)
+            else:
+                result = write_json_simulator_adapter(format_name, bundle, format_dir, task_output_root, project_root, args)
+            format_results[format_name] = result
+        adapter_manifest_path = task_output_root / "simulator_adapters.json"
+        adapter_manifest = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_task_reset_adapter",
+            "task_id": task_id,
+            "source_task_reset": item.get("path"),
+            "source_task_reset_bundle": str(sidecar_bundle),
+            "formats": format_results,
+            "notes": "Per-task initial-state simulator adapters generated from a task reset sidecar bundle.",
+        }
+        write_json(adapter_manifest_path, adapter_manifest)
+        reset_adapters.append(
+            {
+                "task_id": task_id,
+                "task_type": item.get("task_type"),
+                "source_task_reset": item.get("path"),
+                "source_task_reset_bundle": str(sidecar_bundle),
+                "adapter_root": str(task_output_root),
+                "adapter_manifest": str(adapter_manifest_path),
+                "formats": format_results,
+                "candidate_goal_status": item.get("candidate_goal_status"),
+                "manipulated_object": item.get("manipulated_object"),
+                "target_object": item.get("target_object"),
+            }
+        )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_reset_adapters",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or resets_payload.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else "empty" if not reset_adapters else "task_reset_adapters_exported",
+        "ok": not required,
+        "task_resets": str(task_resets_path),
+        "output_dir": str(output_dir),
+        "formats": formats,
+        "reset_adapters": reset_adapters,
+        "skipped_resets": skipped,
+        "issues": issues,
+        "summary": {
+            "reset_count": len(resets_payload.get("reset_index", []) if isinstance(resets_payload.get("reset_index"), list) else []),
+            "adapter_count": len(reset_adapters),
+            "skipped_reset_count": len(skipped),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Adapter bridge for SimFoundry task initial-state sidecars. It exports simulator adapters per accepted reset without overwriting the main bundle or main adapters.",
+    }
+
+
+def cmd_export_simfoundry_task_reset_adapters(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    task_specs_path = simfoundry_task_specs_path(project_root, manifest, None)
+    task_resets_path = simfoundry_task_resets_path(project_root, manifest, args.task_resets, task_specs_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else task_resets_path.parent / "reset_adapters"
+    )
+    report = generate_simfoundry_task_reset_adapters(
+        project_root,
+        manifest,
+        task_resets_path=task_resets_path,
+        output_dir=output_dir,
+        formats=args.format,
+        args=args,
+    )
+    output_path = args.output.resolve() if args.output else output_dir / "task_reset_adapters_manifest.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_task_reset_adapters"] = str(output_path)
+    manifest.setdefault("artifacts", {})["simfoundry_task_reset_adapters_dir"] = str(output_dir)
+    manifest.setdefault("external_stages", {})["simfoundry_task_reset_adapters"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "task_resets": str(task_resets_path),
+        "output_dir": str(output_dir),
+        "formats": args.format,
+        "summary": report.get("summary", {}),
+        "notes": "Per-task simulator adapters exported from SimFoundry task reset sidecar bundles.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry task reset adapters: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"resets={summary.get('reset_count')} adapters={summary.get('adapter_count')} "
+            f"skipped={summary.get('skipped_reset_count')} required={summary.get('required_issue_count')} "
+            f"warnings={summary.get('warning_count')}"
+        )
+        print(f"Manifest: {output_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("adapter_count"):
+        return 1
+    return 0
+
+
+def simfoundry_task_reset_adapters_path(
+    project_root: Path,
+    manifest: dict[str, Any],
+    explicit: Path | None,
+    task_resets_path: Path | None = None,
+) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_task_reset_adapters"), project_root)
+    if existing:
+        return existing
+    if task_resets_path is not None:
+        return task_resets_path.parent / "reset_adapters" / "task_reset_adapters_manifest.json"
+    return project_root / manifest["simulator_assets_dir"] / "task_specs" / "reset_adapters" / "task_reset_adapters_manifest.json"
+
+
+def simfoundry_scene_cousins_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_scene_cousins"), project_root)
+    if existing:
+        return existing
+    return project_root / manifest["simulator_assets_dir"] / "simfoundry_scene_cousins" / "scene_cousins_manifest.json"
+
+
+def simfoundry_find_scene_cousin_variant(scene_cousins_payload: dict[str, Any], variant_id: str | None) -> dict[str, Any] | None:
+    variants = scene_cousins_payload.get("variants") if isinstance(scene_cousins_payload.get("variants"), list) else []
+    if not variants:
+        return None
+    if variant_id:
+        for variant in variants:
+            if isinstance(variant, dict) and str(variant.get("variant_id") or "") == str(variant_id):
+                return variant
+        return None
+    return variants[0] if isinstance(variants[0], dict) else None
+
+
+def simfoundry_deep_merge_bundle(base: Any, patch: Any) -> Any:
+    if isinstance(base, dict) and isinstance(patch, dict):
+        merged = dict(base)
+        for key, value in patch.items():
+            if key in {"schema_version", "patch_format", "notes"} and key not in merged:
+                merged[key] = value
+                continue
+            if key == "objects" and isinstance(value, list):
+                merged[key] = simfoundry_merge_objects_by_id(merged.get(key), value)
+            elif key == "static_colliders" and isinstance(value, list):
+                merged[key] = value
+            elif key in merged:
+                merged[key] = simfoundry_deep_merge_bundle(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return patch
+
+
+def simfoundry_merge_objects_by_id(base_objects: Any, patch_objects: list[Any]) -> list[Any]:
+    merged: list[Any] = [dict(item) if isinstance(item, dict) else item for item in (base_objects if isinstance(base_objects, list) else [])]
+    index: dict[str, int] = {}
+    for idx, obj in enumerate(merged):
+        if isinstance(obj, dict):
+            object_id = slugify(str(obj.get("object_id") or obj.get("id") or obj.get("name") or ""), "object")
+            if object_id:
+                index[object_id] = idx
+    for raw_patch in patch_objects:
+        if not isinstance(raw_patch, dict):
+            merged.append(raw_patch)
+            continue
+        object_id = slugify(str(raw_patch.get("object_id") or raw_patch.get("id") or raw_patch.get("name") or ""), "object")
+        if object_id in index and isinstance(merged[index[object_id]], dict):
+            merged[index[object_id]] = simfoundry_deep_merge_bundle(merged[index[object_id]], raw_patch)
+        else:
+            merged.append(dict(raw_patch))
+            index[object_id] = len(merged) - 1
+    return merged
+
+
+def simfoundry_bundle_patch_payload(raw_patch: Any) -> dict[str, Any]:
+    if not isinstance(raw_patch, dict):
+        raise ValueError("Scene cousin bundle patch must be a JSON object.")
+    if isinstance(raw_patch.get("bundle_patch"), dict):
+        return raw_patch["bundle_patch"]
+    if isinstance(raw_patch.get("patch"), dict):
+        return raw_patch["patch"]
+    return raw_patch
+
+
+def simfoundry_import_scene_cousin(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    source_bundle_path: Path,
+    scene_cousins_path: Path,
+    variant_id: str | None,
+    bundle_patch: Path | None,
+    sidecar_bundle: Path | None,
+    output_dir: Path,
+    formats: list[str],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    scene_cousins_payload = safe_read_json(scene_cousins_path)
+    if not isinstance(scene_cousins_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_scene_cousins_manifest",
+                "Run prepare-simfoundry-scene-cousins before importing a scene cousin, or pass --scene-cousins.",
+                source="import-simfoundry-scene-cousin",
+                path=str(scene_cousins_path),
+            )
+        )
+        scene_cousins_payload = {}
+    variant = simfoundry_find_scene_cousin_variant(scene_cousins_payload, variant_id)
+    if not variant:
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_scene_cousin_variant",
+                "Requested scene cousin variant was not found in the scene cousins manifest.",
+                source="import-simfoundry-scene-cousin",
+                object_id=str(variant_id or ""),
+                path=str(scene_cousins_path),
+            )
+        )
+        variant = {}
+    resolved_variant_id = slugify(str(variant.get("variant_id") or variant_id or "scene_cousin"), "scene_cousin")
+    expected = variant.get("expected_artifacts") if isinstance(variant.get("expected_artifacts"), dict) else {}
+    sidecar_bundle_path = (
+        resolve_project_cli_path(sidecar_bundle, project_root)
+        if sidecar_bundle
+        else resolve_existing_path(expected.get("sidecar_bundle"), project_root)
+    )
+    bundle_patch_path = (
+        resolve_project_cli_path(bundle_patch, project_root)
+        if bundle_patch
+        else resolve_existing_path(expected.get("bundle_patch"), project_root)
+    )
+    source_bundle = read_json(source_bundle_path)
+    output_dir = ensure_dir(output_dir)
+    imported_bundle_path = output_dir / f"simulator_asset_bundle.{resolved_variant_id}.json"
+    patch_payload: dict[str, Any] | None = None
+    import_mode = "sidecar_bundle"
+    if sidecar_bundle_path and sidecar_bundle_path.exists():
+        cousin_bundle = read_json(sidecar_bundle_path)
+    elif bundle_patch_path and bundle_patch_path.exists():
+        patch_payload = simfoundry_bundle_patch_payload(read_json(bundle_patch_path))
+        cousin_bundle = simfoundry_deep_merge_bundle(source_bundle, patch_payload)
+        import_mode = "bundle_patch"
+    else:
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_scene_cousin_output",
+                "No readable sidecar bundle or bundle patch was found for the scene cousin variant.",
+                source="import-simfoundry-scene-cousin",
+                object_id=resolved_variant_id,
+                path=str(sidecar_bundle_path or bundle_patch_path or ""),
+            )
+        )
+        cousin_bundle = dict(source_bundle)
+        import_mode = "unmodified_source_due_to_missing_output"
+    cousin_bundle["scene_id"] = str(cousin_bundle.get("scene_id") or manifest.get("scene_id") or source_bundle.get("scene_id") or "scene")
+    cousin_bundle["source_bundle"] = str(source_bundle_path)
+    cousin_bundle["simfoundry_scene_cousin"] = {
+        "variant_id": resolved_variant_id,
+        "intent": variant.get("intent"),
+        "source_scene_cousins": str(scene_cousins_path),
+        "import_mode": import_mode,
+        "source_sidecar_bundle": str(sidecar_bundle_path) if sidecar_bundle_path else None,
+        "source_bundle_patch": str(bundle_patch_path) if bundle_patch_path else None,
+        "main_bundle_overwritten": False,
+        "timestamp": int(time.time()),
+    }
+    if patch_payload is not None:
+        cousin_bundle["simfoundry_scene_cousin"]["patch_keys"] = sorted(str(key) for key in patch_payload.keys())
+    write_json(imported_bundle_path, cousin_bundle)
+
+    adapter_root = ensure_dir(output_dir / "adapters")
+    format_results: dict[str, Any] = {}
+    for format_name in formats:
+        format_dir = ensure_dir(adapter_root / format_name)
+        if format_name == "mujoco":
+            result = write_mujoco_adapter(cousin_bundle, format_dir, adapter_root, project_root, args)
+        else:
+            result = write_json_simulator_adapter(format_name, cousin_bundle, format_dir, adapter_root, project_root, args)
+        format_results[format_name] = result
+    adapter_manifest_path = adapter_root / "simulator_adapters.json"
+    write_json(
+        adapter_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_scene_cousin_adapter",
+            "variant_id": resolved_variant_id,
+            "source_bundle": str(imported_bundle_path),
+            "formats": format_results,
+            "notes": "Per-scene-cousin simulator adapters generated from a sidecar bundle. Main simulator bundle is not overwritten.",
+        },
+    )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_scene_cousin_import",
+        "project_root": str(project_root),
+        "scene_id": cousin_bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else "scene_cousin_imported",
+        "ok": not required,
+        "variant_id": resolved_variant_id,
+        "intent": variant.get("intent"),
+        "source_bundle": str(source_bundle_path),
+        "scene_cousins": str(scene_cousins_path),
+        "import_mode": import_mode,
+        "source_sidecar_bundle": str(sidecar_bundle_path) if sidecar_bundle_path else None,
+        "source_bundle_patch": str(bundle_patch_path) if bundle_patch_path else None,
+        "output_dir": str(output_dir),
+        "sidecar_bundle": str(imported_bundle_path),
+        "adapter_manifest": str(adapter_manifest_path),
+        "formats": format_results,
+        "issues": issues,
+        "summary": {
+            "object_count": len(cousin_bundle.get("objects", []) if isinstance(cousin_bundle.get("objects"), list) else []),
+            "static_collider_count": len(static_collider_records_from_bundle(cousin_bundle)),
+            "adapter_count": len(format_results),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+            "main_bundle_overwritten": False,
+        },
+        "notes": "Imported a SimFoundry scene cousin output into a simulator-ready sidecar bundle and adapters without replacing the main bundle.",
+    }
+
+
+def cmd_import_simfoundry_scene_cousin(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    source_bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not source_bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {source_bundle_path}. Run export-simulator-assets first.")
+    scene_cousins_path = simfoundry_scene_cousins_path(project_root, manifest, args.scene_cousins)
+    output_root = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_scene_cousins" / "imported"
+    )
+    variant_slug = slugify(str(args.variant_id or "scene_cousin"), "scene_cousin")
+    if not args.variant_id:
+        scene_cousins_payload = safe_read_json(scene_cousins_path)
+        if isinstance(scene_cousins_payload, dict):
+            first_variant = simfoundry_find_scene_cousin_variant(scene_cousins_payload, None)
+            if isinstance(first_variant, dict) and first_variant.get("variant_id"):
+                variant_slug = slugify(str(first_variant["variant_id"]), "scene_cousin")
+    output_dir = ensure_dir(output_root / variant_slug)
+    report = simfoundry_import_scene_cousin(
+        project_root,
+        manifest,
+        source_bundle_path=source_bundle_path,
+        scene_cousins_path=scene_cousins_path,
+        variant_id=args.variant_id,
+        bundle_patch=args.bundle_patch,
+        sidecar_bundle=args.sidecar_bundle,
+        output_dir=output_dir,
+        formats=args.format,
+        args=args,
+    )
+    report_path = args.output.resolve() if args.output else output_dir / "scene_cousin_import_manifest.json"
+    write_json(report_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_cousin_import"] = str(report_path)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_cousin_import_dir"] = str(output_root)
+    manifest.setdefault("external_stages", {})["simfoundry_scene_cousin_import"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "variant_id": report.get("variant_id"),
+        "sidecar_bundle": report.get("sidecar_bundle"),
+        "adapter_manifest": report.get("adapter_manifest"),
+        "summary": report.get("summary", {}),
+        "notes": "Imported one scene cousin output into a simulator-ready sidecar bundle without overwriting the main bundle.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"Imported SimFoundry scene cousin: {report.get('status')} ({report.get('variant_id')})")
+        print(
+            f"objects={summary.get('object_count')} adapters={summary.get('adapter_count')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        print(f"Sidecar bundle: {report.get('sidecar_bundle')}")
+        print(f"Adapter manifest: {report.get('adapter_manifest')}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    return 0
+
+
+def simfoundry_object_cousins_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_object_cousins"), project_root)
+    if existing:
+        return existing
+    return project_root / manifest["simulator_assets_dir"] / "simfoundry_object_cousins" / "object_cousins_manifest.json"
+
+
+def simfoundry_object_cousin_variant_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for obj in payload.get("objects", []) if isinstance(payload.get("objects"), list) else []:
+        if not isinstance(obj, dict):
+            continue
+        for variant in obj.get("variants", []) if isinstance(obj.get("variants"), list) else []:
+            if isinstance(variant, dict):
+                records.append(variant)
+    return records
+
+
+def simfoundry_select_object_cousin_variant(payload: dict[str, Any], variant_id: str | None, source_object_id: str | None) -> dict[str, Any] | None:
+    variants = simfoundry_object_cousin_variant_records(payload)
+    if variant_id:
+        for variant in variants:
+            if str(variant.get("variant_id") or "") == str(variant_id):
+                return variant
+        return None
+    if source_object_id:
+        source_slug = slugify(str(source_object_id), "object")
+        for variant in variants:
+            if slugify(str(variant.get("source_object_id") or ""), "object") == source_slug:
+                return variant
+        return None
+    return variants[0] if variants else None
+
+
+def simfoundry_load_object_physics_record(path: Path | None, object_id: str, source_object_id: str) -> dict[str, Any] | None:
+    if not path or not path.exists():
+        return None
+    try:
+        entries = physics_entries(read_json(path))
+    except Exception:
+        return None
+    for entry in entries:
+        raw_id = slugify(str(entry.get("object_id") or entry.get("id") or entry.get("name") or ""), "object")
+        raw_source = slugify(str(entry.get("source_object_id") or ""), "object")
+        if raw_id == object_id or raw_source == source_object_id:
+            return entry
+    return entries[0] if entries else None
+
+
+def simfoundry_load_object_collider_record(path: Path | None, object_id: str, source_object_id: str) -> dict[str, Any] | None:
+    if not path or not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+    except Exception:
+        return None
+    records: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and isinstance(payload.get("objects"), list):
+        records = [item for item in payload["objects"] if isinstance(item, dict)]
+    elif isinstance(payload, list):
+        records = [item for item in payload if isinstance(item, dict)]
+    elif isinstance(payload, dict):
+        records = [payload]
+    for record in records:
+        raw_id = slugify(str(record.get("object_id") or record.get("id") or record.get("name") or ""), "object")
+        raw_source = slugify(str(record.get("source_object_id") or ""), "object")
+        if raw_id == object_id or raw_source == source_object_id:
+            return record
+    return records[0] if records else None
+
+
+def simfoundry_import_object_cousin(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    source_bundle_path: Path,
+    object_cousins_path: Path,
+    variant_id: str | None,
+    source_object_id: str | None,
+    mesh_manifest: Path | None,
+    physics: Path | None,
+    collider_manifest: Path | None,
+    output_dir: Path,
+    formats: list[str],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    object_cousins_payload = safe_read_json(object_cousins_path)
+    if not isinstance(object_cousins_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_object_cousins_manifest",
+                "Run prepare-simfoundry-object-cousins before importing an object cousin, or pass --object-cousins.",
+                source="import-simfoundry-object-cousin",
+                path=str(object_cousins_path),
+            )
+        )
+        object_cousins_payload = {}
+    variant = simfoundry_select_object_cousin_variant(object_cousins_payload, variant_id, source_object_id)
+    if not variant:
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_object_cousin_variant",
+                "Requested object cousin variant was not found in the object cousins manifest.",
+                source="import-simfoundry-object-cousin",
+                object_id=str(variant_id or source_object_id or ""),
+                path=str(object_cousins_path),
+            )
+        )
+        variant = {}
+    resolved_variant_id = slugify(str(variant.get("variant_id") or variant_id or "object_cousin"), "object_cousin")
+    resolved_source_object_id = slugify(str(variant.get("source_object_id") or source_object_id or ""), "object")
+    import_contract = variant.get("import_contract") if isinstance(variant.get("import_contract"), dict) else {}
+    mesh_entry = import_contract.get("mesh_manifest_entry") if isinstance(import_contract.get("mesh_manifest_entry"), dict) else {}
+    physics_entry = import_contract.get("physics_import_entry") if isinstance(import_contract.get("physics_import_entry"), dict) else {}
+    collider_entry = import_contract.get("collider_entry") if isinstance(import_contract.get("collider_entry"), dict) else {}
+    mesh_manifest_path = resolve_project_cli_path(mesh_manifest, project_root) if mesh_manifest else resolve_existing_path(mesh_entry.get("manifest"), project_root)
+    if mesh_manifest_path is None:
+        default_mesh_template = object_cousins_path.parent / "mesh_manifest.template.json"
+        mesh_manifest_path = default_mesh_template if default_mesh_template.exists() else None
+    physics_path = resolve_project_cli_path(physics, project_root) if physics else resolve_existing_path(str(physics_entry.get("path") or ""), project_root)
+    if physics_path is None:
+        default_physics = object_cousins_path.parent / "physics_properties.template.json"
+        physics_path = default_physics if default_physics.exists() else None
+    collider_manifest_path = resolve_project_cli_path(collider_manifest, project_root) if collider_manifest else resolve_existing_path(str(collider_entry.get("manifest") or ""), project_root)
+    if collider_manifest_path is None:
+        default_collider = object_cousins_path.parent / "collider_manifest.template.json"
+        collider_manifest_path = default_collider if default_collider.exists() else None
+
+    mesh_entries = load_external_mesh_manifest(mesh_manifest_path, project_root) if mesh_manifest_path and mesh_manifest_path.exists() else {}
+    selected_mesh_entry = mesh_entries.get(resolved_variant_id)
+    if selected_mesh_entry is None:
+        for candidate in mesh_entries.values():
+            if slugify(str(candidate.get("source_object_id") or ""), "object") == resolved_source_object_id:
+                selected_mesh_entry = candidate
+                break
+    mesh_path = Path(selected_mesh_entry["mesh_path"]) if selected_mesh_entry and selected_mesh_entry.get("mesh_path") else None
+    if not mesh_path or not mesh_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_object_cousin_mesh",
+                "Object cousin mesh manifest has no readable mesh for the selected variant.",
+                source="import-simfoundry-object-cousin",
+                object_id=resolved_variant_id,
+                path=str(mesh_path or mesh_manifest_path or ""),
+            )
+        )
+
+    source_bundle = read_json(source_bundle_path)
+    source_objects = source_bundle.get("objects") if isinstance(source_bundle.get("objects"), list) else []
+    source_obj = next(
+        (obj for obj in source_objects if isinstance(obj, dict) and slugify(str(obj.get("object_id") or ""), "object") == resolved_source_object_id),
+        None,
+    )
+    if not isinstance(source_obj, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_source_object",
+                "Source object for the object cousin is not present in the simulator bundle.",
+                source="import-simfoundry-object-cousin",
+                object_id=resolved_source_object_id,
+            )
+        )
+        source_obj = {}
+    cousin_bundle = copy.deepcopy(source_bundle)
+    bundle_objects = cousin_bundle.get("objects") if isinstance(cousin_bundle.get("objects"), list) else []
+    target_obj = next(
+        (obj for obj in bundle_objects if isinstance(obj, dict) and slugify(str(obj.get("object_id") or ""), "object") == resolved_source_object_id),
+        None,
+    )
+    if not isinstance(target_obj, dict):
+        target_obj = dict(source_obj)
+        bundle_objects.append(target_obj)
+        cousin_bundle["objects"] = bundle_objects
+    target_obj["object_id"] = resolved_variant_id if args.replace_object_id else resolved_source_object_id
+    target_obj["source_object_id"] = resolved_source_object_id
+    target_obj["simfoundry_object_cousin"] = {
+        "variant_id": resolved_variant_id,
+        "source_object_id": resolved_source_object_id,
+        "intent": variant.get("intent"),
+        "source_object_cousins": str(object_cousins_path),
+        "main_bundle_overwritten": False,
+        "timestamp": int(time.time()),
+    }
+    if mesh_path and mesh_path.exists():
+        mesh_asset_path = mesh_path
+        if args.copy_assets:
+            dst = output_dir / "assets" / resolved_variant_id / mesh_path.name
+            if mesh_path.resolve() != dst.resolve():
+                mesh_asset_path = copy_or_link(mesh_path, dst, args.mode)
+        target_obj["mesh"] = {
+            "path": str(mesh_asset_path),
+            "format": mesh_asset_path.suffix.lower().lstrip("."),
+            "source_mesh": str(mesh_path),
+            "provider": (selected_mesh_entry or {}).get("provider") or args.provider,
+            "coordinate_frame": (selected_mesh_entry or {}).get("coordinate_frame") or args.coordinate_frame,
+            "quality": (selected_mesh_entry or {}).get("quality") or {},
+        }
+    physics_record = simfoundry_load_object_physics_record(physics_path, resolved_variant_id, resolved_source_object_id)
+    if physics_record:
+        current_physics = target_obj.get("physics") if isinstance(target_obj.get("physics"), dict) else {}
+        target_obj["physics"] = merge_physics_dict(
+            current_physics,
+            normalize_physics_record(physics_record, current_physics, args.physics_provider),
+            overwrite=True,
+        )
+    collider_record = simfoundry_load_object_collider_record(collider_manifest_path, resolved_variant_id, resolved_source_object_id)
+    collider_path_value = None
+    if isinstance(collider_record, dict):
+        collider_path_value = collider_record.get("path") or collider_record.get("collider") or collider_record.get("collider_path") or collider_record.get("asset_path")
+    collider_path = resolve_existing_path(str(collider_path_value), project_root) if collider_path_value else None
+    if collider_path and collider_path.exists():
+        collider_asset_path = collider_path
+        if args.copy_assets:
+            dst = output_dir / "colliders" / resolved_variant_id / collider_path.name
+            if collider_path.resolve() != dst.resolve():
+                collider_asset_path = copy_or_link(collider_path, dst, args.mode)
+        target_obj["collision_proxy"] = {
+            "shape": (collider_record or {}).get("shape") or (target_obj.get("physics") or {}).get("collider") or "mesh",
+            "path": str(collider_asset_path),
+            "source_collider": str(collider_path),
+            "provider": (collider_record or {}).get("provider") or args.collider_provider,
+            "object_id": target_obj["object_id"],
+            "source_object_id": resolved_source_object_id,
+        }
+        target_obj.setdefault("physics", {})
+        if isinstance(target_obj["physics"], dict):
+            target_obj["physics"]["collision_proxy"] = target_obj["collision_proxy"]
+            target_obj["physics"]["collider"] = target_obj["collision_proxy"]["shape"]
+
+    output_dir = ensure_dir(output_dir)
+    imported_bundle_path = output_dir / f"simulator_asset_bundle.{resolved_variant_id}.json"
+    cousin_bundle["source_bundle"] = str(source_bundle_path)
+    cousin_bundle["simfoundry_object_cousin_import"] = {
+        "variant_id": resolved_variant_id,
+        "source_object_id": resolved_source_object_id,
+        "source_object_cousins": str(object_cousins_path),
+        "mesh_manifest": str(mesh_manifest_path) if mesh_manifest_path else None,
+        "physics": str(physics_path) if physics_path else None,
+        "collider_manifest": str(collider_manifest_path) if collider_manifest_path else None,
+        "main_bundle_overwritten": False,
+        "timestamp": int(time.time()),
+    }
+    write_json(imported_bundle_path, cousin_bundle)
+
+    adapter_root = ensure_dir(output_dir / "adapters")
+    format_results: dict[str, Any] = {}
+    for format_name in formats:
+        format_dir = ensure_dir(adapter_root / format_name)
+        if format_name == "mujoco":
+            result = write_mujoco_adapter(cousin_bundle, format_dir, adapter_root, project_root, args)
+        else:
+            result = write_json_simulator_adapter(format_name, cousin_bundle, format_dir, adapter_root, project_root, args)
+        format_results[format_name] = result
+    adapter_manifest_path = adapter_root / "simulator_adapters.json"
+    write_json(
+        adapter_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_object_cousin_adapter",
+            "variant_id": resolved_variant_id,
+            "source_object_id": resolved_source_object_id,
+            "source_bundle": str(imported_bundle_path),
+            "formats": format_results,
+            "notes": "Per-object-cousin simulator adapters generated from a sidecar bundle. Main simulator bundle is not overwritten.",
+        },
+    )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_object_cousin_import",
+        "project_root": str(project_root),
+        "scene_id": cousin_bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else "object_cousin_imported",
+        "ok": not required,
+        "variant_id": resolved_variant_id,
+        "source_object_id": resolved_source_object_id,
+        "intent": variant.get("intent"),
+        "source_bundle": str(source_bundle_path),
+        "object_cousins": str(object_cousins_path),
+        "mesh_manifest": str(mesh_manifest_path) if mesh_manifest_path else None,
+        "physics": str(physics_path) if physics_path else None,
+        "collider_manifest": str(collider_manifest_path) if collider_manifest_path else None,
+        "output_dir": str(output_dir),
+        "sidecar_bundle": str(imported_bundle_path),
+        "adapter_manifest": str(adapter_manifest_path),
+        "formats": format_results,
+        "issues": issues,
+        "summary": {
+            "object_count": len(cousin_bundle.get("objects", []) if isinstance(cousin_bundle.get("objects"), list) else []),
+            "static_collider_count": len(static_collider_records_from_bundle(cousin_bundle)),
+            "adapter_count": len(format_results),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+            "main_bundle_overwritten": False,
+            "mesh_imported": bool(mesh_path and mesh_path.exists()),
+            "physics_imported": physics_record is not None,
+            "collider_imported": bool(collider_path and collider_path.exists()),
+        },
+        "notes": "Imported a SimFoundry object cousin output into a simulator-ready sidecar bundle and adapters without replacing the main bundle.",
+    }
+
+
+def cmd_import_simfoundry_object_cousin(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    source_bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not source_bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {source_bundle_path}. Run export-simulator-assets first.")
+    object_cousins_path = simfoundry_object_cousins_path(project_root, manifest, args.object_cousins)
+    output_root = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_object_cousins" / "imported"
+    )
+    variant_slug = slugify(str(args.variant_id or args.source_object_id or "object_cousin"), "object_cousin")
+    if not args.variant_id and not args.source_object_id:
+        payload = safe_read_json(object_cousins_path)
+        if isinstance(payload, dict):
+            first_variant = simfoundry_select_object_cousin_variant(payload, None, None)
+            if isinstance(first_variant, dict) and first_variant.get("variant_id"):
+                variant_slug = slugify(str(first_variant["variant_id"]), "object_cousin")
+    output_dir = ensure_dir(output_root / variant_slug)
+    report = simfoundry_import_object_cousin(
+        project_root,
+        manifest,
+        source_bundle_path=source_bundle_path,
+        object_cousins_path=object_cousins_path,
+        variant_id=args.variant_id,
+        source_object_id=args.source_object_id,
+        mesh_manifest=args.mesh_manifest,
+        physics=args.physics,
+        collider_manifest=args.collider_manifest,
+        output_dir=output_dir,
+        formats=args.format,
+        args=args,
+    )
+    report_path = args.output.resolve() if args.output else output_dir / "object_cousin_import_manifest.json"
+    write_json(report_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_object_cousin_import"] = str(report_path)
+    manifest.setdefault("artifacts", {})["simfoundry_object_cousin_import_dir"] = str(output_root)
+    manifest.setdefault("external_stages", {})["simfoundry_object_cousin_import"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "variant_id": report.get("variant_id"),
+        "source_object_id": report.get("source_object_id"),
+        "sidecar_bundle": report.get("sidecar_bundle"),
+        "adapter_manifest": report.get("adapter_manifest"),
+        "summary": report.get("summary", {}),
+        "notes": "Imported one object cousin output into a simulator-ready sidecar bundle without overwriting the main bundle.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"Imported SimFoundry object cousin: {report.get('status')} ({report.get('variant_id')})")
+        print(
+            f"objects={summary.get('object_count')} adapters={summary.get('adapter_count')} "
+            f"mesh={summary.get('mesh_imported')} physics={summary.get('physics_imported')} "
+            f"collider={summary.get('collider_imported')} required={summary.get('required_issue_count')}"
+        )
+        print(f"Sidecar bundle: {report.get('sidecar_bundle')}")
+        print(f"Adapter manifest: {report.get('adapter_manifest')}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    return 0
+
+
+def simfoundry_task_cousin_commands(project_root: Path, output_dir: Path) -> list[str]:
+    return [
+        f"python -m video2mesh.cli verify-simfoundry-task-specs --project-root {shlex.quote(str(project_root))} --json --fail-on-required",
+        f"python -m video2mesh.cli prepare-simfoundry-task-resets --project-root {shlex.quote(str(project_root))} --json --fail-on-required",
+        f"python -m video2mesh.cli export-simfoundry-task-reset-adapters --project-root {shlex.quote(str(project_root))} --json --fail-on-required",
+        f"python -m video2mesh.cli simfoundry-simulator-smoke-test --project-root {shlex.quote(str(project_root))} --format mujoco unity isaac --fail-on-required",
+        f"echo Fill task cousin specs and sidecar bundles under {shlex.quote(str(output_dir / 'variants'))} before policy training or evaluation.",
+    ]
+
+
+def simfoundry_task_cousin_variant(
+    *,
+    task: dict[str, Any],
+    verification_task: dict[str, Any],
+    reset_item: dict[str, Any],
+    reset_adapter: dict[str, Any] | None,
+    variant_index: int,
+    intent: str,
+    variant_dir: Path,
+    object_cousins: Path | None,
+    scene_cousins: Path | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    task_id = slugify(str(task.get("task_id") or verification_task.get("task_id") or reset_item.get("task_id") or "task"))
+    variant_id = f"{task_id}_task_cousin_{variant_index + 1:02d}_{slugify(intent, fallback='variant')}"
+    output_dir = variant_dir / "outputs"
+    expected_task_spec = output_dir / f"{variant_id}_task_spec.json"
+    expected_initial_state = output_dir / f"simulator_asset_bundle.{variant_id}.initial_state.json"
+    expected_success_checker = output_dir / f"{variant_id}_success_checker.json"
+    expected_adapter_manifest = output_dir / f"{variant_id}_adapter_manifest.json"
+    predicates = task.get("goal_predicates") if isinstance(task.get("goal_predicates"), list) else []
+    primary_predicate = simfoundry_task_primary_predicate(task) or {}
+    manipulated_object = str(reset_item.get("manipulated_object") or primary_predicate.get("subject") or "")
+    target_object = str(reset_item.get("target_object") or primary_predicate.get("object") or "")
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_cousin_variant",
+        "variant_id": variant_id,
+        "source_task_id": task_id,
+        "intent": intent,
+        "status": "template_pending_external_generation",
+        "instruction": task.get("instruction"),
+        "prompt": (
+            f"Create a SimFoundry-style task cousin for task {task_id}. "
+            f"Intent: {intent}. Preserve simulator importability, initial-state reset semantics, "
+            "goal predicate auditability, and do not store API keys."
+        ),
+        "source_links": {
+            "task_spec": task.get("task_spec_path"),
+            "verification_goal_status": verification_task.get("goal_status"),
+            "task_reset": reset_item.get("path"),
+            "task_reset_sidecar_bundle": reset_item.get("sidecar_bundle"),
+            "task_reset_adapter": reset_adapter.get("adapter_manifest") if isinstance(reset_adapter, dict) else None,
+            "object_cousins": str(object_cousins) if object_cousins else None,
+            "scene_cousins": str(scene_cousins) if scene_cousins else None,
+        },
+        "task_context": {
+            "task_type": task.get("task_type"),
+            "manipulated_object": manipulated_object,
+            "target_object": target_object,
+            "goal_predicates": predicates,
+            "source_goal_status": verification_task.get("goal_status"),
+            "reset_candidate_goal_status": reset_item.get("candidate_goal_status"),
+            "reset_accepted": reset_item.get("accepted"),
+        },
+        "model_plan": {
+            "task_reasoning": {
+                "model": args.model,
+                "reasoning_effort": args.model_reasoning_effort,
+                "expected_output": str(expected_task_spec),
+            },
+            "goal_rephrase_or_predicate_edit": {
+                "model": args.model,
+                "expected_output": str(expected_success_checker),
+                "constraints": "Keep success predicates machine-checkable and tied to simulator object ids.",
+            },
+            "object_cousin_selection": {
+                "source_manifest": str(object_cousins) if object_cousins else "",
+                "enabled": object_cousins is not None,
+                "role": "Optional object swap pool for task cousin variants.",
+            },
+            "scene_cousin_selection": {
+                "source_manifest": str(scene_cousins) if scene_cousins else "",
+                "enabled": scene_cousins is not None,
+                "role": "Optional scene/layout cousin pool for task variants.",
+            },
+            "image_context_editing": {
+                "model": args.image_model,
+                "enabled": bool(args.enable_image_editing),
+                "role": "Optional visual reference or task card rendering; not required for simulator import.",
+            },
+        },
+        "expected_artifacts": {
+            "task_spec": str(expected_task_spec),
+            "initial_state_sidecar_bundle": str(expected_initial_state),
+            "success_checker": str(expected_success_checker),
+            "adapter_manifest": str(expected_adapter_manifest),
+        },
+        "acceptance_gates": [
+            "source task has a reviewed goal predicate and simulator object ids",
+            "reset sidecar bundle exists and does not overwrite the main simulator_asset_bundle.json",
+            "reset initial state does not already satisfy the goal predicate",
+            "task reset adapter or equivalent simulator adapter is available",
+            "success checker is explicit and machine-checkable",
+            "export-simulator-adapter and simfoundry-simulator-smoke-test pass before policy use",
+            "human or VLM review is required before treating the task cousin as benchmark truth",
+        ],
+        "import_contract": {
+            "task_spec": str(expected_task_spec),
+            "initial_state_sidecar_bundle": str(expected_initial_state),
+            "success_checker": str(expected_success_checker),
+            "adapter_manifest": str(expected_adapter_manifest),
+            "main_bundle_overwritten": False,
+            "postprocess_required": [
+                "verify task cousin predicates against the sidecar bundle",
+                "export per-task simulator adapter",
+                "run simfoundry-simulator-smoke-test",
+            ],
+        },
+        "notes": "Task cousin variant template only. External workers may fill task specs or sidecar bundles; this command does not call closed models.",
+    }
+
+
+def cmd_prepare_simfoundry_task_cousins(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    task_specs_path = simfoundry_task_specs_path(project_root, manifest, args.task_specs)
+    verification_path = simfoundry_task_verification_path(project_root, manifest, args.verification, task_specs_path)
+    task_resets_path = simfoundry_task_resets_path(project_root, manifest, args.task_resets, task_specs_path)
+    reset_adapters_path = simfoundry_task_reset_adapters_path(project_root, manifest, args.reset_adapters, task_resets_path)
+    object_cousins = (
+        resolve_existing_path(str(args.object_cousins), project_root)
+        if args.object_cousins
+        else resolve_existing_path(manifest.get("artifacts", {}).get("simfoundry_object_cousins"), project_root)
+    )
+    scene_cousins = (
+        resolve_existing_path(str(args.scene_cousins), project_root)
+        if args.scene_cousins
+        else resolve_existing_path(manifest.get("artifacts", {}).get("simfoundry_scene_cousins"), project_root)
+    )
+
+    issues: list[dict[str, Any]] = []
+    task_specs_payload = safe_read_json(task_specs_path)
+    if not isinstance(task_specs_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_specs",
+                "Run export-simfoundry-task-specs before preparing task cousins.",
+                source="prepare-simfoundry-task-cousins",
+                path=str(task_specs_path),
+            )
+        )
+        task_specs_payload = {}
+    verification_payload = safe_read_json(verification_path)
+    if not isinstance(verification_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_verification",
+                "Run verify-simfoundry-task-specs before preparing task cousins.",
+                source="prepare-simfoundry-task-cousins",
+                path=str(verification_path),
+            )
+        )
+        verification_payload = {}
+    resets_payload = safe_read_json(task_resets_path)
+    if not isinstance(resets_payload, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_task_resets",
+                "Run prepare-simfoundry-task-resets before preparing task cousins.",
+                source="prepare-simfoundry-task-cousins",
+                path=str(task_resets_path),
+            )
+        )
+        resets_payload = {}
+    reset_adapters_payload = safe_read_json(reset_adapters_path)
+    if not isinstance(reset_adapters_payload, dict):
+        reset_adapters_payload = {}
+
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "task_specs" / "task_cousins"
+    )
+    variants_dir = ensure_dir(output_dir / "variants")
+    provider_config_path = output_dir / "provider_config.template.json"
+    provider_config = simfoundry_provider_config_template(args)
+    provider_config["profile"] = "simfoundry_task_cousins_custom_responses"
+    provider_config["task_cousin_defaults"] = {
+        "task_cousin_count": int(args.task_cousin_count),
+        "task_cousin_intents": simfoundry_csv_items(args.task_cousin_intents, ["object_swap", "scene_swap", "goal_rephrase"]),
+        "requires_reset_sidecar": True,
+        "requires_success_checker": True,
+    }
+    write_json(provider_config_path, provider_config)
+
+    verification_by_id = {
+        str(item.get("task_id") or "task"): item
+        for item in verification_payload.get("tasks", []) if isinstance(item, dict)
+    }
+    reset_by_id = {
+        str(item.get("task_id") or "task"): item
+        for item in resets_payload.get("reset_index", []) if isinstance(item, dict)
+    }
+    adapter_by_id = {
+        str(item.get("task_id") or "task"): item
+        for item in reset_adapters_payload.get("reset_adapters", []) if isinstance(item, dict)
+    }
+    task_records = simfoundry_task_spec_records(task_specs_payload, project_root)
+    intents = simfoundry_csv_items(args.task_cousin_intents, ["object_swap", "scene_swap", "goal_rephrase"])
+    variants: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for task in task_records:
+        if args.max_tasks and len({item.get("source_task_id") for item in variants}) >= int(args.max_tasks):
+            skipped.append({"task_id": task.get("task_id"), "reason": "max_tasks_reached", "max_tasks": int(args.max_tasks)})
+            continue
+        task_id = str(task.get("task_id") or "task")
+        verification_task = verification_by_id.get(task_id)
+        reset_item = reset_by_id.get(task_id)
+        if not verification_task:
+            skipped.append({"task_id": task_id, "reason": "missing_verification"})
+            continue
+        if not reset_item:
+            skipped.append({"task_id": task_id, "reason": "missing_accepted_reset"})
+            continue
+        if reset_item.get("accepted") is not True:
+            skipped.append({"task_id": task_id, "reason": "reset_not_accepted"})
+            continue
+        if reset_item.get("candidate_goal_status") != "not_satisfied":
+            skipped.append({"task_id": task_id, "reason": "reset_initial_state_not_verified_not_satisfied"})
+            continue
+        task_dir = ensure_dir(variants_dir / slugify(task_id, fallback="task"))
+        for idx in range(max(0, int(args.task_cousin_count))):
+            intent = intents[idx % len(intents)]
+            variant_dir = ensure_dir(task_dir / f"{slugify(task_id, fallback='task')}_task_cousin_{idx + 1:02d}_{slugify(intent, fallback='variant')}")
+            variant = simfoundry_task_cousin_variant(
+                task=task,
+                verification_task=verification_task,
+                reset_item=reset_item,
+                reset_adapter=adapter_by_id.get(task_id),
+                variant_index=idx,
+                intent=intent,
+                variant_dir=variant_dir,
+                object_cousins=object_cousins,
+                scene_cousins=scene_cousins,
+                args=args,
+            )
+            variant_path = variant_dir / "task_cousin_variant.json"
+            write_json(variant_path, variant)
+            variants.append({**variant, "variant_path": str(variant_path)})
+
+    task_template_path = output_dir / "task_cousin_specs.template.json"
+    success_template_path = output_dir / "success_checkers.template.json"
+    write_json(
+        task_template_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "source_task_specs": str(task_specs_path),
+            "source_task_resets": str(task_resets_path),
+            "variants": [
+                {
+                    "variant_id": item.get("variant_id"),
+                    "source_task_id": item.get("source_task_id"),
+                    "task_spec": item.get("expected_artifacts", {}).get("task_spec"),
+                    "initial_state_sidecar_bundle": item.get("expected_artifacts", {}).get("initial_state_sidecar_bundle"),
+                }
+                for item in variants
+            ],
+            "notes": "External task cousin worker fills per-variant task specs and optional initial-state sidecar bundles; main bundle must not be overwritten.",
+        },
+    )
+    write_json(
+        success_template_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "source_task_specs": str(task_specs_path),
+            "variants": [
+                {
+                    "variant_id": item.get("variant_id"),
+                    "source_task_id": item.get("source_task_id"),
+                    "success_checker": item.get("expected_artifacts", {}).get("success_checker"),
+                    "goal_predicates": item.get("task_context", {}).get("goal_predicates", []),
+                }
+                for item in variants
+            ],
+            "notes": "Success checkers must stay machine-checkable and be reviewed before benchmark use.",
+        },
+    )
+    commands = simfoundry_task_cousin_commands(project_root, output_dir)
+    script_path = output_dir / "run_after_task_cousin_outputs.sh"
+    script_path.write_text("\n".join(["#!/usr/bin/env bash", "set -euo pipefail", "", *commands, ""]), encoding="utf-8")
+    script_path.chmod(0o755)
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    status = "fail" if required else "empty" if not variants else "task_cousins_prepared"
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_task_cousins",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or task_specs_payload.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "source_bundle": str(bundle_path),
+        "task_specs": str(task_specs_path),
+        "verification": str(verification_path),
+        "task_resets": str(task_resets_path),
+        "task_reset_adapters": str(reset_adapters_path) if reset_adapters_path.exists() else None,
+        "object_cousins": str(object_cousins) if object_cousins else None,
+        "scene_cousins": str(scene_cousins) if scene_cousins else None,
+        "output_dir": str(output_dir),
+        "provider_config": str(provider_config_path),
+        "model_stage_catalog": simfoundry_model_stage_catalog(args),
+        "variants": variants,
+        "skipped_tasks": skipped,
+        "task_cousin_specs_template": str(task_template_path),
+        "success_checkers_template": str(success_template_path),
+        "postprocess_script": str(script_path),
+        "postprocess_commands": commands,
+        "issues": issues,
+        "summary": {
+            "task_count": len(task_records),
+            "task_cousin_count": len(variants),
+            "skipped_task_count": len(skipped),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+            "model_provider": args.model_provider,
+            "provider_name": args.provider_name,
+            "reasoning_model": args.model,
+            "image_model": args.image_model,
+            "disable_response_storage": bool(args.disable_response_storage),
+            "uses_object_cousins": object_cousins is not None,
+            "uses_scene_cousins": scene_cousins is not None,
+            "uses_reset_adapters": bool(reset_adapters_payload.get("reset_adapters")),
+        },
+        "secret_policy": provider_config["secret_policy"],
+        "notes": "Prepared SimFoundry-style task cousin contracts. No model call is made and no API key is stored.",
+    }
+    manifest_path = output_dir / "task_cousins_manifest.json"
+    write_json(manifest_path, payload)
+    manifest.setdefault("artifacts", {})["simfoundry_task_cousins"] = str(manifest_path)
+    manifest.setdefault("artifacts", {})["simfoundry_task_cousins_dir"] = str(output_dir)
+    manifest.setdefault("artifacts", {})["simfoundry_task_cousins_provider_config"] = str(provider_config_path)
+    manifest.setdefault("external_stages", {})["simfoundry_task_cousins"] = {
+        "status": status,
+        "report": str(manifest_path),
+        "provider_config": str(provider_config_path),
+        "task_cousin_count": len(variants),
+        "summary": payload["summary"],
+        "notes": "Prepared task cousin templates for SimFoundry-style augmentation.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Prepared SimFoundry task cousins: {manifest_path}")
+        print(f"Tasks: {len(task_records)}; variants={len(variants)}; skipped={len(skipped)}")
+        print(f"Provider config template: {provider_config_path}")
+        print(f"Postprocess script: {script_path}")
+    if args.fail_on_required and required:
+        return 1
+    if args.fail_on_empty and not variants:
+        return 1
+    return 0
+
+
+def simfoundry_object_support_candidates(
+    subject: dict[str, Any],
+    objects: list[dict[str, Any]],
+    *,
+    up_idx: int,
+    axis_name: str,
+    up_direction: str,
+    horizontal_axes: list[int],
+    max_support_gap: float,
+    min_support_overlap: float,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    direction_sign = axis_direction_sign(up_direction)
+    for other in objects:
+        if subject["object_id"] == other["object_id"]:
+            continue
+        if bbox_axis_center(subject, up_idx, direction_sign) <= bbox_axis_center(other, up_idx, direction_sign):
+            continue
+        vertical_gap = bbox_axis_low(subject, up_idx, direction_sign) - bbox_axis_high(other, up_idx, direction_sign)
+        overlap_ratio = bbox_footprint_overlap_ratio(subject, other, horizontal_axes)
+        if abs(vertical_gap) <= float(max_support_gap) and overlap_ratio >= float(min_support_overlap):
+            candidates.append(
+                {
+                    "object_id": other["object_id"],
+                    "asset_role": other.get("asset_role"),
+                    "category": other.get("category"),
+                    "up_axis": axis_name,
+                    "up_direction": normalize_axis_direction(up_direction),
+                    "vertical_gap": vertical_gap,
+                    "abs_vertical_gap": abs(vertical_gap),
+                    "footprint_overlap_over_smaller": overlap_ratio,
+                    "penetrating_support": vertical_gap < 0.0,
+                }
+            )
+    candidates.sort(key=lambda item: (float(item["abs_vertical_gap"]), -float(item["footprint_overlap_over_smaller"])))
+    return candidates
+
+
+def simfoundry_reviewed_support_candidates(
+    obj: dict[str, Any],
+    bbox: dict[str, Any],
+    objects_by_id: dict[str, dict[str, Any]],
+    *,
+    axis_name: str,
+    up_direction: str,
+) -> list[dict[str, Any]]:
+    review = obj.get("support_relation_review") if isinstance(obj.get("support_relation_review"), dict) else {}
+    decision = str(review.get("decision") or review.get("status") or "").strip().lower()
+    if decision in {"rejected", "pending", "none", "unsupported"}:
+        return []
+    support_id = (
+        review.get("support_object_id")
+        or review.get("support_id")
+        or review.get("object_id")
+        or review.get("object")
+        or review.get("target_object_id")
+    )
+    support_key = slugify(str(support_id or ""))
+    support = objects_by_id.get(support_key)
+    if not support:
+        return []
+    confidence = review.get("confidence")
+    try:
+        confidence_value = float(confidence) if confidence is not None else 0.7
+    except (TypeError, ValueError):
+        confidence_value = 0.7
+    return [
+        {
+            "object_id": support["object_id"],
+            "asset_role": support.get("asset_role"),
+            "category": support.get("category"),
+            "up_axis": axis_name,
+            "up_direction": normalize_axis_direction(up_direction),
+            "vertical_gap": None,
+            "abs_vertical_gap": None,
+            "footprint_overlap_over_smaller": bbox_footprint_overlap_ratio(
+                bbox,
+                support,
+                [idx for idx in [0, 1, 2] if idx != axis_index(axis_name)],
+            ),
+            "penetrating_support": None,
+            "source": "reviewed_support_relation",
+            "decision": decision or "accepted",
+            "confidence": max(0.0, min(1.0, confidence_value)),
+            "review": review,
+        }
+    ]
+
+
+def generate_simfoundry_scene_stability_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    up_axis: str | None,
+    up_direction: str,
+    max_support_gap: float,
+    min_support_overlap: float,
+    max_penetration_depth: float,
+    max_overlap_volume_ratio: float,
+    require_support: bool,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run export-simulator-assets before scene stability reporting.",
+                source="simfoundry-scene-stability-report",
+                path=str(bundle_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_scene_stability",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "status": "fail",
+            "ok": False,
+            "objects": [],
+            "object_reports": {},
+            "penetrations": [],
+            "issues": issues,
+            "summary": {"object_count": 0, "required_issue_count": 1, "warning_count": 0},
+        }
+
+    bundle = read_json(bundle_path)
+    coordinate_system = bundle.get("coordinate_system") if isinstance(bundle.get("coordinate_system"), dict) else {}
+    axis_name = str(up_axis or coordinate_system.get("up_axis") or "y").lower()
+    direction_name = normalize_axis_direction(up_direction or coordinate_system.get("up_direction"))
+    direction_sign = axis_direction_sign(direction_name)
+    up_idx = axis_index(axis_name)
+    horizontal_axes = [idx for idx in [0, 1, 2] if idx != up_idx]
+    raw_objects = [obj for obj in bundle.get("objects", []) if isinstance(obj, dict)]
+    objects: list[dict[str, Any]] = []
+    for obj in raw_objects:
+        record = scene_relation_bbox_from_object(obj)
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        if record:
+            physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+            record["body_type"] = physics.get("body_type")
+            record["has_collision_proxy"] = isinstance(obj.get("collision_proxy"), dict) and bool(obj.get("collision_proxy"))
+            objects.append(record)
+        else:
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "missing_stability_bbox",
+                    "Object has no pose bbox or bbox_3d for stability inference.",
+                    source="simfoundry-scene-stability-report",
+                    object_id=object_id,
+                )
+            )
+
+    object_reports: dict[str, Any] = {}
+    unsupported_dynamic = 0
+    for obj in objects:
+        is_dynamic = str(obj.get("body_type") or "").lower() == "dynamic"
+        is_background = obj.get("asset_role") == "background_structure"
+        candidates = simfoundry_object_support_candidates(
+            obj,
+            objects,
+            up_idx=up_idx,
+            axis_name=axis_name,
+            up_direction=direction_name,
+            horizontal_axes=horizontal_axes,
+            max_support_gap=max_support_gap,
+            min_support_overlap=min_support_overlap,
+        )
+        best = candidates[0] if candidates else None
+        floating_gap = None
+        if is_dynamic and not best:
+            below = []
+            for other in objects:
+                if obj["object_id"] == other["object_id"]:
+                    continue
+                if bbox_axis_center(obj, up_idx, direction_sign) <= bbox_axis_center(other, up_idx, direction_sign):
+                    continue
+                overlap_ratio = bbox_footprint_overlap_ratio(obj, other, horizontal_axes)
+                if overlap_ratio <= 0.0:
+                    continue
+                below.append(bbox_axis_low(obj, up_idx, direction_sign) - bbox_axis_high(other, up_idx, direction_sign))
+            if below:
+                floating_gap = min(below, key=lambda value: abs(value))
+        status = "supported" if best else "static_or_background" if is_background or not is_dynamic else "unsupported"
+        if is_dynamic and not best:
+            unsupported_dynamic += 1
+            issues.append(
+                sim_preflight_issue(
+                    "required" if require_support else "warning",
+                    "dynamic_object_without_support",
+                    "Dynamic object has no support candidate within gap/overlap thresholds.",
+                    source="simfoundry-scene-stability-report",
+                    object_id=obj["object_id"],
+                )
+            )
+        object_reports[obj["object_id"]] = {
+            "object_id": obj["object_id"],
+            "asset_role": obj.get("asset_role"),
+            "category": obj.get("category"),
+            "body_type": obj.get("body_type"),
+            "bbox": {"min": obj["min"], "max": obj["max"], "center": obj["center"], "size": obj["size"], "source": obj.get("source")},
+            "status": status,
+            "support": best,
+            "support_candidates": candidates[:5],
+            "floating_gap_to_nearest_overlap": floating_gap,
+            "has_collision_proxy": obj.get("has_collision_proxy"),
+        }
+
+    penetrations: list[dict[str, Any]] = []
+    for left_index, left in enumerate(objects):
+        for right in objects[left_index + 1 :]:
+            metrics = bbox_overlap_metrics(left, right)
+            if not metrics["has_3d_overlap"]:
+                continue
+            penetration_depth = float(metrics["axis_overlap"][up_idx])
+            if penetration_depth <= float(max_penetration_depth) and float(metrics["overlap_over_smaller"]) <= float(max_overlap_volume_ratio):
+                continue
+            item = {
+                "objects": [left["object_id"], right["object_id"]],
+                "asset_roles": [left.get("asset_role"), right.get("asset_role")],
+                "categories": [left.get("category"), right.get("category")],
+                "up_axis": axis_name,
+                "penetration_depth": penetration_depth,
+                "overlap_volume": metrics["overlap_volume"],
+                "overlap_over_smaller": metrics["overlap_over_smaller"],
+                "axis_overlap": metrics["axis_overlap"],
+            }
+            penetrations.append(item)
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "bbox_penetration",
+                    "Object bboxes overlap beyond the configured penetration thresholds.",
+                    source="simfoundry-scene-stability-report",
+                    object_id=",".join(item["objects"]),
+                )
+            )
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    status = "fail" if required else "warning" if warnings or penetrations else "stable_preflight"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_scene_stability",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "coordinate_system": {**coordinate_system, "up_axis": axis_name, "up_direction": direction_name},
+        "thresholds": {
+            "max_support_gap": float(max_support_gap),
+            "min_support_overlap": float(min_support_overlap),
+            "max_penetration_depth": float(max_penetration_depth),
+            "max_overlap_volume_ratio": float(max_overlap_volume_ratio),
+            "require_support": bool(require_support),
+            "up_direction": direction_name,
+        },
+        "objects": objects,
+        "object_reports": object_reports,
+        "penetrations": penetrations,
+        "issues": issues,
+        "summary": {
+            "object_count": len(objects),
+            "dynamic_object_count": len([item for item in objects if str(item.get("body_type") or "").lower() == "dynamic"]),
+            "supported_dynamic_count": len([item for item in object_reports.values() if item.get("status") == "supported" and str(item.get("body_type") or "").lower() == "dynamic"]),
+            "unsupported_dynamic_count": unsupported_dynamic,
+            "penetration_count": len(penetrations),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "BBox-level stability preflight for SimFoundry-style simulator readiness; run target simulator settling after fixing required issues.",
+    }
+
+
+DEFAULT_SIMFOUNDRY_MOVABLE_CATEGORIES = {
+    "bag",
+    "basket",
+    "bed",
+    "book",
+    "bottle",
+    "box",
+    "chair",
+    "cup",
+    "lamp",
+    "mug",
+    "nightstand",
+    "plant",
+    "pillow",
+    "sofa",
+    "stool",
+    "table",
+    "toy",
+    "vase",
+}
+
+DEFAULT_SIMFOUNDRY_STATIC_CATEGORIES = {
+    "ceiling",
+    "door",
+    "floor",
+    "ground",
+    "road",
+    "room",
+    "sky",
+    "terrain",
+    "wall",
+    "wall_art",
+    "wall-art",
+    "window",
+}
+
+
+def normalize_axis_direction(value: str | None) -> str:
+    text = str(value or "positive").strip().lower()
+    if text in {"positive", "+", "plus", "pos", "1"}:
+        return "positive"
+    if text in {"negative", "-", "minus", "neg", "-1"}:
+        return "negative"
+    raise ValueError(f"Unsupported axis direction: {value!r}")
+
+
+def axis_direction_sign(value: str | None) -> int:
+    return -1 if normalize_axis_direction(value) == "negative" else 1
+
+
+def bbox_axis_low(record: dict[str, Any], up_idx: int, direction_sign: int) -> float:
+    return float(record["min"][up_idx]) if direction_sign > 0 else -float(record["max"][up_idx])
+
+
+def bbox_axis_high(record: dict[str, Any], up_idx: int, direction_sign: int) -> float:
+    return float(record["max"][up_idx]) if direction_sign > 0 else -float(record["min"][up_idx])
+
+
+def bbox_axis_center(record: dict[str, Any], up_idx: int, direction_sign: int) -> float:
+    return float(record["center"][up_idx]) * float(direction_sign)
+
+
+def simfoundry_dynamic_variant_penetrations_for_object(
+    subject: dict[str, Any],
+    objects: list[dict[str, Any]],
+    *,
+    up_idx: int,
+    max_penetration_depth: float,
+    max_overlap_volume_ratio: float,
+) -> list[dict[str, Any]]:
+    penetrations: list[dict[str, Any]] = []
+    for other in objects:
+        if subject["object_id"] == other["object_id"]:
+            continue
+        metrics = bbox_overlap_metrics(subject, other)
+        if not metrics["has_3d_overlap"]:
+            continue
+        penetration_depth = float(metrics["axis_overlap"][up_idx])
+        overlap_ratio = float(metrics["overlap_over_smaller"])
+        if penetration_depth <= float(max_penetration_depth) and overlap_ratio <= float(max_overlap_volume_ratio):
+            continue
+        penetrations.append(
+            {
+                "object_id": other["object_id"],
+                "asset_role": other.get("asset_role"),
+                "category": other.get("category"),
+                "penetration_depth": penetration_depth,
+                "overlap_over_smaller": overlap_ratio,
+                "overlap_volume": metrics["overlap_volume"],
+                "axis_overlap": metrics["axis_overlap"],
+            }
+        )
+    penetrations.sort(key=lambda item: (-float(item["overlap_over_smaller"]), -float(item["penetration_depth"])))
+    return penetrations
+
+
+def simfoundry_dynamic_variant_candidate_report(
+    obj: dict[str, Any],
+    bbox: dict[str, Any] | None,
+    *,
+    objects: list[dict[str, Any]],
+    objects_by_id: dict[str, dict[str, Any]],
+    up_idx: int,
+    axis_name: str,
+    up_direction: str,
+    horizontal_axes: list[int],
+    movable_categories: set[str],
+    exclude_categories: set[str],
+    include_objects: set[str],
+    exclude_objects: set[str],
+    max_support_gap: float,
+    min_support_overlap: float,
+    max_penetration_depth: float,
+    max_overlap_volume_ratio: float,
+    allow_penetration: bool,
+    require_support: bool,
+) -> dict[str, Any]:
+    object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+    category_slug = slugify(str(obj.get("category") or ""))
+    asset_role = str(obj.get("asset_role") or "object")
+    physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+    reasons: list[str] = []
+    eligible = True
+
+    if not bbox:
+        eligible = False
+        reasons.append("missing_bbox")
+    if asset_role == "background_structure":
+        eligible = False
+        reasons.append("background_structure")
+    if object_id in exclude_objects:
+        eligible = False
+        reasons.append("excluded_object")
+    if category_slug in exclude_categories:
+        eligible = False
+        reasons.append("excluded_category")
+    if include_objects and object_id not in include_objects:
+        eligible = False
+        reasons.append("not_included_object")
+    if not include_objects and movable_categories and category_slug not in movable_categories:
+        eligible = False
+        reasons.append("category_not_movable")
+    if str(physics.get("collider") or "").lower() in {"", "none"} and not isinstance(obj.get("collision_proxy"), dict):
+        eligible = False
+        reasons.append("missing_collider")
+
+    support_candidates: list[dict[str, Any]] = []
+    penetrations: list[dict[str, Any]] = []
+    if bbox:
+        support_candidates = simfoundry_reviewed_support_candidates(
+            obj,
+            bbox,
+            objects_by_id,
+            axis_name=axis_name,
+            up_direction=up_direction,
+        )
+        geometric_support_candidates = simfoundry_object_support_candidates(
+            bbox,
+            objects,
+            up_idx=up_idx,
+            axis_name=axis_name,
+            up_direction=up_direction,
+            horizontal_axes=horizontal_axes,
+            max_support_gap=max_support_gap,
+            min_support_overlap=min_support_overlap,
+        )
+        reviewed_support_ids = {item.get("object_id") for item in support_candidates}
+        support_candidates.extend(
+            item for item in geometric_support_candidates if item.get("object_id") not in reviewed_support_ids
+        )
+        penetrations = simfoundry_dynamic_variant_penetrations_for_object(
+            bbox,
+            objects=objects,
+            up_idx=up_idx,
+            max_penetration_depth=max_penetration_depth,
+            max_overlap_volume_ratio=max_overlap_volume_ratio,
+        )
+        if require_support and not support_candidates:
+            eligible = False
+            reasons.append("unsupported")
+        if penetrations and not allow_penetration:
+            eligible = False
+            reasons.append("penetration")
+
+    status = "accepted_dynamic" if eligible else "kept_static"
+    return {
+        "object_id": object_id,
+        "category": obj.get("category"),
+        "category_slug": category_slug,
+        "asset_role": asset_role,
+        "source_body_type": physics.get("body_type"),
+        "status": status,
+        "accepted": bool(eligible),
+        "reasons": reasons,
+        "support": support_candidates[0] if support_candidates else None,
+        "support_candidates": support_candidates[:5],
+        "penetrations": penetrations[:10],
+        "bbox": bbox,
+    }
+
+
+def generate_simfoundry_dynamic_variant(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    output_dir: Path,
+    output_bundle: Path | None,
+    up_axis: str | None,
+    up_direction: str,
+    movable_categories: set[str],
+    exclude_categories: set[str],
+    include_objects: set[str],
+    exclude_objects: set[str],
+    max_support_gap: float,
+    min_support_overlap: float,
+    max_penetration_depth: float,
+    max_overlap_volume_ratio: float,
+    allow_penetration: bool,
+    require_support: bool,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run export-simulator-assets before preparing a dynamic variant.",
+                source="prepare-simfoundry-dynamic-variant",
+                path=str(bundle_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_dynamic_variant",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "status": "fail",
+            "ok": False,
+            "bundle": str(bundle_path),
+            "variant_bundle": None,
+            "objects": [],
+            "issues": issues,
+            "summary": {"object_count": 0, "accepted_dynamic_count": 0, "required_issue_count": 1, "warning_count": 0},
+        }
+
+    source_bundle = read_json(bundle_path)
+    variant_bundle = copy.deepcopy(source_bundle)
+    coordinate_system = variant_bundle.get("coordinate_system") if isinstance(variant_bundle.get("coordinate_system"), dict) else {}
+    axis_name = str(up_axis or coordinate_system.get("up_axis") or "y").lower()
+    direction_name = normalize_axis_direction(up_direction or coordinate_system.get("up_direction"))
+    up_idx = axis_index(axis_name)
+    horizontal_axes = [idx for idx in [0, 1, 2] if idx != up_idx]
+    raw_objects = [obj for obj in variant_bundle.get("objects", []) if isinstance(obj, dict)]
+    bbox_by_id: dict[str, dict[str, Any]] = {}
+    objects: list[dict[str, Any]] = []
+    for obj in raw_objects:
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        bbox = scene_relation_bbox_from_object(obj)
+        if bbox:
+            physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+            bbox["body_type"] = physics.get("body_type")
+            bbox["has_collision_proxy"] = isinstance(obj.get("collision_proxy"), dict) and bool(obj.get("collision_proxy"))
+            bbox_by_id[object_id] = bbox
+            objects.append(bbox)
+        else:
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "missing_dynamic_variant_bbox",
+                    "Object has no pose bbox or bbox_3d for dynamic candidate gating.",
+                    source="prepare-simfoundry-dynamic-variant",
+                    object_id=object_id,
+                )
+            )
+
+    object_reports: list[dict[str, Any]] = []
+    objects_by_id = {item["object_id"]: item for item in objects}
+    accepted_ids: set[str] = set()
+    rejected_ids: set[str] = set()
+    for obj in raw_objects:
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        report = simfoundry_dynamic_variant_candidate_report(
+            obj,
+            bbox_by_id.get(object_id),
+            objects=objects,
+            objects_by_id=objects_by_id,
+            up_idx=up_idx,
+            axis_name=axis_name,
+            up_direction=direction_name,
+            horizontal_axes=horizontal_axes,
+            movable_categories=movable_categories,
+            exclude_categories=exclude_categories,
+            include_objects=include_objects,
+            exclude_objects=exclude_objects,
+            max_support_gap=max_support_gap,
+            min_support_overlap=min_support_overlap,
+            max_penetration_depth=max_penetration_depth,
+            max_overlap_volume_ratio=max_overlap_volume_ratio,
+            allow_penetration=allow_penetration,
+            require_support=require_support,
+        )
+        physics = obj.setdefault("physics", {})
+        if not isinstance(physics, dict):
+            physics = {}
+            obj["physics"] = physics
+        previous_body_type = physics.get("body_type")
+        if report["accepted"]:
+            physics["body_type"] = "dynamic"
+            if not physics.get("mass_kg"):
+                physics["mass_kg"] = 1.0
+            physics["source"] = "simfoundry_dynamic_variant"
+            physics["dynamic_variant"] = {
+                "source_bundle": str(bundle_path),
+                "support": report.get("support"),
+                "accepted_at": int(time.time()),
+                "previous_body_type": previous_body_type,
+            }
+            obj["simfoundry_dynamic_variant"] = {
+                "status": "accepted_dynamic",
+                "source_bundle": str(bundle_path),
+                "support": report.get("support"),
+            }
+            accepted_ids.add(object_id)
+        else:
+            physics["body_type"] = "static"
+            obj["simfoundry_dynamic_variant"] = {
+                "status": "kept_static",
+                "source_bundle": str(bundle_path),
+                "reasons": report.get("reasons", []),
+            }
+            rejected_ids.add(object_id)
+        object_reports.append(report)
+
+    output_dir = ensure_dir(output_dir)
+    variant_bundle_path = output_bundle.resolve() if output_bundle else output_dir / "simulator_asset_bundle.dynamic_variant.json"
+    variant_bundle.setdefault("notes", [])
+    if isinstance(variant_bundle["notes"], list):
+        variant_bundle["notes"].append(
+            "SimFoundry dynamic variant: conservative dynamic candidates gated by bbox support and penetration checks."
+        )
+    variant_bundle["source_bundle"] = str(bundle_path)
+    variant_bundle["simfoundry_dynamic_variant"] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source_bundle": str(bundle_path),
+        "accepted_dynamic_objects": sorted(accepted_ids),
+        "rejected_static_objects": sorted(rejected_ids),
+        "output_dir": str(output_dir),
+        "timestamp": int(time.time()),
+    }
+    write_json(variant_bundle_path, variant_bundle)
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    status = "fail" if required else "dynamic_variant_ready" if accepted_ids else "dynamic_variant_empty"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_dynamic_variant",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or source_bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "variant_bundle": str(variant_bundle_path),
+        "coordinate_system": {**coordinate_system, "up_axis": axis_name, "up_direction": direction_name},
+        "thresholds": {
+            "movable_categories": sorted(movable_categories),
+            "exclude_categories": sorted(exclude_categories),
+            "include_objects": sorted(include_objects),
+            "exclude_objects": sorted(exclude_objects),
+            "max_support_gap": float(max_support_gap),
+            "min_support_overlap": float(min_support_overlap),
+            "max_penetration_depth": float(max_penetration_depth),
+            "max_overlap_volume_ratio": float(max_overlap_volume_ratio),
+            "allow_penetration": bool(allow_penetration),
+            "require_support": bool(require_support),
+            "up_direction": direction_name,
+        },
+        "objects": object_reports,
+        "accepted_dynamic_objects": sorted(accepted_ids),
+        "kept_static_objects": sorted(rejected_ids),
+        "issues": issues,
+        "summary": {
+            "object_count": len(raw_objects),
+            "candidate_count": len([item for item in object_reports if "category_not_movable" not in item.get("reasons", []) and "background_structure" not in item.get("reasons", [])]),
+            "accepted_dynamic_count": len(accepted_ids),
+            "kept_static_count": len(rejected_ids),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Conservative sidecar bundle for SimFoundry-style dynamic object trials. Main bundle is unchanged unless --replace-bundle is used.",
+    }
+    report_path = output_dir / "dynamic_variant_report.json"
+    write_json(report_path, report)
+    report["report"] = str(report_path)
+    write_json(report_path, report)
+    return report
+
+
+def cmd_prepare_simfoundry_dynamic_variant(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    movable_categories = slug_set_from_csv(args.movable_categories)
+    exclude_categories = DEFAULT_SIMFOUNDRY_STATIC_CATEGORIES | slug_set_from_csv(args.exclude_categories)
+    include_objects = slug_set_from_csv(args.include_objects)
+    exclude_objects = slug_set_from_csv(args.exclude_objects)
+    output_dir = args.output_dir.resolve() if args.output_dir else project_root / manifest["simulator_assets_dir"] / "simfoundry_dynamic_variant"
+    report = generate_simfoundry_dynamic_variant(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        output_dir=output_dir,
+        output_bundle=args.output_bundle,
+        up_axis=args.up_axis,
+        up_direction=args.up_direction,
+        movable_categories=movable_categories,
+        exclude_categories=exclude_categories,
+        include_objects=include_objects,
+        exclude_objects=exclude_objects,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        max_penetration_depth=args.max_penetration_depth,
+        max_overlap_volume_ratio=args.max_overlap_volume_ratio,
+        allow_penetration=args.allow_penetration,
+        require_support=args.require_support,
+    )
+    report_path = Path(str(report.get("report") or output_dir / "dynamic_variant_report.json"))
+    variant_bundle_path = Path(str(report.get("variant_bundle"))) if report.get("variant_bundle") else None
+
+    manifest.setdefault("artifacts", {})["simfoundry_dynamic_variant_report"] = str(report_path)
+    if variant_bundle_path:
+        manifest["artifacts"]["simfoundry_dynamic_variant_bundle"] = str(variant_bundle_path)
+        if args.replace_bundle:
+            manifest["artifacts"]["simulator_asset_bundle"] = str(variant_bundle_path)
+            report["replaced_manifest_bundle"] = True
+            write_json(report_path, report)
+    manifest.setdefault("external_stages", {})["simfoundry_dynamic_variant"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "variant_bundle": str(variant_bundle_path) if variant_bundle_path else None,
+        "source_bundle": str(bundle_path),
+        "summary": report.get("summary", {}),
+        "replace_bundle": bool(args.replace_bundle),
+        "up_direction": normalize_axis_direction(args.up_direction),
+        "notes": "Prepared conservative dynamic-object variant bundle for SimFoundry-style simulator trials.",
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry dynamic variant: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"objects={summary.get('object_count')} accepted_dynamic={summary.get('accepted_dynamic_count')} "
+            f"kept_static={summary.get('kept_static_count')} required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        print(f"Variant bundle: {variant_bundle_path}")
+        print(f"Report: {report_path}")
+
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("accepted_dynamic_count"):
+        return 1
+    return 0
+
+
+def simfoundry_dynamic_report_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None = None) -> Path:
+    if explicit:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    resolved = resolve_existing_path(str(artifacts.get("simfoundry_dynamic_variant_report") or ""), project_root)
+    if resolved:
+        return resolved
+    return project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_dynamic_variant" / "dynamic_variant_report.json"
+
+
+def simfoundry_dynamic_blocker_is_candidate(record: dict[str, Any]) -> bool:
+    reasons = set(record.get("reasons") or [])
+    return "background_structure" not in reasons and "category_not_movable" not in reasons
+
+
+def simfoundry_dynamic_blocker_reason_counts(objects: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for obj in objects:
+        for reason in obj.get("reasons") or []:
+            reason_text = str(reason)
+            counts[reason_text] = counts.get(reason_text, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def simfoundry_dynamic_blocker_recommendation(reasons: set[str]) -> str:
+    if "penetration" in reasons and "unsupported" in reasons:
+        return "repair support pose and penetration together before releasing as dynamic"
+    if "penetration" in reasons:
+        return "shrink/refit collider or repair semantic split against the listed blockers"
+    if "unsupported" in reasons:
+        return "correct vertical pose or author a support relation, then rerun dynamic gate"
+    if "missing_collider" in reasons:
+        return "build an object collision proxy before dynamic trials"
+    if "missing_bbox" in reasons:
+        return "restore pose bbox or bbox_3d before dynamic trials"
+    return "keep static unless category or object policy changes"
+
+
+def simfoundry_dynamic_blocker_priority(reasons: set[str]) -> str:
+    if "penetration" in reasons and "unsupported" in reasons:
+        return "p0_support_and_penetration"
+    if "penetration" in reasons:
+        return "p1_penetration"
+    if "unsupported" in reasons:
+        return "p2_support"
+    return "p3_policy_or_missing_data"
+
+
+def generate_simfoundry_dynamic_blocker_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    dynamic_report_path: Path,
+    output_path: Path,
+    max_objects: int,
+    max_penetrations: int,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not dynamic_report_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_dynamic_variant_report",
+                "Run prepare-simfoundry-dynamic-variant before blocker analysis.",
+                source="simfoundry-dynamic-blocker-report",
+                path=str(dynamic_report_path),
+            )
+        )
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_dynamic_blocker_report",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "fail",
+            "ok": False,
+            "source_report": str(dynamic_report_path),
+            "output": str(output_path),
+            "issues": issues,
+            "summary": {"required_issue_count": 1, "warning_count": 0},
+        }
+
+    source_report = read_json(dynamic_report_path)
+    objects = [obj for obj in source_report.get("objects", []) if isinstance(obj, dict)]
+    candidates = [obj for obj in objects if simfoundry_dynamic_blocker_is_candidate(obj)]
+    blocked_candidates = [obj for obj in candidates if not bool(obj.get("accepted"))]
+    accepted_candidates = [obj for obj in candidates if bool(obj.get("accepted"))]
+
+    blocker_objects: dict[str, dict[str, Any]] = {}
+    repair_queue: list[dict[str, Any]] = []
+    unsupported_candidates: list[dict[str, Any]] = []
+    penetration_candidates: list[dict[str, Any]] = []
+
+    for obj in blocked_candidates:
+        reasons = set(str(reason) for reason in (obj.get("reasons") or []))
+        penetrations = [item for item in obj.get("penetrations", []) if isinstance(item, dict)]
+        support_candidates = [item for item in obj.get("support_candidates", []) if isinstance(item, dict)]
+        if "unsupported" in reasons:
+            unsupported_candidates.append(
+                {
+                    "object_id": obj.get("object_id"),
+                    "category": obj.get("category"),
+                    "reason_count": len(reasons),
+                    "support_candidate_count": len(support_candidates),
+                    "nearest_support": support_candidates[0] if support_candidates else None,
+                }
+            )
+        if "penetration" in reasons:
+            penetration_candidates.append(
+                {
+                    "object_id": obj.get("object_id"),
+                    "category": obj.get("category"),
+                    "penetration_count": len(penetrations),
+                    "top_penetrations": penetrations[: max(0, int(max_penetrations))],
+                }
+            )
+            for pen in penetrations:
+                blocker_id = str(pen.get("object_id") or "unknown")
+                current = blocker_objects.setdefault(
+                    blocker_id,
+                    {
+                        "object_id": blocker_id,
+                        "category": pen.get("category"),
+                        "asset_role": pen.get("asset_role"),
+                        "affected_candidates": [],
+                        "affected_candidate_count": 0,
+                        "max_penetration_depth": 0.0,
+                        "max_overlap_over_smaller": 0.0,
+                        "max_overlap_volume": 0.0,
+                    },
+                )
+                affected = str(obj.get("object_id") or "")
+                if affected and affected not in current["affected_candidates"]:
+                    current["affected_candidates"].append(affected)
+                current["affected_candidate_count"] = len(current["affected_candidates"])
+                current["max_penetration_depth"] = max(
+                    float(current.get("max_penetration_depth") or 0.0),
+                    float(pen.get("penetration_depth") or 0.0),
+                )
+                current["max_overlap_over_smaller"] = max(
+                    float(current.get("max_overlap_over_smaller") or 0.0),
+                    float(pen.get("overlap_over_smaller") or 0.0),
+                )
+                current["max_overlap_volume"] = max(
+                    float(current.get("max_overlap_volume") or 0.0),
+                    float(pen.get("overlap_volume") or 0.0),
+                )
+
+        repair_queue.append(
+            {
+                "object_id": obj.get("object_id"),
+                "category": obj.get("category"),
+                "asset_role": obj.get("asset_role"),
+                "priority": simfoundry_dynamic_blocker_priority(reasons),
+                "reasons": sorted(reasons),
+                "recommendation": simfoundry_dynamic_blocker_recommendation(reasons),
+                "support": obj.get("support"),
+                "support_candidate_count": len(support_candidates),
+                "penetration_count": len(penetrations),
+                "top_penetrations": penetrations[: max(0, int(max_penetrations))],
+            }
+        )
+
+    priority_rank = {
+        "p0_support_and_penetration": 0,
+        "p1_penetration": 1,
+        "p2_support": 2,
+        "p3_policy_or_missing_data": 3,
+    }
+    repair_queue.sort(
+        key=lambda item: (
+            priority_rank.get(str(item.get("priority")), 9),
+            -int(item.get("penetration_count") or 0),
+            str(item.get("object_id") or ""),
+        )
+    )
+    top_blockers = sorted(
+        blocker_objects.values(),
+        key=lambda item: (
+            -int(item.get("affected_candidate_count") or 0),
+            -float(item.get("max_overlap_over_smaller") or 0.0),
+            -float(item.get("max_penetration_depth") or 0.0),
+            str(item.get("object_id") or ""),
+        ),
+    )
+
+    source_summary = source_report.get("summary") if isinstance(source_report.get("summary"), dict) else {}
+    reason_counts = simfoundry_dynamic_blocker_reason_counts(objects)
+    candidate_reason_counts = simfoundry_dynamic_blocker_reason_counts(candidates)
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    status = "fail" if required else "dynamic_blockers_found" if blocked_candidates else "no_dynamic_blockers"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_dynamic_blocker_report",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or source_report.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "source_report": str(dynamic_report_path),
+        "source_status": source_report.get("status"),
+        "source_summary": source_summary,
+        "output": str(output_path),
+        "thresholds": source_report.get("thresholds", {}),
+        "reason_counts": reason_counts,
+        "candidate_reason_counts": candidate_reason_counts,
+        "repair_queue": repair_queue[: max(0, int(max_objects))],
+        "unsupported_candidates": unsupported_candidates[: max(0, int(max_objects))],
+        "penetration_candidates": penetration_candidates[: max(0, int(max_objects))],
+        "top_penetration_blockers": top_blockers[: max(0, int(max_objects))],
+        "accepted_dynamic_objects": source_report.get("accepted_dynamic_objects", []),
+        "issues": issues,
+        "summary": {
+            "object_count": len(objects),
+            "candidate_count": len(candidates),
+            "accepted_dynamic_count": len(accepted_candidates),
+            "blocked_candidate_count": len(blocked_candidates),
+            "unsupported_candidate_count": len(unsupported_candidates),
+            "penetration_candidate_count": len(penetration_candidates),
+            "unique_penetration_blocker_count": len(top_blockers),
+            "required_issue_count": len(required),
+            "warning_count": 0,
+        },
+        "notes": [
+            "Diagnostic-only report; it does not mutate the source bundle or dynamic sidecar.",
+            "Use this to choose support, pose, semantic split, or collider repair before rerunning prepare-simfoundry-dynamic-variant.",
+        ],
+    }
+
+
+def markdown_cell(value: Any) -> str:
+    text = str(value if value is not None else "")
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def write_simfoundry_dynamic_blocker_markdown(path: Path, report: dict[str, Any]) -> None:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    lines = [
+        "# SimFoundry Dynamic Blocker Report",
+        "",
+        f"Scene: `{report.get('scene_id')}`",
+        f"Source report: `{report.get('source_report')}`",
+        "",
+        "## Summary",
+        "",
+        f"- Source status: `{report.get('source_status')}`",
+        f"- Candidates: {summary.get('candidate_count')}",
+        f"- Accepted dynamic: {summary.get('accepted_dynamic_count')}",
+        f"- Blocked candidates: {summary.get('blocked_candidate_count')}",
+        f"- Unsupported candidates: {summary.get('unsupported_candidate_count')}",
+        f"- Penetration candidates: {summary.get('penetration_candidate_count')}",
+        f"- Unique penetration blockers: {summary.get('unique_penetration_blocker_count')}",
+        "",
+        "## Candidate Reason Counts",
+        "",
+    ]
+    candidate_reason_counts = report.get("candidate_reason_counts") if isinstance(report.get("candidate_reason_counts"), dict) else {}
+    if candidate_reason_counts:
+        for reason, count in candidate_reason_counts.items():
+            lines.append(f"- `{reason}`: {count}")
+    else:
+        lines.append("No candidate blockers were found.")
+
+    lines.extend(["", "## Repair Queue", ""])
+    repair_queue = report.get("repair_queue") if isinstance(report.get("repair_queue"), list) else []
+    if repair_queue:
+        lines.extend(["| Object | Category | Priority | Reasons | Penetrations | Recommendation |", "|---|---|---|---|---:|---|"])
+        for item in repair_queue:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{markdown_cell(item.get('object_id'))}`",
+                        markdown_cell(item.get("category")),
+                        f"`{markdown_cell(item.get('priority'))}`",
+                        markdown_cell(", ".join(item.get("reasons") or [])),
+                        markdown_cell(item.get("penetration_count")),
+                        markdown_cell(item.get("recommendation")),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("No dynamic candidate is currently blocked.")
+
+    lines.extend(["", "## Top Penetration Blockers", ""])
+    blockers = report.get("top_penetration_blockers") if isinstance(report.get("top_penetration_blockers"), list) else []
+    if blockers:
+        lines.extend(["| Blocker | Category | Affected candidates | Max depth | Max overlap ratio |", "|---|---|---:|---:|---:|"])
+        for item in blockers:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{markdown_cell(item.get('object_id'))}`",
+                        markdown_cell(item.get("category")),
+                        markdown_cell(item.get("affected_candidate_count")),
+                        f"{float(item.get('max_penetration_depth') or 0.0):.4f}",
+                        f"{float(item.get('max_overlap_over_smaller') or 0.0):.4f}",
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("No penetration blockers were found.")
+
+    lines.extend(["", "## Next Step", ""])
+    lines.append("Repair the highest-priority support and penetration rows, then rerun the tight collider and dynamic variant commands.")
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def simfoundry_object_lookup_by_id(bundle: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        slugify(str(obj.get("object_id") or obj.get("name") or "object")): obj
+        for obj in bundle.get("objects", [])
+        if isinstance(obj, dict)
+    }
+
+
+def simfoundry_candidate_ids_from_blocker_report(blocker_report: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for section_name in ["repair_queue", "penetration_candidates", "unsupported_candidates"]:
+        section = blocker_report.get(section_name)
+        if not isinstance(section, list):
+            continue
+        for item in section:
+            if not isinstance(item, dict):
+                continue
+            object_id = slugify(str(item.get("object_id") or ""))
+            if object_id and object_id not in seen:
+                ids.append(object_id)
+                seen.add(object_id)
+    return ids
+
+
+def simfoundry_repair_local_bbox_proxy(
+    *,
+    source_obj: dict[str, Any],
+    repaired_obj: dict[str, Any],
+    object_id: str,
+    output_dir: Path,
+    shrink_ratio: float,
+    min_extent: float,
+    provider: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    pose = repaired_obj.setdefault("pose", {})
+    if not isinstance(pose, dict):
+        pose = {}
+        repaired_obj["pose"] = pose
+    source_bbox = scene_relation_bbox_from_object(source_obj) or scene_relation_bbox_from_object(repaired_obj)
+    if not source_bbox:
+        raise RuntimeError(f"Object has no bbox to repair: {object_id}")
+    ratio = max(0.01, min(1.0, float(shrink_ratio)))
+    source_size = [max(float(value), float(min_extent)) for value in source_bbox["size"][:3]]
+    repaired_size = [max(float(value) * ratio, float(min_extent)) for value in source_size]
+    center = [float(value) for value in source_bbox["center"][:3]]
+    proxy_path = output_dir / "colliders" / "objects" / object_id / f"{object_id}_repair_bbox_collider.obj"
+    write_centered_bbox_obj_mesh(proxy_path, [0.0, 0.0, 0.0], repaired_size)
+    proxy = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "type": "bbox",
+        "shape": "box",
+        "path": str(proxy_path),
+        "format": proxy_path.suffix.lower().lstrip("."),
+        "coordinate_frame": "object_local",
+        "center": [0.0, 0.0, 0.0],
+        "bbox_size": repaired_size,
+        "source": "simfoundry_penetration_repair_bbox_shrink",
+        "object_id": object_id,
+        "role": "object_collision_proxy",
+        "provider": provider,
+        "summary": summarize_triangle_mesh(proxy_path),
+        "repair": {
+            "strategy": "uniform_bbox_shrink",
+            "shrink_ratio": ratio,
+            "min_extent": float(min_extent),
+            "source_bbox": source_bbox,
+        },
+        "notes": "Conservative candidate collision proxy for blocker repair planning; validate before dynamic release.",
+    }
+    repaired_bbox = bbox_record_from_center_size(center, repaired_size)
+    pose["position"] = repaired_bbox["center"]
+    pose["bbox_size"] = repaired_bbox["size"]
+    pose["bbox_3d"] = copy.deepcopy(repaired_bbox)
+    repaired_obj["bbox_3d"] = copy.deepcopy(repaired_bbox)
+    repaired_obj["collision_proxy"] = proxy
+    physics = repaired_obj.setdefault("physics", {})
+    if not isinstance(physics, dict):
+        physics = {}
+        repaired_obj["physics"] = physics
+    physics["body_type"] = "static"
+    physics["collider"] = "box"
+    physics["collision_shape"] = "box"
+    physics["collision_proxy"] = {
+        "type": proxy["type"],
+        "shape": proxy["shape"],
+        "path": proxy["path"],
+        "coordinate_frame": proxy["coordinate_frame"],
+        "center": proxy["center"],
+        "bbox_size": proxy["bbox_size"],
+        "source": proxy["source"],
+        "provider": proxy["provider"],
+    }
+    repaired_obj["simfoundry_penetration_repair"] = {
+        "status": "candidate_proxy_repaired",
+        "strategy": "uniform_bbox_shrink",
+        "shrink_ratio": ratio,
+        "source_bbox": source_bbox,
+        "repaired_bbox": repaired_bbox,
+        "main_bundle_overwritten": False,
+    }
+    report = {
+        "object_id": object_id,
+        "category": repaired_obj.get("category"),
+        "asset_role": repaired_obj.get("asset_role"),
+        "strategy": "uniform_bbox_shrink",
+        "shrink_ratio": ratio,
+        "source_bbox": source_bbox,
+        "repaired_bbox": repaired_bbox,
+        "source_volume": bbox_volume(source_bbox),
+        "repaired_volume": bbox_volume(repaired_bbox),
+        "proxy": proxy,
+    }
+    return proxy, report
+
+
+def generate_simfoundry_penetration_repair_variant(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    blocker_report_path: Path,
+    output_dir: Path,
+    output_bundle: Path | None,
+    up_axis: str | None,
+    up_direction: str,
+    shrink_ratio: float,
+    min_extent: float,
+    provider: str,
+    max_support_gap: float,
+    min_support_overlap: float,
+    max_penetration_depth: float,
+    max_overlap_volume_ratio: float,
+    require_support: bool,
+    write_sidecar_bundle: bool,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run prepare-simfoundry-tight-collider-variant before penetration repair planning.",
+                source="prepare-simfoundry-penetration-repair-variant",
+                path=str(bundle_path),
+            )
+        )
+    if not blocker_report_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_dynamic_blocker_report",
+                "Run simfoundry-dynamic-blocker-report before penetration repair planning.",
+                source="prepare-simfoundry-penetration-repair-variant",
+                path=str(blocker_report_path),
+            )
+        )
+    if issues:
+        required = [issue for issue in issues if issue.get("severity") == "required"]
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_penetration_repair_variant",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "status": "fail",
+            "ok": False,
+            "bundle": str(bundle_path),
+            "blocker_report": str(blocker_report_path),
+            "variant_bundle": None,
+            "repairs": [],
+            "issues": issues,
+            "summary": {"repair_count": 0, "required_issue_count": len(required), "warning_count": 0},
+        }
+
+    source_bundle = read_json(bundle_path)
+    blocker_report = read_json(blocker_report_path)
+    output_dir = ensure_dir(output_dir)
+    variant_bundle_path = (
+        output_bundle.resolve()
+        if output_bundle
+        else output_dir / "simulator_asset_bundle.penetration_repair.json"
+    )
+    candidate_ids = simfoundry_candidate_ids_from_blocker_report(blocker_report)
+    if not candidate_ids:
+        issues.append(
+            sim_preflight_issue(
+                "warning",
+                "empty_repair_candidate_queue",
+                "The blocker report has no repair_queue or penetration candidates.",
+                source="prepare-simfoundry-penetration-repair-variant",
+                path=str(blocker_report_path),
+            )
+        )
+
+    variant_bundle = copy.deepcopy(source_bundle)
+    source_by_id = simfoundry_object_lookup_by_id(source_bundle)
+    variant_by_id = simfoundry_object_lookup_by_id(variant_bundle)
+    repairs: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for object_id in candidate_ids:
+        source_obj = source_by_id.get(object_id)
+        repaired_obj = variant_by_id.get(object_id)
+        if not source_obj or not repaired_obj:
+            skipped.append({"object_id": object_id, "reason": "object_not_found_in_bundle"})
+            continue
+        try:
+            _proxy, repair = simfoundry_repair_local_bbox_proxy(
+                source_obj=source_obj,
+                repaired_obj=repaired_obj,
+                object_id=object_id,
+                output_dir=output_dir,
+                shrink_ratio=shrink_ratio,
+                min_extent=min_extent,
+                provider=provider,
+            )
+            repair_path = output_dir / "objects" / object_id / "penetration_repair_report.json"
+            write_json(
+                repair_path,
+                {
+                    "schema_version": DEFAULT_SCHEMA_VERSION,
+                    "stage": "simfoundry_penetration_object_repair",
+                    "source_bundle": str(bundle_path),
+                    "source_blocker_report": str(blocker_report_path),
+                    **repair,
+                },
+            )
+            repair["report"] = str(repair_path)
+            repairs.append(repair)
+        except Exception as exc:
+            skipped.append({"object_id": object_id, "reason": "repair_failed", "error": str(exc)})
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "penetration_repair_failed",
+                    f"Could not prepare candidate repair proxy: {exc}",
+                    source="prepare-simfoundry-penetration-repair-variant",
+                    object_id=object_id,
+                )
+            )
+
+    variant_bundle.setdefault("notes", [])
+    if isinstance(variant_bundle["notes"], list):
+        variant_bundle["notes"].append(
+            "SimFoundry penetration repair variant: candidate sidecar only; main bundle remains unchanged and dynamic release still requires revalidation."
+        )
+    variant_bundle["source_bundle"] = str(bundle_path)
+    variant_bundle["simfoundry_penetration_repair_variant"] = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source_bundle": str(bundle_path),
+        "source_blocker_report": str(blocker_report_path),
+        "repaired_objects": [item["object_id"] for item in repairs],
+        "skipped_objects": skipped,
+        "strategy": "uniform_bbox_shrink",
+        "shrink_ratio": float(shrink_ratio),
+        "main_bundle_overwritten": False,
+        "timestamp": int(time.time()),
+    }
+    if write_sidecar_bundle:
+        write_json(variant_bundle_path, variant_bundle)
+
+    before_stability = generate_simfoundry_scene_stability_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        up_axis=up_axis,
+        up_direction=up_direction,
+        max_support_gap=max_support_gap,
+        min_support_overlap=min_support_overlap,
+        max_penetration_depth=max_penetration_depth,
+        max_overlap_volume_ratio=max_overlap_volume_ratio,
+        require_support=require_support,
+    )
+    after_stability = None
+    if write_sidecar_bundle:
+        after_stability = generate_simfoundry_scene_stability_report(
+            project_root,
+            manifest,
+            bundle_path=variant_bundle_path,
+            up_axis=up_axis,
+            up_direction=up_direction,
+            max_support_gap=max_support_gap,
+            min_support_overlap=min_support_overlap,
+            max_penetration_depth=max_penetration_depth,
+            max_overlap_volume_ratio=max_overlap_volume_ratio,
+            require_support=require_support,
+        )
+
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    before_penetrations = int((before_stability.get("summary") or {}).get("penetration_count") or 0)
+    after_penetrations = (
+        int((after_stability.get("summary") or {}).get("penetration_count") or 0)
+        if isinstance(after_stability, dict)
+        else None
+    )
+    before_penetration_items = before_stability.get("penetrations") if isinstance(before_stability.get("penetrations"), list) else []
+    after_penetration_items = after_stability.get("penetrations") if isinstance(after_stability, dict) and isinstance(after_stability.get("penetrations"), list) else []
+    before_total_volume = sum(float(item.get("overlap_volume") or 0.0) for item in before_penetration_items if isinstance(item, dict))
+    after_total_volume = sum(float(item.get("overlap_volume") or 0.0) for item in after_penetration_items if isinstance(item, dict))
+    before_max_depth = max(
+        [float(item.get("penetration_depth") or 0.0) for item in before_penetration_items if isinstance(item, dict)] or [0.0]
+    )
+    after_max_depth = max(
+        [float(item.get("penetration_depth") or 0.0) for item in after_penetration_items if isinstance(item, dict)] or [0.0]
+    )
+    improved_count = after_penetrations is not None and after_penetrations < before_penetrations
+    improved_severity = (
+        after_penetrations is not None
+        and (
+            improved_count
+            or after_total_volume < before_total_volume
+            or after_max_depth < before_max_depth
+        )
+    )
+    status = "fail" if required else "repair_variant_ready" if repairs else "repair_variant_empty"
+    report_path = output_dir / "penetration_repair_variant_report.json"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_penetration_repair_variant",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or source_bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "blocker_report": str(blocker_report_path),
+        "variant_bundle": str(variant_bundle_path) if write_sidecar_bundle else None,
+        "output_dir": str(output_dir),
+        "provider": provider,
+        "parameters": {
+            "strategy": "uniform_bbox_shrink",
+            "shrink_ratio": float(shrink_ratio),
+            "min_extent": float(min_extent),
+            "up_direction": normalize_axis_direction(up_direction),
+            "write_sidecar_bundle": bool(write_sidecar_bundle),
+        },
+        "repairs": repairs,
+        "skipped": skipped,
+        "stability_before": before_stability,
+        "stability_after": after_stability,
+        "issues": issues,
+        "summary": {
+            "candidate_count": len(candidate_ids),
+            "repair_count": len(repairs),
+            "skipped_count": len(skipped),
+            "before_penetration_count": before_penetrations,
+            "after_penetration_count": after_penetrations,
+            "before_total_penetration_volume": before_total_volume,
+            "after_total_penetration_volume": after_total_volume,
+            "before_max_penetration_depth": before_max_depth,
+            "after_max_penetration_depth": after_max_depth,
+            "improved_penetration_count": bool(improved_count),
+            "improved_penetration_severity": bool(improved_severity),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings)
+            + (int((after_stability.get("summary") or {}).get("warning_count") or 0) if isinstance(after_stability, dict) else 0),
+        },
+        "notes": [
+            "Sidecar repair candidate only; it does not prove dynamic objects are safe.",
+            "Rerun prepare-simfoundry-dynamic-variant and simulator smoke tests before using any repaired object as dynamic.",
+        ],
+    }
+    report["report"] = str(report_path)
+    write_json(report_path, report)
+    return report
+
+
+def write_simfoundry_penetration_repair_markdown(path: Path, report: dict[str, Any]) -> None:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    lines = [
+        "# SimFoundry Penetration Repair Variant",
+        "",
+        f"Scene: `{report.get('scene_id')}`",
+        f"Source bundle: `{report.get('bundle')}`",
+        f"Blocker report: `{report.get('blocker_report')}`",
+        "",
+        "## Summary",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Candidates: {summary.get('candidate_count')}",
+        f"- Repairs: {summary.get('repair_count')}",
+        f"- Skipped: {summary.get('skipped_count')}",
+        f"- Penetrations: {summary.get('before_penetration_count')} -> {summary.get('after_penetration_count')}",
+        f"- Required issues: {summary.get('required_issue_count')}",
+        "",
+        "## Repairs",
+        "",
+    ]
+    repairs = report.get("repairs") if isinstance(report.get("repairs"), list) else []
+    if repairs:
+        lines.extend(["| Object | Category | Strategy | Shrink | Source volume | Repaired volume |", "|---|---|---|---:|---:|---:|"])
+        for item in repairs:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{markdown_cell(item.get('object_id'))}`",
+                        markdown_cell(item.get("category")),
+                        markdown_cell(item.get("strategy")),
+                        f"{float(item.get('shrink_ratio') or 0.0):.3f}",
+                        f"{float(item.get('source_volume') or 0.0):.4f}",
+                        f"{float(item.get('repaired_volume') or 0.0):.4f}",
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("No repair candidates were written.")
+    lines.extend(["", "## Boundary", ""])
+    lines.append("This is a candidate repair sidecar. It does not overwrite the main bundle and does not release dynamic objects.")
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def cmd_prepare_simfoundry_penetration_repair_variant(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    default_blocker = (
+        Path(manifest.get("artifacts", {}).get("simfoundry_dynamic_blocker_report"))
+        if manifest.get("artifacts", {}).get("simfoundry_dynamic_blocker_report")
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_dynamic_variant" / "dynamic_blocker_report.json"
+    )
+    blocker_report_path = resolve_project_cli_path(args.blocker_report, project_root) if args.blocker_report else default_blocker
+    output_dir = (
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_penetration_repair_variant"
+    )
+    output_bundle = resolve_project_cli_path(args.output_bundle, project_root) if args.output_bundle else None
+    report = generate_simfoundry_penetration_repair_variant(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        blocker_report_path=blocker_report_path,
+        output_dir=output_dir,
+        output_bundle=output_bundle,
+        up_axis=args.up_axis,
+        up_direction=args.up_direction,
+        shrink_ratio=args.shrink_ratio,
+        min_extent=args.min_extent,
+        provider=args.provider,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        max_penetration_depth=args.max_penetration_depth,
+        max_overlap_volume_ratio=args.max_overlap_volume_ratio,
+        require_support=args.require_support,
+        write_sidecar_bundle=args.write_sidecar_bundle,
+    )
+    report_path = Path(str(report.get("report") or output_dir / "penetration_repair_variant_report.json"))
+    markdown_path = resolve_project_cli_path(args.markdown_output, project_root) if args.markdown_output else report_path.with_suffix(".md")
+    if not args.no_markdown:
+        write_simfoundry_penetration_repair_markdown(markdown_path, report)
+        report["markdown"] = str(markdown_path)
+        write_json(report_path, report)
+    variant_bundle_path = Path(str(report.get("variant_bundle"))) if report.get("variant_bundle") else None
+    manifest.setdefault("artifacts", {})["simfoundry_penetration_repair_variant_report"] = str(report_path)
+    if not args.no_markdown:
+        manifest["artifacts"]["simfoundry_penetration_repair_variant_md"] = str(markdown_path)
+    if variant_bundle_path:
+        manifest["artifacts"]["simfoundry_penetration_repair_variant_bundle"] = str(variant_bundle_path)
+        if args.replace_bundle:
+            manifest["artifacts"]["simulator_asset_bundle"] = str(variant_bundle_path)
+            report["replaced_manifest_bundle"] = True
+            write_json(report_path, report)
+    manifest.setdefault("external_stages", {})["simfoundry_penetration_repair_variant"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "markdown": str(markdown_path) if not args.no_markdown else None,
+        "variant_bundle": str(variant_bundle_path) if variant_bundle_path else None,
+        "source_bundle": str(bundle_path),
+        "blocker_report": str(blocker_report_path),
+        "summary": report.get("summary", {}),
+        "replace_bundle": bool(args.replace_bundle),
+        "notes": "Prepared conservative penetration repair sidecar candidates before rerunning dynamic release.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry penetration repair variant: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"candidates={summary.get('candidate_count')} repairs={summary.get('repair_count')} skipped={summary.get('skipped_count')} "
+            f"penetrations={summary.get('before_penetration_count')}->{summary.get('after_penetration_count')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        if variant_bundle_path:
+            print(f"Variant bundle: {variant_bundle_path}")
+        print(f"Report: {report_path}")
+        if not args.no_markdown:
+            print(f"Markdown: {markdown_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("repair_count"):
+        return 1
+    if args.fail_on_no_improvement and not report.get("summary", {}).get("improved_penetration_severity"):
+        return 1
+    return 0
+
+
+def simfoundry_structural_repair_default_blocker(project_root: Path, manifest: dict[str, Any]) -> Path:
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    if artifacts.get("simfoundry_dynamic_blocker_report"):
+        return Path(str(artifacts["simfoundry_dynamic_blocker_report"]))
+    return project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_dynamic_variant" / "dynamic_blocker_report.json"
+
+
+def simfoundry_structural_repair_provider_contract(
+    *,
+    provider: str,
+    model_provider: str,
+    provider_name: str,
+    base_url: str,
+    wire_api: str,
+    model: str,
+    image_model: str,
+    model_reasoning_effort: str,
+    disable_response_storage: bool,
+    auth_env: str,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "model_provider": model_provider,
+        "provider_name": provider_name,
+        "base_url": base_url,
+        "wire_api": wire_api,
+        "model": model,
+        "image_model": image_model,
+        "model_reasoning_effort": model_reasoning_effort,
+        "disable_response_storage": bool(disable_response_storage),
+        "auth_env": auth_env,
+        "secret_policy": "Do not write API keys to repo artifacts; resolve auth from auth_env at runtime.",
+    }
+
+
+def simfoundry_structural_repair_action_for_blocker(blocker: dict[str, Any], bundle_obj: dict[str, Any] | None) -> str:
+    asset_role = str(blocker.get("asset_role") or (bundle_obj or {}).get("asset_role") or "")
+    category_slug = slugify(str(blocker.get("category") or (bundle_obj or {}).get("category") or ""))
+    if asset_role == "background_structure" or category_slug in DEFAULT_SIMFOUNDRY_STATIC_CATEGORIES:
+        return "structural_semantic_split_or_bbox_refit"
+    return "object_pair_disambiguation_or_collider_refit"
+
+
+def generate_simfoundry_structural_repair_plan(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    blocker_report_path: Path,
+    output_path: Path,
+    max_objects: int,
+    provider: str,
+    model_provider: str,
+    provider_name: str,
+    base_url: str,
+    wire_api: str,
+    model: str,
+    image_model: str,
+    model_reasoning_effort: str,
+    disable_response_storage: bool,
+    auth_env: str,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run a SimFoundry collider or repair variant before structural repair planning.",
+                source="prepare-simfoundry-structural-repair-plan",
+                path=str(bundle_path),
+            )
+        )
+    if not blocker_report_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_dynamic_blocker_report",
+                "Run simfoundry-dynamic-blocker-report before structural repair planning.",
+                source="prepare-simfoundry-structural-repair-plan",
+                path=str(blocker_report_path),
+            )
+        )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    provider_contract = simfoundry_structural_repair_provider_contract(
+        provider=provider,
+        model_provider=model_provider,
+        provider_name=provider_name,
+        base_url=base_url,
+        wire_api=wire_api,
+        model=model,
+        image_model=image_model,
+        model_reasoning_effort=model_reasoning_effort,
+        disable_response_storage=disable_response_storage,
+        auth_env=auth_env,
+    )
+    if required:
+        return {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_structural_repair_plan",
+            "project_root": str(project_root),
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "fail",
+            "ok": False,
+            "bundle": str(bundle_path),
+            "blocker_report": str(blocker_report_path),
+            "output": str(output_path),
+            "provider_contract": provider_contract,
+            "object_repair_plans": [],
+            "structural_blocker_plans": [],
+            "issues": issues,
+            "summary": {"required_issue_count": len(required), "warning_count": 0},
+        }
+
+    bundle = read_json(bundle_path)
+    blocker_report = read_json(blocker_report_path)
+    bundle_by_id = simfoundry_object_lookup_by_id(bundle)
+    repair_queue = [item for item in blocker_report.get("repair_queue", []) if isinstance(item, dict)]
+    unsupported_by_id = {
+        str(item.get("object_id")): item
+        for item in blocker_report.get("unsupported_candidates", [])
+        if isinstance(item, dict) and item.get("object_id")
+    }
+    top_blockers = [item for item in blocker_report.get("top_penetration_blockers", []) if isinstance(item, dict)]
+
+    object_plans: list[dict[str, Any]] = []
+    for item in repair_queue[: max(0, int(max_objects))]:
+        object_id = str(item.get("object_id") or "")
+        reasons = [str(reason) for reason in (item.get("reasons") or [])]
+        actions: list[str] = []
+        if "unsupported" in reasons:
+            actions.append("author_support_relation_or_pose_snap")
+        if "penetration" in reasons:
+            actions.append("repair_semantic_split_or_collision_proxy")
+        if not actions:
+            actions.append("review_dynamic_policy")
+        unsupported = unsupported_by_id.get(object_id, {})
+        object_plans.append(
+            {
+                "object_id": object_id,
+                "category": item.get("category"),
+                "asset_role": item.get("asset_role"),
+                "priority": item.get("priority"),
+                "reasons": reasons,
+                "actions": actions,
+                "support_plan": {
+                    "status": "needs_review" if "unsupported" in reasons else "not_required",
+                    "recommendation": "author a support relation, correct vertical pose, or keep static until reviewed",
+                    "nearest_support": unsupported.get("nearest_support"),
+                    "support_candidate_count": unsupported.get("support_candidate_count", item.get("support_candidate_count")),
+                },
+                "penetration_plan": {
+                    "status": "needs_review" if "penetration" in reasons else "not_required",
+                    "penetration_count": item.get("penetration_count", 0),
+                    "top_penetrations": item.get("top_penetrations", []),
+                    "recommendation": "repair semantic split, refit bbox/collider, or regenerate candidate mesh before dynamic release",
+                },
+                "expected_artifacts": [
+                    f"objects/{object_id}/support_relation.review.json",
+                    f"objects/{object_id}/bbox_or_collider_patch.review.json",
+                ],
+                "dynamic_release_policy": "rerun prepare-simfoundry-dynamic-variant; do not use --allow-penetration as a repair substitute",
+            }
+        )
+
+    blocker_plans: list[dict[str, Any]] = []
+    for blocker in top_blockers[: max(0, int(max_objects))]:
+        blocker_id = str(blocker.get("object_id") or "")
+        bundle_obj = bundle_by_id.get(slugify(blocker_id))
+        action = simfoundry_structural_repair_action_for_blocker(blocker, bundle_obj)
+        blocker_plans.append(
+            {
+                "object_id": blocker_id,
+                "category": blocker.get("category") or (bundle_obj or {}).get("category"),
+                "asset_role": blocker.get("asset_role") or (bundle_obj or {}).get("asset_role"),
+                "action": action,
+                "affected_candidates": blocker.get("affected_candidates", []),
+                "affected_candidate_count": blocker.get("affected_candidate_count", 0),
+                "max_penetration_depth": blocker.get("max_penetration_depth", 0.0),
+                "max_overlap_over_smaller": blocker.get("max_overlap_over_smaller", 0.0),
+                "max_overlap_volume": blocker.get("max_overlap_volume", 0.0),
+                "expected_artifacts": [
+                    f"structural_blockers/{blocker_id}/semantic_split_or_bbox_patch.review.json",
+                    f"structural_blockers/{blocker_id}/collider_patch.review.json",
+                ],
+            }
+        )
+
+    structural_count = len([item for item in blocker_plans if item.get("action") == "structural_semantic_split_or_bbox_refit"])
+    status = "structural_repair_plan_ready" if object_plans or blocker_plans else "structural_repair_plan_empty"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_structural_repair_plan",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id") or blocker_report.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": True,
+        "bundle": str(bundle_path),
+        "blocker_report": str(blocker_report_path),
+        "source_status": blocker_report.get("status"),
+        "source_summary": blocker_report.get("summary", {}),
+        "output": str(output_path),
+        "provider_contract": provider_contract,
+        "object_repair_plans": object_plans,
+        "structural_blocker_plans": blocker_plans,
+        "review_contract": {
+            "main_bundle_overwritten": False,
+            "dynamic_release_requires": [
+                "support relation or pose review",
+                "semantic split or collider refit review",
+                "rerun dynamic gate",
+                "rerun simulator smoke test",
+            ],
+        },
+        "issues": issues,
+        "summary": {
+            "object_repair_plan_count": len(object_plans),
+            "structural_blocker_plan_count": len(blocker_plans),
+            "structural_background_blocker_count": structural_count,
+            "support_repair_plan_count": len([item for item in object_plans if "author_support_relation_or_pose_snap" in item.get("actions", [])]),
+            "penetration_repair_plan_count": len([item for item in object_plans if "repair_semantic_split_or_collision_proxy" in item.get("actions", [])]),
+            "required_issue_count": 0,
+            "warning_count": 0,
+        },
+        "notes": [
+            "Planning artifact only; it does not mutate the simulator bundle.",
+            "Use this as a repair queue for manual review, VLM review, or external model workers before dynamic release.",
+        ],
+    }
+
+
+def write_simfoundry_structural_repair_plan_markdown(path: Path, report: dict[str, Any]) -> None:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    lines = [
+        "# SimFoundry Structural Repair Plan",
+        "",
+        f"Scene: `{report.get('scene_id')}`",
+        f"Source bundle: `{report.get('bundle')}`",
+        f"Blocker report: `{report.get('blocker_report')}`",
+        "",
+        "## Summary",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Object repair plans: {summary.get('object_repair_plan_count')}",
+        f"- Structural blocker plans: {summary.get('structural_blocker_plan_count')}",
+        f"- Support repair plans: {summary.get('support_repair_plan_count')}",
+        f"- Penetration repair plans: {summary.get('penetration_repair_plan_count')}",
+        "",
+        "## Object Repair Plans",
+        "",
+    ]
+    object_plans = report.get("object_repair_plans") if isinstance(report.get("object_repair_plans"), list) else []
+    if object_plans:
+        lines.extend(["| Object | Priority | Reasons | Actions | Penetrations |", "|---|---|---|---|---:|"])
+        for item in object_plans:
+            penetration_plan = item.get("penetration_plan") if isinstance(item.get("penetration_plan"), dict) else {}
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{markdown_cell(item.get('object_id'))}`",
+                        f"`{markdown_cell(item.get('priority'))}`",
+                        markdown_cell(", ".join(item.get("reasons") or [])),
+                        markdown_cell(", ".join(item.get("actions") or [])),
+                        markdown_cell(penetration_plan.get("penetration_count", 0)),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("No object repair plans were generated.")
+    lines.extend(["", "## Structural Blocker Plans", ""])
+    blocker_plans = report.get("structural_blocker_plans") if isinstance(report.get("structural_blocker_plans"), list) else []
+    if blocker_plans:
+        lines.extend(["| Blocker | Category | Action | Affected | Max depth |", "|---|---|---|---:|---:|"])
+        for item in blocker_plans:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{markdown_cell(item.get('object_id'))}`",
+                        markdown_cell(item.get("category")),
+                        f"`{markdown_cell(item.get('action'))}`",
+                        markdown_cell(item.get("affected_candidate_count")),
+                        f"{float(item.get('max_penetration_depth') or 0.0):.4f}",
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("No structural blocker plans were generated.")
+    lines.extend(["", "## Boundary", ""])
+    lines.append("This is a planning sidecar. It does not overwrite the main bundle and does not release dynamic objects.")
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def cmd_prepare_simfoundry_structural_repair_plan(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    blocker_report_path = (
+        resolve_project_cli_path(args.blocker_report, project_root)
+        if args.blocker_report
+        else simfoundry_structural_repair_default_blocker(project_root, manifest)
+    )
+    output_path = (
+        resolve_project_cli_path(args.output, project_root)
+        if args.output
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_structural_repair_plan" / "structural_repair_plan.json"
+    )
+    markdown_path = (
+        resolve_project_cli_path(args.markdown_output, project_root)
+        if args.markdown_output
+        else output_path.with_suffix(".md")
+    )
+    report = generate_simfoundry_structural_repair_plan(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        blocker_report_path=blocker_report_path,
+        output_path=output_path,
+        max_objects=args.max_objects,
+        provider=args.provider,
+        model_provider=args.model_provider,
+        provider_name=args.provider_name,
+        base_url=args.base_url,
+        wire_api=args.wire_api,
+        model=args.model,
+        image_model=args.image_model,
+        model_reasoning_effort=args.model_reasoning_effort,
+        disable_response_storage=args.disable_response_storage,
+        auth_env=args.auth_env,
+    )
+    write_json(output_path, report)
+    if not args.no_markdown:
+        write_simfoundry_structural_repair_plan_markdown(markdown_path, report)
+        report["markdown"] = str(markdown_path)
+        write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_structural_repair_plan"] = str(output_path)
+    if not args.no_markdown:
+        manifest["artifacts"]["simfoundry_structural_repair_plan_md"] = str(markdown_path)
+    manifest.setdefault("external_stages", {})["simfoundry_structural_repair_plan"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "markdown": str(markdown_path) if not args.no_markdown else None,
+        "source_bundle": str(bundle_path),
+        "blocker_report": str(blocker_report_path),
+        "summary": report.get("summary", {}),
+        "notes": "Prepared structural/support repair planning sidecar without mutating the simulator bundle.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry structural repair plan: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"objects={summary.get('object_repair_plan_count')} structural_blockers={summary.get('structural_blocker_plan_count')} "
+            f"support={summary.get('support_repair_plan_count')} penetration={summary.get('penetration_repair_plan_count')}"
+        )
+        print(f"Report: {output_path}")
+        if not args.no_markdown:
+            print(f"Markdown: {markdown_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and report.get("status") == "structural_repair_plan_empty":
+        return 1
+    return 0
+
+
+def simfoundry_structural_repair_plan_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+    if explicit is not None:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    existing = resolve_existing_path(artifacts.get("simfoundry_structural_repair_plan"), project_root)
+    if existing:
+        return existing
+    return project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_structural_repair_plan" / "structural_repair_plan.json"
+
+
+def simfoundry_structural_review_payload(raw_patch: Any) -> dict[str, Any]:
+    if not isinstance(raw_patch, dict):
+        raise ValueError("Structural repair review patch must be a JSON object.")
+    for key in ["structural_repair_patch", "review_patch", "patch"]:
+        if isinstance(raw_patch.get(key), dict):
+            return raw_patch[key]
+    return raw_patch
+
+
+def simfoundry_structural_patch_bbox(raw_patch: dict[str, Any]) -> dict[str, Any] | None:
+    patch = raw_patch.get("bbox") if isinstance(raw_patch.get("bbox"), dict) else raw_patch
+    pose = raw_patch.get("pose") if isinstance(raw_patch.get("pose"), dict) else {}
+    bbox_3d = raw_patch.get("bbox_3d") if isinstance(raw_patch.get("bbox_3d"), dict) else {}
+    center = (
+        patch.get("center")
+        or patch.get("position")
+        or patch.get("bbox_center")
+        or pose.get("position")
+        or bbox_3d.get("center")
+    )
+    size = (
+        patch.get("size")
+        or patch.get("bbox_size")
+        or patch.get("extent")
+        or pose.get("bbox_size")
+        or bbox_3d.get("size")
+    )
+    mins = patch.get("min") or patch.get("bbox_min") or bbox_3d.get("min")
+    maxs = patch.get("max") or patch.get("bbox_max") or bbox_3d.get("max")
+    if isinstance(center, (list, tuple)) and isinstance(size, (list, tuple)) and len(center) >= 3 and len(size) >= 3:
+        return bbox_record_from_center_size([float(value) for value in center[:3]], [float(value) for value in size[:3]])
+    if isinstance(mins, (list, tuple)) and isinstance(maxs, (list, tuple)) and len(mins) >= 3 and len(maxs) >= 3:
+        min_values = [float(value) for value in mins[:3]]
+        max_values = [float(value) for value in maxs[:3]]
+        center_values = [(min_values[idx] + max_values[idx]) * 0.5 for idx in range(3)]
+        size_values = [max_values[idx] - min_values[idx] for idx in range(3)]
+        return bbox_record_from_center_size(center_values, size_values)
+    return None
+
+
+def simfoundry_apply_structural_object_patch(
+    *,
+    obj: dict[str, Any],
+    patch: dict[str, Any],
+    output_dir: Path,
+    provider: str,
+    allow_dynamic: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    object_id = slugify(str(obj.get("object_id") or patch.get("object_id") or "object"))
+    bbox = simfoundry_structural_patch_bbox(patch)
+    applied: dict[str, Any] = {
+        "object_id": object_id,
+        "status": "patched",
+        "review_status": patch.get("review_status") or patch.get("status") or "accepted",
+        "source": "simfoundry_structural_repair_review_patch",
+        "updated_fields": [],
+    }
+    if bbox:
+        pose = obj.setdefault("pose", {})
+        if not isinstance(pose, dict):
+            pose = {}
+            obj["pose"] = pose
+        pose["position"] = bbox["center"]
+        pose["bbox_size"] = bbox["size"]
+        pose["bbox_3d"] = copy.deepcopy(bbox)
+        obj["bbox_3d"] = copy.deepcopy(bbox)
+        proxy_path = output_dir / "colliders" / "objects" / object_id / f"{object_id}_structural_bbox_collider.obj"
+        write_centered_bbox_obj_mesh(proxy_path, [0.0, 0.0, 0.0], bbox["size"])
+        proxy = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "type": "bbox",
+            "shape": "box",
+            "path": str(proxy_path),
+            "format": proxy_path.suffix.lower().lstrip("."),
+            "coordinate_frame": "object_local",
+            "center": [0.0, 0.0, 0.0],
+            "bbox_size": bbox["size"],
+            "source": "simfoundry_structural_repair_review_patch",
+            "object_id": object_id,
+            "role": "object_collision_proxy",
+            "provider": provider,
+            "summary": summarize_triangle_mesh(proxy_path),
+            "review": {
+                "source_patch": patch.get("source_patch") or patch.get("review_id"),
+                "reason": patch.get("reason") or patch.get("notes"),
+            },
+            "notes": "Structural repair review patch; validate dynamic release after rerunning gates.",
+        }
+        obj["collision_proxy"] = proxy
+        physics = obj.setdefault("physics", {})
+        if not isinstance(physics, dict):
+            physics = {}
+            obj["physics"] = physics
+        physics["collider"] = "box"
+        physics["collision_shape"] = "box"
+        physics["collision_proxy"] = {
+            "type": proxy["type"],
+            "shape": proxy["shape"],
+            "path": proxy["path"],
+            "coordinate_frame": proxy["coordinate_frame"],
+            "center": proxy["center"],
+            "bbox_size": proxy["bbox_size"],
+            "source": proxy["source"],
+            "provider": proxy["provider"],
+        }
+        applied["bbox"] = bbox
+        applied["collision_proxy"] = proxy
+        applied["updated_fields"].extend(["pose.position", "pose.bbox_size", "bbox_3d", "collision_proxy", "physics.collision_proxy"])
+
+    object_merge = patch.get("object_patch") if isinstance(patch.get("object_patch"), dict) else {}
+    if object_merge:
+        obj.update(simfoundry_deep_merge_bundle(copy.deepcopy(obj), object_merge))
+        applied["updated_fields"].append("object_patch")
+    if isinstance(patch.get("physics"), dict):
+        physics = obj.setdefault("physics", {})
+        if not isinstance(physics, dict):
+            physics = {}
+            obj["physics"] = physics
+        requested_body_type = str(patch["physics"].get("body_type") or "").lower()
+        physics_patch = dict(patch["physics"])
+        if requested_body_type == "dynamic" and not allow_dynamic:
+            physics_patch["body_type"] = "static"
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "dynamic_release_blocked",
+                    "Structural repair import keeps objects static unless --allow-dynamic is set.",
+                    source="import-simfoundry-structural-repair",
+                    object_id=object_id,
+                )
+            )
+        obj["physics"] = merge_physics_dict(physics, physics_patch, overwrite=True)
+        applied["updated_fields"].append("physics")
+    else:
+        physics = obj.setdefault("physics", {})
+        if isinstance(physics, dict):
+            physics["body_type"] = "static"
+
+    if patch.get("support_relation_review") is not None:
+        obj["support_relation_review"] = patch.get("support_relation_review")
+        applied["updated_fields"].append("support_relation_review")
+    if patch.get("semantic_split_review") is not None:
+        obj["semantic_split_review"] = patch.get("semantic_split_review")
+        applied["updated_fields"].append("semantic_split_review")
+    if patch.get("collider_review") is not None:
+        obj["collider_review"] = patch.get("collider_review")
+        applied["updated_fields"].append("collider_review")
+    obj["simfoundry_structural_repair"] = {
+        "status": "review_patch_imported",
+        "provider": provider,
+        "main_bundle_overwritten": False,
+        "timestamp": int(time.time()),
+        "review_status": applied["review_status"],
+        "source_patch": patch.get("source_patch") or patch.get("review_id"),
+    }
+    return applied, issues
+
+
+def simfoundry_import_structural_repair(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    source_bundle_path: Path,
+    repair_plan_path: Path,
+    review_patch_path: Path,
+    output_dir: Path,
+    formats: list[str],
+    provider: str,
+    allow_dynamic: bool,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not source_bundle_path.exists():
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Run a SimFoundry collider/repair stage before importing structural repair patches.",
+                source="import-simfoundry-structural-repair",
+                path=str(source_bundle_path),
+            )
+        )
+    repair_plan = safe_read_json(repair_plan_path)
+    if not isinstance(repair_plan, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_structural_repair_plan",
+                "Run prepare-simfoundry-structural-repair-plan or pass --repair-plan.",
+                source="import-simfoundry-structural-repair",
+                path=str(repair_plan_path),
+            )
+        )
+        repair_plan = {}
+    raw_review = safe_read_json(review_patch_path)
+    if not isinstance(raw_review, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_structural_review_patch",
+                "A filled review patch JSON is required before importing structural repairs.",
+                source="import-simfoundry-structural-repair",
+                path=str(review_patch_path),
+            )
+        )
+        raw_review = {}
+    source_bundle = read_json(source_bundle_path) if source_bundle_path.exists() else {"objects": []}
+    output_dir = ensure_dir(output_dir)
+    try:
+        review_patch = simfoundry_structural_review_payload(raw_review)
+    except Exception as exc:
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "invalid_structural_review_patch",
+                f"Could not parse structural repair review patch: {exc}",
+                source="import-simfoundry-structural-repair",
+                path=str(review_patch_path),
+            )
+        )
+        review_patch = {}
+
+    sidecar_bundle = copy.deepcopy(source_bundle)
+    bundle_patch = review_patch.get("bundle_patch") if isinstance(review_patch.get("bundle_patch"), dict) else None
+    if bundle_patch:
+        sidecar_bundle = simfoundry_deep_merge_bundle(sidecar_bundle, bundle_patch)
+    objects = sidecar_bundle.get("objects") if isinstance(sidecar_bundle.get("objects"), list) else []
+    object_by_id = {
+        slugify(str(obj.get("object_id") or obj.get("id") or obj.get("name") or ""), "object"): obj
+        for obj in objects
+        if isinstance(obj, dict)
+    }
+    object_patches = review_patch.get("object_patches") if isinstance(review_patch.get("object_patches"), list) else []
+    applied_objects: list[dict[str, Any]] = []
+    skipped_objects: list[dict[str, Any]] = []
+    for raw_patch in object_patches:
+        if not isinstance(raw_patch, dict):
+            skipped_objects.append({"reason": "invalid_patch_record"})
+            continue
+        object_id = slugify(str(raw_patch.get("object_id") or raw_patch.get("id") or raw_patch.get("name") or ""), "object")
+        obj = object_by_id.get(object_id)
+        if not isinstance(obj, dict):
+            skipped_objects.append({"object_id": object_id, "reason": "object_not_found_in_bundle"})
+            issues.append(
+                sim_preflight_issue(
+                    "warning",
+                    "structural_patch_object_missing",
+                    "Object patch target does not exist in the source bundle.",
+                    source="import-simfoundry-structural-repair",
+                    object_id=object_id,
+                )
+            )
+            continue
+        applied, patch_issues = simfoundry_apply_structural_object_patch(
+            obj=obj,
+            patch=raw_patch,
+            output_dir=output_dir,
+            provider=provider,
+            allow_dynamic=allow_dynamic,
+        )
+        applied_objects.append(applied)
+        issues.extend(patch_issues)
+
+    sidecar_bundle["scene_id"] = str(sidecar_bundle.get("scene_id") or manifest.get("scene_id") or source_bundle.get("scene_id") or "scene")
+    sidecar_bundle["source_bundle"] = str(source_bundle_path)
+    sidecar_bundle["simfoundry_structural_repair_import"] = {
+        "source_repair_plan": str(repair_plan_path),
+        "source_review_patch": str(review_patch_path),
+        "provider": provider,
+        "main_bundle_overwritten": False,
+        "bundle_patch_applied": bundle_patch is not None,
+        "applied_objects": [item.get("object_id") for item in applied_objects],
+        "skipped_objects": skipped_objects,
+        "allow_dynamic": bool(allow_dynamic),
+        "timestamp": int(time.time()),
+    }
+    sidecar_bundle_path = output_dir / "simulator_asset_bundle.structural_repair.json"
+    write_json(sidecar_bundle_path, sidecar_bundle)
+
+    adapter_root = ensure_dir(output_dir / "adapters")
+    format_results: dict[str, Any] = {}
+    for format_name in formats:
+        format_dir = ensure_dir(adapter_root / format_name)
+        if format_name == "mujoco":
+            result = write_mujoco_adapter(sidecar_bundle, format_dir, adapter_root, project_root, args)
+        else:
+            result = write_json_simulator_adapter(format_name, sidecar_bundle, format_dir, adapter_root, project_root, args)
+        format_results[format_name] = result
+    adapter_manifest_path = adapter_root / "simulator_adapters.json"
+    write_json(
+        adapter_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_structural_repair_adapter",
+            "source_bundle": str(sidecar_bundle_path),
+            "source_repair_plan": str(repair_plan_path),
+            "source_review_patch": str(review_patch_path),
+            "formats": format_results,
+            "notes": "Structural repair simulator adapters generated from a sidecar bundle. Main simulator bundle is not overwritten.",
+        },
+    )
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_structural_repair_import",
+        "project_root": str(project_root),
+        "scene_id": sidecar_bundle.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else "structural_repair_imported",
+        "ok": not required,
+        "source_bundle": str(source_bundle_path),
+        "repair_plan": str(repair_plan_path),
+        "review_patch": str(review_patch_path),
+        "output_dir": str(output_dir),
+        "sidecar_bundle": str(sidecar_bundle_path),
+        "adapter_manifest": str(adapter_manifest_path),
+        "provider": provider,
+        "source_plan_summary": repair_plan.get("summary", {}),
+        "bundle_patch_applied": bundle_patch is not None,
+        "applied_objects": applied_objects,
+        "skipped_objects": skipped_objects,
+        "formats": format_results,
+        "issues": issues,
+        "summary": {
+            "object_patch_count": len(object_patches),
+            "applied_object_patch_count": len(applied_objects),
+            "skipped_object_patch_count": len(skipped_objects),
+            "bundle_patch_applied": bundle_patch is not None,
+            "object_count": len(sidecar_bundle.get("objects", []) if isinstance(sidecar_bundle.get("objects"), list) else []),
+            "static_collider_count": len(static_collider_records_from_bundle(sidecar_bundle)),
+            "adapter_count": len(format_results),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+            "main_bundle_overwritten": False,
+        },
+        "notes": "Imported structural/support repair review outputs into a simulator-ready sidecar bundle and adapters without replacing the main bundle.",
+    }
+
+
+def write_simfoundry_structural_repair_import_markdown(path: Path, report: dict[str, Any]) -> None:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    lines = [
+        "# SimFoundry Structural Repair Import",
+        "",
+        f"Scene: `{report.get('scene_id')}`",
+        f"Source bundle: `{report.get('source_bundle')}`",
+        f"Repair plan: `{report.get('repair_plan')}`",
+        f"Review patch: `{report.get('review_patch')}`",
+        "",
+        "## Summary",
+        "",
+        f"- Status: `{report.get('status')}`",
+        f"- Object patches: {summary.get('applied_object_patch_count')} / {summary.get('object_patch_count')}",
+        f"- Bundle patch applied: {summary.get('bundle_patch_applied')}",
+        f"- Adapters: {summary.get('adapter_count')}",
+        f"- Required issues: {summary.get('required_issue_count')}",
+        f"- Warnings: {summary.get('warning_count')}",
+        f"- Main bundle overwritten: {summary.get('main_bundle_overwritten')}",
+        "",
+        "## Applied Objects",
+        "",
+    ]
+    applied_objects = report.get("applied_objects") if isinstance(report.get("applied_objects"), list) else []
+    if applied_objects:
+        lines.extend(["| Object | Review | Updated fields |", "|---|---|---|"])
+        for item in applied_objects:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{markdown_cell(item.get('object_id'))}`",
+                        markdown_cell(item.get("review_status")),
+                        markdown_cell(", ".join(item.get("updated_fields") or [])),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("No object patches were applied.")
+    lines.extend(["", "## Boundary", ""])
+    lines.append("This import writes a sidecar simulator bundle and adapters. It does not overwrite the main bundle and does not prove dynamic release.")
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def cmd_import_simfoundry_structural_repair(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    source_bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    repair_plan_path = simfoundry_structural_repair_plan_path(project_root, manifest, args.repair_plan)
+    review_patch_path = resolve_project_cli_path(args.review_patch, project_root)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_structural_repair_import"
+    )
+    report = simfoundry_import_structural_repair(
+        project_root,
+        manifest,
+        source_bundle_path=source_bundle_path,
+        repair_plan_path=repair_plan_path,
+        review_patch_path=review_patch_path,
+        output_dir=output_dir,
+        formats=args.format,
+        provider=args.provider,
+        allow_dynamic=args.allow_dynamic,
+        args=args,
+    )
+    report_path = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / "structural_repair_import_manifest.json"
+    write_json(report_path, report)
+    markdown_path = resolve_project_cli_path(args.markdown_output, project_root) if args.markdown_output else report_path.with_suffix(".md")
+    if not args.no_markdown:
+        write_simfoundry_structural_repair_import_markdown(markdown_path, report)
+        report["markdown"] = str(markdown_path)
+        write_json(report_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_structural_repair_import"] = str(report_path)
+    manifest.setdefault("artifacts", {})["simfoundry_structural_repair_import_dir"] = str(output_dir)
+    manifest.setdefault("artifacts", {})["simfoundry_structural_repair_import_bundle"] = report.get("sidecar_bundle")
+    if not args.no_markdown:
+        manifest["artifacts"]["simfoundry_structural_repair_import_md"] = str(markdown_path)
+    manifest.setdefault("external_stages", {})["simfoundry_structural_repair_import"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "markdown": str(markdown_path) if not args.no_markdown else None,
+        "source_bundle": str(source_bundle_path),
+        "repair_plan": str(repair_plan_path),
+        "review_patch": str(review_patch_path),
+        "sidecar_bundle": report.get("sidecar_bundle"),
+        "adapter_manifest": report.get("adapter_manifest"),
+        "summary": report.get("summary", {}),
+        "notes": "Imported structural/support repair review outputs into a simulator-ready sidecar bundle without overwriting the main bundle.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"Imported SimFoundry structural repair: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"object_patches={summary.get('applied_object_patch_count')}/{summary.get('object_patch_count')} "
+            f"adapters={summary.get('adapter_count')} required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        print(f"Sidecar bundle: {report.get('sidecar_bundle')}")
+        print(f"Adapter manifest: {report.get('adapter_manifest')}")
+        print(f"Report: {report_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("applied_object_patch_count"):
+        return 1
+    return 0
+
+
+SECRET_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{10,}\b")
+
+
+def scrub_provider_secrets(value: Any) -> Any:
+    if isinstance(value, str):
+        return SECRET_TOKEN_RE.sub("sk-REDACTED", value)
+    if isinstance(value, list):
+        return [scrub_provider_secrets(item) for item in value]
+    if isinstance(value, dict):
+        return {key: scrub_provider_secrets(item) for key, item in value.items()}
+    return value
+
+
+def simfoundry_structural_review_worker_default_plan(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+    return simfoundry_structural_repair_plan_path(project_root, manifest, explicit)
+
+
+def simfoundry_structural_review_worker_provider_contract(
+    args: argparse.Namespace,
+    repair_plan: dict[str, Any],
+    provider_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    plan_contract = repair_plan.get("provider_contract") if isinstance(repair_plan.get("provider_contract"), dict) else {}
+    config_provider = provider_config.get("provider") if isinstance(provider_config, dict) and isinstance(provider_config.get("provider"), dict) else {}
+    config_models = provider_config.get("models") if isinstance(provider_config, dict) and isinstance(provider_config.get("models"), dict) else {}
+    return {
+        "provider": args.provider or plan_contract.get("provider") or "simfoundry_structural_repair_review_worker",
+        "model_provider": args.model_provider
+        or plan_contract.get("model_provider")
+        or (provider_config.get("model_provider") if isinstance(provider_config, dict) else None)
+        or "custom",
+        "provider_name": args.provider_name or plan_contract.get("provider_name") or config_provider.get("name"),
+        "base_url": args.base_url or plan_contract.get("base_url") or config_provider.get("base_url"),
+        "wire_api": args.wire_api or plan_contract.get("wire_api") or config_provider.get("wire_api"),
+        "model": args.model or plan_contract.get("model") or config_models.get("reasoning_model"),
+        "image_model": args.image_model or plan_contract.get("image_model") or config_models.get("image_editing_model"),
+        "model_reasoning_effort": args.model_reasoning_effort or plan_contract.get("model_reasoning_effort") or config_models.get("reasoning_effort"),
+        "disable_response_storage": bool(args.disable_response_storage),
+        "auth_env": args.auth_env or plan_contract.get("auth_env") or config_provider.get("auth_env") or "OPENAI_API_KEY",
+        "secret_policy": "Resolve API keys from auth_env at runtime. Never write plaintext keys to request, report, or patch artifacts.",
+    }
+
+
+def simfoundry_structural_review_worker_context(
+    repair_plan: dict[str, Any],
+    bundle: dict[str, Any],
+    *,
+    max_objects: int,
+    object_ids: list[str],
+) -> dict[str, Any]:
+    requested_ids = {slugify(item) for item in object_ids if item}
+    object_plans = [item for item in repair_plan.get("object_repair_plans", []) if isinstance(item, dict)]
+    blocker_plans = [item for item in repair_plan.get("structural_blocker_plans", []) if isinstance(item, dict)]
+    if requested_ids:
+        object_plans = [item for item in object_plans if slugify(str(item.get("object_id") or "")) in requested_ids]
+        blocker_plans = [item for item in blocker_plans if slugify(str(item.get("object_id") or "")) in requested_ids]
+    limit = max(0, int(max_objects))
+    if limit:
+        object_plans = object_plans[:limit]
+        blocker_plans = blocker_plans[:limit]
+    bundle_by_id = simfoundry_object_lookup_by_id(bundle)
+    selected_ids: list[str] = []
+    for item in [*object_plans, *blocker_plans]:
+        object_id = slugify(str(item.get("object_id") or ""))
+        if object_id and object_id not in selected_ids:
+            selected_ids.append(object_id)
+        for affected in item.get("affected_candidates", []) if isinstance(item.get("affected_candidates"), list) else []:
+            affected_id = slugify(str(affected or ""))
+            if affected_id and affected_id not in selected_ids:
+                selected_ids.append(affected_id)
+    objects = []
+    for object_id in selected_ids:
+        obj = bundle_by_id.get(object_id)
+        if not isinstance(obj, dict):
+            continue
+        pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+        physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+        collision_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+        objects.append(
+            {
+                "object_id": object_id,
+                "name": obj.get("name"),
+                "category": obj.get("category"),
+                "asset_role": obj.get("asset_role"),
+                "pose": {
+                    "position": pose.get("position"),
+                    "bbox_size": pose.get("bbox_size"),
+                    "bbox_3d": pose.get("bbox_3d") or obj.get("bbox_3d"),
+                },
+                "physics": {
+                    "body_type": physics.get("body_type"),
+                    "collider": physics.get("collider"),
+                    "mass_kg": physics.get("mass_kg"),
+                },
+                "collision_proxy": {
+                    "type": collision_proxy.get("type"),
+                    "shape": collision_proxy.get("shape"),
+                    "bbox_size": collision_proxy.get("bbox_size"),
+                    "source": collision_proxy.get("source"),
+                },
+            }
+        )
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "scene_id": repair_plan.get("scene_id") or bundle.get("scene_id"),
+        "source_plan_summary": repair_plan.get("summary", {}),
+        "source_status": repair_plan.get("status"),
+        "object_repair_plans": object_plans,
+        "structural_blocker_plans": blocker_plans,
+        "bundle_objects": objects,
+        "output_contract": {
+            "required_shape": {
+                "schema_version": 1,
+                "structural_repair_patch": {
+                    "bundle_patch": {"metadata": {}},
+                    "object_patches": [
+                        {
+                            "object_id": "<existing object_id>",
+                            "review_status": "accepted|needs_human_review|rejected",
+                            "bbox": {"center": [0, 0, 0], "size": [1, 1, 1]},
+                            "physics": {"body_type": "static", "collider": "box"},
+                            "support_relation_review": {},
+                            "semantic_split_review": {},
+                            "collider_review": {},
+                        }
+                    ],
+                },
+            },
+            "rules": [
+                "Only reference object_id values present in bundle_objects.",
+                "Do not set dynamic body_type unless evidence is strong; static is the safe default.",
+                "Return JSON only. Do not include prose outside the JSON object.",
+                "If geometry is uncertain, set review_status to needs_human_review and omit bbox.",
+            ],
+        },
+    }
+
+
+def simfoundry_structural_review_worker_prompt(context: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "You are filling a SimFoundry-style structural repair review patch for a simulator asset bundle.",
+            "Use the provided bbox/pose/blocker evidence to propose conservative static bbox/collider/support review patches.",
+            "Prefer marking uncertain cases as needs_human_review instead of inventing exact geometry.",
+            "Return a single JSON object matching output_contract.required_shape. Do not include Markdown.",
+            "",
+            json.dumps(context, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def simfoundry_draft_structural_review_patch(context: dict[str, Any], *, provider: str) -> dict[str, Any]:
+    object_ids: list[str] = []
+    for item in [*context.get("object_repair_plans", []), *context.get("structural_blocker_plans", [])]:
+        if isinstance(item, dict):
+            object_id = slugify(str(item.get("object_id") or ""))
+            if object_id and object_id not in object_ids:
+                object_ids.append(object_id)
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source": "simfoundry_structural_review_worker_dry_run",
+        "provider": provider,
+        "import_ready": False,
+        "notes": "Dry-run placeholder patch. Fill bbox/support/collider reviews manually or run with --run-provider before importing.",
+        "structural_repair_patch": {
+            "bundle_patch": {
+                "metadata": {
+                    "structural_review_worker": "dry_run_request_prepared",
+                    "main_bundle_overwritten": False,
+                    "dynamic_release": False,
+                }
+            },
+            "object_patches": [
+                {
+                    "object_id": object_id,
+                    "review_status": "needs_provider_or_human_review",
+                    "support_relation_review": {"decision": "pending"},
+                    "semantic_split_review": {"decision": "pending"},
+                    "collider_review": {"decision": "pending"},
+                }
+                for object_id in object_ids
+            ],
+        },
+    }
+
+
+def simfoundry_responses_endpoint(base_url: str) -> str:
+    base = str(base_url or "").rstrip("/")
+    if not base:
+        raise ValueError("Responses provider base_url is required.")
+    return f"{base}/responses" if base.endswith("/v1") else f"{base}/v1/responses"
+
+
+def simfoundry_response_output_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        return str(response or "")
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"]
+    chunks: list[str] = []
+    for output in response.get("output", []) if isinstance(response.get("output"), list) else []:
+        if not isinstance(output, dict):
+            continue
+        if isinstance(output.get("text"), str):
+            chunks.append(output["text"])
+        for content in output.get("content", []) if isinstance(output.get("content"), list) else []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+            elif isinstance(text, dict) and isinstance(text.get("value"), str):
+                chunks.append(text["value"])
+    if chunks:
+        return "\n".join(chunks)
+    if isinstance(response.get("choices"), list):
+        for choice in response["choices"]:
+            if isinstance(choice, dict):
+                message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                if isinstance(message.get("content"), str):
+                    chunks.append(message["content"])
+        if chunks:
+            return "\n".join(chunks)
+    return json.dumps(response, ensure_ascii=False)
+
+
+def simfoundry_extract_json_from_text(text: str) -> dict[str, Any]:
+    cleaned = str(text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        cleaned = fence.group(1).strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(cleaned[start : end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Provider response did not contain a JSON object.")
+
+
+def simfoundry_normalize_structural_review_patch(parsed: dict[str, Any], *, provider: str, source: str) -> dict[str, Any]:
+    payload = simfoundry_structural_review_payload(parsed)
+    if not isinstance(payload, dict):
+        raise ValueError("Structural review payload must be a JSON object.")
+    normalized = (
+        parsed
+        if isinstance(parsed.get("structural_repair_patch"), dict)
+        else {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "source": source,
+            "provider": provider,
+            "structural_repair_patch": payload,
+        }
+    )
+    normalized.setdefault("schema_version", DEFAULT_SCHEMA_VERSION)
+    normalized.setdefault("source", source)
+    normalized.setdefault("provider", provider)
+    normalized["structural_repair_patch"].setdefault("bundle_patch", {})
+    normalized["structural_repair_patch"].setdefault("object_patches", [])
+    return scrub_provider_secrets(normalized)
+
+
+def simfoundry_call_responses_provider(
+    *,
+    endpoint: str,
+    auth_env: str,
+    model: str,
+    reasoning_effort: str,
+    prompt: str,
+    disable_response_storage: bool,
+    timeout_seconds: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = os.environ.get(auth_env)
+    if not api_key:
+        raise RuntimeError(f"Missing required provider environment variable: {auth_env}")
+    request_payload = {
+        "model": model,
+        "input": prompt,
+        "store": not bool(disable_response_storage),
+        "reasoning": {"effort": reasoning_effort},
+        "text": {"format": {"type": "json_object"}},
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=max(1, int(timeout_seconds))) as response:
+        raw = response.read().decode("utf-8")
+    parsed = json.loads(raw)
+    summary = {
+        "endpoint": endpoint,
+        "status": parsed.get("status"),
+        "id": parsed.get("id"),
+        "model": parsed.get("model"),
+        "output_text_length": len(simfoundry_response_output_text(parsed)),
+    }
+    return parsed, summary
+
+
+def generate_simfoundry_structural_review_worker_report(
+    project_root: Path,
+    manifest: dict[str, Any],
+    *,
+    bundle_path: Path,
+    repair_plan_path: Path,
+    provider_config_path: Path | None,
+    output_patch_path: Path,
+    request_output_path: Path,
+    run_provider: bool,
+    mock_provider_response: Path | None,
+    max_objects: int,
+    object_ids: list[str],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    repair_plan = safe_read_json(repair_plan_path)
+    if not isinstance(repair_plan, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_structural_repair_plan",
+                "Run prepare-simfoundry-structural-repair-plan before running the review worker.",
+                source="run-simfoundry-structural-review-worker",
+                path=str(repair_plan_path),
+            )
+        )
+        repair_plan = {}
+    bundle = safe_read_json(bundle_path)
+    if not isinstance(bundle, dict):
+        issues.append(
+            sim_preflight_issue(
+                "required",
+                "missing_simulator_asset_bundle",
+                "Structural review worker needs a source simulator bundle.",
+                source="run-simfoundry-structural-review-worker",
+                path=str(bundle_path),
+            )
+        )
+        bundle = {"objects": []}
+    provider_config = safe_read_json(provider_config_path) if provider_config_path and provider_config_path.exists() else None
+    provider_contract = simfoundry_structural_review_worker_provider_contract(args, repair_plan, provider_config if isinstance(provider_config, dict) else None)
+    context = simfoundry_structural_review_worker_context(
+        repair_plan,
+        bundle,
+        max_objects=max_objects,
+        object_ids=object_ids,
+    )
+    prompt = simfoundry_structural_review_worker_prompt(context)
+    endpoint = simfoundry_responses_endpoint(str(provider_contract.get("base_url") or args.base_url))
+    request_manifest = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_structural_review_worker_request",
+        "scene_id": context.get("scene_id"),
+        "repair_plan": str(repair_plan_path),
+        "bundle": str(bundle_path),
+        "provider_contract": provider_contract,
+        "endpoint": endpoint,
+        "run_provider": bool(run_provider),
+        "mock_provider_response": str(mock_provider_response) if mock_provider_response else None,
+        "request_body": {
+            "model": provider_contract.get("model"),
+            "input": prompt,
+            "store": False,
+            "reasoning": {"effort": provider_contract.get("model_reasoning_effort")},
+            "text": {"format": {"type": "json_object"}},
+        },
+        "secret_policy": provider_contract.get("secret_policy"),
+    }
+    write_json(request_output_path, scrub_provider_secrets(request_manifest))
+
+    provider_summary: dict[str, Any] = {"called": False, "mock": False}
+    status = "dry_run_request_prepared"
+    review_patch = simfoundry_draft_structural_review_patch(context, provider=str(provider_contract.get("provider")))
+    if mock_provider_response:
+        mock_raw = safe_read_json(mock_provider_response)
+        text = simfoundry_response_output_text(mock_raw) if isinstance(mock_raw, dict) else mock_provider_response.read_text(encoding="utf-8")
+        try:
+            parsed = simfoundry_extract_json_from_text(text)
+            review_patch = simfoundry_normalize_structural_review_patch(parsed, provider=str(provider_contract.get("provider")), source="mock_provider_response")
+            provider_summary = {"called": False, "mock": True, "output_text_length": len(text)}
+            status = "mock_review_patch_written"
+        except Exception as exc:
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "invalid_mock_provider_response",
+                    f"Could not parse mock provider response as structural review patch JSON: {exc}",
+                    source="run-simfoundry-structural-review-worker",
+                    path=str(mock_provider_response),
+                )
+            )
+            status = "fail"
+    elif run_provider:
+        try:
+            provider_response, provider_summary = simfoundry_call_responses_provider(
+                endpoint=endpoint,
+                auth_env=str(provider_contract.get("auth_env") or "OPENAI_API_KEY"),
+                model=str(provider_contract.get("model") or args.model),
+                reasoning_effort=str(provider_contract.get("model_reasoning_effort") or args.model_reasoning_effort),
+                prompt=prompt,
+                disable_response_storage=bool(provider_contract.get("disable_response_storage")),
+                timeout_seconds=args.timeout_seconds,
+            )
+            provider_summary["called"] = True
+            text = simfoundry_response_output_text(provider_response)
+            parsed = simfoundry_extract_json_from_text(text)
+            review_patch = simfoundry_normalize_structural_review_patch(parsed, provider=str(provider_contract.get("provider")), source="responses_provider")
+            status = "provider_review_patch_written"
+        except Exception as exc:
+            issues.append(
+                sim_preflight_issue(
+                    "required",
+                    "provider_review_worker_failed",
+                    f"Responses provider call failed: {exc}",
+                    source="run-simfoundry-structural-review-worker",
+                )
+            )
+            provider_summary = {"called": True, "mock": False, "error": str(exc)}
+            status = "fail"
+    write_json(output_patch_path, review_patch)
+    payload = simfoundry_structural_review_payload(review_patch)
+    object_patches = payload.get("object_patches") if isinstance(payload.get("object_patches"), list) else []
+    required = [issue for issue in issues if issue.get("severity") == "required"]
+    warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_structural_review_worker",
+        "project_root": str(project_root),
+        "scene_id": context.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": "fail" if required else status,
+        "ok": not required,
+        "bundle": str(bundle_path),
+        "repair_plan": str(repair_plan_path),
+        "provider_config": str(provider_config_path) if provider_config_path else None,
+        "request_manifest": str(request_output_path),
+        "review_patch": str(output_patch_path),
+        "provider_contract": provider_contract,
+        "provider_summary": scrub_provider_secrets(provider_summary),
+        "run_provider": bool(run_provider),
+        "mock_provider_response": str(mock_provider_response) if mock_provider_response else None,
+        "issues": issues,
+        "summary": {
+            "selected_object_plan_count": len(context.get("object_repair_plans", [])),
+            "selected_structural_blocker_count": len(context.get("structural_blocker_plans", [])),
+            "bundle_context_object_count": len(context.get("bundle_objects", [])),
+            "object_patch_count": len(object_patches),
+            "import_ready": bool(review_patch.get("import_ready", True)),
+            "provider_called": bool(provider_summary.get("called")),
+            "mock_provider_response": bool(provider_summary.get("mock")),
+            "required_issue_count": len(required),
+            "warning_count": len(warnings),
+        },
+        "notes": "Structural review worker output is a review patch sidecar. Import it with import-simfoundry-structural-repair after review.",
+        "next_command": (
+            f"python -m video2mesh.cli import-simfoundry-structural-repair --project-root {shlex.quote(str(project_root))} "
+            f"--bundle {shlex.quote(str(bundle_path))} --repair-plan {shlex.quote(str(repair_plan_path))} "
+            f"--review-patch {shlex.quote(str(output_patch_path))} --json --fail-on-required"
+        ),
+    }
+
+
+def write_simfoundry_structural_review_worker_markdown(path: Path, report: dict[str, Any]) -> None:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    provider = report.get("provider_contract") if isinstance(report.get("provider_contract"), dict) else {}
+    lines = [
+        "# SimFoundry Structural Review Worker",
+        "",
+        f"Scene: `{report.get('scene_id')}`",
+        f"Status: `{report.get('status')}`",
+        f"Repair plan: `{report.get('repair_plan')}`",
+        f"Review patch: `{report.get('review_patch')}`",
+        f"Request manifest: `{report.get('request_manifest')}`",
+        "",
+        "## Summary",
+        "",
+        f"- Provider: `{provider.get('provider_name')}` / `{provider.get('wire_api')}`",
+        f"- Model: `{provider.get('model')}`",
+        f"- Image model hint: `{provider.get('image_model')}`",
+        f"- Provider called: {summary.get('provider_called')}",
+        f"- Mock response: {summary.get('mock_provider_response')}",
+        f"- Object patches: {summary.get('object_patch_count')}",
+        f"- Required issues: {summary.get('required_issue_count')}",
+        f"- Warnings: {summary.get('warning_count')}",
+        "",
+        "## Boundary",
+        "",
+        "This worker writes a review patch sidecar only. It does not overwrite the main bundle and does not release dynamic objects.",
+    ]
+    ensure_dir(path.parent)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def cmd_run_simfoundry_structural_review_worker(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    repair_plan_path = simfoundry_structural_review_worker_default_plan(project_root, manifest, args.repair_plan)
+    repair_plan = safe_read_json(repair_plan_path) if repair_plan_path.exists() else {}
+    plan_bundle = Path(str(repair_plan.get("bundle"))) if isinstance(repair_plan, dict) and repair_plan.get("bundle") else None
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle or plan_bundle)
+    provider_config_path = resolve_project_cli_path(args.provider_config, project_root) if args.provider_config else resolve_existing_path(manifest.get("artifacts", {}).get("simfoundry_provider_config_template") if isinstance(manifest.get("artifacts"), dict) else None, project_root)
+    output_patch_path = (
+        resolve_project_cli_path(args.output, project_root)
+        if args.output
+        else repair_plan_path.parent / "structural_repair_review_patch.worker.json"
+    )
+    request_output_path = (
+        resolve_project_cli_path(args.request_output, project_root)
+        if args.request_output
+        else repair_plan_path.parent / "structural_repair_review_request.json"
+    )
+    report_path = (
+        resolve_project_cli_path(args.report, project_root)
+        if args.report
+        else repair_plan_path.parent / "structural_repair_review_worker_report.json"
+    )
+    object_ids = []
+    for value in args.object_id or []:
+        object_ids.extend([item.strip() for item in str(value).split(",") if item.strip()])
+    report = generate_simfoundry_structural_review_worker_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        repair_plan_path=repair_plan_path,
+        provider_config_path=provider_config_path,
+        output_patch_path=output_patch_path,
+        request_output_path=request_output_path,
+        run_provider=args.run_provider,
+        mock_provider_response=resolve_project_cli_path(args.mock_provider_response, project_root) if args.mock_provider_response else None,
+        max_objects=args.max_objects,
+        object_ids=object_ids,
+        args=args,
+    )
+    write_json(report_path, report)
+    markdown_path = resolve_project_cli_path(args.markdown_output, project_root) if args.markdown_output else report_path.with_suffix(".md")
+    if not args.no_markdown:
+        write_simfoundry_structural_review_worker_markdown(markdown_path, report)
+        report["markdown"] = str(markdown_path)
+        write_json(report_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_structural_review_worker"] = str(report_path)
+    manifest["artifacts"]["simfoundry_structural_review_patch"] = str(output_patch_path)
+    manifest["artifacts"]["simfoundry_structural_review_request"] = str(request_output_path)
+    if not args.no_markdown:
+        manifest["artifacts"]["simfoundry_structural_review_worker_md"] = str(markdown_path)
+    manifest.setdefault("external_stages", {})["simfoundry_structural_review_worker"] = {
+        "status": report.get("status"),
+        "report": str(report_path),
+        "review_patch": str(output_patch_path),
+        "request_manifest": str(request_output_path),
+        "summary": report.get("summary", {}),
+        "notes": "Prepared or ran a safe Responses-provider structural repair review worker. API keys are resolved from env only.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry structural review worker: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"provider_called={summary.get('provider_called')} object_patches={summary.get('object_patch_count')} "
+            f"required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        print(f"Review patch: {output_patch_path}")
+        print(f"Report: {report_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_empty and not report.get("summary", {}).get("object_patch_count"):
+        return 1
+    return 0
+
+
+def cmd_simfoundry_dynamic_blocker_report(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    dynamic_report = simfoundry_dynamic_report_path(project_root, manifest, args.report)
+    default_output = dynamic_report.parent / "dynamic_blocker_report.json" if dynamic_report.exists() else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_dynamic_blockers" / "dynamic_blocker_report.json"
+    output_path = resolve_project_cli_path(args.output, project_root) if args.output else default_output
+    markdown_path = (
+        resolve_project_cli_path(args.markdown_output, project_root)
+        if args.markdown_output
+        else output_path.with_suffix(".md")
+    )
+    report = generate_simfoundry_dynamic_blocker_report(
+        project_root,
+        manifest,
+        dynamic_report_path=dynamic_report,
+        output_path=output_path,
+        max_objects=args.max_objects,
+        max_penetrations=args.max_penetrations,
+    )
+    write_json(output_path, report)
+    if not args.no_markdown:
+        write_simfoundry_dynamic_blocker_markdown(markdown_path, report)
+        report["markdown"] = str(markdown_path)
+        write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_dynamic_blocker_report"] = str(output_path)
+    if not args.no_markdown:
+        manifest["artifacts"]["simfoundry_dynamic_blocker_report_md"] = str(markdown_path)
+    manifest.setdefault("external_stages", {})["simfoundry_dynamic_blocker_report"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "markdown": str(markdown_path) if not args.no_markdown else None,
+        "source_report": str(dynamic_report),
+        "summary": report.get("summary", {}),
+        "notes": "Diagnostic blocker report for conservative SimFoundry dynamic-object release.",
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry dynamic blocker report: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"candidates={summary.get('candidate_count')} accepted={summary.get('accepted_dynamic_count')} "
+            f"blocked={summary.get('blocked_candidate_count')} unsupported={summary.get('unsupported_candidate_count')} "
+            f"penetration={summary.get('penetration_candidate_count')}"
+        )
+        print(f"JSON: {output_path}")
+        if not args.no_markdown:
+            print(f"Markdown: {markdown_path}")
+
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_blockers and report.get("summary", {}).get("blocked_candidate_count"):
+        return 1
+    return 0
+
+
+def simfoundry_dynamic_readiness_status(
+    tight_report: dict[str, Any],
+    dynamic_report: dict[str, Any],
+    blocker_report: dict[str, Any],
+    smoke_report: dict[str, Any] | None,
+) -> str:
+    required = (
+        int((tight_report.get("summary") or {}).get("required_issue_count") or 0)
+        + int((dynamic_report.get("summary") or {}).get("required_issue_count") or 0)
+        + int((blocker_report.get("summary") or {}).get("required_issue_count") or 0)
+    )
+    if smoke_report is not None:
+        required += int((smoke_report.get("summary") or {}).get("required_issue_count") or 0)
+    if required:
+        return "fail"
+    accepted = int((dynamic_report.get("summary") or {}).get("accepted_dynamic_count") or 0)
+    blocked = int((blocker_report.get("summary") or {}).get("blocked_candidate_count") or 0)
+    if accepted and not blocked:
+        return "dynamic_release_ready"
+    if accepted:
+        return "partial_dynamic_release_ready"
+    return "dynamic_blocked"
+
+
+def cmd_prepare_simfoundry_dynamic_readiness(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    output_dir = (
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_dynamic_readiness"
+    )
+    output_dir = ensure_dir(output_dir)
+
+    movable_categories = slug_set_from_csv(args.movable_categories)
+    exclude_categories = DEFAULT_SIMFOUNDRY_STATIC_CATEGORIES | slug_set_from_csv(args.exclude_categories)
+    include_objects = slug_set_from_csv(args.include_objects)
+    exclude_objects = slug_set_from_csv(args.exclude_objects)
+
+    tight_dir = output_dir / "tight_collider_variant"
+    tight_report = generate_simfoundry_tight_collider_variant(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        output_dir=tight_dir,
+        output_bundle=None,
+        q_min=args.quantile_min,
+        q_max=args.quantile_max,
+        padding_ratio=args.padding_ratio,
+        include_background=args.include_background,
+        provider=args.tight_provider,
+        up_axis=args.up_axis,
+        up_direction=args.up_direction,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        max_penetration_depth=args.max_penetration_depth,
+        max_overlap_volume_ratio=args.max_overlap_volume_ratio,
+        require_support=args.require_support,
+    )
+    tight_bundle_path = Path(str(tight_report.get("variant_bundle"))) if tight_report.get("variant_bundle") else bundle_path
+
+    dynamic_dir = output_dir / "dynamic_variant"
+    dynamic_report = generate_simfoundry_dynamic_variant(
+        project_root,
+        manifest,
+        bundle_path=tight_bundle_path,
+        output_dir=dynamic_dir,
+        output_bundle=None,
+        up_axis=args.up_axis,
+        up_direction=args.up_direction,
+        movable_categories=movable_categories,
+        exclude_categories=exclude_categories,
+        include_objects=include_objects,
+        exclude_objects=exclude_objects,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        max_penetration_depth=args.max_penetration_depth,
+        max_overlap_volume_ratio=args.max_overlap_volume_ratio,
+        allow_penetration=args.allow_penetration,
+        require_support=args.require_support,
+    )
+    dynamic_bundle_path = Path(str(dynamic_report.get("variant_bundle"))) if dynamic_report.get("variant_bundle") else None
+    dynamic_report_path = Path(str(dynamic_report.get("report") or dynamic_dir / "dynamic_variant_report.json"))
+
+    blocker_path = dynamic_dir / "dynamic_blocker_report.json"
+    blocker_report = generate_simfoundry_dynamic_blocker_report(
+        project_root,
+        manifest,
+        dynamic_report_path=dynamic_report_path,
+        output_path=blocker_path,
+        max_objects=args.max_objects,
+        max_penetrations=args.max_penetrations,
+    )
+    write_json(blocker_path, blocker_report)
+    blocker_md = blocker_path.with_suffix(".md")
+    if not args.no_markdown:
+        write_simfoundry_dynamic_blocker_markdown(blocker_md, blocker_report)
+        blocker_report["markdown"] = str(blocker_md)
+        write_json(blocker_path, blocker_report)
+
+    adapter_manifest_path: Path | None = None
+    adapter_manifest: dict[str, Any] | None = None
+    smoke_report: dict[str, Any] | None = None
+    smoke_path: Path | None = None
+    if dynamic_bundle_path and dynamic_bundle_path.exists():
+        adapter_manifest_path, adapter_manifest = export_simulator_adapters_for_bundle(
+            project_root,
+            dynamic_bundle_path,
+            output_dir / "adapters",
+            formats=args.format,
+            body_type=args.body_type,
+            default_mass=args.default_mass,
+            copy_assets=True,
+            mode=args.mode,
+        )
+        if args.smoke_test:
+            smoke_report = generate_simfoundry_simulator_smoke_report(
+                project_root,
+                manifest,
+                bundle_path=dynamic_bundle_path,
+                adapter_root=adapter_manifest_path.parent,
+                formats=args.format,
+                min_mesh_vertices=args.min_mesh_vertices,
+                require_physics=args.require_physics,
+                require_collider=args.require_collider,
+                require_scale_calibration=args.require_scale_calibration,
+                allow_estimated_physics=args.allow_estimated_physics,
+                mujoco_runtime_mode=args.mujoco_runtime,
+                mujoco_steps=args.mujoco_steps,
+            )
+            smoke_path = output_dir / "sim_preflight_report.json"
+            write_json(smoke_path, smoke_report)
+
+    status = simfoundry_dynamic_readiness_status(tight_report, dynamic_report, blocker_report, smoke_report)
+    summary = {
+        "object_count": int((dynamic_report.get("summary") or {}).get("object_count") or 0),
+        "tight_updated_count": int((tight_report.get("summary") or {}).get("updated_count") or 0),
+        "tight_before_penetration_count": int((tight_report.get("summary") or {}).get("before_penetration_count") or 0),
+        "tight_after_penetration_count": int((tight_report.get("summary") or {}).get("after_penetration_count") or 0),
+        "candidate_count": int((dynamic_report.get("summary") or {}).get("candidate_count") or 0),
+        "accepted_dynamic_count": int((dynamic_report.get("summary") or {}).get("accepted_dynamic_count") or 0),
+        "blocked_candidate_count": int((blocker_report.get("summary") or {}).get("blocked_candidate_count") or 0),
+        "unsupported_candidate_count": int((blocker_report.get("summary") or {}).get("unsupported_candidate_count") or 0),
+        "penetration_candidate_count": int((blocker_report.get("summary") or {}).get("penetration_candidate_count") or 0),
+        "unique_penetration_blocker_count": int((blocker_report.get("summary") or {}).get("unique_penetration_blocker_count") or 0),
+        "adapter_count": len((adapter_manifest or {}).get("formats", {})) if isinstance(adapter_manifest, dict) else 0,
+        "smoke_required_issue_count": int((smoke_report or {}).get("summary", {}).get("required_issue_count") or 0) if smoke_report else 0,
+        "smoke_warning_count": int((smoke_report or {}).get("summary", {}).get("warning_count") or 0) if smoke_report else 0,
+    }
+    required_issue_count = (
+        int((tight_report.get("summary") or {}).get("required_issue_count") or 0)
+        + int((dynamic_report.get("summary") or {}).get("required_issue_count") or 0)
+        + int((blocker_report.get("summary") or {}).get("required_issue_count") or 0)
+        + summary["smoke_required_issue_count"]
+    )
+    warning_count = (
+        int((tight_report.get("summary") or {}).get("warning_count") or 0)
+        + int((dynamic_report.get("summary") or {}).get("warning_count") or 0)
+        + int((blocker_report.get("summary") or {}).get("warning_count") or 0)
+        + summary["smoke_warning_count"]
+    )
+    summary["required_issue_count"] = required_issue_count
+    summary["warning_count"] = warning_count
+
+    readiness_path = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / "dynamic_readiness_report.json"
+    report = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_dynamic_readiness",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id"),
+        "timestamp": int(time.time()),
+        "status": status,
+        "ok": required_issue_count == 0,
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "tight_collider_report": str(tight_report.get("report") or tight_dir / "tight_collider_variant_report.json"),
+        "tight_collider_bundle": str(tight_bundle_path),
+        "dynamic_variant_report": str(dynamic_report_path),
+        "dynamic_variant_bundle": str(dynamic_bundle_path) if dynamic_bundle_path else None,
+        "dynamic_blocker_report": str(blocker_path),
+        "dynamic_blocker_markdown": str(blocker_md) if not args.no_markdown else None,
+        "adapter_manifest": str(adapter_manifest_path) if adapter_manifest_path else None,
+        "smoke_report": str(smoke_path) if smoke_path else None,
+        "accepted_dynamic_objects": dynamic_report.get("accepted_dynamic_objects", []),
+        "kept_static_objects": dynamic_report.get("kept_static_objects", []),
+        "top_penetration_blockers": blocker_report.get("top_penetration_blockers", []),
+        "repair_queue": blocker_report.get("repair_queue", []),
+        "parameters": {
+            "up_axis": args.up_axis,
+            "up_direction": normalize_axis_direction(args.up_direction),
+            "quantile_min": args.quantile_min,
+            "quantile_max": args.quantile_max,
+            "padding_ratio": args.padding_ratio,
+            "max_support_gap": args.max_support_gap,
+            "min_support_overlap": args.min_support_overlap,
+            "max_penetration_depth": args.max_penetration_depth,
+            "max_overlap_volume_ratio": args.max_overlap_volume_ratio,
+            "allow_penetration": bool(args.allow_penetration),
+            "require_support": bool(args.require_support),
+            "formats": args.format,
+        },
+        "summary": summary,
+        "notes": [
+            "Sidecar readiness report only; it does not replace the main static simulator bundle.",
+            "dynamic_blocked means the pipeline correctly refused unsafe dynamic release for the current geometry.",
+            "Use repair_queue/top_penetration_blockers to drive structural repair, tighter decomposition, or scale calibration.",
+        ],
+    }
+    write_json(readiness_path, report)
+    manifest.setdefault("artifacts", {})["simfoundry_dynamic_readiness_report"] = str(readiness_path)
+    manifest.setdefault("artifacts", {})["simfoundry_dynamic_readiness_tight_bundle"] = str(tight_bundle_path)
+    if dynamic_bundle_path:
+        manifest["artifacts"]["simfoundry_dynamic_readiness_bundle"] = str(dynamic_bundle_path)
+    if adapter_manifest_path:
+        manifest["artifacts"]["simfoundry_dynamic_readiness_adapters"] = str(adapter_manifest_path)
+    if smoke_path:
+        manifest["artifacts"]["simfoundry_dynamic_readiness_smoke_report"] = str(smoke_path)
+    manifest.setdefault("external_stages", {})["simfoundry_dynamic_readiness"] = {
+        "status": status,
+        "report": str(readiness_path),
+        "source_bundle": str(bundle_path),
+        "dynamic_variant_bundle": str(dynamic_bundle_path) if dynamic_bundle_path else None,
+        "summary": summary,
+        "notes": "Prepared SimFoundry-style dynamic readiness sidecar with tight colliders, dynamic gate, blocker report, sidecar adapters, and optional smoke test.",
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(f"SimFoundry dynamic readiness: {status} ({manifest.get('scene_id')})")
+        print(
+            f"candidates={summary['candidate_count']} accepted={summary['accepted_dynamic_count']} "
+            f"blocked={summary['blocked_candidate_count']} penetrations={summary['penetration_candidate_count']} "
+            f"required={summary['required_issue_count']} warnings={summary['warning_count']}"
+        )
+        print(f"Report: {readiness_path}")
+
+    if args.fail_on_required and required_issue_count:
+        return 1
+    if args.fail_on_blocked and summary["blocked_candidate_count"]:
+        return 1
+    if args.fail_on_empty and summary["accepted_dynamic_count"] == 0:
+        return 1
+    return 0
+
+
+def cmd_simfoundry_scene_stability_report(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    report = generate_simfoundry_scene_stability_report(
+        project_root,
+        manifest,
+        bundle_path=bundle_path,
+        up_axis=args.up_axis,
+        up_direction=args.up_direction,
+        max_support_gap=args.max_support_gap,
+        min_support_overlap=args.min_support_overlap,
+        max_penetration_depth=args.max_penetration_depth,
+        max_overlap_volume_ratio=args.max_overlap_volume_ratio,
+        require_support=args.require_support,
+    )
+    output_path = args.output.resolve() if args.output else project_root / manifest["simulator_assets_dir"] / "physics" / "scene_stability_report.json"
+    write_json(output_path, report)
+    manifest.setdefault("artifacts", {})["scene_stability_report"] = str(output_path)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_stability_report"] = str(output_path)
+    manifest.setdefault("external_stages", {})["simfoundry_scene_stability"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "summary": report.get("summary", {}),
+        "up_direction": normalize_axis_direction(args.up_direction),
+        "notes": "BBox-level support and penetration preflight before simulator settling.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"Scene stability: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"objects={summary.get('object_count')} dynamic={summary.get('dynamic_object_count')} "
+            f"supported={summary.get('supported_dynamic_count')} unsupported={summary.get('unsupported_dynamic_count')} "
+            f"penetrations={summary.get('penetration_count')} required={summary.get('required_issue_count')} warnings={summary.get('warning_count')}"
+        )
+        for issue in report.get("issues", [])[: args.max_issues]:
+            object_prefix = f"{issue.get('object_id')}: " if issue.get("object_id") else ""
+            print(f"- [{issue.get('severity')}] {object_prefix}{issue.get('name')}: {issue.get('detail')}")
+        if len(report.get("issues", [])) > args.max_issues:
+            print(f"- ... {len(report.get('issues', [])) - args.max_issues} more issue(s)")
+        print(f"Report: {output_path}")
+    if args.fail_on_required and report.get("summary", {}).get("required_issue_count"):
+        return 1
+    if args.fail_on_warning and report.get("summary", {}).get("warning_count"):
+        return 1
+    if args.fail_on_penetration and report.get("summary", {}).get("penetration_count"):
+        return 1
+    return 0
+
+
+def simfoundry_provider_evidence(obj: dict[str, Any], max_images: int) -> dict[str, Any]:
+    selected_frames = obj.get("selected_frames") if isinstance(obj.get("selected_frames"), list) else []
+    object_images = obj.get("object_images") if isinstance(obj.get("object_images"), list) else []
+    frame_paths = []
+    crop_paths = []
+    for item in selected_frames:
+        if isinstance(item, str):
+            frame_paths.append(item)
+        elif isinstance(item, dict):
+            value = item.get("image") or item.get("path") or item.get("frame_path") or item.get("object_image")
+            if value:
+                frame_paths.append(str(value))
+    for item in object_images:
+        if isinstance(item, str):
+            crop_paths.append(item)
+        elif isinstance(item, dict):
+            value = item.get("image") or item.get("path") or item.get("object_image")
+            if value:
+                crop_paths.append(str(value))
+    if max_images > 0:
+        frame_paths = frame_paths[:max_images]
+        crop_paths = crop_paths[:max_images]
+    masks = obj.get("masks") if isinstance(obj.get("masks"), dict) else {}
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    return {
+        "selected_frames": frame_paths,
+        "object_images": crop_paths,
+        "primary_frame": frame_paths[0] if frame_paths else "",
+        "primary_crop": crop_paths[0] if crop_paths else "",
+        "mask_3d_cloud": masks.get("mask_3d_cloud") or obj.get("mask_3d_cloud") or "",
+        "bbox_3d": obj.get("bbox_3d"),
+        "pose": pose,
+    }
+
+
+def simfoundry_provider_config_template(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "profile": "simfoundry_custom_responses",
+        "model_provider": args.model_provider,
+        "provider": {
+            "name": args.provider_name,
+            "base_url": args.base_url,
+            "wire_api": args.wire_api,
+            "requires_openai_auth": True,
+            "auth_env": args.auth_env,
+            "disable_response_storage": bool(args.disable_response_storage),
+        },
+        "models": {
+            "reasoning_model": args.model,
+            "reasoning_effort": args.model_reasoning_effort,
+            "image_editing_model": args.image_model,
+            "mesh_generation_candidates": [item.strip() for item in args.mesh_models.split(",") if item.strip()],
+            "collider_generation_candidates": [item.strip() for item in args.collider_models.split(",") if item.strip()],
+            "physics_reasoning_model": args.physics_model or args.model,
+        },
+        "secret_policy": {
+            "store_plaintext_keys": False,
+            "required_env_vars": [args.auth_env],
+            "notes": "Do not commit API keys. Set the environment variable at runtime in the external worker.",
+        },
+        "request_defaults": {
+            "temperature": 0,
+            "response_format": "json_object",
+            "store": False,
+            "disable_response_storage": bool(args.disable_response_storage),
+        },
+    }
+
+
+def simfoundry_model_stage_catalog(args: argparse.Namespace) -> list[dict[str, Any]]:
+    return [
+        {
+            "stage": "representative_frame_and_depth",
+            "simfoundry_like_choice": ["DepthAnything3", "FoundationStereo"],
+            "video2mesh_route": ["COLMAP/MASt3R/VGGT depth or existing reconstruction artifacts"],
+            "status": "external_or_existing",
+        },
+        {
+            "stage": "image_editing_and_clean_plate",
+            "simfoundry_like_choice": ["Gemini image editing"],
+            "video2mesh_route": [args.image_model, "manual clean plate fallback"],
+            "status": "job_template_only",
+        },
+        {
+            "stage": "object_mesh_generation",
+            "simfoundry_like_choice": ["Hunyuan2.1", "TRELLIS.2"],
+            "video2mesh_route": [item.strip() for item in args.mesh_models.split(",") if item.strip()],
+            "status": "job_template_only",
+        },
+        {
+            "stage": "pose_scale_refinement",
+            "simfoundry_like_choice": ["FoundationPose"],
+            "video2mesh_route": ["bbox/point-cloud alignment", "scale calibration jobs", "future FoundationPose adapter"],
+            "status": "fallback_now",
+        },
+        {
+            "stage": "physics_properties",
+            "simfoundry_like_choice": ["VLM physics/material inference"],
+            "video2mesh_route": [args.physics_model or args.model, "prepare-simulator-physics-jobs", "manual import fallback"],
+            "status": "job_template_only",
+        },
+        {
+            "stage": "collision_geometry",
+            "simfoundry_like_choice": ["CoACD"],
+            "video2mesh_route": [item.strip() for item in args.collider_models.split(",") if item.strip()],
+            "status": "bbox_fallback_available",
+        },
+        {
+            "stage": "simulator_validation",
+            "simfoundry_like_choice": ["PyBullet settling", "IsaacLab import"],
+            "video2mesh_route": ["simfoundry-simulator-smoke-test", "settle-simulator-scene", "export-scene-relations"],
+            "status": "implemented_structural_path",
+        },
+    ]
+
+
+def simfoundry_provider_object_job(
+    obj: dict[str, Any],
+    *,
+    project_root: Path,
+    object_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    object_id = slugify(str(obj.get("object_id") or obj.get("name") or object_dir.name or "object"))
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
+    collision_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+    physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+    evidence = simfoundry_provider_evidence(obj, args.max_evidence_images)
+    expected_mesh = object_dir / "outputs" / f"{object_id}.{args.mesh_format}"
+    expected_physics = object_dir / "outputs" / f"{object_id}_physics.json"
+    expected_collider = object_dir / "outputs" / f"{object_id}_collider.obj"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "object_id": object_id,
+        "name": obj.get("name", object_id),
+        "category": obj.get("category", "unknown"),
+        "asset_role": obj.get("asset_role", "object"),
+        "provider_profile": "simfoundry_custom_responses",
+        "evidence": evidence,
+        "current_assets": {
+            "mesh": mesh,
+            "collision_proxy": collision_proxy,
+            "physics": physics,
+            "pose": pose,
+        },
+        "jobs": {
+            "image_editing": {
+                "enabled": bool(args.enable_image_editing),
+                "model": args.image_model,
+                "task": "Generate/refine object crop or clean visual reference; return image asset paths and provenance.",
+                "expected_output": str(object_dir / "outputs" / f"{object_id}_edited_reference.png"),
+            },
+            "object_mesh_generation": {
+                "enabled": True,
+                "candidate_models": [item.strip() for item in args.mesh_models.split(",") if item.strip()],
+                "fallback": "Use existing mesh or Video2Mesh bbox/mask reconstruction if external mesh generation is unavailable.",
+                "expected_mesh": str(expected_mesh),
+                "coordinate_frame": "object_local",
+            },
+            "physics_properties": {
+                "enabled": True,
+                "model": args.physics_model or args.model,
+                "expected_output": str(expected_physics),
+                "required_fields": ["object_id", "body_type", "collider", "mass_kg", "material"],
+            },
+            "collider_generation": {
+                "enabled": True,
+                "candidate_models": [item.strip() for item in args.collider_models.split(",") if item.strip()],
+                "fallback": "prepare-simfoundry-object-colliders bbox proxy",
+                "expected_collider": str(expected_collider),
+            },
+        },
+        "import_contract": {
+            "mesh_manifest_entry": {
+                "object_id": object_id,
+                "mesh_path": str(expected_mesh),
+                "provider": args.mesh_provider,
+                "coordinate_frame": "object_local",
+                "quality": {"status": "pending_external_mesh"},
+            },
+            "physics_import_entry": {
+                "object_id": object_id,
+                "body_type": "dynamic",
+                "collider": "box|convex_hull|mesh",
+                "mass_kg": None,
+                "material": {"name": "", "friction": [0.8, 0.02, 0.001], "restitution": 0.1},
+                "source": args.physics_model or args.model,
+            },
+        },
+        "notes": "External provider job template only. It does not contain API keys and does not run closed models.",
+    }
+
+
+def simfoundry_provider_commands(project_root: Path, output_dir: Path, args: argparse.Namespace) -> list[str]:
+    mesh_manifest = output_dir / "mesh_manifest.template.json"
+    physics_template = output_dir / "physics_properties.template.json"
+    return [
+        f"python -m video2mesh.cli import-object-meshes --project-root {shlex.quote(str(project_root))} --mesh-manifest {shlex.quote(str(mesh_manifest))} --provider {shlex.quote(args.mesh_provider)} --coordinate-frame object_local --copy-to-assets",
+        f"python -m video2mesh.cli import-simulator-physics --project-root {shlex.quote(str(project_root))} --physics {shlex.quote(str(physics_template))} --provider {shlex.quote(args.physics_model or args.model)} --skip-missing",
+        f"python -m video2mesh.cli prepare-simfoundry-object-colliders --project-root {shlex.quote(str(project_root))}",
+        f"python -m video2mesh.cli export-simulator-adapter --project-root {shlex.quote(str(project_root))} --format mujoco unity isaac",
+        f"python -m video2mesh.cli simfoundry-simulator-smoke-test --project-root {shlex.quote(str(project_root))} --format mujoco unity --fail-on-required",
+        f"python -m video2mesh.cli settle-simulator-scene --project-root {shlex.quote(str(project_root))}",
+        f"python -m video2mesh.cli export-scene-relations --project-root {shlex.quote(str(project_root))}",
+    ]
+
+
+def simfoundry_csv_items(value: str | None, fallback: list[str]) -> list[str]:
+    items = [str(item).strip() for item in str(value or "").split(",") if str(item).strip()]
+    return items or list(fallback)
+
+
+def cmd_prepare_simfoundry_provider_jobs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_provider_jobs"
+    )
+    jobs_dir = ensure_dir(output_dir / "objects")
+    provider_config_path = output_dir / "provider_config.template.json"
+    provider_config = simfoundry_provider_config_template(args)
+    write_json(provider_config_path, provider_config)
+
+    objects = []
+    skipped: dict[str, Any] = {}
+    mesh_manifest_entries = []
+    physics_entries = []
+    for obj in bundle.get("objects", []):
+        if not isinstance(obj, dict):
+            continue
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        if obj.get("asset_role") == "background_structure" and not args.include_background:
+            skipped[object_id] = {"reason": "background_structure", "stage": "provider_jobs"}
+            continue
+        object_dir = ensure_dir(jobs_dir / object_id)
+        object_job = simfoundry_provider_object_job(obj, project_root=project_root, object_dir=object_dir, args=args)
+        object_job_path = object_dir / "provider_job.json"
+        write_json(object_job_path, object_job)
+        objects.append({**object_job, "job_path": str(object_job_path)})
+        mesh_manifest_entries.append(object_job["import_contract"]["mesh_manifest_entry"])
+        physics_entries.append(object_job["import_contract"]["physics_import_entry"])
+
+    mesh_manifest_path = output_dir / "mesh_manifest.template.json"
+    physics_template_path = output_dir / "physics_properties.template.json"
+    write_json(
+        mesh_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider": args.mesh_provider,
+            "coordinate_frame": "object_local",
+            "objects": mesh_manifest_entries,
+            "notes": "Fill mesh_path after external object mesh generation, then import with import-object-meshes.",
+        },
+    )
+    write_json(
+        physics_template_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider": args.physics_model or args.model,
+            "source_bundle": str(bundle_path),
+            "objects": physics_entries,
+            "notes": "Fill body_type/collider/mass/material after VLM/manual review, then import with import-simulator-physics.",
+        },
+    )
+
+    commands = simfoundry_provider_commands(project_root, output_dir, args)
+    script_path = output_dir / "run_after_provider_outputs.sh"
+    script_path.write_text("\n".join(["#!/usr/bin/env bash", "set -euo pipefail", "", *commands, ""]), encoding="utf-8")
+    script_path.chmod(0o755)
+
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_provider_jobs",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "provider_config": str(provider_config_path),
+        "model_stage_catalog": simfoundry_model_stage_catalog(args),
+        "objects": objects,
+        "skipped": skipped,
+        "mesh_manifest_template": str(mesh_manifest_path),
+        "physics_template": str(physics_template_path),
+        "postprocess_script": str(script_path),
+        "postprocess_commands": commands,
+        "summary": {
+            "object_job_count": len(objects),
+            "skipped_count": len(skipped),
+            "provider_profile": provider_config["profile"],
+            "model_provider": args.model_provider,
+            "reasoning_model": args.model,
+            "image_model": args.image_model,
+            "disable_response_storage": bool(args.disable_response_storage),
+        },
+        "secret_policy": provider_config["secret_policy"],
+        "notes": "Prepared SimFoundry-style external provider job templates. No closed model is run and no API key is stored.",
+    }
+    manifest_path = output_dir / "simfoundry_provider_jobs.json"
+    write_json(manifest_path, payload)
+    manifest.setdefault("artifacts", {})["simfoundry_provider_jobs"] = str(manifest_path)
+    manifest.setdefault("artifacts", {})["simfoundry_provider_config_template"] = str(provider_config_path)
+    manifest.setdefault("external_stages", {})["simfoundry_provider_jobs"] = {
+        "status": "provider_jobs_prepared",
+        "report": str(manifest_path),
+        "provider_config": str(provider_config_path),
+        "object_job_count": len(objects),
+        "skipped_objects": skipped,
+        "notes": "Prepared safe external provider job templates for SimFoundry-style model stages.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Prepared SimFoundry provider jobs: {manifest_path}")
+        print(f"Objects: {len(objects)}; skipped={len(skipped)}")
+        print(f"Provider config template: {provider_config_path}")
+        print(f"Postprocess script: {script_path}")
+    return 1 if args.fail_on_empty and not objects else 0
+
+
+def simfoundry_remote_handoff_posix(path: Path | PurePosixPath | str) -> str:
+    return str(path).replace("\\", "/")
+
+
+def simfoundry_remote_handoff_project_label(project_root: Path) -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        return simfoundry_remote_handoff_posix(project_root.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        return project_root.name
+
+
+def simfoundry_remote_handoff_remote_project_root(project_root: Path, remote_root: str) -> str:
+    label = simfoundry_remote_handoff_project_label(project_root)
+    return simfoundry_remote_handoff_posix(PurePosixPath(str(remote_root).rstrip("/")) / PurePosixPath(label))
+
+
+def simfoundry_remote_handoff_remote_path(local_path: Path, project_root: Path, remote_project_root: str) -> str:
+    try:
+        rel = local_path.resolve().relative_to(project_root.resolve())
+        return simfoundry_remote_handoff_posix(PurePosixPath(str(remote_project_root)) / PurePosixPath(simfoundry_remote_handoff_posix(rel)))
+    except ValueError:
+        try:
+            repo_root = Path(__file__).resolve().parents[1]
+            rel = local_path.resolve().relative_to(repo_root.resolve())
+            return simfoundry_remote_handoff_posix(PurePosixPath(str(remote_project_root)).parents[len(PurePosixPath(simfoundry_remote_handoff_project_label(project_root)).parts) - 1] / PurePosixPath(simfoundry_remote_handoff_posix(rel)))
+        except Exception:
+            return simfoundry_remote_handoff_posix(local_path)
+
+
+def simfoundry_remote_handoff_artifact_record(
+    name: str,
+    path: Path,
+    project_root: Path,
+    remote_project_root: str,
+    *,
+    required: bool = False,
+    kind: str = "file",
+    notes: str = "",
+) -> dict[str, Any]:
+    exists = path.exists()
+    local_value = str(path.resolve()) if path.is_absolute() else str(path)
+    return {
+        "name": name,
+        "kind": kind,
+        "required": bool(required),
+        "exists": bool(exists),
+        "local_path": local_value,
+        "remote_path": simfoundry_remote_handoff_remote_path(path.resolve() if path.is_absolute() else path, project_root, remote_project_root),
+        "notes": notes,
+    }
+
+
+def simfoundry_remote_handoff_find_artifact(
+    project_root: Path,
+    manifest: dict[str, Any],
+    artifact_key: str,
+    default: Path | list[Path] | None = None,
+) -> Path | None:
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    found = resolve_existing_path(str(artifacts.get(artifact_key)), project_root) if artifacts.get(artifact_key) else None
+    if found:
+        return found
+    defaults = default if isinstance(default, list) else [default] if default is not None else []
+    resolved_defaults = [resolve_project_cli_path(item, project_root) for item in defaults]
+    for candidate in resolved_defaults:
+        if candidate.exists():
+            return candidate
+    if resolved_defaults:
+        return resolved_defaults[0]
+    return None
+
+
+def simfoundry_remote_handoff_default_artifacts(
+    project_root: Path,
+    manifest: dict[str, Any],
+    bundle_path: Path,
+    remote_project_root: str,
+    *,
+    include_provider_jobs: bool,
+    include_structural_review: bool,
+    include_scale_calibration: bool,
+    include_dynamic_readiness: bool,
+) -> list[dict[str, Any]]:
+    sim_dir = project_root / manifest.get("simulator_assets_dir", "simulator_assets")
+    records = [
+        simfoundry_remote_handoff_artifact_record(
+            "project_manifest",
+            project_root / "manifest.json",
+            project_root,
+            remote_project_root,
+            required=True,
+            notes="Project manifest used to resolve simulator bundle and stage artifacts.",
+        ),
+        simfoundry_remote_handoff_artifact_record(
+            "source_bundle",
+            bundle_path,
+            project_root,
+            remote_project_root,
+            required=True,
+            notes="Simulator asset bundle to execute or review remotely.",
+        ),
+    ]
+    adapter_manifest = simfoundry_remote_handoff_find_artifact(
+        project_root,
+        manifest,
+        "simulator_adapters",
+        sim_dir / "adapters" / "simulator_adapters.json",
+    )
+    if adapter_manifest:
+        records.append(
+            simfoundry_remote_handoff_artifact_record(
+                "simulator_adapters",
+                adapter_manifest,
+                project_root,
+                remote_project_root,
+                kind="file",
+                notes="Adapter manifest for MuJoCo/Unity/Isaac simulator imports when present.",
+            )
+        )
+    if include_provider_jobs:
+        provider_jobs = simfoundry_remote_handoff_find_artifact(
+            project_root,
+            manifest,
+            "simfoundry_provider_jobs",
+            sim_dir / "simfoundry_provider_jobs" / "simfoundry_provider_jobs.json",
+        )
+        provider_config = simfoundry_remote_handoff_find_artifact(
+            project_root,
+            manifest,
+            "simfoundry_provider_config_template",
+            sim_dir / "simfoundry_provider_jobs" / "provider_config.template.json",
+        )
+        if provider_jobs:
+            records.append(
+                simfoundry_remote_handoff_artifact_record(
+                    "simfoundry_provider_jobs",
+                    provider_jobs,
+                    project_root,
+                    remote_project_root,
+                    notes="Safe external model job manifest; no plaintext API key.",
+                )
+            )
+        if provider_config:
+            records.append(
+                simfoundry_remote_handoff_artifact_record(
+                    "simfoundry_provider_config_template",
+                    provider_config,
+                    project_root,
+                    remote_project_root,
+                    notes="Provider metadata template. Uses auth_env only.",
+                )
+            )
+    if include_scale_calibration:
+        for key, default, notes in [
+            (
+                "scale_calibration_job",
+                sim_dir / "scale_calibration_jobs" / "scale_calibration_job.json",
+                "Scale calibration job spec for real-world length measurement.",
+            ),
+            (
+                "scale_calibration_template",
+                sim_dir / "scale_calibration_jobs" / "scale_calibration_template.json",
+                "Fill real reference length here before importing production scale.",
+            ),
+        ]:
+            path = simfoundry_remote_handoff_find_artifact(project_root, manifest, key, default)
+            if path:
+                records.append(
+                    simfoundry_remote_handoff_artifact_record(
+                        key,
+                        path,
+                        project_root,
+                        remote_project_root,
+                        notes=notes,
+                    )
+                )
+    if include_dynamic_readiness:
+        for key, default, notes in [
+            (
+                "simfoundry_dynamic_readiness_report",
+                sim_dir / "simfoundry_dynamic_readiness" / "dynamic_readiness_report.json",
+                "Current dynamic-readiness gate report.",
+            ),
+            (
+                "simfoundry_dynamic_blocker_report",
+                [
+                    sim_dir / "simfoundry_dynamic_readiness" / "dynamic_variant" / "dynamic_blocker_report.json",
+                    sim_dir / "simfoundry_dynamic_readiness" / "dynamic_blocker_report.json",
+                    sim_dir / "simfoundry_dynamic_variant" / "dynamic_blocker_report.json",
+                ],
+                "Blocker report explaining why candidates remain static.",
+            ),
+        ]:
+            path = simfoundry_remote_handoff_find_artifact(project_root, manifest, key, default)
+            if path:
+                records.append(
+                    simfoundry_remote_handoff_artifact_record(
+                        key,
+                        path,
+                        project_root,
+                        remote_project_root,
+                        notes=notes,
+                    )
+                )
+    if include_structural_review:
+        for key, default, notes in [
+            (
+                "simfoundry_structural_repair_plan",
+                sim_dir / "simfoundry_structural_repair_plan" / "structural_repair_plan.json",
+                "Structural/support review plan for VLM/manual worker.",
+            ),
+            (
+                "simfoundry_structural_review_request",
+                sim_dir / "simfoundry_structural_repair_plan" / "structural_repair_review_request.json",
+                "Prepared Responses request manifest when structural review worker has been dry-run.",
+            ),
+            (
+                "simfoundry_structural_review_patch",
+                sim_dir / "simfoundry_structural_repair_plan" / "structural_repair_review_patch.worker.json",
+                "Review patch sidecar to import after external/manual review.",
+            ),
+        ]:
+            path = simfoundry_remote_handoff_find_artifact(project_root, manifest, key, default)
+            if path:
+                records.append(
+                    simfoundry_remote_handoff_artifact_record(
+                        key,
+                        path,
+                        project_root,
+                        remote_project_root,
+                        notes=notes,
+                    )
+                )
+    return records
+
+
+def simfoundry_remote_handoff_provider_contract(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "model_provider": args.model_provider,
+        "provider_name": args.provider_name,
+        "base_url": args.base_url,
+        "wire_api": args.wire_api,
+        "auth_env": args.auth_env,
+        "model": args.model,
+        "model_reasoning_effort": args.model_reasoning_effort,
+        "image_model": args.image_model,
+        "disable_response_storage": bool(args.disable_response_storage),
+        "request_defaults": {
+            "store": False,
+            "disable_response_storage": bool(args.disable_response_storage),
+            "response_format": "json_object",
+        },
+        "secret_policy": {
+            "store_plaintext_keys": False,
+            "required_env_vars": [args.auth_env],
+            "notes": "Set API keys only in the remote shell environment. Do not write plaintext keys to repo artifacts, logs, request manifests, Markdown, or scripts.",
+        },
+    }
+
+
+def generate_simfoundry_remote_handoff(
+    project_root: Path,
+    manifest: dict[str, Any],
+    bundle_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[1]
+    remote_root = simfoundry_remote_handoff_posix(args.remote_root)
+    remote_project_root = simfoundry_remote_handoff_remote_project_root(project_root, remote_root)
+    remote_target = {
+        "host": args.remote_host,
+        "port": int(args.remote_port),
+        "user": args.remote_user,
+        "root": remote_root,
+        "project_root": remote_project_root,
+        "ssh": f"ssh -p {int(args.remote_port)} {args.remote_user}@{args.remote_host}",
+        "scp_target": f"{args.remote_user}@{args.remote_host}:{remote_root.rstrip('/')}/",
+    }
+    provider_contract = simfoundry_remote_handoff_provider_contract(args)
+    local_artifacts = simfoundry_remote_handoff_default_artifacts(
+        project_root,
+        manifest,
+        bundle_path,
+        remote_project_root,
+        include_provider_jobs=bool(args.include_provider_jobs),
+        include_structural_review=bool(args.include_structural_review),
+        include_scale_calibration=bool(args.include_scale_calibration),
+        include_dynamic_readiness=bool(args.include_dynamic_readiness),
+    )
+    repo_label = simfoundry_remote_handoff_project_label(project_root)
+    remote_bundle = simfoundry_remote_handoff_remote_path(bundle_path, project_root, remote_project_root)
+    provider_jobs_remote = f"{remote_project_root}/simulator_assets/simfoundry_provider_jobs/simfoundry_provider_jobs.json"
+    repair_plan_remote = f"{remote_project_root}/simulator_assets/simfoundry_structural_repair_plan/structural_repair_plan.json"
+    review_patch_remote = f"{remote_project_root}/simulator_assets/simfoundry_structural_repair_plan/structural_repair_review_patch.worker.json"
+    scale_template_remote = f"{remote_project_root}/simulator_assets/scale_calibration_jobs/scale_calibration_template.json"
+    dynamic_report_remote = f"{remote_project_root}/simulator_assets/simfoundry_dynamic_readiness/dynamic_readiness_report.json"
+    ssh_base = f"ssh -p {int(args.remote_port)} {args.remote_user}@{args.remote_host}"
+    rsync_ssh = f"ssh -p {int(args.remote_port)}"
+    sync_commands = [
+        f"{ssh_base} 'mkdir -p {shlex.quote(remote_root)}'",
+        (
+            f"rsync -az --delete --exclude '.git/' --exclude '.venv/' --exclude '__pycache__/' "
+            f"-e {shlex.quote(rsync_ssh)} {shlex.quote(str(repo_root) + '/')} "
+            f"{shlex.quote(args.remote_user + '@' + args.remote_host + ':' + remote_root.rstrip('/') + '/')}"
+        ),
+    ]
+    remote_setup_commands = [
+        f"cd {shlex.quote(remote_root)}",
+        "python3 -m venv .venv || true",
+        ". .venv/bin/activate",
+        "python -m pip install -U pip",
+        "python -m pip install -e .",
+    ]
+    remote_provider_commands = [
+        f"cd {shlex.quote(remote_root)}",
+        ". .venv/bin/activate",
+        (
+            f"python -m video2mesh.cli prepare-simfoundry-provider-jobs --project-root {shlex.quote(remote_project_root)} "
+            f"--bundle {shlex.quote(remote_bundle)} --model-provider {shlex.quote(args.model_provider)} "
+            f"--provider-name {shlex.quote(args.provider_name)} --base-url {shlex.quote(args.base_url)} "
+            f"--wire-api {shlex.quote(args.wire_api)} --auth-env {shlex.quote(args.auth_env)} "
+            f"--model {shlex.quote(args.model)} --model-reasoning-effort {shlex.quote(args.model_reasoning_effort)} "
+            f"--image-model {shlex.quote(args.image_model)} --json"
+        ),
+    ]
+    if args.include_structural_review:
+        remote_provider_commands.append(
+            (
+                f"python -m video2mesh.cli run-simfoundry-structural-review-worker --project-root {shlex.quote(remote_project_root)} "
+                f"--bundle {shlex.quote(remote_bundle)} --repair-plan {shlex.quote(repair_plan_remote)} "
+                f"--model-provider {shlex.quote(args.model_provider)} --provider-name {shlex.quote(args.provider_name)} "
+                f"--base-url {shlex.quote(args.base_url)} --wire-api {shlex.quote(args.wire_api)} "
+                f"--auth-env {shlex.quote(args.auth_env)} --model {shlex.quote(args.model)} "
+                f"--model-reasoning-effort {shlex.quote(args.model_reasoning_effort)} "
+                f"--image-model {shlex.quote(args.image_model)} --json"
+            )
+        )
+        remote_provider_commands.append(
+            (
+                f"{args.auth_env}=<set-in-shell> python -m video2mesh.cli run-simfoundry-structural-review-worker "
+                f"--project-root {shlex.quote(remote_project_root)} --bundle {shlex.quote(remote_bundle)} "
+                f"--repair-plan {shlex.quote(repair_plan_remote)} --run-provider --json --fail-on-required"
+            )
+        )
+    return_commands = [
+        (
+            f"rsync -az -e {shlex.quote(rsync_ssh)} "
+            f"{shlex.quote(args.remote_user + '@' + args.remote_host + ':' + remote_project_root.rstrip('/') + '/simulator_assets/')} "
+            f"{shlex.quote(str((project_root / 'simulator_assets').resolve()) + '/')}"
+        )
+    ]
+    local_import_commands = [
+        (
+            f"PYTHONPATH=. uv run python -m video2mesh.cli simfoundry-simulator-smoke-test "
+            f"--project-root {shlex.quote(str(project_root))} --bundle {shlex.quote(str(bundle_path))} "
+            f"--format mujoco unity isaac --fail-on-required"
+        )
+    ]
+    if args.include_scale_calibration:
+        local_import_commands.insert(
+            0,
+            (
+                f"PYTHONPATH=. uv run python -m video2mesh.cli import-scale-calibration "
+                f"--project-root {shlex.quote(str(project_root))} --calibration {shlex.quote(str(project_root / 'simulator_assets' / 'scale_calibration_jobs' / 'scale_calibration_template.json'))} "
+                f"--json"
+            ),
+        )
+    if args.include_structural_review:
+        local_import_commands.insert(
+            0,
+            (
+                f"PYTHONPATH=. uv run python -m video2mesh.cli import-simfoundry-structural-repair "
+                f"--project-root {shlex.quote(str(project_root))} --bundle {shlex.quote(str(bundle_path))} "
+                f"--repair-plan {shlex.quote(str(project_root / 'simulator_assets' / 'simfoundry_structural_repair_plan' / 'structural_repair_plan.json'))} "
+                f"--review-patch {shlex.quote(str(project_root / 'simulator_assets' / 'simfoundry_structural_repair_plan' / 'structural_repair_review_patch.worker.json'))} "
+                f"--json --fail-on-required"
+            ),
+        )
+    missing_required = [item for item in local_artifacts if item.get("required") and not item.get("exists")]
+    existing_count = len([item for item in local_artifacts if item.get("exists")])
+    return scrub_provider_secrets(
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_remote_handoff",
+            "project_root": str(project_root),
+            "repo_root": str(repo_root),
+            "repo_project_label": repo_label,
+            "scene_id": manifest.get("scene_id"),
+            "timestamp": int(time.time()),
+            "status": "remote_handoff_prepared" if not missing_required else "missing_required_artifacts",
+            "ok": not missing_required,
+            "source_bundle": str(bundle_path),
+            "output_dir": str(output_dir),
+            "remote_target": remote_target,
+            "provider_contract": provider_contract,
+            "local_artifacts": local_artifacts,
+            "sync_commands": sync_commands,
+            "remote_setup_commands": remote_setup_commands,
+            "remote_provider_commands": remote_provider_commands,
+            "return_commands": return_commands,
+            "local_import_commands": local_import_commands,
+            "remote_artifact_hints": {
+                "provider_jobs": provider_jobs_remote,
+                "structural_repair_plan": repair_plan_remote,
+                "structural_review_patch": review_patch_remote,
+                "scale_calibration_template": scale_template_remote,
+                "dynamic_readiness_report": dynamic_report_remote,
+            },
+            "summary": {
+                "artifact_count": len(local_artifacts),
+                "existing_artifact_count": existing_count,
+                "missing_required_count": len(missing_required),
+                "remote_host": args.remote_host,
+                "remote_port": int(args.remote_port),
+                "remote_user": args.remote_user,
+                "model_provider": args.model_provider,
+                "provider_name": args.provider_name,
+                "wire_api": args.wire_api,
+                "reasoning_model": args.model,
+                "image_model": args.image_model,
+                "disable_response_storage": bool(args.disable_response_storage),
+            },
+            "secret_policy": provider_contract["secret_policy"],
+            "notes": [
+                "This handoff only writes commands and contracts. It does not SSH, rsync, or call providers.",
+                f"Set {args.auth_env} only in the remote shell before explicit --run-provider commands.",
+                "Run dry-run provider commands first; import returned patches locally only after review.",
+                "Scale calibration remains a required production boundary when scale_calibrated is false or assumed.",
+            ],
+        }
+    )
+
+
+def write_simfoundry_remote_handoff_markdown(report: dict[str, Any], output_path: Path) -> None:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    remote = report.get("remote_target") if isinstance(report.get("remote_target"), dict) else {}
+    provider = report.get("provider_contract") if isinstance(report.get("provider_contract"), dict) else {}
+    lines = [
+        f"# SimFoundry Remote Handoff: {report.get('scene_id') or 'scene'}",
+        "",
+        "## Summary",
+        "",
+        markdown_table(
+            ["Field", "Value"],
+            [
+                ["status", report.get("status")],
+                ["remote", remote.get("ssh")],
+                ["remote_project_root", remote.get("project_root")],
+                ["provider", f"{provider.get('model_provider')}/{provider.get('provider_name')}/{provider.get('wire_api')}"],
+                ["model", provider.get("model")],
+                ["image_model", provider.get("image_model")],
+                ["disable_response_storage", provider.get("disable_response_storage")],
+                ["auth_env", provider.get("auth_env")],
+                ["artifacts", f"{summary.get('existing_artifact_count')}/{summary.get('artifact_count')} existing"],
+            ],
+        ),
+        "",
+        "## Local Artifacts",
+        "",
+        markdown_table(
+            ["Name", "Exists", "Required", "Local Path", "Remote Path", "Notes"],
+            [
+                [
+                    item.get("name"),
+                    item.get("exists"),
+                    item.get("required"),
+                    item.get("local_path"),
+                    item.get("remote_path"),
+                    item.get("notes"),
+                ]
+                for item in report.get("local_artifacts", [])
+                if isinstance(item, dict)
+            ],
+        ),
+        "",
+        "## Sync To Server",
+        "",
+        "```bash",
+        *[str(command) for command in report.get("sync_commands", [])],
+        "```",
+        "",
+        "## Remote Setup",
+        "",
+        "```bash",
+        *[str(command) for command in report.get("remote_setup_commands", [])],
+        "```",
+        "",
+        "## Remote Provider Commands",
+        "",
+        "```bash",
+        *[str(command) for command in report.get("remote_provider_commands", [])],
+        "```",
+        "",
+        "## Return To Local",
+        "",
+        "```bash",
+        *[str(command) for command in report.get("return_commands", [])],
+        "```",
+        "",
+        "## Local Import And Smoke",
+        "",
+        "```bash",
+        *[str(command) for command in report.get("local_import_commands", [])],
+        "```",
+        "",
+        "## Secret Policy",
+        "",
+        f"- Store plaintext keys: `{provider.get('secret_policy', {}).get('store_plaintext_keys') if isinstance(provider.get('secret_policy'), dict) else False}`",
+        f"- Required env vars: `{', '.join(provider.get('secret_policy', {}).get('required_env_vars', [])) if isinstance(provider.get('secret_policy'), dict) else provider.get('auth_env')}`",
+        "- Do not paste or commit API key values into generated artifacts.",
+        "",
+    ]
+    ensure_dir(output_path.parent)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_simfoundry_remote_handoff_script(report: dict[str, Any], output_path: Path) -> None:
+    remote = report.get("remote_target") if isinstance(report.get("remote_target"), dict) else {}
+    ssh_command = str(remote.get("ssh") or "")
+    dry_run_commands = [str(command) for command in report.get("remote_setup_commands", [])]
+    dry_run_commands.extend(
+        str(command)
+        for command in report.get("remote_provider_commands", [])
+        if "<set-in-shell>" not in str(command)
+    )
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        "# Generated SimFoundry remote handoff helper.",
+        "# It prepares commands only; provider execution still requires explicit env setup.",
+        "",
+        "case \"${1:-help}\" in",
+        "  sync)",
+    ]
+    for command in report.get("sync_commands", []):
+        lines.append(f"    {command}")
+    lines.extend(["    ;;", "  remote-dry-run)", "    cat <<'REMOTE_COMMANDS'"])
+    for command in dry_run_commands:
+        lines.append(command)
+    lines.extend(["REMOTE_COMMANDS", "    ;;"])
+    if ssh_command:
+        lines.extend(["  remote-run-dry-run)", f"    {ssh_command} 'bash -s' <<'REMOTE_COMMANDS'"])
+        for command in dry_run_commands:
+            lines.append(command)
+        lines.extend(["REMOTE_COMMANDS", "    ;;"])
+    lines.extend(["  fetch)"])
+    for command in report.get("return_commands", []):
+        lines.append(f"    {command}")
+    lines.extend(["    ;;", "  local-import)"])
+    for command in report.get("local_import_commands", []):
+        lines.append(f"    {command}")
+    lines.extend(
+        [
+            "    ;;",
+            "  *)",
+            "    echo \"Usage: $0 {sync|remote-dry-run|remote-run-dry-run|fetch|local-import}\"",
+            "    ;;",
+            "esac",
+            "",
+        ]
+    )
+    ensure_dir(output_path.parent)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    output_path.chmod(0o755)
+
+
+def cmd_prepare_simfoundry_remote_handoff(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}")
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "simfoundry_remote_handoff"
+    )
+    output_path = resolve_project_cli_path(args.output, project_root) if args.output else output_dir / "simfoundry_remote_handoff.json"
+    markdown_path = (
+        resolve_project_cli_path(args.markdown_output, project_root)
+        if args.markdown_output
+        else output_dir / "simfoundry_remote_handoff.md"
+    )
+    script_path = (
+        resolve_project_cli_path(args.script_output, project_root)
+        if args.script_output
+        else output_dir / "simfoundry_remote_handoff.sh"
+    )
+    report = generate_simfoundry_remote_handoff(project_root, manifest, bundle_path, output_dir, args)
+    write_json(output_path, report)
+    if not args.no_markdown:
+        write_simfoundry_remote_handoff_markdown(report, markdown_path)
+    if not args.no_script:
+        write_simfoundry_remote_handoff_script(report, script_path)
+    manifest.setdefault("artifacts", {})["simfoundry_remote_handoff"] = str(output_path)
+    if not args.no_markdown:
+        manifest["artifacts"]["simfoundry_remote_handoff_md"] = str(markdown_path)
+    if not args.no_script:
+        manifest["artifacts"]["simfoundry_remote_handoff_script"] = str(script_path)
+    manifest.setdefault("external_stages", {})["simfoundry_remote_handoff"] = {
+        "status": report.get("status"),
+        "report": str(output_path),
+        "markdown": str(markdown_path) if not args.no_markdown else None,
+        "script": str(script_path) if not args.no_script else None,
+        "remote_target": report.get("remote_target"),
+        "provider_contract": report.get("provider_contract"),
+        "summary": report.get("summary", {}),
+        "notes": "Prepared safe server handoff commands/contracts for SimFoundry-style external execution. No API key is stored.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        summary = report.get("summary", {})
+        print(f"SimFoundry remote handoff: {report.get('status')} ({report.get('scene_id')})")
+        print(
+            f"remote={args.remote_user}@{args.remote_host}:{args.remote_port} "
+            f"artifacts={summary.get('existing_artifact_count')}/{summary.get('artifact_count')}"
+        )
+        print(f"JSON: {output_path}")
+        if not args.no_markdown:
+            print(f"Markdown: {markdown_path}")
+        if not args.no_script:
+            print(f"Script: {script_path}")
+    return 1 if args.fail_on_missing_required and report.get("summary", {}).get("missing_required_count") else 0
+
+
+def simfoundry_object_cousin_prompt(
+    obj: dict[str, Any],
+    *,
+    intent: str,
+    object_id: str,
+    variant_id: str,
+    preserve_scale: bool,
+    preserve_category: bool,
+) -> str:
+    category = str(obj.get("category") or "object")
+    name = str(obj.get("name") or object_id)
+    constraints = []
+    if preserve_category:
+        constraints.append(f"keep the object recognizable as category '{category}'")
+    if preserve_scale:
+        constraints.append("preserve the original metric scale envelope and simulator contact role")
+    constraints.append("return provenance and do not invent scene-level geometry")
+    return (
+        f"Create a SimFoundry-style object cousin for {name} ({object_id}). "
+        f"Variant id: {variant_id}. Intent: {intent}. "
+        f"Use the supplied object crop/frame, bbox, pose and physics sidecars. "
+        f"Constraints: {'; '.join(constraints)}."
+    )
+
+
+def simfoundry_object_cousin_variant(
+    obj: dict[str, Any],
+    *,
+    object_id: str,
+    variant_index: int,
+    intent: str,
+    variant_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    variant_id = f"{object_id}_cousin_{variant_index + 1:02d}_{slugify(intent, fallback='variant')}"
+    output_dir = variant_dir / "outputs"
+    expected_reference = output_dir / f"{variant_id}_edited_reference.png"
+    expected_mesh = output_dir / f"{variant_id}.{args.mesh_format}"
+    expected_pose = output_dir / f"{variant_id}_pose_scale.json"
+    expected_physics = output_dir / f"{variant_id}_physics.json"
+    expected_collider = output_dir / f"{variant_id}_collider.obj"
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_object_cousin_variant",
+        "variant_id": variant_id,
+        "source_object_id": object_id,
+        "intent": intent,
+        "status": "template_pending_external_generation",
+        "prompt": simfoundry_object_cousin_prompt(
+            obj,
+            intent=intent,
+            object_id=object_id,
+            variant_id=variant_id,
+            preserve_scale=args.preserve_scale,
+            preserve_category=args.preserve_category,
+        ),
+        "model_plan": {
+            "image_editing": {
+                "model": args.image_model,
+                "enabled": bool(args.enable_image_editing),
+                "expected_output": str(expected_reference),
+                "role": "object visual cousin reference or clean crop",
+            },
+            "mesh_generation": {
+                "candidate_models": simfoundry_csv_items(args.mesh_models, ["hunyuan3d", "trellis", "image-blaster"]),
+                "expected_mesh": str(expected_mesh),
+                "coordinate_frame": "object_local",
+                "fallback": "reuse existing Video2Mesh object mesh if external generation is unavailable",
+            },
+            "pose_scale_refinement": {
+                "candidate_models": simfoundry_csv_items(args.pose_models, ["foundationpose", "bbox_alignment"]),
+                "expected_output": str(expected_pose),
+                "fallback": "bbox/point-cloud alignment and simulator scale calibration",
+            },
+            "physics_properties": {
+                "model": args.physics_model or args.model,
+                "expected_output": str(expected_physics),
+                "required_fields": ["object_id", "body_type", "collider", "mass_kg", "material"],
+            },
+            "collider_generation": {
+                "candidate_models": simfoundry_csv_items(args.collider_models, ["coacd", "vhacd", "bbox"]),
+                "expected_collider": str(expected_collider),
+                "fallback": "bbox collision proxy",
+            },
+        },
+        "acceptance_gates": [
+            "mesh file exists and can be imported",
+            "object-local bbox is within configured source scale envelope",
+            "physics sidecar contains mass/material/collider provenance",
+            "collider fallback exists when CoACD/V-HACD is unavailable",
+            "export-simulator-adapter and simfoundry-simulator-smoke-test pass before using the cousin in simulation",
+        ],
+        "import_contract": {
+            "mesh_manifest_entry": {
+                "object_id": variant_id,
+                "source_object_id": object_id,
+                "cousin_of": object_id,
+                "mesh_path": str(expected_mesh),
+                "provider": args.mesh_provider,
+                "coordinate_frame": "object_local",
+                "quality": {
+                    "status": "pending_external_object_cousin",
+                    "variant_intent": intent,
+                    "preserve_scale": bool(args.preserve_scale),
+                },
+            },
+            "physics_import_entry": {
+                "object_id": variant_id,
+                "source_object_id": object_id,
+                "body_type": "dynamic",
+                "collider": "box|convex_hull|mesh",
+                "mass_kg": None,
+                "material": {"name": "", "friction": [0.8, 0.02, 0.001], "restitution": 0.1},
+                "source": args.physics_model or args.model,
+            },
+            "collider_entry": {
+                "object_id": variant_id,
+                "source_object_id": object_id,
+                "path": str(expected_collider),
+                "provider": "coacd|vhacd|bbox",
+            },
+        },
+        "notes": "Object cousin variant template only. External workers fill expected artifacts; this command does not call closed models.",
+    }
+
+
+def simfoundry_object_cousin_spec(
+    obj: dict[str, Any],
+    *,
+    project_root: Path,
+    object_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    object_id = slugify(str(obj.get("object_id") or obj.get("name") or object_dir.name or "object"))
+    evidence = simfoundry_provider_evidence(obj, args.max_evidence_images)
+    intents = simfoundry_csv_items(args.cousin_intents, ["appearance", "geometry", "material"])
+    variants: list[dict[str, Any]] = []
+    variant_count = max(0, int(args.cousin_count))
+    variants_dir = ensure_dir(object_dir / "variants")
+    for idx in range(variant_count):
+        intent = intents[idx % len(intents)]
+        variant_dir = ensure_dir(variants_dir / f"{object_id}_cousin_{idx + 1:02d}_{slugify(intent, fallback='variant')}")
+        variant = simfoundry_object_cousin_variant(obj, object_id=object_id, variant_index=idx, intent=intent, variant_dir=variant_dir, args=args)
+        write_json(variant_dir / "cousin_variant.json", variant)
+        variants.append({**variant, "variant_path": str(variant_dir / "cousin_variant.json")})
+    mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
+    collision_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+    physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_object_cousin",
+        "object_id": object_id,
+        "name": obj.get("name", object_id),
+        "category": obj.get("category", "unknown"),
+        "asset_role": obj.get("asset_role", "object"),
+        "provider_profile": "simfoundry_custom_responses",
+        "evidence": evidence,
+        "source_assets": {
+            "mesh": mesh,
+            "collision_proxy": collision_proxy,
+            "physics": physics,
+            "pose": pose,
+            "bbox_3d": obj.get("bbox_3d"),
+        },
+        "cousin_policy": {
+            "preserve_category": bool(args.preserve_category),
+            "preserve_scale": bool(args.preserve_scale),
+            "allow_geometry_variation": bool(args.allow_geometry_variation),
+            "variant_intents": intents,
+            "variant_count": variant_count,
+        },
+        "variants": variants,
+        "notes": "Per-object SimFoundry-style cousin scaffold. It prepares model/provider contracts, not final generated assets.",
+    }
+
+
+def simfoundry_object_cousin_commands(project_root: Path, output_dir: Path, args: argparse.Namespace) -> list[str]:
+    mesh_manifest = output_dir / "mesh_manifest.template.json"
+    physics_template = output_dir / "physics_properties.template.json"
+    return [
+        f"python -m video2mesh.cli import-simfoundry-object-cousin --project-root {shlex.quote(str(project_root))} --mesh-manifest {shlex.quote(str(mesh_manifest))} --physics {shlex.quote(str(physics_template))} --json --fail-on-required",
+        f"python -m video2mesh.cli import-object-meshes --project-root {shlex.quote(str(project_root))} --mesh-manifest {shlex.quote(str(mesh_manifest))} --provider {shlex.quote(args.mesh_provider)} --coordinate-frame object_local --copy-to-assets",
+        f"python -m video2mesh.cli import-simulator-physics --project-root {shlex.quote(str(project_root))} --physics {shlex.quote(str(physics_template))} --provider {shlex.quote(args.physics_model or args.model)} --skip-missing",
+        f"python -m video2mesh.cli build-simfoundry-object-colliders --project-root {shlex.quote(str(project_root))} --provider simfoundry_collider_builder",
+        f"python -m video2mesh.cli prepare-simfoundry-dynamic-variant --project-root {shlex.quote(str(project_root))} --json",
+        f"python -m video2mesh.cli export-simulator-adapter --project-root {shlex.quote(str(project_root))} --format mujoco unity isaac",
+        f"python -m video2mesh.cli simfoundry-simulator-smoke-test --project-root {shlex.quote(str(project_root))} --format mujoco unity isaac --fail-on-required",
+    ]
+
+
+def cmd_prepare_simfoundry_object_cousins(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_object_cousins"
+    )
+    objects_dir = ensure_dir(output_dir / "objects")
+    provider_config_path = output_dir / "provider_config.template.json"
+    provider_config = simfoundry_provider_config_template(args)
+    provider_config["profile"] = "simfoundry_object_cousins_custom_responses"
+    provider_config["cousin_defaults"] = {
+        "cousin_count": int(args.cousin_count),
+        "cousin_intents": simfoundry_csv_items(args.cousin_intents, ["appearance", "geometry", "material"]),
+        "preserve_category": bool(args.preserve_category),
+        "preserve_scale": bool(args.preserve_scale),
+    }
+    write_json(provider_config_path, provider_config)
+
+    object_specs: list[dict[str, Any]] = []
+    skipped: dict[str, Any] = {}
+    mesh_entries: list[dict[str, Any]] = []
+    physics_entries: list[dict[str, Any]] = []
+    collider_entries: list[dict[str, Any]] = []
+    for obj in bundle.get("objects", []) if isinstance(bundle.get("objects"), list) else []:
+        if not isinstance(obj, dict):
+            continue
+        object_id = slugify(str(obj.get("object_id") or obj.get("name") or "object"))
+        if obj.get("asset_role") == "background_structure" and not args.include_background:
+            skipped[object_id] = {"reason": "background_structure", "stage": "object_cousins"}
+            continue
+        object_dir = ensure_dir(objects_dir / object_id)
+        spec = simfoundry_object_cousin_spec(obj, project_root=project_root, object_dir=object_dir, args=args)
+        spec_path = object_dir / "object_cousin_spec.json"
+        write_json(spec_path, spec)
+        object_specs.append({**spec, "spec_path": str(spec_path)})
+        for variant in spec.get("variants", []):
+            contract = variant.get("import_contract") if isinstance(variant.get("import_contract"), dict) else {}
+            mesh_entry = contract.get("mesh_manifest_entry")
+            physics_entry = contract.get("physics_import_entry")
+            collider_entry = contract.get("collider_entry")
+            if isinstance(mesh_entry, dict):
+                mesh_entries.append(mesh_entry)
+            if isinstance(physics_entry, dict):
+                physics_entries.append(physics_entry)
+            if isinstance(collider_entry, dict):
+                collider_entries.append(collider_entry)
+
+    mesh_manifest_path = output_dir / "mesh_manifest.template.json"
+    physics_template_path = output_dir / "physics_properties.template.json"
+    collider_manifest_path = output_dir / "collider_manifest.template.json"
+    write_json(
+        mesh_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider": args.mesh_provider,
+            "coordinate_frame": "object_local",
+            "objects": mesh_entries,
+            "notes": "Fill mesh_path values after external object cousin generation, then import or review before simulator bundle replacement.",
+        },
+    )
+    write_json(
+        physics_template_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider": args.physics_model or args.model,
+            "source_bundle": str(bundle_path),
+            "objects": physics_entries,
+            "notes": "Fill cousin physics properties after VLM/manual review before importing.",
+        },
+    )
+    write_json(
+        collider_manifest_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider_candidates": simfoundry_csv_items(args.collider_models, ["coacd", "vhacd", "bbox"]),
+            "objects": collider_entries,
+            "notes": "Optional cousin collider outputs. If absent, build-simfoundry-object-colliders can fall back to bbox proxies.",
+        },
+    )
+    commands = simfoundry_object_cousin_commands(project_root, output_dir, args)
+    script_path = output_dir / "run_after_cousin_outputs.sh"
+    script_path.write_text("\n".join(["#!/usr/bin/env bash", "set -euo pipefail", "", *commands, ""]), encoding="utf-8")
+    script_path.chmod(0o755)
+
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_object_cousins",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "provider_config": str(provider_config_path),
+        "model_stage_catalog": simfoundry_model_stage_catalog(args),
+        "objects": object_specs,
+        "skipped": skipped,
+        "mesh_manifest_template": str(mesh_manifest_path),
+        "physics_template": str(physics_template_path),
+        "collider_manifest_template": str(collider_manifest_path),
+        "postprocess_script": str(script_path),
+        "postprocess_commands": commands,
+        "summary": {
+            "object_count": len(object_specs),
+            "cousin_variant_count": len(mesh_entries),
+            "skipped_count": len(skipped),
+            "model_provider": args.model_provider,
+            "provider_name": args.provider_name,
+            "reasoning_model": args.model,
+            "image_model": args.image_model,
+            "mesh_models": simfoundry_csv_items(args.mesh_models, ["hunyuan3d", "trellis", "image-blaster"]),
+            "pose_models": simfoundry_csv_items(args.pose_models, ["foundationpose", "bbox_alignment"]),
+            "collider_models": simfoundry_csv_items(args.collider_models, ["coacd", "vhacd", "bbox"]),
+            "disable_response_storage": bool(args.disable_response_storage),
+        },
+        "secret_policy": provider_config["secret_policy"],
+        "notes": "Prepared SimFoundry-style object cousin contracts. No model call is made and no API key is stored.",
+    }
+    manifest_path = output_dir / "object_cousins_manifest.json"
+    write_json(manifest_path, payload)
+    manifest.setdefault("artifacts", {})["simfoundry_object_cousins"] = str(manifest_path)
+    manifest.setdefault("artifacts", {})["simfoundry_object_cousins_dir"] = str(output_dir)
+    manifest.setdefault("artifacts", {})["simfoundry_object_cousins_provider_config"] = str(provider_config_path)
+    manifest.setdefault("external_stages", {})["simfoundry_object_cousins"] = {
+        "status": "object_cousins_prepared",
+        "report": str(manifest_path),
+        "provider_config": str(provider_config_path),
+        "object_count": len(object_specs),
+        "cousin_variant_count": len(mesh_entries),
+        "skipped_objects": skipped,
+        "notes": "Prepared object cousin templates for SimFoundry-style augmentation.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Prepared SimFoundry object cousins: {manifest_path}")
+        print(f"Objects: {len(object_specs)}; variants={len(mesh_entries)}; skipped={len(skipped)}")
+        print(f"Provider config template: {provider_config_path}")
+        print(f"Postprocess script: {script_path}")
+    return 1 if args.fail_on_empty and not object_specs else 0
+
+
+def simfoundry_scene_cousin_variant(
+    *,
+    bundle: dict[str, Any],
+    variant_index: int,
+    intent: str,
+    variant_dir: Path,
+    movable_objects: list[dict[str, Any]],
+    background_objects: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    scene_id = slugify(str(bundle.get("scene_id") or "scene"), fallback="scene")
+    variant_id = f"{scene_id}_scene_cousin_{variant_index + 1:02d}_{slugify(intent, fallback='variant')}"
+    output_dir = variant_dir / "outputs"
+    expected_background = output_dir / f"{variant_id}_clean_plate.png"
+    expected_bundle_patch = output_dir / f"{variant_id}_bundle_patch.json"
+    expected_relations = output_dir / f"{variant_id}_scene_relations.json"
+    expected_bundle = output_dir / f"simulator_asset_bundle.{variant_id}.json"
+    selected_objects = [slugify(str(obj.get("object_id") or obj.get("name") or "object")) for obj in movable_objects[: max(0, int(args.max_objects_per_variant))]]
+    selected_background = [slugify(str(obj.get("object_id") or obj.get("name") or "object")) for obj in background_objects]
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_scene_cousin_variant",
+        "variant_id": variant_id,
+        "intent": intent,
+        "status": "template_pending_external_generation",
+        "prompt": (
+            f"Create a SimFoundry-style scene cousin for scene {scene_id}. "
+            f"Intent: {intent}. Preserve navigable structure, scale, static collider semantics, and simulator importability. "
+            "Return only scene-level patch/provenance artifacts; do not store API keys."
+        ),
+        "scope": {
+            "selected_foreground_objects": selected_objects,
+            "background_structures": selected_background,
+            "static_collider_policy": "preserve_or_regenerate_with_same_coordinate_frame",
+            "scale_policy": "preserve calibrated/assumed scale envelope",
+        },
+        "model_plan": {
+            "scene_reasoning": {
+                "model": args.model,
+                "reasoning_effort": args.model_reasoning_effort,
+                "expected_output": str(expected_bundle_patch),
+            },
+            "image_editing_clean_plate": {
+                "model": args.image_model,
+                "enabled": bool(args.enable_image_editing),
+                "expected_output": str(expected_background),
+                "role": "scene-level clean plate or visual reference for inpainting/object swap",
+            },
+            "object_cousin_pool": {
+                "source_manifest": str(args.object_cousins) if args.object_cousins else "",
+                "usage": "optional source of generated object variants for swap/replace cousins",
+            },
+            "relation_regeneration": {
+                "route": "export-scene-relations",
+                "expected_output": str(expected_relations),
+            },
+            "collider_validation": {
+                "route": "prepare-simfoundry-collider-scene or preserve existing scene_static_collider.obj",
+                "fallback": "keep static collider unchanged until a verified scene cousin mesh exists",
+            },
+        },
+        "expected_artifacts": {
+            "clean_plate_or_reference": str(expected_background),
+            "bundle_patch": str(expected_bundle_patch),
+            "scene_relations": str(expected_relations),
+            "sidecar_bundle": str(expected_bundle),
+        },
+        "acceptance_gates": [
+            "sidecar bundle exists and does not overwrite the main simulator_asset_bundle.json",
+            "static scene collider is present and readable",
+            "object collision proxies are present for every dynamic candidate",
+            "simfoundry-scene-stability-report has zero required issues",
+            "export-simulator-adapter and simfoundry-simulator-smoke-test pass before simulation use",
+        ],
+        "import_contract": {
+            "sidecar_bundle": str(expected_bundle),
+            "main_bundle_overwritten": False,
+            "postprocess_required": [
+                "apply bundle_patch to a sidecar copy of simulator_asset_bundle.json",
+                "rerun export-scene-relations",
+                "rerun export-simulator-adapter",
+                "rerun simfoundry-simulator-smoke-test",
+            ],
+        },
+        "notes": "Scene cousin template only. External workers may fill bundle patches or clean plates; this command does not call closed models.",
+    }
+
+
+def simfoundry_scene_cousin_commands(project_root: Path, output_dir: Path, args: argparse.Namespace) -> list[str]:
+    return [
+        f"python -m video2mesh.cli import-simfoundry-scene-cousin --project-root {shlex.quote(str(project_root))} --json --fail-on-required",
+        f"python -m video2mesh.cli export-scene-relations --project-root {shlex.quote(str(project_root))} --json",
+        f"python -m video2mesh.cli simfoundry-scene-stability-report --project-root {shlex.quote(str(project_root))} --json --fail-on-required",
+        f"python -m video2mesh.cli export-simulator-adapter --project-root {shlex.quote(str(project_root))} --format mujoco unity isaac",
+        f"python -m video2mesh.cli simfoundry-simulator-smoke-test --project-root {shlex.quote(str(project_root))} --format mujoco unity isaac --fail-on-required",
+        f"echo Fill scene cousin sidecar bundles under {shlex.quote(str(output_dir / 'variants'))} before running simulator task evaluation.",
+    ]
+
+
+def cmd_prepare_simfoundry_scene_cousins(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest["simulator_assets_dir"] / "simfoundry_scene_cousins"
+    )
+    variants_dir = ensure_dir(output_dir / "variants")
+    provider_config_path = output_dir / "provider_config.template.json"
+    provider_config = simfoundry_provider_config_template(args)
+    provider_config["profile"] = "simfoundry_scene_cousins_custom_responses"
+    provider_config["scene_cousin_defaults"] = {
+        "scene_cousin_count": int(args.scene_cousin_count),
+        "scene_cousin_intents": simfoundry_csv_items(args.scene_cousin_intents, ["clean_plate", "layout_perturbation", "object_swap"]),
+        "preserve_static_collider": bool(args.preserve_static_collider),
+        "max_objects_per_variant": int(args.max_objects_per_variant),
+    }
+    write_json(provider_config_path, provider_config)
+
+    objects = [obj for obj in bundle.get("objects", []) if isinstance(obj, dict)]
+    foreground = [obj for obj in objects if obj.get("asset_role") != "background_structure"]
+    background = [obj for obj in objects if obj.get("asset_role") == "background_structure"]
+    intents = simfoundry_csv_items(args.scene_cousin_intents, ["clean_plate", "layout_perturbation", "object_swap"])
+    variant_count = max(0, int(args.scene_cousin_count))
+    variants: list[dict[str, Any]] = []
+    for idx in range(variant_count):
+        intent = intents[idx % len(intents)]
+        scene_id = slugify(str(bundle.get("scene_id") or "scene"), fallback="scene")
+        variant_dir = ensure_dir(variants_dir / f"{scene_id}_scene_cousin_{idx + 1:02d}_{slugify(intent, fallback='variant')}")
+        variant = simfoundry_scene_cousin_variant(
+            bundle=bundle,
+            variant_index=idx,
+            intent=intent,
+            variant_dir=variant_dir,
+            movable_objects=foreground,
+            background_objects=background,
+            args=args,
+        )
+        variant_path = variant_dir / "scene_cousin_variant.json"
+        write_json(variant_path, variant)
+        variants.append({**variant, "variant_path": str(variant_path)})
+
+    scene_patch_template_path = output_dir / "scene_bundle_patch.template.json"
+    scene_relation_template_path = output_dir / "scene_relations.template.json"
+    write_json(
+        scene_patch_template_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "provider": args.model,
+            "source_bundle": str(bundle_path),
+            "patch_format": "sidecar_bundle_patch",
+            "variants": [
+                {
+                    "variant_id": variant.get("variant_id"),
+                    "bundle_patch": variant.get("expected_artifacts", {}).get("bundle_patch"),
+                    "sidecar_bundle": variant.get("expected_artifacts", {}).get("sidecar_bundle"),
+                }
+                for variant in variants
+            ],
+            "notes": "External scene cousin worker should fill per-variant bundle patches and sidecar bundles; the main bundle must not be overwritten.",
+        },
+    )
+    write_json(
+        scene_relation_template_path,
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "source_bundle": str(bundle_path),
+            "variants": [
+                {
+                    "variant_id": variant.get("variant_id"),
+                    "scene_relations": variant.get("expected_artifacts", {}).get("scene_relations"),
+                }
+                for variant in variants
+            ],
+            "notes": "Regenerate or review scene predicates after applying a scene cousin sidecar bundle.",
+        },
+    )
+    commands = simfoundry_scene_cousin_commands(project_root, output_dir, args)
+    script_path = output_dir / "run_after_scene_cousin_outputs.sh"
+    script_path.write_text("\n".join(["#!/usr/bin/env bash", "set -euo pipefail", "", *commands, ""]), encoding="utf-8")
+    script_path.chmod(0o755)
+
+    object_cousin_manifest = resolve_existing_path(args.object_cousins, project_root) if args.object_cousins else resolve_existing_path(
+        manifest.get("artifacts", {}).get("simfoundry_object_cousins"), project_root
+    )
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_scene_cousins",
+        "project_root": str(project_root),
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "provider_config": str(provider_config_path),
+        "object_cousins": str(object_cousin_manifest) if object_cousin_manifest else None,
+        "model_stage_catalog": simfoundry_model_stage_catalog(args),
+        "variants": variants,
+        "scene_bundle_patch_template": str(scene_patch_template_path),
+        "scene_relations_template": str(scene_relation_template_path),
+        "postprocess_script": str(script_path),
+        "postprocess_commands": commands,
+        "summary": {
+            "scene_cousin_count": len(variants),
+            "foreground_object_count": len(foreground),
+            "background_structure_count": len(background),
+            "model_provider": args.model_provider,
+            "provider_name": args.provider_name,
+            "reasoning_model": args.model,
+            "image_model": args.image_model,
+            "disable_response_storage": bool(args.disable_response_storage),
+            "uses_object_cousins": object_cousin_manifest is not None,
+        },
+        "secret_policy": provider_config["secret_policy"],
+        "notes": "Prepared SimFoundry-style scene cousin contracts. No model call is made and no API key is stored.",
+    }
+    manifest_path = output_dir / "scene_cousins_manifest.json"
+    write_json(manifest_path, payload)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_cousins"] = str(manifest_path)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_cousins_dir"] = str(output_dir)
+    manifest.setdefault("artifacts", {})["simfoundry_scene_cousins_provider_config"] = str(provider_config_path)
+    manifest.setdefault("external_stages", {})["simfoundry_scene_cousins"] = {
+        "status": "scene_cousins_prepared",
+        "report": str(manifest_path),
+        "provider_config": str(provider_config_path),
+        "scene_cousin_count": len(variants),
+        "uses_object_cousins": object_cousin_manifest is not None,
+        "notes": "Prepared scene cousin templates for SimFoundry-style augmentation.",
+    }
+    save_manifest(project_root, manifest)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Prepared SimFoundry scene cousins: {manifest_path}")
+        print(f"Variants: {len(variants)}; foreground={len(foreground)}; background={len(background)}")
+        print(f"Provider config template: {provider_config_path}")
+        print(f"Postprocess script: {script_path}")
+    return 1 if args.fail_on_empty and not variants else 0
 
 
 def sceneverse_category_id(category: str, fallback: int) -> int:
@@ -33338,6 +43930,7 @@ def simulator_physics_quality_item(
     pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
     mesh = obj.get("mesh") if isinstance(obj.get("mesh"), dict) else {}
     collision_proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
+    physics_proxy = physics.get("collision_proxy") if isinstance(physics.get("collision_proxy"), dict) else {}
     mesh_path = resolve_existing_path(mesh.get("path"), project_root) if mesh else None
     proxy_path = simulator_collision_proxy_path(obj, physics, project_root)
     bbox_size = numeric_list(pose.get("bbox_size"), 3)
@@ -41231,6 +51824,75 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_reconstruct_scene_meshes)
 
+    p = sub.add_parser("prepare-simfoundry-collider-scene", help="Prepare the first SimFoundry-style stage: a static scene collider mesh sidecar.")
+    add_common_project_arg(p)
+    p.add_argument("--scene-mesh", type=Path, help="Existing scene collider mesh. Defaults to manifest scene_collider_mesh_ply/scene_mesh_ply.")
+    p.add_argument("--reconstruct", action="store_true", help="Run reconstruct-scene-meshes first from a COLMAP dense workspace.")
+    p.add_argument("--method", choices=["colmap_delaunay"], default="colmap_delaunay")
+    p.add_argument("--colmap-dense-workspace", type=Path, help="Used with --reconstruct. Defaults to manifest artifacts.colmap_dense_workspace or external/colmap/dense.")
+    p.add_argument("--reconstruction-output-dir", type=Path, help="Used with --reconstruct. Defaults to simulator_assets/scene_meshes/colmap_delaunay_dense.")
+    p.add_argument("--reconstruction-output", type=Path, help="Used with --reconstruct. Defaults to reconstruction-output-dir/mesh.ply.")
+    p.add_argument("--colmap-binary", default="colmap")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--copy-input-point-cloud", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_collider_scene.")
+    p.add_argument("--collider-output", type=Path, help="Defaults to simulator_assets/colliders/scene_static_collider.obj.")
+    p.add_argument("--collider-format", choices=["obj", "source"], default="obj", help="Default writes an OBJ sidecar for simulator adapters; source keeps the source mesh suffix.")
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--min-vertices", type=int, default=8)
+    p.add_argument("--min-triangles", type=int, default=1)
+    p.add_argument("--update-bundle", action=argparse.BooleanOptionalAction, default=True, help="If simulator_asset_bundle.json exists, register static_colliders[] there too.")
+    p.add_argument("--write-collider-only-bundle", action=argparse.BooleanOptionalAction, default=True, help="Write simulator_asset_bundle.collider_only.json so adapter export can run before object assets exist.")
+    p.add_argument("--collider-only-bundle-output", type=Path, help="Defaults to simulator_assets/simulator_asset_bundle.collider_only.json.")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-fail", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_collider_scene)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-static-object-scene",
+        help="Prepare a SimFoundry-style static object scene bundle from semantic mesh splits, scene collider, and simulator adapters.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--mesh", type=Path, help="Scene mesh used for semantic object splitting. Defaults to manifest scene mesh artifact.")
+    p.add_argument("--scene-mesh", type=Path, help="Scene mesh used for the static collider. Defaults to --mesh or manifest scene collider mesh.")
+    p.add_argument("--semantics", type=Path, help="Mesh semantics JSON. Defaults to manifest mesh_semantics_local/projected/nearest.")
+    p.add_argument("--split-objects", action=argparse.BooleanOptionalAction, default=True, help="Run split-mesh-by-semantics when object records are missing.")
+    p.add_argument("--refresh-object-splits", action="store_true", help="Force re-running split-mesh-by-semantics even when object records already exist.")
+    p.add_argument("--object-mesh-output-dir", type=Path, help="Output directory for semantic object mesh splits.")
+    p.add_argument("--min-faces", type=int, default=20)
+    p.add_argument("--min-probability", type=float, default=0.0)
+    p.add_argument("--include-unknown", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--prepare-collider", action=argparse.BooleanOptionalAction, default=True, help="Run prepare-simfoundry-collider-scene before exporting simulator assets.")
+    p.add_argument("--min-vertices", type=int, default=8)
+    p.add_argument("--min-triangles", type=int, default=1)
+    p.add_argument("--body-type", choices=["static", "kinematic", "dynamic"], default="static")
+    p.add_argument("--collider", choices=["mesh", "convex_hull", "box", "none"], default="mesh")
+    p.add_argument("--collision-proxy", choices=["none", "bbox"], default="bbox")
+    p.add_argument("--ascii-meshes", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--estimate-physics", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--physics-provider", default="simfoundry_bbox_physics")
+    p.add_argument("--default-density-kg-m3", type=float, default=120.0)
+    p.add_argument("--min-mass-kg", type=float, default=0.05)
+    p.add_argument("--max-mass-kg", type=float, default=50.0)
+    p.add_argument("--default-material", default="estimated_rigid")
+    p.add_argument("--friction", type=float, default=0.8)
+    p.add_argument("--torsional-friction", type=float, default=0.02)
+    p.add_argument("--rolling-friction", type=float, default=0.001)
+    p.add_argument("--restitution", type=float, default=0.1)
+    p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--scale-to-meters", type=float, default=1.0)
+    p.add_argument("--scale-calibrated", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--up-axis", choices=["x", "y", "z"], default="y")
+    p.add_argument("--calibration-notes", default="Static object scene wrapper assumes scale_to_meters=1.0 unless a measured value is supplied.")
+    p.add_argument("--format", choices=["mujoco", "isaac", "unity"], nargs="+", default=["mujoco", "unity", "isaac"])
+    p.add_argument("--default-mass", type=float, default=1.0)
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/simfoundry_static_object_scene/static_object_scene_report.json.")
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_static_object_scene)
+
     p = sub.add_parser("split-mesh-by-semantics", help="Split one face-annotated scene mesh into one PLY mesh per semantic object label.")
     add_common_project_arg(p)
     p.add_argument("--mesh", type=Path, help="Defaults to manifest scene mesh artifact.")
@@ -41661,8 +52323,250 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fit-axis", choices=["diagonal", "longest"], default="diagonal", help="Object-local bbox fitting length metric.")
     p.add_argument("--collision-proxy", choices=["none", "bbox"], default="none", help="Generate object-local collision proxy geometry in addition to the visual mesh.")
     p.add_argument("--use-collision-proxy", action=argparse.BooleanOptionalAction, default=True, help="When a proxy is generated, set physics.collider to the proxy shape.")
+    p.add_argument("--estimate-physics", action=argparse.BooleanOptionalAction, default=True, help="Estimate baseline mass/material fields from bbox collision proxies.")
+    p.add_argument("--physics-provider", default="simfoundry_bbox_physics")
+    p.add_argument("--default-density-kg-m3", type=float, default=120.0)
+    p.add_argument("--min-mass-kg", type=float, default=0.05)
+    p.add_argument("--max-mass-kg", type=float, default=50.0)
+    p.add_argument("--default-material", default="estimated_rigid")
+    p.add_argument("--friction", type=float, default=0.8)
+    p.add_argument("--torsional-friction", type=float, default=0.02)
+    p.add_argument("--rolling-friction", type=float, default=0.001)
+    p.add_argument("--restitution", type=float, default=0.1)
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_export_simulator_assets)
+
+    p = sub.add_parser("prepare-simfoundry-object-colliders", help="Prepare the next SimFoundry-style stage: object-level bbox collision proxy sidecars from simulator_asset_bundle.json.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_object_colliders.")
+    p.add_argument("--collider-root", type=Path, help="Defaults to simulator_assets/colliders/objects.")
+    p.add_argument("--provider", default="simfoundry_bbox_proxy")
+    p.add_argument("--body-type", choices=["static", "kinematic", "dynamic"], default="dynamic")
+    p.add_argument("--default-density-kg-m3", type=float, default=120.0)
+    p.add_argument("--min-mass-kg", type=float, default=0.05)
+    p.add_argument("--max-mass-kg", type=float, default=50.0)
+    p.add_argument("--default-material", default="estimated_rigid")
+    p.add_argument("--friction", type=float, default=0.8)
+    p.add_argument("--torsional-friction", type=float, default=0.02)
+    p.add_argument("--rolling-friction", type=float, default=0.001)
+    p.add_argument("--restitution", type=float, default=0.1)
+    p.add_argument("--include-background", action="store_true")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--ascii", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_object_colliders)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-tight-collider-variant",
+        help="Create a sidecar bundle with object box colliders tightened from robust visual-mesh quantiles.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_tight_collider_variant.")
+    p.add_argument("--output-bundle", type=Path, help="Defaults to output-dir/simulator_asset_bundle.tight_collider.json.")
+    p.add_argument("--quantile-min", type=float, default=0.10, help="Lower mesh-vertex quantile for robust object-local bbox fitting.")
+    p.add_argument("--quantile-max", type=float, default=0.90, help="Upper mesh-vertex quantile for robust object-local bbox fitting.")
+    p.add_argument("--padding-ratio", type=float, default=0.02, help="Relative padding added after quantile bbox fitting.")
+    p.add_argument("--provider", default="simfoundry_tight_mesh_bbox")
+    p.add_argument("--include-background", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--up-direction", choices=["positive", "negative"], help="Direction along --up-axis treated as upward. Defaults to bundle coordinate_system.up_direction or positive.")
+    p.add_argument("--max-support-gap", type=float, default=0.08, help="Used for before/after stability comparison.")
+    p.add_argument("--min-support-overlap", type=float, default=0.15, help="Used for before/after stability comparison.")
+    p.add_argument("--max-penetration-depth", type=float, default=0.02, help="Used for before/after stability comparison.")
+    p.add_argument("--max-overlap-volume-ratio", type=float, default=0.05, help="Used for before/after stability comparison.")
+    p.add_argument("--require-support", action=argparse.BooleanOptionalAction, default=True, help="Used for before/after stability comparison.")
+    p.add_argument("--replace-bundle", action="store_true", help="Update manifest simulator_asset_bundle to the tight variant. Default leaves the main bundle unchanged.")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_tight_collider_variant)
+
+    p = sub.add_parser(
+        "build-simfoundry-object-colliders",
+        help="Build SimFoundry-style object colliders with CoACD/V-HACD command hooks and bbox fallback.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_collider_build.")
+    p.add_argument("--methods", default="coacd,vhacd,bbox", help="Comma-separated method order, e.g. coacd,vhacd,bbox.")
+    p.add_argument("--provider", default="simfoundry_collider_builder")
+    p.add_argument("--coacd-binary", default="coacd")
+    p.add_argument("--vhacd-binary", default="vhacd")
+    p.add_argument("--coacd-command-template", help="Shell template using {input_mesh}, {output_mesh}, {output_dir}, {object_id}.")
+    p.add_argument("--vhacd-command-template", help="Shell template using {input_mesh}, {output_mesh}, {output_dir}, {object_id}.")
+    p.add_argument("--timeout-seconds", type=int, default=600)
+    p.add_argument("--body-type", choices=["static", "kinematic", "dynamic"], default="dynamic")
+    p.add_argument("--default-density-kg-m3", type=float, default=120.0)
+    p.add_argument("--min-mass-kg", type=float, default=0.05)
+    p.add_argument("--max-mass-kg", type=float, default=50.0)
+    p.add_argument("--default-material", default="estimated_rigid")
+    p.add_argument("--physics-provider", default="video2mesh_estimated_physics")
+    p.add_argument("--friction", type=float, default=0.8)
+    p.add_argument("--torsional-friction", type=float, default=0.02)
+    p.add_argument("--rolling-friction", type=float, default=0.001)
+    p.add_argument("--restitution", type=float, default=0.1)
+    p.add_argument("--include-background", action="store_true")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--ascii", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.add_argument("--fail-on-failed", action="store_true")
+    p.add_argument("--fail-on-fallback", action="store_true")
+    p.set_defaults(func=cmd_build_simfoundry_object_colliders)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-provider-jobs",
+        help="Prepare safe SimFoundry-style external model job templates without storing API keys.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_provider_jobs.")
+    p.add_argument("--model-provider", default="custom", help="Provider id stored in the template, matching Codex/OpenAI-style config names.")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--auth-env", default="OPENAI_API_KEY", help="Environment variable name expected by the external worker; the value is never written.")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--physics-model", help="Defaults to --model.")
+    p.add_argument("--mesh-models", default="hunyuan3d,trellis,image-blaster", help="Comma-separated mesh-generation candidates.")
+    p.add_argument("--collider-models", default="coacd,vhacd,bbox", help="Comma-separated collider-generation candidates.")
+    p.add_argument("--mesh-provider", default="simfoundry_external_mesh")
+    p.add_argument("--mesh-format", default="glb")
+    p.add_argument("--max-evidence-images", type=int, default=4)
+    p.add_argument("--enable-image-editing", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-background", action="store_true")
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_provider_jobs)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-remote-handoff",
+        help="Prepare a safe server handoff package for SimFoundry-style external execution without storing API keys.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_remote_handoff.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/simfoundry_remote_handoff.json.")
+    p.add_argument("--markdown-output", type=Path, help="Defaults to output-dir/simfoundry_remote_handoff.md.")
+    p.add_argument("--script-output", type=Path, help="Defaults to output-dir/simfoundry_remote_handoff.sh.")
+    p.add_argument("--remote-host", default="connect.westc.seetacloud.com")
+    p.add_argument("--remote-port", type=int, default=22356)
+    p.add_argument("--remote-user", default="root")
+    p.add_argument("--remote-root", default="/root/simfoundry_video2mesh")
+    p.add_argument("--model-provider", default="custom")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--auth-env", default="OPENAI_API_KEY", help="Environment variable name expected by the external worker; the value is never written.")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-provider-jobs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-structural-review", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-scale-calibration", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-dynamic-readiness", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--no-script", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-missing-required", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_remote_handoff)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-object-cousins",
+        help="Prepare SimFoundry-style object cousin generation contracts without calling closed models.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_object_cousins.")
+    p.add_argument("--model-provider", default="custom")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--auth-env", default="OPENAI_API_KEY", help="Environment variable name expected by the external worker; the value is never written.")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--physics-model", help="Defaults to --model.")
+    p.add_argument("--mesh-models", default="hunyuan3d,trellis,image-blaster")
+    p.add_argument("--pose-models", default="foundationpose,bbox_alignment")
+    p.add_argument("--collider-models", default="coacd,vhacd,bbox")
+    p.add_argument("--mesh-provider", default="simfoundry_object_cousin")
+    p.add_argument("--mesh-format", choices=["obj", "ply", "glb", "stl"], default="glb")
+    p.add_argument("--cousin-count", type=int, default=3)
+    p.add_argument("--cousin-intents", default="appearance,geometry,material", help="Comma-separated variant intents cycled per source object.")
+    p.add_argument("--max-evidence-images", type=int, default=4)
+    p.add_argument("--enable-image-editing", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--include-background", action="store_true")
+    p.add_argument("--preserve-category", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--preserve-scale", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--allow-geometry-variation", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_object_cousins)
+
+    p = sub.add_parser("import-simfoundry-object-cousin", help="Import filled SimFoundry object cousin mesh/physics/collider outputs into a simulator-ready sidecar bundle.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Source simulator_asset_bundle.json. Defaults to manifest artifact.")
+    p.add_argument("--object-cousins", type=Path, help="Optional object_cousins_manifest.json. Defaults to manifest artifact.")
+    p.add_argument("--variant-id", help="Object cousin variant id to import. Defaults to the first variant in the manifest.")
+    p.add_argument("--source-object-id", help="Source object id to import the first matching variant for.")
+    p.add_argument("--mesh-manifest", type=Path, help="Filled object cousin mesh manifest. Defaults to simfoundry_object_cousins/mesh_manifest.template.json when present.")
+    p.add_argument("--physics", type=Path, help="Filled object cousin physics JSON. Defaults to simfoundry_object_cousins/physics_properties.template.json when present.")
+    p.add_argument("--collider-manifest", type=Path, help="Filled object cousin collider manifest. Defaults to simfoundry_object_cousins/collider_manifest.template.json when present.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_object_cousins/imported.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/<variant>/object_cousin_import_manifest.json.")
+    p.add_argument("--format", nargs="+", choices=["mujoco", "unity", "isaac"], default=["mujoco", "unity", "isaac"])
+    p.add_argument("--provider", default="simfoundry_object_cousin")
+    p.add_argument("--physics-provider", default="simfoundry_object_cousin_physics")
+    p.add_argument("--collider-provider", default="simfoundry_object_cousin_collider")
+    p.add_argument("--coordinate-frame", default="object_local")
+    p.add_argument("--replace-object-id", action=argparse.BooleanOptionalAction, default=False, help="Use the cousin variant id as the object id in the sidecar bundle. Default preserves source object id for task compatibility.")
+    p.add_argument("--body-type", choices=["static", "dynamic", "kinematic"], default="dynamic", help="Fallback body type when an object physics block does not define one.")
+    p.add_argument("--default-mass", type=float, default=1.0)
+    p.add_argument("--copy-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.set_defaults(func=cmd_import_simfoundry_object_cousin)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-scene-cousins",
+        help="Prepare SimFoundry-style scene cousin generation contracts without calling closed models.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--object-cousins", type=Path, help="Optional object_cousins_manifest.json; defaults to manifest artifact when present.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_scene_cousins.")
+    p.add_argument("--model-provider", default="custom")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--auth-env", default="OPENAI_API_KEY", help="Environment variable name expected by the external worker; the value is never written.")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--physics-model", help="Defaults to --model.")
+    p.add_argument("--mesh-models", default="hunyuan3d,trellis,image-blaster")
+    p.add_argument("--collider-models", default="coacd,vhacd,bbox")
+    p.add_argument("--scene-cousin-count", type=int, default=3)
+    p.add_argument("--scene-cousin-intents", default="clean_plate,layout_perturbation,object_swap")
+    p.add_argument("--max-objects-per-variant", type=int, default=8)
+    p.add_argument("--enable-image-editing", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--preserve-static-collider", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mesh-provider", default="simfoundry_scene_cousin")
+    p.add_argument("--mesh-format", choices=["obj", "ply", "glb", "stl"], default="glb")
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_scene_cousins)
 
     p = sub.add_parser("calibrate-simulator-assets", help="Set simulator scale/up-axis and estimated physics defaults in the asset bundle.")
     add_common_project_arg(p)
@@ -41682,6 +52586,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-mass-kg", type=float, default=0.05)
     p.add_argument("--max-mass-kg", type=float, default=50.0)
     p.add_argument("--default-material", default="estimated_rigid")
+    p.add_argument("--physics-provider", default="video2mesh_estimated_physics")
     p.add_argument("--friction", type=float, default=0.8)
     p.add_argument("--torsional-friction", type=float, default=0.02)
     p.add_argument("--rolling-friction", type=float, default=0.001)
@@ -41753,6 +52658,393 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--copy-assets", action=argparse.BooleanOptionalAction, default=True, help="Copy/symlink meshes into simulator_assets/adapters/assets.")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_export_simulator_adapter)
+
+    p = sub.add_parser("simfoundry-simulator-smoke-test", help="Preflight SimFoundry-style simulator assets, static colliders, object proxies, adapters, and optional MuJoCo runtime load.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--adapter-dir", type=Path, help="Defaults to manifest simulator_adapters parent or simulator_assets/adapters.")
+    p.add_argument("--format", choices=["mujoco", "isaac", "unity"], nargs="+", default=["mujoco", "unity"], help="Adapter formats expected in the preflight.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/physics/sim_preflight_report.json.")
+    p.add_argument("--min-mesh-vertices", type=int, default=20)
+    p.add_argument("--require-physics", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--require-collider", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--require-scale-calibration", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--allow-estimated-physics", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mujoco-runtime", choices=["auto", "require", "skip"], default="auto", help="auto runs MuJoCo XML load/step only when the mujoco Python package exists.")
+    p.add_argument("--mujoco-steps", type=int, default=5)
+    p.add_argument("--max-issues", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-warning", action="store_true")
+    p.set_defaults(func=cmd_simfoundry_simulator_smoke_test)
+
+    p = sub.add_parser("settle-simulator-scene", help="Run an optional MuJoCo settle pass and write a SimFoundry-style stable_pose_cache.json.")
+    add_common_project_arg(p)
+    p.add_argument("--adapter-dir", type=Path, help="Defaults to manifest simulator_adapters parent or simulator_assets/adapters.")
+    p.add_argument("--mujoco-xml", type=Path, help="Defaults to adapters/mujoco/scene.xml.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/physics/stable_pose_cache.json.")
+    p.add_argument("--steps", type=int, default=240)
+    p.add_argument("--timestep", type=float, help="Optional MuJoCo timestep override.")
+    p.add_argument("--mujoco-runtime", choices=["auto", "require", "skip"], default="auto", help="auto runs when mujoco is installed; skip writes a cache placeholder.")
+    p.add_argument("--max-issues", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-warning", action="store_true")
+    p.add_argument("--fail-on-unavailable", action="store_true")
+    p.set_defaults(func=cmd_settle_simulator_scene)
+
+    p = sub.add_parser("export-scene-relations", help="Infer rule-based bbox scene relations for SimFoundry-style support/near/task-cousin metadata.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/semantic/scene_relations.json.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--max-support-gap", type=float, default=0.08, help="Maximum vertical gap between object bottom and support top.")
+    p.add_argument("--min-support-overlap", type=float, default=0.15, help="Minimum footprint overlap over smaller footprint for OnTopOf/SupportedBy.")
+    p.add_argument("--near-distance", type=float, default=0.15, help="Maximum bbox gap for Near relation.")
+    p.add_argument("--include-background-near", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_export_scene_relations)
+
+    p = sub.add_parser("export-simfoundry-task-specs", help="Generate reviewed-task-candidate specs from SimFoundry-style scene relations.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--relations", type=Path, help="Optional scene_relations.json path. Defaults to manifest artifact or simulator_assets/semantic/scene_relations.json.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/task_specs.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/task_specs_manifest.json.")
+    p.add_argument("--refresh-relations", action=argparse.BooleanOptionalAction, default=False, help="Regenerate scene relations before task spec export.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Used when refreshing relations.")
+    p.add_argument("--max-support-gap", type=float, default=0.08, help="Used when refreshing relations.")
+    p.add_argument("--min-support-overlap", type=float, default=0.15, help="Used when refreshing relations.")
+    p.add_argument("--near-distance", type=float, default=0.15, help="Used when refreshing relations.")
+    p.add_argument("--include-background-near", action=argparse.BooleanOptionalAction, default=False, help="Used when refreshing relations.")
+    p.add_argument("--min-confidence", type=float, default=0.45)
+    p.add_argument("--include-near", action=argparse.BooleanOptionalAction, default=False, help="Also emit move-near task candidates from Near relations.")
+    p.add_argument("--include-background-subjects", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--max-tasks", type=int, default=0, help="Maximum task specs to emit; 0 means no limit.")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_export_simfoundry_task_specs)
+
+    p = sub.add_parser("verify-simfoundry-task-specs", help="Verify SimFoundry task candidate goal predicates against current simulator bundle bboxes.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--task-specs", type=Path, help="Optional task_specs_manifest.json path. Defaults to manifest artifact.")
+    p.add_argument("--output", type=Path, help="Defaults to task_specs/task_specs_verification.json.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--max-support-gap", type=float, default=0.08)
+    p.add_argument("--min-support-overlap", type=float, default=0.15)
+    p.add_argument("--near-distance", type=float, default=0.15)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-warning", action="store_true")
+    p.add_argument("--fail-on-unknown", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_verify_simfoundry_task_specs)
+
+    p = sub.add_parser("prepare-simfoundry-task-resets", help="Generate bbox initial-state sidecars for task goals that are already satisfied in the reconstructed scene.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--task-specs", type=Path, help="Optional task_specs_manifest.json path. Defaults to manifest artifact.")
+    p.add_argument("--verification", type=Path, help="Optional task_specs_verification.json path. Defaults to manifest artifact or task_specs/task_specs_verification.json.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/task_specs.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/task_reset_manifest.json.")
+    p.add_argument("--refresh-verification", action=argparse.BooleanOptionalAction, default=False, help="Regenerate task verification before reset generation.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--reset-margin", type=float, default=0.25, help="Extra horizontal gap added when moving the manipulated object away from the target.")
+    p.add_argument("--max-support-gap", type=float, default=0.08)
+    p.add_argument("--min-support-overlap", type=float, default=0.15)
+    p.add_argument("--near-distance", type=float, default=0.15)
+    p.add_argument("--write-sidecar-bundles", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--max-tasks", type=int, default=0, help="Maximum resets to emit; 0 means no limit.")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-unresettable", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_task_resets)
+
+    p = sub.add_parser("export-simfoundry-task-reset-adapters", help="Export per-task simulator adapters from accepted SimFoundry task reset sidecar bundles.")
+    add_common_project_arg(p)
+    p.add_argument("--task-resets", type=Path, help="Optional task_reset_manifest.json path. Defaults to manifest artifact or task_specs/task_reset_manifest.json.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to task_specs/reset_adapters.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/task_reset_adapters_manifest.json.")
+    p.add_argument("--format", nargs="+", choices=["mujoco", "unity", "isaac"], default=["mujoco", "unity", "isaac"])
+    p.add_argument("--body-type", choices=["static", "dynamic", "kinematic"], default="static", help="Fallback body type when an object physics block does not define one.")
+    p.add_argument("--default-mass", type=float, default=1.0)
+    p.add_argument("--copy-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_export_simfoundry_task_reset_adapters)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-task-cousins",
+        help="Prepare SimFoundry-style task cousin contracts from task specs, resets, and cousin pools without calling closed models.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--task-specs", type=Path, help="Optional task_specs_manifest.json path. Defaults to manifest artifact.")
+    p.add_argument("--verification", type=Path, help="Optional task_specs_verification.json path. Defaults to manifest artifact.")
+    p.add_argument("--task-resets", type=Path, help="Optional task_reset_manifest.json path. Defaults to manifest artifact.")
+    p.add_argument("--reset-adapters", type=Path, help="Optional task_reset_adapters_manifest.json path. Defaults to manifest artifact when present.")
+    p.add_argument("--object-cousins", type=Path, help="Optional object_cousins_manifest.json; defaults to manifest artifact when present.")
+    p.add_argument("--scene-cousins", type=Path, help="Optional scene_cousins_manifest.json; defaults to manifest artifact when present.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/task_specs/task_cousins.")
+    p.add_argument("--model-provider", default="custom")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--auth-env", default="OPENAI_API_KEY", help="Environment variable name expected by the external worker; the value is never written.")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--physics-model", help="Defaults to --model.")
+    p.add_argument("--mesh-models", default="hunyuan3d,trellis,image-blaster")
+    p.add_argument("--collider-models", default="coacd,vhacd,bbox")
+    p.add_argument("--task-cousin-count", type=int, default=3)
+    p.add_argument("--task-cousin-intents", default="object_swap,scene_swap,goal_rephrase")
+    p.add_argument("--max-tasks", type=int, default=0, help="Maximum source tasks to prepare variants for; 0 means no limit.")
+    p.add_argument("--enable-image-editing", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mesh-provider", default="simfoundry_task_cousin")
+    p.add_argument("--mesh-format", choices=["obj", "ply", "glb", "stl"], default="glb")
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_task_cousins)
+
+    p = sub.add_parser("import-simfoundry-scene-cousin", help="Import a filled SimFoundry scene cousin bundle patch/sidecar into simulator-ready sidecar adapters.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Source simulator_asset_bundle.json. Defaults to manifest artifact.")
+    p.add_argument("--scene-cousins", type=Path, help="Optional scene_cousins_manifest.json. Defaults to manifest artifact.")
+    p.add_argument("--variant-id", help="Scene cousin variant id to import. Defaults to the first variant in the manifest.")
+    p.add_argument("--bundle-patch", type=Path, help="Filled bundle patch JSON from an external scene cousin worker.")
+    p.add_argument("--sidecar-bundle", type=Path, help="Filled simulator_asset_bundle sidecar JSON from an external scene cousin worker.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_scene_cousins/imported.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/<variant>/scene_cousin_import_manifest.json.")
+    p.add_argument("--format", nargs="+", choices=["mujoco", "unity", "isaac"], default=["mujoco", "unity", "isaac"])
+    p.add_argument("--body-type", choices=["static", "dynamic", "kinematic"], default="static", help="Fallback body type when an object physics block does not define one.")
+    p.add_argument("--default-mass", type=float, default=1.0)
+    p.add_argument("--copy-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.set_defaults(func=cmd_import_simfoundry_scene_cousin)
+
+    p = sub.add_parser("prepare-simfoundry-dynamic-variant", help="Create a sidecar bundle with conservative dynamic objects gated by support/penetration checks.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_dynamic_variant.")
+    p.add_argument("--output-bundle", type=Path, help="Defaults to output-dir/simulator_asset_bundle.dynamic_variant.json.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--up-direction", choices=["positive", "negative"], help="Direction along --up-axis treated as upward. Defaults to bundle coordinate_system.up_direction or positive.")
+    p.add_argument("--movable-categories", default=",".join(sorted(DEFAULT_SIMFOUNDRY_MOVABLE_CATEGORIES)), help="Comma-separated category allow-list for automatic dynamic candidates.")
+    p.add_argument("--exclude-categories", default="", help="Comma-separated categories to keep static in addition to structural defaults.")
+    p.add_argument("--include-objects", default="", help="Comma-separated object ids to consider even when their category is not in --movable-categories.")
+    p.add_argument("--exclude-objects", default="", help="Comma-separated object ids to keep static.")
+    p.add_argument("--max-support-gap", type=float, default=0.08, help="Maximum vertical gap between dynamic object bottom and support top.")
+    p.add_argument("--min-support-overlap", type=float, default=0.15, help="Minimum footprint overlap over smaller footprint for support candidates.")
+    p.add_argument("--max-penetration-depth", type=float, default=0.02, help="Allowed bbox overlap along the up axis before rejecting a dynamic candidate.")
+    p.add_argument("--max-overlap-volume-ratio", type=float, default=0.05, help="Allowed overlap volume over smaller bbox before rejecting a dynamic candidate.")
+    p.add_argument("--allow-penetration", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--require-support", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--replace-bundle", action="store_true", help="Update manifest simulator_asset_bundle to the dynamic variant. Default leaves the main bundle unchanged.")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_dynamic_variant)
+
+    p = sub.add_parser("simfoundry-dynamic-blocker-report", help="Summarize why conservative SimFoundry dynamic candidates remain static.")
+    add_common_project_arg(p)
+    p.add_argument("--report", type=Path, help="dynamic_variant_report.json. Defaults to manifest artifact or simulator_assets/simfoundry_dynamic_variant/dynamic_variant_report.json.")
+    p.add_argument("--output", type=Path, help="Defaults to the source report directory as dynamic_blocker_report.json.")
+    p.add_argument("--markdown-output", type=Path, help="Defaults to output path with .md suffix.")
+    p.add_argument("--max-objects", type=int, default=20)
+    p.add_argument("--max-penetrations", type=int, default=5)
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-blockers", action="store_true")
+    p.set_defaults(func=cmd_simfoundry_dynamic_blocker_report)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-dynamic-readiness",
+        help="Prepare a non-mutating SimFoundry dynamic-readiness sidecar from tight colliders, dynamic gate, blocker report, adapters, and optional smoke test.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_dynamic_readiness.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/dynamic_readiness_report.json.")
+    p.add_argument("--quantile-min", type=float, default=0.10)
+    p.add_argument("--quantile-max", type=float, default=0.90)
+    p.add_argument("--padding-ratio", type=float, default=0.02)
+    p.add_argument("--tight-provider", default="simfoundry_tight_mesh_bbox")
+    p.add_argument("--include-background", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--up-direction", choices=["positive", "negative"], default="positive")
+    p.add_argument("--movable-categories", default=",".join(sorted(DEFAULT_SIMFOUNDRY_MOVABLE_CATEGORIES)))
+    p.add_argument("--exclude-categories", default="")
+    p.add_argument("--include-objects", default="")
+    p.add_argument("--exclude-objects", default="")
+    p.add_argument("--max-support-gap", type=float, default=0.08)
+    p.add_argument("--min-support-overlap", type=float, default=0.15)
+    p.add_argument("--max-penetration-depth", type=float, default=0.02)
+    p.add_argument("--max-overlap-volume-ratio", type=float, default=0.05)
+    p.add_argument("--allow-penetration", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--require-support", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--format", choices=["mujoco", "isaac", "unity"], nargs="+", default=["mujoco", "unity", "isaac"])
+    p.add_argument("--body-type", choices=["static", "kinematic", "dynamic"], default="static")
+    p.add_argument("--default-mass", type=float, default=1.0)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--min-mesh-vertices", type=int, default=20)
+    p.add_argument("--require-physics", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--require-collider", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--require-scale-calibration", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--allow-estimated-physics", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mujoco-runtime", choices=["auto", "require", "skip"], default="auto")
+    p.add_argument("--mujoco-steps", type=int, default=5)
+    p.add_argument("--max-objects", type=int, default=20)
+    p.add_argument("--max-penetrations", type=int, default=5)
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-blocked", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_dynamic_readiness)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-penetration-repair-variant",
+        help="Prepare conservative sidecar bbox repair candidates from a SimFoundry dynamic blocker report.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--blocker-report", type=Path, help="dynamic_blocker_report.json. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_penetration_repair_variant.")
+    p.add_argument("--output-bundle", type=Path, help="Defaults to output-dir/simulator_asset_bundle.penetration_repair.json.")
+    p.add_argument("--markdown-output", type=Path, help="Defaults to output path with .md suffix.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--up-direction", choices=["positive", "negative"], help="Direction along --up-axis treated as upward. Defaults to bundle coordinate_system.up_direction or positive.")
+    p.add_argument("--shrink-ratio", type=float, default=0.7, help="Uniform bbox shrink ratio for candidate object proxies.")
+    p.add_argument("--min-extent", type=float, default=0.02, help="Minimum bbox extent after shrink.")
+    p.add_argument("--provider", default="simfoundry_penetration_repair_bbox")
+    p.add_argument("--max-support-gap", type=float, default=0.08)
+    p.add_argument("--min-support-overlap", type=float, default=0.15)
+    p.add_argument("--max-penetration-depth", type=float, default=0.02)
+    p.add_argument("--max-overlap-volume-ratio", type=float, default=0.05)
+    p.add_argument("--require-support", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--write-sidecar-bundle", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--replace-bundle", action="store_true", help="Update manifest simulator_asset_bundle to the repair variant. Default leaves the main bundle unchanged.")
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.add_argument("--fail-on-no-improvement", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_penetration_repair_variant)
+
+    p = sub.add_parser(
+        "prepare-simfoundry-structural-repair-plan",
+        help="Prepare a non-mutating structural/support repair plan from SimFoundry dynamic blockers.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--blocker-report", type=Path, help="dynamic_blocker_report.json. Defaults to manifest artifact.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/simfoundry_structural_repair_plan/structural_repair_plan.json.")
+    p.add_argument("--markdown-output", type=Path, help="Defaults to output path with .md suffix.")
+    p.add_argument("--max-objects", type=int, default=20)
+    p.add_argument("--provider", default="simfoundry_structural_repair_planner")
+    p.add_argument("--model-provider", default="custom")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--auth-env", default="OPENAI_API_KEY")
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_prepare_simfoundry_structural_repair_plan)
+
+    p = sub.add_parser(
+        "run-simfoundry-structural-review-worker",
+        help="Prepare or run a custom Responses-provider worker that fills a SimFoundry structural repair review patch.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Source simulator_asset_bundle.json. Defaults to the repair plan bundle or manifest artifact.")
+    p.add_argument("--repair-plan", type=Path, help="structural_repair_plan.json. Defaults to manifest artifact.")
+    p.add_argument("--provider-config", type=Path, help="Optional provider_config.template.json. Defaults to manifest artifact when present.")
+    p.add_argument("--output", type=Path, help="Defaults to the repair plan directory as structural_repair_review_patch.worker.json.")
+    p.add_argument("--request-output", type=Path, help="Defaults to the repair plan directory as structural_repair_review_request.json.")
+    p.add_argument("--report", type=Path, help="Defaults to the repair plan directory as structural_repair_review_worker_report.json.")
+    p.add_argument("--markdown-output", type=Path, help="Defaults to report path with .md suffix.")
+    p.add_argument("--object-id", action="append", help="Limit to one object id, or comma-separated ids. Can be repeated.")
+    p.add_argument("--max-objects", type=int, default=5)
+    p.add_argument("--provider", default="simfoundry_structural_repair_review_worker")
+    p.add_argument("--model-provider", default="custom")
+    p.add_argument("--provider-name", default="Sub2API")
+    p.add_argument("--base-url", default="https://plbbl.com")
+    p.add_argument("--wire-api", default="responses")
+    p.add_argument("--model", default="gpt-5-codex")
+    p.add_argument("--image-model", default="gpt-image-2")
+    p.add_argument("--model-reasoning-effort", default="high")
+    p.add_argument("--disable-response-storage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--auth-env", default="OPENAI_API_KEY")
+    p.add_argument("--run-provider", action=argparse.BooleanOptionalAction, default=False, help="Actually call the configured Responses provider. Default only writes request and placeholder patch.")
+    p.add_argument("--mock-provider-response", type=Path, help="Parse a saved provider-like JSON/text response instead of calling the provider.")
+    p.add_argument("--timeout-seconds", type=int, default=120)
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_run_simfoundry_structural_review_worker)
+
+    p = sub.add_parser(
+        "import-simfoundry-structural-repair",
+        help="Import filled SimFoundry structural/support repair review patches into a simulator-ready sidecar bundle.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Source simulator_asset_bundle.json. Defaults to manifest artifact.")
+    p.add_argument("--repair-plan", type=Path, help="structural_repair_plan.json. Defaults to manifest artifact.")
+    p.add_argument("--review-patch", type=Path, required=True, help="Filled structural repair review patch JSON from a manual/VLM/external worker.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/simfoundry_structural_repair_import.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/structural_repair_import_manifest.json.")
+    p.add_argument("--markdown-output", type=Path, help="Defaults to output path with .md suffix.")
+    p.add_argument("--format", nargs="+", choices=["mujoco", "unity", "isaac"], default=["mujoco", "unity", "isaac"])
+    p.add_argument("--provider", default="simfoundry_structural_repair_review")
+    p.add_argument("--allow-dynamic", action=argparse.BooleanOptionalAction, default=False, help="Allow review patches to release dynamic bodies. Default keeps them static.")
+    p.add_argument("--body-type", choices=["static", "dynamic", "kinematic"], default="static", help="Fallback body type when an object physics block does not define one.")
+    p.add_argument("--default-mass", type=float, default=1.0)
+    p.add_argument("--copy-assets", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
+    p.add_argument("--no-markdown", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_import_simfoundry_structural_repair)
+
+    p = sub.add_parser("simfoundry-scene-stability-report", help="Write a bbox-level SimFoundry-style support and penetration preflight report.")
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output", type=Path, help="Defaults to simulator_assets/physics/scene_stability_report.json.")
+    p.add_argument("--up-axis", choices=["x", "y", "z"], help="Defaults to bundle coordinate_system.up_axis or y.")
+    p.add_argument("--up-direction", choices=["positive", "negative"], help="Direction along --up-axis treated as upward. Defaults to bundle coordinate_system.up_direction or positive.")
+    p.add_argument("--max-support-gap", type=float, default=0.08, help="Maximum vertical gap between dynamic object bottom and support top.")
+    p.add_argument("--min-support-overlap", type=float, default=0.15, help="Minimum footprint overlap over smaller footprint for support candidates.")
+    p.add_argument("--max-penetration-depth", type=float, default=0.02, help="Allowed bbox overlap along the up axis before reporting penetration.")
+    p.add_argument("--max-overlap-volume-ratio", type=float, default=0.05, help="Allowed overlap volume over smaller bbox before reporting penetration.")
+    p.add_argument("--require-support", action=argparse.BooleanOptionalAction, default=True, help="Treat unsupported dynamic objects as required issues.")
+    p.add_argument("--max-issues", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-required", action="store_true")
+    p.add_argument("--fail-on-warning", action="store_true")
+    p.add_argument("--fail-on-penetration", action="store_true")
+    p.set_defaults(func=cmd_simfoundry_scene_stability_report)
 
     p = sub.add_parser("qa-simulator-assets", help="Run simulator-readiness QA on exported object meshes, scale, colliders, and physics fields.")
     add_common_project_arg(p)

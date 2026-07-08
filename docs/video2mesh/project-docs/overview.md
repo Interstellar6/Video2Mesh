@@ -23,6 +23,7 @@ tags:
 | [项目简介](project-intro.md) | Video2Mesh 要做什么、产物分几层、和外部项目的边界在哪里 |
 | [Pipeline](pipeline.md) | 从扫描视频到 3DGS、mesh、语义、collider、simulator bundle 的流程合同 |
 | [如何运行](how-to-run.md) | 本地/远端常用命令、输出目录、验证方式和注意事项 |
+| [SimFoundry 复刻分支运行说明](simfoundry-replica.md) | 如何把现有 simulator bundle 包装成 SimFoundry-style 仿真资产合同 |
 
 ## 当前一句话
 

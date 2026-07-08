@@ -23,7 +23,7 @@ bash tools/run_video2mesh_quick.sh dataset/<video>.mp4
 ## 本地文档站
 
 ```bash
-python3 docs-blog/build_site.py
+python3 docs-blog/build_video2mesh_site_data.py
 python3 -m http.server 4173 -d docs-blog/_public
 ```
 
