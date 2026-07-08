@@ -3,7 +3,7 @@ title: SimFoundry 复刻分支运行说明
 id: video2mesh-simfoundry-replica
 category: 项目文档
 visibility: public
-summary: 记录 Video2Mesh 在 codex/simfoundry-replica 分支上按 SimFoundry 思路复刻 P0 collider-only scene 与 P1 static object scene 的当前重建结果、产物和仿真 smoke 结果。
+summary: 记录 Video2Mesh 在 codex/simfoundry-replica 分支上按 SimFoundry 思路收口到资产生成六件套：高质量 3DGS、语义 3DGS、高质量 mesh、语义 mesh、整场景 GLB 和单物体 GLB。
 tags:
   - SimFoundry
   - Collider
@@ -15,23 +15,89 @@ tags:
 
 当前分支：`codex/simfoundry-replica`
 
-当前边界：**从前到后一步步来，本轮最新验收到 P1 static object scene；仿真器可加载，但所有 object 仍保持 static。**
+当前边界：**从前到后一步步来，本阶段正式交付资产生成六件套，不继续 Blender / Isaac / MuJoCo adapter，也不验收动态仿真。目标是把 Video2Mesh 已有重建结果整理成后续仿真器能消费的 visual / semantic / object GLB 资产。**
 
-这份文档把当前完成口径收在 P0 collider-only scene 和 P1 static object scene。dynamic rigid body release、digital cousins、真实 provider 调用或 policy learning 仍不算完成项。下方保留早前 P2/P4/P5 探索记录，但它们不是本轮“先重建 collider 场景，再接 static object scene”的验收边界。
+这份文档当前完成口径收在六类资产：高质量 3DGS 点云、语义分割 3DGS 点云、高质量 mesh、语义分割 mesh、整个场景 GLB、单个物体 GLB。历史 P2-P8 dynamic-readiness、support-pose dynamic sidecar 和 provider-shaped repair 记录保留在下方，作为后续继续贴近 SimFoundry 的探索证据，不作为本阶段验收。
 
-## 最新验收：2026-07-08 P0/P1 rebuild
+## 当前验收：2026-07-08 资产生成六件套
 
-本轮重新按“先能放进仿真模拟器”的最小前向路径跑了两组干净 timestamped 目录，避免把早期 dynamic gate、repair 和 provider-shaped dry-run 混进当前验收口径：
+当前 P1 资产目录：
+
+```text
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/
+```
+
+| 资产 | 状态 | 当前证据 |
+|---|---|---|
+| 高质量 3DGS 点云 | 已有 | `tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/3dgs_point_cloud_clean_iteration30000.ply`，GraphDECO 30k clean，971,305 vertices，约 230 MB |
+| 语义分割 3DGS 点云 | 已有 baseline | `simulator_assets/semantic_3dgs_from_semantic_mesh_transfer.ply`，971,305 vertices，含 `object_id` / `object_probability` |
+| 高质量 mesh 重建 | 已有 | `tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/mesh_recon_results/colmap_delaunay_dense/mesh.ply`，82,920 vertices / 167,082 faces |
+| 语义分割 mesh | 已有 | `simulator_assets/semantic_object_meshes/semantic_object_meshes.json`，16 objects，73,970 vertices / 141,993 faces |
+| 整个场景 GLB | 已有 | `simulator_assets/scene_glb/scene.glb`，16 objects，约 2.8 MB |
+| 单个物体 GLB | 已有 | `simulator_assets/semantic_object_glbs/semantic_object_glbs.json`，`status=semantic_object_glbs_exported`，16/16 objects，`error_count=0` |
+
+语义 3DGS 当前是从已有 semantic mesh debug PLY 最近邻转移到 clean GraphDECO 30k 3DGS 的工程 baseline，不是完整 SVLGaussian，也不是 SimFoundry 论文里的完整 2D 概率反投影链路。这个 baseline 的价值是先把 object-level 语义属性贴回高质量 3DGS 点云，便于后续 viewer、编辑器和仿真资产索引消费。
+
+单物体 GLB 已补成可回放命令：
+
+```bash
+PYTHONPATH=. uv run --with numpy --with trimesh python -m video2mesh.cli export-semantic-object-glbs \
+  --project-root exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534 \
+  --semantic-meshes exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/semantic_object_meshes/semantic_object_meshes.json \
+  --output-dir exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/semantic_object_glbs \
+  --json \
+  --fail-on-empty \
+  --fail-on-failed
+```
+
+整场景 GLB 复验命令：
+
+```bash
+PYTHONPATH=. uv run --with numpy --with trimesh python -m video2mesh.cli export-simfoundry-scene-glb \
+  --project-root exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534 \
+  --bundle exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simulator_asset_bundle.json \
+  --output-dir exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/scene_glb \
+  --json \
+  --fail-on-empty
+```
+
+本阶段不使用 API key，不调用 provider，不把资产推进到 dynamic body release，也不把历史 MuJoCo smoke 当作当前目标。下一步如果继续吸收 SimFoundry，应该先围绕资产质量做 semantic split refinement、scale calibration 和 collider/physics sidecar，而不是直接扩展动态仿真。
+
+## 历史探索：2026-07-08 P0-P8 static-to-dynamic-sidecar handoff
+
+本轮按“先重建生成 collider 场景，再推进静态对象层，再跑动态门禁和修复合同”的顺序重新跑了干净 timestamped 目录。P0/P0.1 证明 scene collider 和坐标合同能进入模拟器；P1 在不释放动态体的前提下，把语义对象层、bbox collision proxy、静态物理 sidecar 和三套 adapter 接进 simulator bundle，补齐 16 个 per-object semantic GLB，新增一个 scene-level visual GLB aggregate，并把已有 semantic mesh debug PLY 的 `object_id/object_probability` 最近邻转移到 clean GraphDECO 30k 3DGS，恢复出语义 3DGS PLY；P2 在当时的 P1 上生成 tight collider variant 和 dynamic blocker report；P3 生成 penetration repair sidecar，并修复 tight-collider 后续覆盖 P3 repair proxy 的问题；P4 生成 provider-shaped repair plan / review request；P6 生成远端服务器 handoff 包；P7/P8 用同一套 review-patch/import/gate 机制做 support-pose 诊断 sidecar，先后把 plant4、plant3 和 lamp4 三个小物体释放为 dynamic：
 
 ```text
 P0:
-exports/simfoundry_bedroom4_step1_collider_scene_rebuild_p0_20260708_031553/
+exports/simfoundry_bedroom4_collider_scene_only_p0_20260708_160728/
+
+P0.1:
+exports/simfoundry_bedroom4_collider_scene_only_p0_20260708_160728/
 
 P1:
-exports/simfoundry_bedroom4_step2_static_object_scene_rebuild_p1_20260708_031841/
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/
+
+P2 dynamic-readiness:
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_dynamic_readiness/
+
+P3 penetration repair + preserved readiness:
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_penetration_repair_variant/
+
+P4 structural repair dry-run:
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_structural_repair_plan/
+
+P6 remote handoff:
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_remote_handoff/
+
+历史 P7 support-pose dynamic sidecar:
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_support_pose_trial_p3_plant4/
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3/
+
+历史 P8 support-pose dynamic sidecar:
+exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/
 ```
 
-最新流程：
+历史探索流程：
 
 ```text
 bedroom4 COLMAP Delaunay mesh
@@ -39,13 +105,28 @@ bedroom4 COLMAP Delaunay mesh
   -> P0 collider-only simulator bundle
   -> P0 MuJoCo / Unity / Isaac adapters
   -> P0 MuJoCo runtime smoke
-  -> P1 local face semantics split
-  -> P1 16 static semantic objects + bbox collision proxies
-  -> P1 MuJoCo / Unity / Isaac adapters
-  -> P1 MuJoCo runtime smoke
+  -> P0.1 up_axis=y coordinate sidecar
+  -> P0.1 normal smoke: runtime pass with scale warnings
+  -> P0.1 strict scale smoke: expected scale gate fail, MuJoCo runtime pass
+  -> P1 semantic object meshes + bbox collision proxies
+  -> P1 semantic 3DGS from semantic mesh nearest transfer
+  -> P1 scene-level visual GLB aggregate
+  -> P1 static object simulator bundle
+  -> P1 normal smoke: runtime pass with scale warnings
+  -> P1 strict scale smoke: expected scale gate fail, MuJoCo runtime pass
+  -> P2 tight collider variant + dynamic blocker report
+  -> P2 dynamic readiness: dynamic_blocked, accepted dynamic = 0
+  -> P3 penetration repair sidecar: 8 repaired proxies, main bundle unchanged
+  -> P3 preserved readiness: repair proxies retained, still dynamic_blocked
+  -> P4 structural repair plan + Sub2API/gpt-5-codex shaped request
+  -> P6 remote handoff for ssh -p 22356 root@connect.westc.seetacloud.com
+  -> P7 support-pose trial: plant_4 dynamic sidecar
+  -> P7 support-pose trial: plant_3 + plant_4 dynamic sidecar
+  -> P8 support-pose trial: lamp_4 + plant_3 + plant_4 dynamic sidecar
+  -> P8 MuJoCo sidecar runtime smoke with 3 dynamic bodies
 ```
 
-最新 P0 验收：
+历史 P0 验收：
 
 | 项 | 结果 |
 |---|---:|
@@ -59,37 +140,270 @@ bedroom4 COLMAP Delaunay mesh
 | MuJoCo runtime | pass |
 | MuJoCo nbody / ngeom / nmesh | 2 / 2 / 1 |
 
-最新 P1 验收：
+历史 P1 验收：
 
 | 项 | 结果 |
 |---|---:|
+| run | `exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/` |
 | semantic object meshes | 16 |
+| semantic 3DGS PLY | 971,305 vertices |
+| semantic 3DGS method | `nearest_semantic_ply_to_splats_transfer` |
+| semantic 3DGS source | semantic mesh debug PLY, 501,246 semantic vertices |
+| semantic 3DGS properties | `object_id`, `object_probability` |
+| semantic 3DGS labeled foreground classes | 16 nonzero objects |
+| per-object semantic GLB | 16 / 16 |
+| scene-level visual GLB | `scene.glb`, 2.9 MB |
+| scene GLB vertices / triangles | 73,970 / 141,993 |
+| scene GLB exported objects | 16 / 16 |
 | foreground / background | 10 / 6 |
 | scene static collider | 1 |
 | object bbox proxies | 16 / 16 |
 | object body type | `static: 16` |
 | object collider | `box: 16` |
-| adapter ready | 3 / 3 |
+| physics source | `simfoundry_bbox_physics: 16` |
+| scale_to_meters | 1.0 |
+| scale_calibrated | `false` |
+| up_axis | `y` |
 | static scene report | `ready` |
-| static scene required issues | 0 |
-| smoke required issues | 0 |
-| smoke warnings | 2 个 `scale_not_calibrated` |
+| static scene required / warning | 0 / 0 |
+| normal smoke | `runtime_pass_with_warnings` |
+| normal required / warning | 0 / 2 |
+| strict scale smoke | `fail` as expected |
+| strict required / warning | 2 / 0 |
+| strict required issue | 2 个 `scale_not_calibrated` |
 | MuJoCo runtime | pass |
 | MuJoCo nbody / ngeom / nmesh | 18 / 18 / 1 |
 | freejoint / dynamic scan | 0 命中 |
-| branch test | `tests/test_simfoundry_replica.py` 47 passed |
+| secret scan | 0 命中 |
+| branch test | `tests/test_simfoundry_replica.py` 54 passed |
+
+历史 P2/P3/P4/P6 验收：
+
+| 项 | 结果 |
+|---|---:|
+| P2 status | `dynamic_blocked` |
+| tight collider updated | 16 / 16 |
+| bbox penetration | 42 -> 19 |
+| dynamic candidates | 8 |
+| accepted dynamic | 0 |
+| blocked candidates | 8 |
+| unsupported candidates | 6 |
+| penetration candidates | 8 |
+| unique penetration blockers | 10 |
+| P2 sidecar adapter ready | 3 / 3 |
+| P2 smoke required / warning | 0 / 2 |
+| P3 repair status | `repair_variant_ready` |
+| P3 repaired / skipped | 8 / 0 |
+| P3 repair penetration count | 42 -> 33 |
+| P3 repair total penetration volume | 6627.2491 -> 4559.7405 |
+| P3 preserve-fix tight updated / preserved | 8 / 8 |
+| P3 preserve-fix bbox penetration | 33 -> 21 |
+| P3 preserve-fix status | `dynamic_blocked` |
+| P3 preserve-fix accepted dynamic | 0 |
+| P3 preserve-fix blocked / unsupported / penetration candidates | 8 / 6 / 7 |
+| P3 preserve-fix unique penetration blockers | 9 |
+| P3 preserve-fix smoke required / warning | 0 / 2 |
+| P4 repair plan status | `structural_repair_plan_ready` |
+| object repair plans | 8 |
+| structural blocker plans | 10 |
+| support repair plans | 6 |
+| penetration repair plans | 8 |
+| review worker status | `dry_run_request_prepared` |
+| provider called | `false` |
+| provider model | `custom` / `Sub2API` / `gpt-5-codex` / `gpt-image-2` |
+| request storage | `store=false`，`disable_response_storage=true` |
+| remote handoff | 12 / 12 artifacts present |
+| remote target | `ssh -p 22356 root@connect.westc.seetacloud.com` |
+| main bundle body type | `static: 16` |
+| dynamic variant body type | `static: 16` |
+| dynamic / freejoint scan | 0 命中 |
+| secret scan | 0 命中 |
+
+历史 P8 support-pose sidecar 验收：
+
+| 项 | 结果 |
+|---|---:|
+| plant4 sidecar status | `partial_dynamic_release_ready` |
+| plant4 accepted dynamic | `gdino_object_plant_4` |
+| plant4 dynamic body type | `static: 15, dynamic: 1` |
+| plant4 MuJoCo runtime | pass, 5 steps |
+| plant4 freejoint | 1 |
+| plant3+plant4 sidecar status | `partial_dynamic_release_ready` |
+| plant3+plant4 accepted dynamic | `gdino_object_plant_3`, `gdino_object_plant_4` |
+| plant3+plant4 dynamic body type | `static: 14, dynamic: 2` |
+| plant3+plant4 MuJoCo runtime | pass, 5 steps |
+| plant3+plant4 sidecar adapter root | `simfoundry_support_pose_trial_p3_plant4_plant3/dynamic_readiness_after_support_pose_trial/adapters` |
+| plant3+plant4 MuJoCo nbody / ngeom / nmesh | 18 / 18 / 1 |
+| plant3+plant4 freejoint | 2 |
+| lamp4+plant3+plant4 sidecar status | `partial_dynamic_release_ready` |
+| lamp4+plant3+plant4 accepted dynamic | `gdino_object_lamp_4`, `gdino_object_plant_3`, `gdino_object_plant_4` |
+| lamp4+plant3+plant4 dynamic body type | `static: 13, dynamic: 3` |
+| lamp4+plant3+plant4 blocked candidates | 5 |
+| lamp4+plant3+plant4 MuJoCo runtime | pass, 5 steps |
+| lamp4+plant3+plant4 sidecar adapter root | `simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/dynamic_readiness_after_support_pose_trial/adapters` |
+| lamp4+plant3+plant4 MuJoCo nbody / ngeom / nmesh | 18 / 18 / 1 |
+| lamp4+plant3+plant4 freejoint | 3 |
+| remaining smoke warning | 2 个 `scale_not_calibrated` |
+| main bundle overwritten | `false` |
+| boundary | diagnostic support-pose sidecar, not final visual placement |
+
+历史 P0.1 验收：
+
+| 项 | 结果 |
+|---|---:|
+| run | `exports/simfoundry_bedroom4_collider_scene_only_p0_20260708_160728/` |
+| coordinate method | `manual_scale_to_meters` |
+| scale_to_meters | 1.0 |
+| scale_calibrated | `false` |
+| up_axis | `y` |
+| updated objects / records | 0 / 0 |
+| objects | 0 |
+| static colliders | 1 |
+| adapters ready | 3 / 3 |
+| normal smoke | `runtime_pass_with_warnings` |
+| normal required / warning | 0 / 2 |
+| strict scale smoke | `fail` as expected |
+| strict required / warning | 2 / 0 |
+| strict required issue | 2 个 `scale_not_calibrated` |
+| MuJoCo runtime | pass |
+| MuJoCo nbody / ngeom / nmesh | 2 / 2 / 1 |
+
+P0 关键文件：
+
+```text
+simulator_assets/colliders/scene_static_collider.obj
+simulator_assets/simulator_asset_bundle.collider_only.json
+simulator_assets/simfoundry_collider_scene/collider_scene_manifest.json
+simulator_assets/adapters/simulator_adapters.json
+simulator_assets/adapters/mujoco/scene.xml
+simulator_assets/adapters/unity/unity_adapter.json
+simulator_assets/adapters/isaac/isaac_adapter.json
+simulator_assets/physics/sim_preflight_report.json
+```
+
+P0.1 额外关键文件：
+
+```text
+simulator_assets/simulator_calibration.json
+simulator_assets/physics/sim_preflight_report.json
+simulator_assets/physics/sim_preflight_report.require_scale_calibration.json
+```
+
+P1 关键文件：
+
+```text
+simulator_assets/simulator_asset_bundle.json
+simulator_assets/simfoundry_static_object_scene/static_object_scene_report.json
+simulator_assets/semantic_object_meshes/semantic_object_meshes.json
+simulator_assets/semantic_3dgs_from_semantic_mesh_transfer.ply
+simulator_assets/semantic_3dgs_from_semantic_mesh_transfer_manifest.json
+simulator_assets/semantic_object_glbs/semantic_object_glbs.json
+simulator_assets/semantic_object_glbs/<object_id>/<object_id>.glb
+simulator_assets/scene_glb/scene.glb
+simulator_assets/scene_glb/scene_glb_manifest.json
+simulator_assets/objects/<object_id>/object_asset.json
+simulator_assets/objects/<object_id>/collision/*_bbox_collider.obj
+simulator_assets/adapters/simulator_adapters.json
+simulator_assets/adapters/mujoco/scene.xml
+simulator_assets/adapters/unity/unity_adapter.json
+simulator_assets/adapters/isaac/isaac_adapter.json
+simulator_assets/physics/sim_preflight_report.json
+simulator_assets/physics/sim_preflight_report.require_scale_calibration.json
+simulator_assets/scale_calibration_jobs_p1/
+```
+
+P2/P3/P4/P6/P7/P8 关键文件：
+
+```text
+simulator_assets/simfoundry_dynamic_readiness/dynamic_readiness_report.json
+simulator_assets/simfoundry_dynamic_readiness/dynamic_variant/dynamic_blocker_report.json
+simulator_assets/simfoundry_dynamic_readiness/sim_preflight_report.json
+simulator_assets/simfoundry_penetration_repair_variant/penetration_repair_variant_report.json
+simulator_assets/simfoundry_penetration_repair_variant/simulator_asset_bundle.penetration_repair.json
+simulator_assets/simfoundry_penetration_repair_variant/dynamic_readiness_after_p3_preserve_fix/dynamic_readiness_report.json
+simulator_assets/simfoundry_penetration_repair_variant/dynamic_readiness_after_p3_preserve_fix/tight_collider_variant/tight_collider_variant_report.json
+simulator_assets/simfoundry_penetration_repair_variant/dynamic_readiness_after_p3_preserve_fix/dynamic_variant/dynamic_blocker_report.json
+simulator_assets/simfoundry_penetration_repair_variant/dynamic_readiness_after_p3_preserve_fix/sim_preflight_report.json
+simulator_assets/simfoundry_provider_jobs/simfoundry_provider_jobs.json
+simulator_assets/simfoundry_provider_jobs/provider_config.template.json
+simulator_assets/simfoundry_structural_repair_plan/structural_repair_plan.json
+simulator_assets/simfoundry_structural_repair_plan/structural_repair_plan.md
+simulator_assets/simfoundry_structural_repair_plan/structural_repair_review_request.json
+simulator_assets/simfoundry_structural_repair_plan/structural_repair_review_patch.worker.json
+simulator_assets/simfoundry_structural_repair_plan/structural_repair_review_worker_report.json
+simulator_assets/simfoundry_remote_handoff/simfoundry_remote_handoff.json
+simulator_assets/simfoundry_remote_handoff/simfoundry_remote_handoff.md
+simulator_assets/simfoundry_remote_handoff/simfoundry_remote_handoff.sh
+simulator_assets/simfoundry_support_pose_trial_p3_plant4/dynamic_readiness_after_support_pose_trial/dynamic_variant/simulator_asset_bundle.dynamic_variant.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4/dynamic_readiness_after_support_pose_trial/sim_preflight_report.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3/structural_support_pose_review_patch.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3/import/simulator_asset_bundle.structural_repair.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3/dynamic_readiness_after_support_pose_trial/dynamic_variant/simulator_asset_bundle.dynamic_variant.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3/dynamic_readiness_after_support_pose_trial/sim_preflight_report.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/structural_support_pose_review_patch.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/import/simulator_asset_bundle.structural_repair.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/dynamic_readiness_after_support_pose_trial/dynamic_variant/simulator_asset_bundle.dynamic_variant.json
+simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/dynamic_readiness_after_support_pose_trial/sim_preflight_report.json
+```
+
+P0 复验命令：
+
+```bash
+PYTHONPATH=. uv run --with mujoco --with numpy python -m video2mesh.cli simfoundry-simulator-smoke-test \
+  --project-root exports/simfoundry_bedroom4_collider_scene_only_p0_20260708_160728 \
+  --bundle exports/simfoundry_bedroom4_collider_scene_only_p0_20260708_160728/simulator_assets/simulator_asset_bundle.collider_only.json \
+  --format mujoco unity isaac \
+  --mujoco-runtime require \
+  --mujoco-steps 5 \
+  --output exports/simfoundry_bedroom4_collider_scene_only_p0_20260708_160728/simulator_assets/physics/sim_preflight_report.json \
+  --json \
+  --fail-on-required
+```
+
+P1 复验命令：
+
+```bash
+PYTHONPATH=. uv run --with mujoco --with numpy python -m video2mesh.cli simfoundry-simulator-smoke-test \
+  --project-root exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534 \
+  --bundle exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simulator_asset_bundle.json \
+  --format mujoco unity isaac \
+  --mujoco-runtime require \
+  --mujoco-steps 5 \
+  --output exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/physics/sim_preflight_report.json \
+  --json \
+  --fail-on-required
+```
+
+P8 lamp4+plant3+plant4 sidecar 复验命令：
+
+```bash
+PYTHONPATH=. uv run --with mujoco --with numpy python -m video2mesh.cli simfoundry-simulator-smoke-test \
+  --project-root exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534 \
+  --bundle exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/dynamic_readiness_after_support_pose_trial/dynamic_variant/simulator_asset_bundle.dynamic_variant.json \
+  --format mujoco unity isaac \
+  --mujoco-runtime require \
+  --mujoco-steps 5 \
+  --output exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/simfoundry_support_pose_trial_p3_plant4_plant3_lamp4/dynamic_readiness_after_support_pose_trial/sim_preflight_report.json \
+  --json \
+  --fail-on-required
+```
 
 本轮安全边界：
 
 - 不调用 provider，不使用用户提供的 API key，不生成 provider request。
 - P0 collider-only bundle 内 `objects=[]`。
-- P1 主 bundle 内 16 个对象全部是 `static`。
-- MuJoCo XML 和产物目录扫描没有 `freejoint` / dynamic body。
-- 当前只证明 simulator-ready static scene 能运行；不证明真实尺度已校准，也不证明 dynamic object release 已完成。
+- P0.1 bundle 仍然 `objects=[]`，没有 object collision proxy、freejoint、dynamic body 或 kinematic body。
+- P1 bundle 有 16 个 object records，但全部是 `static` body；collision proxy 当前是 bbox 近似，不是 convex decomposition 或结构修复结果。
+- P2/P3/P4/P6/P7/P8 都是非覆盖 sidecar：不覆盖主 `simulator_asset_bundle.json`。只有 P7/P8 的 dynamic variant sidecar 写入 `freejoint`，主 P1 bundle 和 P2/P3/P4/P6 仍不写 `freejoint`。
+- P3 penetration repair 只生成候选 collision proxy sidecar。当前代码已保证后续 tight-collider readiness 会保留 `simfoundry_penetration_repair_bbox_shrink` 代理，不再把 P3 修复结果重算覆盖；但 preserve-fix 后仍是 `dynamic_blocked`，不能当成 dynamic release。
+- provider 合同只保存 `auth_env=OPENAI_API_KEY`，不保存明文 key；`run_provider=false`，`provider_called=false`。provider job 模板里可能要求模型填写候选 `body_type=dynamic` 物理属性，但这不是 simulator bundle 的 dynamic release。
+- P8 support-pose sidecar 属于历史探索，证明 lamp4/plant3/plant4 可在 conservative gate 下作为三个 dynamic body 进入 MuJoCo；它仍需要真实尺度校准和视觉/物理复核，不能替代完整 structural repair 或 SimFoundry policy-learning pipeline。
+- MuJoCo / Unity / Isaac adapter 是导入骨架和资产清单；真实尺度、up-axis、接触材质和目标模拟器内的可视化检查仍是下一阶段。
+- 历史动态探索证明 collider-only scene、static object scene 和小物体 dynamic sidecar 可以作为结构级仿真输入，动态门禁可以保守拒绝不安全释放，也可以在 support-pose sidecar 修复后放行三个低风险对象；provider/remote 交接合同已经文件化；strict scale gate 仍正确阻止它被误标成生产级真实尺度仿真资产。本阶段正式验收仍只认顶部资产六件套。
 
 ## 历史探索：P2/P4/P5 dynamic-readiness 与 repair
 
-早前分支上已经探索过 P2 dynamic-readiness、provider-shaped repair dry-run、manual/local structural refit，以及 P5 dynamic-release sidecar。它们说明当前代码已经有继续向动态层推进的接口雏形，但本轮按用户最新要求先收口在 P0/P1：静态 collider 场景和 static object scene 能放进仿真器。
+早前分支上已经探索过 P2 dynamic-readiness、provider-shaped repair dry-run、manual/local structural refit，以及 P5/P7/P8 dynamic-release sidecar。它们说明当前代码已经有继续向动态层推进的接口雏形；但本阶段正式验收以上方资产六件套为准。
 
 ## 历史验收：2026-07-07 P0 collider-only rebuild
 
@@ -166,7 +480,7 @@ simulator_assets/physics/sim_preflight_report.require_scale_calibration.json
 - 本轮 P0 没有 provider request，也没有真实 provider 调用。
 - `PYTHONPATH=. uv run --with pytest --with numpy pytest tests/test_simfoundry_replica.py -q` 通过：47 passed。
 
-这个结果证明当前场景已经可以作为静态 collider asset 导入模拟器做结构级检查；它仍不证明真实尺度已校准，也不证明 object-level static scene、dynamic release 或完整 SimFoundry 复现已经完成。
+这个结果证明当前场景已经可以作为静态 collider asset 导入模拟器做结构级检查；它仍不证明真实尺度已校准，也不证明 object-level static scene、dynamic release 或完整 SimFoundry 复现已达成。
 
 ## 下一格：scale / up-axis 校准边界
 
@@ -191,7 +505,7 @@ simulator_assets/scale_calibration_jobs_p0/
 
 该 job 的 `candidate_count=0`。这不是错误，而是 collider-only 场景没有 object/background records 的自然结果。
 
-## 最新推进：2026-07-07 P1 static object scene rebuild
+## 历史推进：2026-07-07 P1 static object scene rebuild
 
 在 P0 collider-only 通过后，又单独开了一个干净 P1 目录，重建 static object scene：
 
@@ -270,11 +584,11 @@ simulator_assets/scale_calibration_jobs_p1/
 | `gdino_object_window` | window | z | 16.2287 |
 | `gdino_object_bed` | bed | x | 14.7931 |
 
-这个结果把项目从 P0 “只有场景碰撞体能进模拟器”推进到 P1 “语义对象 + bbox proxy 的静态场景能进模拟器”。它仍不代表 dynamic release、真实尺度校准、真实 provider 修复或完整 SimFoundry 复现已经完成。
+这个结果把项目从 P0 “只有场景碰撞体能进模拟器”推进到 P1 “语义对象 + bbox proxy 的静态场景能进模拟器”。它仍不代表 dynamic release、真实尺度校准、真实 provider 修复或完整 SimFoundry 复现已达成。
 
-## 最新推进：2026-07-08 P2 dynamic-readiness gate
+## 历史推进：2026-07-08 P2 dynamic-readiness gate
 
-在最新 P1 static object scene 上，继续生成 P2 dynamic-readiness sidecar：
+在当时的 P1 static object scene 上，继续生成 P2 dynamic-readiness sidecar：
 
 ```text
 exports/simfoundry_bedroom4_step2_static_object_scene_rebuild_p1_20260707_235133/simulator_assets/simfoundry_dynamic_readiness_p2_20260708_013632/
@@ -353,7 +667,7 @@ sim_preflight_report.json
 
 ## 后续探索状态
 
-页面下方保留了更早的 P1 static object scene、dynamic-readiness gate 和 provider-shaped structural repair dry-run 历史记录。当前最新可验收进度已经推进到 P2 dynamic-readiness gate：门禁运行成功，但 accepted dynamic 仍为 0；structural repair 和 cousins 仍只作为后续探索证据，不混进本轮完成口径。
+页面下方保留了更早的 P1 static object scene、dynamic-readiness gate 和 provider-shaped structural repair dry-run 历史记录。当前正式验收口径已经收回到本页顶部的资产生成六件套；早期 P2 只作为历史门禁证据，其中 accepted dynamic 仍为 0。真实 provider 输出导入、最终 structural repair 成果、动态仿真和 cousins 仍只作为后续工作，不混进本轮完成口径。
 
 关键后续目录：
 
@@ -535,21 +849,21 @@ SimFoundry 的完整系统目标很大：单段视频到 sim-ready digital twin�
 
 ## 历史 P0 建议记录
 
-以下是 P0 collider-only 通过时的建议记录。当前页面顶部的最新状态已经推进到 P2 dynamic-readiness gate；这段保留为历史上下文，不作为最新验收口径。
+以下是 P0 collider-only 通过时的建议记录。这段为历史上下文，不作为最新验收口径；当前页面顶部的最新状态是资产生成六件套。
 
 当时建议不要直接跳到 policy learning。更合理的顺序是：
 
 1. 做真实 scale calibration，消掉 `scale_not_calibrated` warning。
-2. 在不覆盖 P0 基线的前提下，单独推进并复验 P1 static object scene。当前已完成。
+2. 在不覆盖 P0 基线的前提下，单独推进并复验 P1 static object scene。
 3. 继续优化 object collider，用 bbox / convex decomposition / compound primitive 降低互穿。
 4. 跑 penetration / support / dynamic-readiness gate。
 5. 只有当 gate 发现明确 blocker 时，再接入 provider-shaped structural repair。
 
-当前最新验收已经到 P2：collider-only scene、static object scene 和 dynamic-readiness gate 都已经 rebuilt and simulator-smoked；P2 的 accepted dynamic 仍为 0。后续仍不能跳过真实尺度校准、collider refinement 与 structural repair。
+后续如果重新推进 dynamic release，仍不能跳过真实尺度校准、collider refinement 与 structural repair；本阶段正式验收不包含 dynamic sidecar。
 
 ## P0.1: up-axis / scale calibration probe
 
-在 collider-only 基线通过后，下一步先处理仿真坐标合同，而不是直接跳到 object 或 dynamic。最新 timestamped rebuild 目录已经补齐这一层：
+在 collider-only 基线通过后，下一步先处理仿真坐标合同，而不是直接跳到 object 或 dynamic。当时的 timestamped rebuild 目录已经补齐这一层：
 
 ```text
 exports/simfoundry_bedroom4_step1_collider_scene_rebuild_20260707_195216/
@@ -557,7 +871,7 @@ exports/simfoundry_bedroom4_step1_collider_scene_rebuild_20260707_195216/
 
 本次只写入工程坐标合同：
 
-| 项 | 最新 P0.1 结果 |
+| 项 | 历史 P0.1 结果 |
 |---|---|
 | calibration artifact | `simulator_assets/simulator_calibration.json` |
 | method | `manual_scale_to_meters` |
@@ -756,7 +1070,7 @@ simulator_assets/physics/sim_preflight_report.require_scale_calibration.json
 
 ## P1: static object scene current run
 
-这一节是早期 P1 探索记录；当前最新 P1 验收请以上方 `20260708_014805` timestamped front-to-back rebuild 为准。
+这一节是早期 P1 探索记录；当前资产验收请以上方 `20260708_161534` 资产六件套为准。
 
 在 P0 / P0.1 之后，继续按同一条从前到后的顺序生成静态对象场景。新建目录：
 
@@ -933,7 +1247,7 @@ P1 static object scene run：
 | secret scan | 0 命中 |
 | branch test | `tests/test_simfoundry_replica.py` 46 passed |
 
-这组历史探索证据说明：当前分支具备把 bedroom4 从 raw scene mesh 推到 simulator-ready static object scene 的路线。它仍然保留 `scale_calibrated=false`，所以不能被误用成生产级真实尺度物理资产；当前正式验收以上方 2026-07-08 P0/P1/P2 front-to-back run 为准。
+这组历史探索证据说明：当前分支具备把 bedroom4 从 raw scene mesh 推到 simulator-ready static object scene 的路线。它仍然保留 `scale_calibrated=false`，所以不能被误用成生产级真实尺度物理资产；当前正式验收以上方资产生成六件套为准，P2 作为后续门禁证据保留。
 
 ## P2/P3: tight collider and dynamic-readiness gate
 
@@ -1066,7 +1380,7 @@ gdino_object_nightstand
 gdino_object_nightstand_2
 ```
 
-这个结果说明当时的 front-to-back P1 目录已经能产出 SimFoundry-style 动态释放前门禁报告；同时门禁正确地拒绝了当前几何里不安全的动态释放。当前最新验收请以上方 2026-07-08 P2 gate 为准；它仍不是 dynamic scene。
+这个结果说明当时的 front-to-back P1 目录已经能产出 SimFoundry-style 动态释放前门禁报告；同时门禁正确地拒绝了当前几何里不安全的动态释放。当前正式复验请以上方 2026-07-08 P1 static object rebuild 为准；P2 仍只是门禁证据，不是 dynamic scene。
 
 P2/P3 证据文件：
 

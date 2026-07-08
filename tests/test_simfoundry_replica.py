@@ -3,12 +3,44 @@ import re
 import struct
 from pathlib import Path
 
-from video2mesh.cli import build_parser, main
+from video2mesh.cli import build_parser, main, read_glb_triangle_mesh_light
 
 
 def write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def write_ascii_point_ply(path: Path, rows: list[tuple[float, float, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {len(rows)}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "end_header",
+    ]
+    lines.extend(f"{x} {y} {z}" for x, y, z in rows)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_ascii_semantic_point_ply(path: Path, rows: list[tuple[float, float, float, int, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {len(rows)}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property int object_id",
+        "property float object_probability",
+        "end_header",
+    ]
+    lines.extend(f"{x} {y} {z} {object_id} {probability}" for x, y, z, object_id, probability in rows)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def make_minimal_simulator_project(tmp_path: Path) -> tuple[Path, Path]:
@@ -203,6 +235,123 @@ def write_tiny_binary_scene_ply(path: Path) -> None:
             f.write(struct.pack("<fff", *vertex))
         for face in faces:
             f.write(struct.pack("<Biii", 3, *face))
+
+
+def test_export_simfoundry_scene_glb_from_simulator_bundle(tmp_path):
+    project_root, bundle_path = make_minimal_simulator_project(tmp_path)
+
+    assert (
+        main(
+            [
+                "export-simfoundry-scene-glb",
+                "--project-root",
+                str(project_root),
+                "--bundle",
+                str(bundle_path),
+                "--json",
+                "--fail-on-empty",
+            ]
+        )
+        == 0
+    )
+
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    scene_glb = Path(manifest["artifacts"]["simfoundry_scene_glb"])
+    scene_glb_manifest = Path(manifest["artifacts"]["simfoundry_scene_glb_manifest"])
+    assert scene_glb.exists()
+    assert scene_glb.suffix == ".glb"
+
+    vertices, triangles, parser = read_glb_triangle_mesh_light(scene_glb)
+    assert parser == "light_glb"
+    assert vertices.shape[0] == 8
+    assert triangles.shape[0] == 4
+
+    payload = json.loads(scene_glb_manifest.read_text(encoding="utf-8"))
+    assert payload["status"] == "scene_glb_exported"
+    assert payload["summary"]["exported_object_count"] == 1
+    assert payload["summary"]["skipped_count"] == 1
+    assert "floor_001" in payload["skipped"]
+
+    updated_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert updated_bundle["scene_assets"]["scene_glb"] == str(scene_glb)
+    assert updated_bundle["scene_assets"]["scene_glb_manifest"] == str(scene_glb_manifest)
+
+
+def test_export_semantic_object_glbs_from_semantic_mesh_index(tmp_path):
+    project_root, _bundle_path = make_minimal_simulator_project(tmp_path)
+    mesh_dir = project_root / "simulator_assets" / "semantic_object_meshes"
+    box_mesh = mesh_dir / "box_001" / "box_001.ply"
+    floor_mesh = mesh_dir / "floor_001" / "floor_001.ply"
+    write_tiny_binary_scene_ply(box_mesh)
+    write_tiny_binary_scene_ply(floor_mesh)
+    mesh_index = mesh_dir / "semantic_object_meshes.json"
+    write_json(
+        mesh_index,
+        {
+            "schema_version": 1,
+            "object_count": 2,
+            "objects": {
+                "box_001": {
+                    "object_id": "box_001",
+                    "semantic_id": 1,
+                    "label": "box",
+                    "category": "box",
+                    "asset_role": "object",
+                    "source_mesh": str(box_mesh),
+                    "format": "ply",
+                    "coordinate_frame": "video2mesh_scene",
+                    "provider": "video2mesh_scene_mesh_semantic_split",
+                },
+                "floor_001": {
+                    "object_id": "floor_001",
+                    "semantic_id": 2,
+                    "label": "floor",
+                    "category": "floor",
+                    "asset_role": "background_structure",
+                    "source_mesh": str(floor_mesh),
+                    "format": "ply",
+                    "coordinate_frame": "video2mesh_scene",
+                    "provider": "video2mesh_scene_mesh_semantic_split",
+                },
+            },
+        },
+    )
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["artifacts"]["semantic_object_meshes"] = str(mesh_index)
+    write_json(project_root / "manifest.json", manifest)
+
+    assert (
+        main(
+            [
+                "export-semantic-object-glbs",
+                "--project-root",
+                str(project_root),
+                "--json",
+                "--fail-on-empty",
+                "--fail-on-failed",
+            ]
+        )
+        == 0
+    )
+
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    glb_index = Path(manifest["artifacts"]["semantic_object_glbs"])
+    payload = json.loads(glb_index.read_text(encoding="utf-8"))
+    assert payload["status"] == "semantic_object_glbs_exported"
+    assert payload["object_count"] == 2
+    assert payload["error_count"] == 0
+    assert payload["summary"]["total_vertex_count"] == 8
+    assert payload["summary"]["total_face_count"] == 4
+    assert manifest["external_stages"]["semantic_object_glb_export"]["exported_object_count"] == 2
+
+    for object_id in ["box_001", "floor_001"]:
+        glb_path = Path(payload["objects"][object_id]["glb_path"])
+        assert glb_path.exists()
+        assert glb_path.suffix == ".glb"
+        vertices, triangles, parser = read_glb_triangle_mesh_light(glb_path)
+        assert parser == "light_glb"
+        assert vertices.shape[0] == 4
+        assert triangles.shape[0] == 2
 
 
 def test_prepare_simfoundry_collider_scene_from_existing_mesh_updates_manifest_and_bundle(tmp_path):
@@ -817,6 +966,94 @@ def test_simfoundry_simulator_smoke_test_passes_structural_preflight(tmp_path):
     assert manifest["external_stages"]["simfoundry_simulator_smoke_test"]["status"] == report["status"]
 
 
+def test_simfoundry_simulator_smoke_test_prefers_sidecar_adapters_for_sidecar_bundle(tmp_path):
+    project_root, bundle_path = make_minimal_simulator_project(tmp_path)
+    scene_mesh = project_root / "simulator_assets" / "scene_meshes" / "tiny_scene.ply"
+    write_tiny_scene_ply(scene_mesh)
+
+    assert main(
+        [
+            "prepare-simfoundry-collider-scene",
+            "--project-root",
+            str(project_root),
+            "--scene-mesh",
+            str(scene_mesh),
+            "--min-vertices",
+            "1",
+            "--min-triangles",
+            "1",
+        ]
+    ) == 0
+    assert main(["prepare-simfoundry-object-colliders", "--project-root", str(project_root), "--bundle", str(bundle_path)]) == 0
+    assert main(
+        [
+            "export-simulator-adapter",
+            "--project-root",
+            str(project_root),
+            "--bundle",
+            str(bundle_path),
+            "--format",
+            "mujoco",
+        ]
+    ) == 0
+
+    sidecar_dir = project_root / "simulator_assets" / "sidecar_dynamic"
+    sidecar_bundle_dir = sidecar_dir / "dynamic_variant"
+    sidecar_bundle_dir.mkdir(parents=True)
+    sidecar_bundle = sidecar_bundle_dir / "simulator_asset_bundle.dynamic_variant.json"
+    sidecar_bundle.write_text(bundle_path.read_text(encoding="utf-8"), encoding="utf-8")
+    sidecar_adapter_root = sidecar_dir / "adapters"
+    sidecar_mujoco_dir = sidecar_adapter_root / "mujoco"
+    sidecar_mujoco_dir.mkdir(parents=True)
+    (sidecar_mujoco_dir / "scene.xml").write_text("<mujoco><worldbody/></mujoco>\n", encoding="utf-8")
+    write_json(
+        sidecar_mujoco_dir / "mujoco_adapter.json",
+        {
+            "schema_version": 1,
+            "format": "mujoco",
+            "adapter_file": str(sidecar_mujoco_dir / "scene.xml"),
+            "objects": [{"object_id": "box_001"}],
+            "static_colliders": [{"collider_id": "scene_static", "packaged_mesh_path": str(scene_mesh)}],
+        },
+    )
+    write_json(
+        sidecar_adapter_root / "simulator_adapters.json",
+        {
+            "schema_version": 1,
+            "formats": {
+                "mujoco": {
+                    "adapter_file": str(sidecar_mujoco_dir / "scene.xml"),
+                    "object_count": 2,
+                    "static_collider_count": 1,
+                }
+            },
+        },
+    )
+
+    assert main(
+        [
+            "simfoundry-simulator-smoke-test",
+            "--project-root",
+            str(project_root),
+            "--bundle",
+            str(sidecar_bundle),
+            "--format",
+            "mujoco",
+            "--mujoco-runtime",
+            "skip",
+            "--min-mesh-vertices",
+            "1",
+            "--output",
+            str(sidecar_dir / "sim_preflight_report.json"),
+            "--fail-on-required",
+        ]
+    ) == 0
+
+    report = json.loads((sidecar_dir / "sim_preflight_report.json").read_text(encoding="utf-8"))
+    assert report["adapter_root"] == str(sidecar_adapter_root.resolve())
+    assert report["adapters"][0]["adapter_file"] == str(sidecar_mujoco_dir / "scene.xml")
+
+
 def test_simfoundry_simulator_smoke_test_requires_scale_when_requested(tmp_path):
     project_root, bundle_path = make_minimal_simulator_project(tmp_path)
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
@@ -958,6 +1195,128 @@ def test_prepare_scale_calibration_jobs_writes_template_readme_without_calibrati
     assert after_bundle["coordinate_system"]["scale_calibrated"] is False
     assert after_bundle["coordinate_system"]["calibrated"] is False
     assert manifest["external_stages"]["simulator_scale_calibration"]["status"] == "scale_calibration_job_prepared"
+
+
+def test_transfer_semantic_ply_to_splats_recovers_labels_from_semantic_source(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "transfer-semantic-ply-to-splats",
+            "--project-root",
+            "proj",
+            "--semantic-source-ply",
+            "semantic.ply",
+        ]
+    )
+    assert args.func.__name__ == "cmd_transfer_semantic_ply_to_splats"
+
+    project_root, _bundle_path = make_minimal_simulator_project(tmp_path)
+    splat_ply = project_root / "scene" / "reconstruction" / "3dgs" / "point_cloud" / "iteration_30000" / "point_cloud_clean.ply"
+    semantic_ply = project_root / "simulator_assets" / "semantic_mesh_debug.ply"
+    semantic_manifest = project_root / "simulator_assets" / "semantic_source_manifest.json"
+    output_ply = project_root / "simulator_assets" / "semantic_splats_recovered.ply"
+    output_manifest = project_root / "simulator_assets" / "semantic_splats_recovered_manifest.json"
+    write_ascii_point_ply(
+        splat_ply,
+        [
+            (0.02, 0.01, 0.0),
+            (1.05, 0.0, 0.0),
+            (5.0, 0.0, 0.0),
+        ],
+    )
+    write_ascii_semantic_point_ply(
+        semantic_ply,
+        [
+            (0.0, 0.0, 0.0, 7, 0.9),
+            (1.0, 0.0, 0.0, 9, 0.8),
+        ],
+    )
+    write_json(
+        semantic_manifest,
+        {
+            "schema_version": 1,
+            "objects": [
+                {"object_id": "background", "semantic_id": 0, "name": "background", "category": "background"},
+                {"object_id": "bed_001", "semantic_id": 7, "name": "bed", "category": "bed"},
+                {"object_id": "lamp_001", "semantic_id": 9, "name": "lamp", "category": "lamp"},
+            ],
+        },
+    )
+
+    assert main(
+        [
+            "transfer-semantic-ply-to-splats",
+            "--project-root",
+            str(project_root),
+            "--semantic-source-ply",
+            str(semantic_ply),
+            "--semantic-manifest",
+            str(semantic_manifest),
+            "--splat-ply",
+            str(splat_ply),
+            "--max-transfer-distance",
+            "0.2",
+            "--no-export-viewer-plys",
+            "--output",
+            str(output_ply),
+            "--manifest-output",
+            str(output_manifest),
+        ]
+    ) == 0
+
+    text = output_ply.read_text(encoding="utf-8")
+    assert "property int object_id" in text
+    assert "property float object_probability" in text
+    rows = text.split("end_header\n", 1)[1].strip().splitlines()
+    assert rows[0].split()[-2:] == ["7", "0.89999998"]
+    assert rows[1].split()[-2:] == ["9", "0.80000001"]
+    assert rows[2].split()[-2:] == ["0", "0.00000000"]
+
+    recovered = json.loads(output_manifest.read_text(encoding="utf-8"))
+    assert recovered["method"] == "nearest_semantic_ply_to_splats_transfer"
+    assert recovered["transfer"]["rejected_by_distance"] == 1
+    counts = {item["object_id"]: item["point_count"] for item in recovered["objects"]}
+    assert counts["bed_001"] == 1
+    assert counts["lamp_001"] == 1
+
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifacts"]["semantic_splats_ply"] == str(output_ply)
+    assert manifest["artifacts"]["semantic_splats_manifest"] == str(output_manifest)
+    assert manifest["external_stages"]["semantic_ply_to_splats_transfer"]["status"] == "semantic_splats_recovered_from_semantic_ply"
+
+
+def test_transfer_semantic_ply_to_splats_accepts_cwd_relative_project_prefixed_output(tmp_path):
+    project_root, _bundle_path = make_minimal_simulator_project(Path.cwd() / "exports" / f"pytest_semantic_transfer_{tmp_path.name}")
+    splat_ply = project_root / "scene" / "reconstruction" / "point_cloud.ply"
+    semantic_ply = project_root / "simulator_assets" / "semantic_mesh_debug.ply"
+    write_ascii_point_ply(splat_ply, [(0.0, 0.0, 0.0)])
+    write_ascii_semantic_point_ply(semantic_ply, [(0.0, 0.0, 0.0, 3, 1.0)])
+    output_ply = project_root / "simulator_assets" / "semantic_prefixed_output.ply"
+    output_manifest = project_root / "simulator_assets" / "semantic_prefixed_output_manifest.json"
+
+    assert main(
+        [
+            "transfer-semantic-ply-to-splats",
+            "--project-root",
+            str(project_root),
+            "--semantic-source-ply",
+            str(semantic_ply),
+            "--splat-ply",
+            str(splat_ply),
+            "--no-export-viewer-plys",
+            "--output",
+            str(output_ply.relative_to(Path.cwd())),
+            "--manifest-output",
+            str(output_manifest.relative_to(Path.cwd())),
+        ]
+    ) == 0
+
+    assert output_ply.exists()
+    assert output_manifest.exists()
+    assert not (project_root / output_ply.relative_to(Path.cwd())).exists()
+    import shutil
+
+    shutil.rmtree(project_root, ignore_errors=True)
 
 
 def test_simfoundry_simulator_smoke_test_fails_when_adapter_is_missing(tmp_path):
@@ -1832,6 +2191,43 @@ def test_prepare_simfoundry_dynamic_variant_accepts_reviewed_support_relation(tm
     assert variant_box["simfoundry_dynamic_variant"]["support"]["object_id"] == "floor_001"
     assert variant_box["simfoundry_dynamic_variant"]["support"]["source"] == "reviewed_support_relation"
     assert box_report["support"]["confidence"] == 0.82
+
+
+def test_prepare_simfoundry_dynamic_variant_rejects_reviewed_support_without_overlap(tmp_path):
+    project_root, bundle_path = make_minimal_simulator_project(tmp_path)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    box = next(obj for obj in bundle["objects"] if obj["object_id"] == "box_001")
+    box["pose"]["position"] = [10.0, 2.0, 10.0]
+    box["physics"]["body_type"] = "static"
+    box["support_relation_review"] = {
+        "decision": "accepted",
+        "support_id": "floor_001",
+        "confidence": 0.82,
+        "source": "mock_structural_review",
+    }
+    write_json(bundle_path, bundle)
+
+    assert main(
+        [
+            "prepare-simfoundry-dynamic-variant",
+            "--project-root",
+            str(project_root),
+            "--bundle",
+            str(bundle_path),
+            "--json",
+        ]
+    ) == 0
+
+    report = json.loads((project_root / "simulator_assets" / "simfoundry_dynamic_variant" / "dynamic_variant_report.json").read_text(encoding="utf-8"))
+    variant = json.loads((project_root / "simulator_assets" / "simfoundry_dynamic_variant" / "simulator_asset_bundle.dynamic_variant.json").read_text(encoding="utf-8"))
+    variant_box = next(obj for obj in variant["objects"] if obj["object_id"] == "box_001")
+    box_report = next(obj for obj in report["objects"] if obj["object_id"] == "box_001")
+
+    assert report["status"] == "dynamic_variant_empty"
+    assert report["summary"]["accepted_dynamic_count"] == 0
+    assert variant_box["physics"]["body_type"] == "static"
+    assert "unsupported" in box_report["reasons"]
+    assert box_report["support"] is None
 
 
 def test_simfoundry_dynamic_blocker_report_summarizes_repair_queue(tmp_path):
@@ -2951,6 +3347,143 @@ def test_prepare_simfoundry_penetration_repair_variant_writes_sidecar_without_ov
     assert json.loads(bundle_path.read_text(encoding="utf-8")) == original_bundle
     assert manifest["artifacts"]["simulator_asset_bundle"] == str(bundle_path)
     assert manifest["external_stages"]["simfoundry_penetration_repair_variant"]["status"] == "repair_variant_ready"
+
+
+def test_prepare_simfoundry_tight_collider_variant_preserves_penetration_repair_proxy(tmp_path):
+    project_root, bundle_path = make_minimal_simulator_project(tmp_path)
+    scene_mesh = project_root / "simulator_assets" / "scene_meshes" / "tiny_scene.ply"
+    write_tiny_scene_ply(scene_mesh)
+    assert main(
+        [
+            "prepare-simfoundry-collider-scene",
+            "--project-root",
+            str(project_root),
+            "--scene-mesh",
+            str(scene_mesh),
+            "--min-vertices",
+            "1",
+            "--min-triangles",
+            "1",
+        ]
+    ) == 0
+
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    box = next(obj for obj in bundle["objects"] if obj["object_id"] == "box_001")
+    box["physics"]["body_type"] = "static"
+    box["pose"]["position"] = [0.0, 0.5, 0.0]
+    box["pose"]["bbox_size"] = [1.0, 1.0, 1.0]
+    bundle["objects"].append(
+        {
+            "schema_version": 1,
+            "object_id": "wall_001",
+            "asset_role": "background_structure",
+            "name": "wall",
+            "category": "wall",
+            "mesh": None,
+            "collision_proxy": None,
+            "pose": {
+                "position": [0.0, 0.5, 0.0],
+                "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "scale": [1.0, 1.0, 1.0],
+                "bbox_size": [0.8, 0.8, 0.8],
+            },
+            "physics": {
+                "body_type": "static",
+                "collider": "box",
+                "material": {"name": "wall", "friction": [0.9, 0.02, 0.001], "restitution": 0.0},
+                "source": "manual_physics",
+            },
+        }
+    )
+    write_json(bundle_path, bundle)
+
+    assert (
+        main(
+            [
+                "prepare-simfoundry-dynamic-variant",
+                "--project-root",
+                str(project_root),
+                "--bundle",
+                str(bundle_path),
+                "--include-objects",
+                "box_001",
+                "--json",
+                "--fail-on-required",
+            ]
+        )
+        == 0
+    )
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    dynamic_report = Path(manifest["artifacts"]["simfoundry_dynamic_variant_report"])
+    assert (
+        main(
+            [
+                "simfoundry-dynamic-blocker-report",
+                "--project-root",
+                str(project_root),
+                "--report",
+                str(dynamic_report),
+                "--json",
+                "--fail-on-required",
+            ]
+        )
+        == 0
+    )
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    blocker_report = Path(manifest["artifacts"]["simfoundry_dynamic_blocker_report"])
+    repair_dir = project_root / "simulator_assets" / "p3_repair"
+    assert (
+        main(
+            [
+                "prepare-simfoundry-penetration-repair-variant",
+                "--project-root",
+                str(project_root),
+                "--bundle",
+                str(bundle_path),
+                "--blocker-report",
+                str(blocker_report),
+                "--output-dir",
+                str(repair_dir),
+                "--shrink-ratio",
+                "0.5",
+                "--json",
+                "--fail-on-required",
+                "--fail-on-empty",
+            ]
+        )
+        == 0
+    )
+    repair_bundle_path = repair_dir / "simulator_asset_bundle.penetration_repair.json"
+
+    tight_dir = project_root / "simulator_assets" / "p3_tight_after_repair"
+    assert (
+        main(
+            [
+                "prepare-simfoundry-tight-collider-variant",
+                "--project-root",
+                str(project_root),
+                "--bundle",
+                str(repair_bundle_path),
+                "--output-dir",
+                str(tight_dir),
+                "--no-include-background",
+                "--json",
+                "--fail-on-required",
+            ]
+        )
+        == 0
+    )
+
+    tight_report = json.loads((tight_dir / "tight_collider_variant_report.json").read_text(encoding="utf-8"))
+    tight_bundle = json.loads((tight_dir / "simulator_asset_bundle.tight_collider.json").read_text(encoding="utf-8"))
+    box_after = next(obj for obj in tight_bundle["objects"] if obj["object_id"] == "box_001")
+
+    assert tight_report["summary"]["preserved_count"] == 1
+    assert tight_report["summary"]["updated_count"] == 0
+    assert tight_report["preserved"]["box_001"]["reason"] == "reviewed_penetration_repair_collision_proxy"
+    assert tight_report["preserved"]["box_001"]["source_stage"] == "simfoundry_penetration_repair_variant"
+    assert box_after["collision_proxy"]["source"] == "simfoundry_penetration_repair_bbox_shrink"
+    assert box_after["pose"]["bbox_size"] == [0.5, 0.5, 0.5]
 
 
 def test_prepare_simfoundry_structural_repair_plan_writes_review_sidecar(tmp_path):

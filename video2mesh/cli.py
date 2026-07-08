@@ -465,6 +465,14 @@ def import_numpy():
     return np
 
 
+def import_trimesh():
+    try:
+        import trimesh  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on environment
+        raise RuntimeError("This command requires trimesh.") from exc
+    return trimesh
+
+
 def import_cv2():
     try:
         import cv2  # type: ignore
@@ -3183,6 +3191,169 @@ def background_plane_protection_mask(
     return protected, report
 
 
+def scene_bbox_cluster_keep_mask(
+    points,
+    *,
+    reference_points=None,
+    bbox_filter: bool,
+    bbox_quantile_min: float,
+    bbox_quantile_max: float,
+    bbox_padding_ratio: float,
+    cluster_filter: bool,
+    cluster_eps: float,
+    cluster_eps_ratio: float,
+    cluster_min_samples: int,
+    cluster_min_points: int,
+    cluster_min_ratio: float,
+    cluster_keep_largest: bool,
+    min_keep_ratio: float,
+) -> tuple[Any, dict[str, Any]]:
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    if points_np.ndim != 2 or points_np.shape[1] != 3:
+        raise ValueError(f"Expected Nx3 points for scene filtering, got {points_np.shape}")
+    count = int(points_np.shape[0])
+    keep = np.ones(count, dtype=bool)
+    keep_floor = max(1, int(round(count * max(0.0, min(1.0, float(min_keep_ratio))))))
+    report: dict[str, Any] = {
+        "enabled": bool(bbox_filter or cluster_filter),
+        "input_count": count,
+        "min_keep_ratio": float(min_keep_ratio),
+        "steps": [],
+    }
+    if count == 0 or not report["enabled"]:
+        report["kept_count"] = count
+        report["removed_count"] = 0
+        return keep, report
+
+    if bbox_filter:
+        ref = points_np if reference_points is None else np.asarray(reference_points, dtype=np.float64)
+        bounds = quantile_bounds_from_points(ref, float(bbox_quantile_min), float(bbox_quantile_max), float(bbox_padding_ratio))
+        if bounds is None:
+            report["steps"].append({"name": "reference_quantile_bbox", "enabled": True, "reason": "empty_reference_points"})
+        else:
+            lower, upper = bounds
+            bbox_keep = np.all((points_np >= lower) & (points_np <= upper), axis=1)
+            candidate_keep = keep & bbox_keep
+            candidate_count = int(candidate_keep.sum())
+            step = {
+                "name": "reference_quantile_bbox",
+                "enabled": True,
+                "reference_count": int(ref.shape[0]) if ref.ndim == 2 else 0,
+                "q_min": float(bbox_quantile_min),
+                "q_max": float(bbox_quantile_max),
+                "padding_ratio": float(bbox_padding_ratio),
+                "min": [float(value) for value in lower.tolist()],
+                "max": [float(value) for value in upper.tolist()],
+                "candidate_kept_count": candidate_count,
+                "candidate_removed_count": int(count - candidate_count),
+            }
+            if candidate_count < keep_floor:
+                step["fallback"] = "too_few_points_after_bbox_filter"
+            else:
+                keep = candidate_keep
+                step["kept_count"] = candidate_count
+                step["removed_count"] = int(count - candidate_count)
+            report["steps"].append(step)
+
+    if cluster_filter:
+        active_indices = np.flatnonzero(keep)
+        if active_indices.size < max(1, int(cluster_min_samples)):
+            report["steps"].append(
+                {
+                    "name": "dbscan_significant_clusters",
+                    "enabled": True,
+                    "reason": "too_few_active_points",
+                    "active_count": int(active_indices.size),
+                    "min_samples": int(cluster_min_samples),
+                }
+            )
+        else:
+            active_points = points_np[active_indices]
+            diag = float(np.linalg.norm(np.maximum(active_points.max(axis=0) - active_points.min(axis=0), 1e-8)))
+            eps = float(cluster_eps) if float(cluster_eps) > 0 else diag * float(cluster_eps_ratio)
+            if eps <= 0:
+                report["steps"].append(
+                    {
+                        "name": "dbscan_significant_clusters",
+                        "enabled": True,
+                        "reason": "non_positive_eps",
+                        "bbox_diagonal": diag,
+                        "eps": eps,
+                    }
+                )
+            else:
+                o3d = import_open3d()
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(active_points)
+                labels = np.asarray(
+                    pcd.cluster_dbscan(eps=eps, min_points=max(1, int(cluster_min_samples)), print_progress=False),
+                    dtype=np.int64,
+                )
+                valid = labels >= 0
+                valid_labels = labels[valid]
+                step = {
+                    "name": "dbscan_significant_clusters",
+                    "enabled": True,
+                    "active_count": int(active_indices.size),
+                    "eps": float(eps),
+                    "eps_ratio": float(cluster_eps_ratio),
+                    "bbox_diagonal": diag,
+                    "min_samples": int(cluster_min_samples),
+                    "noise_points": int((~valid).sum()),
+                }
+                if valid_labels.size == 0:
+                    step["reason"] = "no_clusters"
+                    step["kept_count"] = int(keep.sum())
+                    step["removed_count"] = 0
+                    report["steps"].append(step)
+                else:
+                    unique, counts = np.unique(valid_labels, return_counts=True)
+                    largest_idx = int(np.argmax(counts))
+                    largest_label = int(unique[largest_idx])
+                    largest_count = int(counts[largest_idx])
+                    min_cluster_count = max(
+                        int(cluster_min_points),
+                        int(math.ceil(float(cluster_min_ratio) * float(active_indices.size))),
+                    )
+                    kept_labels = {
+                        int(label)
+                        for label, label_count in zip(unique.tolist(), counts.tolist())
+                        if int(label_count) >= min_cluster_count
+                    }
+                    if cluster_keep_largest:
+                        kept_labels.add(largest_label)
+                    cluster_keep_local = np.asarray([int(label) in kept_labels for label in labels], dtype=bool)
+                    candidate_keep = keep.copy()
+                    candidate_keep[active_indices] = cluster_keep_local
+                    candidate_count = int(candidate_keep.sum())
+                    step.update(
+                        {
+                            "cluster_count": int(unique.shape[0]),
+                            "largest_cluster": largest_label,
+                            "largest_cluster_points": largest_count,
+                            "min_cluster_points": int(cluster_min_points),
+                            "min_cluster_ratio": float(cluster_min_ratio),
+                            "effective_min_cluster_points": int(min_cluster_count),
+                            "kept_cluster_count": int(len(kept_labels)),
+                            "kept_clusters": sorted(kept_labels)[:50],
+                            "candidate_kept_count": candidate_count,
+                            "candidate_removed_count": int(count - candidate_count),
+                        }
+                    )
+                    if candidate_count < keep_floor:
+                        step["fallback"] = "too_few_points_after_cluster_filter"
+                    else:
+                        keep = candidate_keep
+                        step["kept_count"] = candidate_count
+                        step["removed_count"] = int(count - candidate_count)
+                    report["steps"].append(step)
+
+    report["kept_count"] = int(keep.sum())
+    report["removed_count"] = int(count - int(keep.sum()))
+    return keep, report
+
+
 def clean_3dgs_floaters(
     input_ply: Path,
     output_ply: Path,
@@ -3193,6 +3364,20 @@ def clean_3dgs_floaters(
     min_opacity: float,
     low_opacity: float,
     remove_low_opacity: bool,
+    strict_scene_filter: bool = False,
+    reference_point_cloud: Path | None = None,
+    bbox_filter: bool = True,
+    bbox_quantile_min: float = 0.005,
+    bbox_quantile_max: float = 0.995,
+    bbox_padding_ratio: float = 0.12,
+    cluster_filter: bool = True,
+    cluster_eps: float = 0.0,
+    cluster_eps_ratio: float = 0.015,
+    cluster_min_samples: int = 20,
+    cluster_min_points: int = 300,
+    cluster_min_ratio: float = 0.001,
+    cluster_keep_largest: bool = True,
+    strict_min_keep_ratio: float = 0.50,
     preserve_background_planes: bool = False,
     background_up_axis: str = "y",
     background_max_planes: int = 8,
@@ -3244,6 +3429,32 @@ def clean_3dgs_floaters(
     if remove_low_opacity:
         remove |= transparent
     candidate_remove = remove.copy()
+    strict_scene_report: dict[str, Any] = {"enabled": False}
+    if strict_scene_filter:
+        reference_points = None
+        reference_path = Path(reference_point_cloud).resolve() if reference_point_cloud else None
+        if reference_path and reference_path.exists():
+            reference_points, _reference_colors = read_point_cloud(reference_path)
+        strict_keep, strict_scene_report = scene_bbox_cluster_keep_mask(
+            means,
+            reference_points=reference_points,
+            bbox_filter=bool(bbox_filter),
+            bbox_quantile_min=float(bbox_quantile_min),
+            bbox_quantile_max=float(bbox_quantile_max),
+            bbox_padding_ratio=float(bbox_padding_ratio),
+            cluster_filter=bool(cluster_filter),
+            cluster_eps=float(cluster_eps),
+            cluster_eps_ratio=float(cluster_eps_ratio),
+            cluster_min_samples=int(cluster_min_samples),
+            cluster_min_points=int(cluster_min_points),
+            cluster_min_ratio=float(cluster_min_ratio),
+            cluster_keep_largest=bool(cluster_keep_largest),
+            min_keep_ratio=float(strict_min_keep_ratio),
+        )
+        strict_scene_report["reference_point_cloud"] = str(reference_path) if reference_path else None
+        strict_removed = ~strict_keep
+        remove |= strict_removed
+        strict_scene_report["candidate_removed_count"] = int(strict_removed.sum())
     background_plane_report: dict[str, Any] = {"enabled": False}
     if preserve_background_planes:
         protected, background_plane_report = background_plane_protection_mask(
@@ -3282,8 +3493,23 @@ def clean_3dgs_floaters(
             "min_opacity": float(min_opacity),
             "low_opacity": float(low_opacity),
             "remove_low_opacity": bool(remove_low_opacity),
+            "strict_scene_filter": bool(strict_scene_filter),
+            "reference_point_cloud": str(reference_point_cloud) if reference_point_cloud else None,
+            "bbox_filter": bool(bbox_filter),
+            "bbox_quantile_min": float(bbox_quantile_min),
+            "bbox_quantile_max": float(bbox_quantile_max),
+            "bbox_padding_ratio": float(bbox_padding_ratio),
+            "cluster_filter": bool(cluster_filter),
+            "cluster_eps": float(cluster_eps),
+            "cluster_eps_ratio": float(cluster_eps_ratio),
+            "cluster_min_samples": int(cluster_min_samples),
+            "cluster_min_points": int(cluster_min_points),
+            "cluster_min_ratio": float(cluster_min_ratio),
+            "cluster_keep_largest": bool(cluster_keep_largest),
+            "strict_min_keep_ratio": float(strict_min_keep_ratio),
             "preserve_background_planes": bool(preserve_background_planes),
         },
+        "strict_scene_filter": strict_scene_report,
         "background_plane_protection": background_plane_report,
         "geometry_outlier": {
             "removed_count": int(geometric_outlier.sum()),
@@ -3301,6 +3527,46 @@ def clean_3dgs_floaters(
         },
     }
     return report
+
+
+def maybe_clean_3dgs_init_point_cloud(
+    init_point_cloud: Path,
+    source_path: Path,
+    args: argparse.Namespace,
+) -> tuple[Path, dict[str, Any]]:
+    if not bool(getattr(args, "clean_init_point_cloud", True)):
+        return init_point_cloud, {"enabled": False, "reason": "--no-clean-init-point-cloud"}
+    output = source_path / "video2mesh_init_point_cloud_clean.ply"
+    try:
+        report = clean_point_cloud_outliers(
+            init_point_cloud,
+            output,
+            q_min=float(getattr(args, "init_clean_quantile_min", 0.005)),
+            q_max=float(getattr(args, "init_clean_quantile_max", 0.995)),
+            padding_ratio=float(getattr(args, "init_clean_padding_ratio", 0.08)),
+            min_keep_ratio=float(getattr(args, "init_clean_min_keep_ratio", 0.70)),
+            keep_largest_cluster=bool(getattr(args, "init_clean_keep_largest_cluster", False)),
+            dbscan_eps=float(getattr(args, "init_clean_dbscan_eps", 0.0)),
+            dbscan_min_points=int(getattr(args, "init_clean_dbscan_min_points", 50)),
+        )
+    except Exception as exc:
+        return init_point_cloud, {
+            "enabled": True,
+            "status": "failed_fallback_to_original",
+            "source_point_cloud": str(init_point_cloud),
+            "error": str(exc),
+        }
+    report_path = output.with_suffix(".outlier_clean_report.json")
+    write_json(report_path, report)
+    if int(report.get("kept_count") or 0) <= 0:
+        report["status"] = "empty_fallback_to_original"
+        report["report"] = str(report_path)
+        write_json(report_path, report)
+        return init_point_cloud, report
+    report["status"] = "cleaned"
+    report["report"] = str(report_path)
+    write_json(report_path, report)
+    return output, report
 
 
 def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
@@ -3322,6 +3588,20 @@ def cmd_clean_3dgs_floaters(args: argparse.Namespace) -> int:
         min_opacity=float(args.min_opacity),
         low_opacity=float(args.low_opacity),
         remove_low_opacity=bool(args.remove_low_opacity),
+        strict_scene_filter=bool(args.strict_scene_filter),
+        reference_point_cloud=resolve_project_cli_path(args.reference_point_cloud, project_root) if args.reference_point_cloud else None,
+        bbox_filter=bool(args.strict_bbox_filter),
+        bbox_quantile_min=float(args.strict_bbox_quantile_min),
+        bbox_quantile_max=float(args.strict_bbox_quantile_max),
+        bbox_padding_ratio=float(args.strict_bbox_padding_ratio),
+        cluster_filter=bool(args.strict_cluster_filter),
+        cluster_eps=float(args.strict_dbscan_eps),
+        cluster_eps_ratio=float(args.strict_dbscan_eps_ratio),
+        cluster_min_samples=int(args.strict_dbscan_min_samples),
+        cluster_min_points=int(args.strict_min_cluster_points),
+        cluster_min_ratio=float(args.strict_min_cluster_ratio),
+        cluster_keep_largest=bool(args.strict_keep_largest_cluster),
+        strict_min_keep_ratio=float(args.strict_min_keep_ratio),
         preserve_background_planes=bool(args.preserve_background_planes),
         background_up_axis=args.background_up_axis,
         background_max_planes=int(args.background_max_planes),
@@ -14417,6 +14697,77 @@ def read_semantic_ply(path: Path):
     return points, labels, colors
 
 
+def object_table_from_semantic_source_manifest(
+    semantic_manifest: dict[str, Any] | None,
+    labels: list[int],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    np = import_numpy()
+    object_table: list[dict[str, Any]] = []
+    object_id_to_semantic: dict[str, int] = {}
+    labels_np = np.asarray(labels, dtype=np.int64)
+
+    manifest_objects = semantic_manifest.get("objects") if isinstance(semantic_manifest, dict) else None
+    if isinstance(manifest_objects, list):
+        for item in manifest_objects:
+            if not isinstance(item, dict):
+                continue
+            try:
+                semantic_id = int(item.get("semantic_id", 0))
+            except Exception:
+                continue
+            object_id = str(item.get("object_id") or ("background" if semantic_id == 0 else f"semantic_{semantic_id}"))
+            object_id_to_semantic[object_id] = semantic_id
+            object_table.append(
+                {
+                    "object_id": object_id,
+                    "semantic_id": semantic_id,
+                    "name": item.get("name", object_id),
+                    "category": item.get("category", "background" if semantic_id == 0 else "unknown"),
+                    "asset_role": item.get("asset_role", "background" if semantic_id == 0 else "object"),
+                    "source_point_count": int(item.get("point_count") or item.get("source_point_count") or 0),
+                    "point_count": int((labels_np == semantic_id).sum()) if labels_np.size else 0,
+                    "bbox_3d": item.get("bbox_3d"),
+                }
+            )
+
+    present_ids = sorted(int(value) for value in np.unique(labels_np).tolist()) if labels_np.size else [0]
+    if not object_table:
+        object_table = [
+            {
+                "object_id": "background" if semantic_id == 0 else f"semantic_{semantic_id}",
+                "semantic_id": semantic_id,
+                "name": "background" if semantic_id == 0 else f"semantic {semantic_id}",
+                "category": "background" if semantic_id == 0 else "unknown",
+                "asset_role": "background" if semantic_id == 0 else "object",
+                "source_point_count": int((labels_np == semantic_id).sum()) if labels_np.size else 0,
+                "point_count": int((labels_np == semantic_id).sum()) if labels_np.size else 0,
+                "bbox_3d": None,
+            }
+            for semantic_id in present_ids
+        ]
+        object_id_to_semantic = {str(item["object_id"]): int(item["semantic_id"]) for item in object_table}
+    else:
+        known_ids = {int(item["semantic_id"]) for item in object_table}
+        for semantic_id in present_ids:
+            if semantic_id in known_ids:
+                continue
+            object_id = "background" if semantic_id == 0 else f"semantic_{semantic_id}"
+            object_id_to_semantic[object_id] = semantic_id
+            object_table.append(
+                {
+                    "object_id": object_id,
+                    "semantic_id": semantic_id,
+                    "name": "background" if semantic_id == 0 else f"semantic {semantic_id}",
+                    "category": "background" if semantic_id == 0 else "unknown",
+                    "asset_role": "background" if semantic_id == 0 else "object",
+                    "source_point_count": int((labels_np == semantic_id).sum()) if labels_np.size else 0,
+                    "point_count": int((labels_np == semantic_id).sum()) if labels_np.size else 0,
+                    "bbox_3d": None,
+                }
+            )
+    return sorted(object_table, key=lambda item: int(item.get("semantic_id", 0))), object_id_to_semantic
+
+
 def semantic_label_counts(labels, indices) -> dict[str, int]:
     np = import_numpy()
     if len(indices) == 0:
@@ -19082,6 +19433,124 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_transfer_semantic_ply_to_splats(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    artifacts = manifest.get("artifacts", {})
+    source_ply = args.splat_ply
+    if source_ply is None:
+        source_value = artifacts.get("scene_3dgs_ply") or manifest["scene"]["point_cloud"]
+        source_ply = resolve_project_cli_path(source_value, project_root)
+    else:
+        source_ply = resolve_project_cli_path(source_ply, project_root)
+    semantic_source_ply = resolve_project_cli_path(args.semantic_source_ply, project_root)
+    semantic_manifest_path = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest") or artifacts.get("gaussian_probabilities_manifest"), project_root)
+    )
+    output_ply = (
+        resolve_project_cli_path(args.output, project_root)
+        if args.output
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_splats_from_semantic_ply.ply"
+    )
+    output_manifest_path = (
+        resolve_project_cli_path(args.manifest_output, project_root)
+        if args.manifest_output
+        else output_ply.with_name(f"{output_ply.stem}_manifest.json")
+    )
+
+    target_points, _colors = read_point_cloud(source_ply)
+    source_points, source_labels_array, source_probabilities_array, _source_colors = read_semantic_ply_with_probabilities(semantic_source_ply)
+    source_labels = [int(value) for value in source_labels_array.tolist()]
+    source_probabilities = (
+        [float(value) for value in source_probabilities_array.tolist()]
+        if source_probabilities_array is not None
+        else None
+    )
+    semantic_manifest = safe_read_json(semantic_manifest_path) if semantic_manifest_path else {}
+    include_probabilities = bool(getattr(args, "include_probabilities", True))
+    labels, probabilities, transfer_info = target_labels_from_transfer(
+        source_labels,
+        source_probabilities if include_probabilities else None,
+        source_points,
+        target_points,
+        "nearest",
+        args.max_transfer_distance,
+    )
+    object_table, object_id_to_semantic = object_table_from_semantic_source_manifest(semantic_manifest, source_labels)
+    update_object_table_counts(object_table, labels)
+    vertex_count, export_mode = write_semantic_ply_with_labels(
+        source_ply,
+        output_ply,
+        labels,
+        probabilities if include_probabilities else None,
+    )
+
+    viewer_exports = None
+    if bool(getattr(args, "export_viewer_plys", True)):
+        try:
+            viewer_exports = export_viewer_plys(output_ply, output_ply.parent, "semantic", include_labels=True)
+        except Exception as exc:
+            viewer_exports = {"error": str(exc)}
+    else:
+        viewer_exports = {
+            "ok": False,
+            "skipped": True,
+            "reason": "--no-export-viewer-plys",
+        }
+
+    semantic_manifest_out = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "project_root": str(project_root),
+        "source_ply": str(source_ply),
+        "semantic_source_ply": str(semantic_source_ply),
+        "semantic_source_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
+        "output_ply": str(output_ply),
+        "vertex_count": int(vertex_count),
+        "export_mode": export_mode,
+        "method": "nearest_semantic_ply_to_splats_transfer",
+        "viewer_exports": viewer_exports,
+        "transfer": transfer_info,
+        "property": "object_id",
+        "probability_property": "object_probability" if include_probabilities and probabilities is not None else None,
+        "includes_object_probability": bool(include_probabilities and probabilities is not None),
+        "object_id_to_semantic": object_id_to_semantic,
+        "objects": object_table,
+        "notes": (
+            "Semantic labels are recovered from an existing semantic PLY source by nearest XYZ transfer to the target 3DGS. "
+            "This is intended for local reconstruction recovery when fused 3D point-index masks were not copied with the run artifacts."
+        ),
+    }
+    write_json(output_manifest_path, semantic_manifest_out)
+    manifest.setdefault("artifacts", {})["semantic_splats_ply"] = str(output_ply)
+    manifest["artifacts"]["semantic_splats_manifest"] = str(output_manifest_path)
+    if isinstance(viewer_exports, dict) and viewer_exports.get("point_cloud_ply"):
+        manifest["artifacts"]["semantic_point_cloud_ply"] = str(viewer_exports["point_cloud_ply"])
+    if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
+        manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["supersplat_ply"])
+    manifest.setdefault("external_stages", {})["semantic_ply_to_splats_transfer"] = {
+        "status": "semantic_splats_recovered_from_semantic_ply",
+        "source_ply": str(source_ply),
+        "semantic_source_ply": str(semantic_source_ply),
+        "output_ply": str(output_ply),
+        "manifest": str(output_manifest_path),
+        "transfer": transfer_info,
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(semantic_manifest_out, indent=2, ensure_ascii=False))
+    else:
+        print(f"Wrote semantic PLY: {output_ply}")
+        print(f"Wrote semantic manifest: {output_manifest_path}")
+        print(
+            f"Transferred {vertex_count} target vertex/gaussian labels from {semantic_source_ply} "
+            f"with {transfer_info.get('engine', transfer_info.get('mode'))}."
+        )
+    return 0
+
+
 def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
@@ -20090,6 +20559,371 @@ def merge_simfoundry_object_physics(existing: dict[str, Any], defaults: dict[str
     return physics
 
 
+def simfoundry_scene_glb_transform_for_object(obj: dict[str, Any]):
+    np = import_numpy()
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else {}
+    position = pose.get("position") if isinstance(pose.get("position"), (list, tuple)) else [0.0, 0.0, 0.0]
+    rotation = pose.get("rotation_xyzw") if isinstance(pose.get("rotation_xyzw"), (list, tuple)) else [0.0, 0.0, 0.0, 1.0]
+    scale = pose.get("scale") if isinstance(pose.get("scale"), (list, tuple)) else [1.0, 1.0, 1.0]
+    position_values = [float(value) for value in (list(position) + [0.0, 0.0, 0.0])[:3]]
+    rotation_values = [float(value) for value in (list(rotation) + [0.0, 0.0, 0.0, 1.0])[:4]]
+    scale_values = [float(value) for value in (list(scale) + [1.0, 1.0, 1.0])[:3]]
+
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = xyzw_quat_to_rotmat(rotation_values) @ np.diag(scale_values)
+    matrix[:3, 3] = np.asarray(position_values, dtype=np.float64)
+    return matrix
+
+
+def load_simfoundry_scene_glb_mesh(path: Path, obj: dict[str, Any], project_root: Path):
+    trimesh = import_trimesh()
+    loaded = trimesh.load(str(path), force="mesh", process=False)
+    if loaded is None:
+        raise RuntimeError(f"trimesh could not load mesh: {path}")
+    if hasattr(loaded, "geometry"):
+        meshes = [mesh for mesh in loaded.geometry.values() if getattr(mesh, "vertices", None) is not None and len(mesh.vertices) > 0]
+        if not meshes:
+            raise RuntimeError(f"trimesh scene has no mesh geometry: {path}")
+        loaded = trimesh.util.concatenate(meshes)
+    if getattr(loaded, "vertices", None) is None or len(loaded.vertices) == 0:
+        raise RuntimeError(f"Mesh has no vertices: {path}")
+    mesh = loaded.copy()
+    mesh.metadata = {
+        "name": str(obj.get("object_id") or path.stem),
+        "video2mesh_object_id": str(obj.get("object_id") or ""),
+        "video2mesh_category": str(obj.get("category") or ""),
+        "video2mesh_asset_role": str(obj.get("asset_role") or "object"),
+        "video2mesh_source_mesh": rel_or_abs(path, project_root),
+    }
+    mesh.apply_transform(simfoundry_scene_glb_transform_for_object(obj))
+    return mesh
+
+
+def cmd_export_simfoundry_scene_glb(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing simulator asset bundle: {bundle_path}. Run export-simulator-assets first.")
+    bundle = read_json(bundle_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "scene_glb"
+    )
+    scene_glb_path = (resolve_project_cli_path(args.output, project_root) if args.output else output_dir / "scene.glb").resolve()
+    ensure_dir(scene_glb_path.parent)
+
+    trimesh = import_trimesh()
+    scene = trimesh.Scene()
+    exported: list[dict[str, Any]] = []
+    skipped: dict[str, dict[str, Any]] = {}
+
+    for raw_obj in bundle.get("objects", []):
+        if not isinstance(raw_obj, dict):
+            continue
+        object_id = slugify(str(raw_obj.get("object_id") or raw_obj.get("name") or "object"))
+        asset_role = str(raw_obj.get("asset_role") or "object")
+        mesh_record = raw_obj.get("mesh") if isinstance(raw_obj.get("mesh"), dict) else {}
+        mesh_path = resolve_existing_path(mesh_record.get("path"), project_root) if mesh_record else None
+        if asset_role == "background_structure" and not args.include_background:
+            skipped[object_id] = {"reason": "background_structure", "asset_role": asset_role}
+            continue
+        if not mesh_path or not mesh_path.exists():
+            skipped[object_id] = {"reason": "missing_mesh", "asset_role": asset_role}
+            continue
+        try:
+            mesh = load_simfoundry_scene_glb_mesh(mesh_path, raw_obj, project_root)
+        except Exception as exc:
+            skipped[object_id] = {"reason": "mesh_load_failed", "mesh": str(mesh_path), "error": str(exc)}
+            continue
+        node_name = f"{object_id}_visual"
+        scene.add_geometry(mesh, node_name=node_name, geom_name=node_name)
+        exported.append(
+            {
+                "object_id": object_id,
+                "asset_role": asset_role,
+                "category": raw_obj.get("category"),
+                "source_mesh": str(mesh_path),
+                "node_name": node_name,
+                "vertex_count": int(len(mesh.vertices)),
+                "face_count": int(len(mesh.faces)) if getattr(mesh, "faces", None) is not None else 0,
+            }
+        )
+
+    collider_exports: list[dict[str, Any]] = []
+    if args.include_static_colliders:
+        for index, collider in enumerate(static_collider_records_from_bundle(bundle), start=1):
+            collider_path = resolve_existing_path(collider.get("path"), project_root)
+            if not collider_path or not collider_path.exists():
+                skipped[f"static_collider_{index}"] = {"reason": "missing_static_collider", "path": collider.get("path")}
+                continue
+            collider_obj = {
+                "object_id": str(collider.get("id") or f"static_collider_{index}"),
+                "category": "static_collider",
+                "asset_role": "static_collider",
+                "pose": {"position": [0.0, 0.0, 0.0], "rotation_xyzw": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+            }
+            try:
+                mesh = load_simfoundry_scene_glb_mesh(collider_path, collider_obj, project_root)
+            except Exception as exc:
+                skipped[f"static_collider_{index}"] = {"reason": "static_collider_load_failed", "path": str(collider_path), "error": str(exc)}
+                continue
+            node_name = f"static_collider_{index}_visual"
+            scene.add_geometry(mesh, node_name=node_name, geom_name=node_name)
+            collider_exports.append({"path": str(collider_path), "node_name": node_name, "vertex_count": int(len(mesh.vertices))})
+
+    if not exported and not collider_exports:
+        payload = {
+            "schema_version": DEFAULT_SCHEMA_VERSION,
+            "stage": "simfoundry_scene_glb_export",
+            "status": "empty",
+            "project_root": str(project_root),
+            "source_bundle": str(bundle_path),
+            "output_glb": str(scene_glb_path),
+            "exported_objects": exported,
+            "exported_static_colliders": collider_exports,
+            "skipped": skipped,
+            "summary": {"exported_object_count": 0, "skipped_count": len(skipped), "static_collider_count": 0},
+        }
+        manifest_path = output_dir / "scene_glb_manifest.json"
+        write_json(manifest_path, payload)
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"No meshes exported to scene GLB: {manifest_path}")
+        return 1 if args.fail_on_empty else 0
+
+    scene.export(str(scene_glb_path))
+    try:
+        glb_vertices, glb_triangles, glb_parser = read_glb_triangle_mesh_light(scene_glb_path)
+        glb_summary: dict[str, Any] = {
+            "readable": True,
+            "parser": glb_parser,
+            "vertex_count": int(glb_vertices.shape[0]),
+            "triangle_count": int(glb_triangles.shape[0]),
+        }
+    except Exception as exc:
+        glb_summary = {"readable": False, "error": str(exc)}
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "simfoundry_scene_glb_export",
+        "status": "scene_glb_exported",
+        "scene_id": manifest.get("scene_id") or bundle.get("scene_id"),
+        "project_root": str(project_root),
+        "source_bundle": str(bundle_path),
+        "output_dir": str(output_dir),
+        "output_glb": str(scene_glb_path),
+        "coordinate_system": bundle.get("coordinate_system"),
+        "exported_objects": exported,
+        "exported_static_colliders": collider_exports,
+        "skipped": skipped,
+        "summary": {
+            "exported_object_count": len(exported),
+            "skipped_count": len(skipped),
+            "static_collider_count": len(collider_exports),
+            "glb_bytes": scene_glb_path.stat().st_size,
+            "glb_readable": bool(glb_summary.get("readable")),
+            "glb_vertex_count": glb_summary.get("vertex_count"),
+            "glb_triangle_count": glb_summary.get("triangle_count"),
+        },
+        "notes": [
+            "Scene GLB is a visual/runtime import aggregate assembled from simulator bundle object meshes and poses.",
+            "It does not replace the simulator collision proxies, physics metadata, or dynamic release gates.",
+        ],
+    }
+    manifest_path = output_dir / "scene_glb_manifest.json"
+    write_json(manifest_path, payload)
+
+    bundle.setdefault("scene_assets", {})
+    if isinstance(bundle["scene_assets"], dict):
+        bundle["scene_assets"]["scene_glb"] = str(scene_glb_path)
+        bundle["scene_assets"]["scene_glb_manifest"] = str(manifest_path)
+    bundle.setdefault("notes", [])
+    if isinstance(bundle["notes"], list):
+        bundle["notes"].append("Scene-level visual GLB aggregate exported by export-simfoundry-scene-glb.")
+    if args.update_bundle:
+        write_json(bundle_path, bundle)
+
+    manifest.setdefault("artifacts", {})["simfoundry_scene_glb"] = str(scene_glb_path)
+    manifest["artifacts"]["simfoundry_scene_glb_manifest"] = str(manifest_path)
+    manifest.setdefault("external_stages", {})["simfoundry_scene_glb_export"] = {
+        "status": "completed",
+        "source_bundle": str(bundle_path),
+        "scene_glb": str(scene_glb_path),
+        "manifest": str(manifest_path),
+        "exported_object_count": len(exported),
+        "skipped_count": len(skipped),
+    }
+    save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Exported SimFoundry scene GLB: {scene_glb_path}")
+        print(f"Objects: {len(exported)}; static colliders: {len(collider_exports)}; skipped: {len(skipped)}")
+    if args.fail_on_empty and not exported:
+        return 1
+    return 0
+
+
+def semantic_object_mesh_index_path(project_root: Path, manifest: dict[str, Any], explicit: Path | None = None) -> Path:
+    if explicit:
+        return resolve_project_cli_path(explicit, project_root)
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    resolved = resolve_existing_path(artifacts.get("semantic_object_meshes"), project_root)
+    if resolved:
+        return resolved
+    return project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_object_meshes" / "semantic_object_meshes.json"
+
+
+def cmd_export_semantic_object_glbs(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    mesh_index_path = semantic_object_mesh_index_path(project_root, manifest, args.semantic_meshes)
+    if not mesh_index_path.exists():
+        raise FileNotFoundError(f"Missing semantic object mesh index: {mesh_index_path}. Run split-mesh-by-semantics first.")
+
+    mesh_index = read_json(mesh_index_path)
+    output_dir = ensure_dir(
+        resolve_project_cli_path(args.output_dir, project_root)
+        if args.output_dir
+        else project_root / manifest.get("simulator_assets_dir", "simulator_assets") / "semantic_object_glbs"
+    )
+    objects = mesh_index.get("objects", {}) if isinstance(mesh_index.get("objects"), dict) else {}
+    trimesh = import_trimesh()
+
+    exported: dict[str, Any] = {}
+    skipped: dict[str, Any] = {}
+    errors: dict[str, Any] = {}
+
+    for object_id_raw, record_raw in sorted(objects.items()):
+        if not isinstance(record_raw, dict):
+            skipped[str(object_id_raw)] = {"reason": "invalid_object_record"}
+            continue
+        object_id = slugify(str(record_raw.get("object_id") or object_id_raw), fallback=str(object_id_raw))
+        asset_role = str(record_raw.get("asset_role") or "object")
+        if asset_role == "background_structure" and not args.include_background:
+            skipped[object_id] = {"reason": "background_structure", "asset_role": asset_role}
+            continue
+        source_path = (
+            resolve_existing_path(record_raw.get("source_mesh"), project_root)
+            or resolve_existing_path(record_raw.get("asset_path"), project_root)
+        )
+        if not source_path or not source_path.exists():
+            errors[object_id] = {"reason": "missing_source_mesh", "source_mesh": record_raw.get("source_mesh"), "asset_path": record_raw.get("asset_path")}
+            continue
+        object_dir = ensure_dir(output_dir / object_id)
+        glb_path = object_dir / f"{object_id}.glb"
+        if glb_path.exists() and not args.overwrite:
+            exported[object_id] = {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "object_id": object_id,
+                "semantic_id": record_raw.get("semantic_id"),
+                "label": record_raw.get("label"),
+                "category": record_raw.get("category"),
+                "asset_role": asset_role,
+                "source_ply": str(source_path),
+                "glb_path": str(glb_path),
+                "glb_relative_path": rel_or_abs(glb_path, project_root),
+                "format": "glb",
+                "coordinate_frame": record_raw.get("coordinate_frame") or "video2mesh_scene",
+                "provider": "trimesh_ply_to_glb_export",
+                "source_provider": record_raw.get("provider"),
+                "byte_size": glb_path.stat().st_size,
+                "skipped_export": "exists",
+            }
+            continue
+        try:
+            mesh = trimesh.load(str(source_path), force="mesh", process=False)
+            if mesh is None:
+                raise RuntimeError("trimesh returned None")
+            if hasattr(mesh, "geometry"):
+                parts = [item for item in mesh.geometry.values() if getattr(item, "vertices", None) is not None and len(item.vertices) > 0]
+                if not parts:
+                    raise RuntimeError("trimesh scene has no mesh geometry")
+                mesh = trimesh.util.concatenate(parts)
+            if getattr(mesh, "vertices", None) is None or len(mesh.vertices) == 0:
+                raise RuntimeError("mesh has no vertices")
+            mesh.metadata = {
+                "name": object_id,
+                "video2mesh_object_id": object_id,
+                "video2mesh_category": str(record_raw.get("category") or ""),
+                "video2mesh_asset_role": asset_role,
+                "video2mesh_source_mesh": rel_or_abs(source_path, project_root),
+            }
+            mesh.export(str(glb_path))
+            vertices, triangles, parser = read_glb_triangle_mesh_light(glb_path)
+            exported[object_id] = {
+                "schema_version": DEFAULT_SCHEMA_VERSION,
+                "object_id": object_id,
+                "semantic_id": record_raw.get("semantic_id"),
+                "label": record_raw.get("label"),
+                "category": record_raw.get("category"),
+                "asset_role": asset_role,
+                "source_ply": str(source_path),
+                "glb_path": str(glb_path),
+                "glb_relative_path": rel_or_abs(glb_path, project_root),
+                "format": "glb",
+                "coordinate_frame": record_raw.get("coordinate_frame") or "video2mesh_scene",
+                "provider": "trimesh_ply_to_glb_export",
+                "source_provider": record_raw.get("provider"),
+                "byte_size": glb_path.stat().st_size,
+                "vertex_count": int(vertices.shape[0]),
+                "face_count": int(triangles.shape[0]),
+                "parser": parser,
+            }
+        except Exception as exc:
+            errors[object_id] = {"reason": "export_failed", "source_ply": str(source_path), "error": str(exc)}
+
+    index_path = output_dir / "semantic_object_glbs.json"
+    payload = {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "stage": "semantic_object_glb_export",
+        "status": "semantic_object_glbs_exported" if exported and not errors else "semantic_object_glbs_partial" if exported else "semantic_object_glbs_failed",
+        "project_root": str(project_root),
+        "source_manifest": str(mesh_index_path),
+        "output_dir": str(output_dir),
+        "object_count": len(exported),
+        "error_count": len(errors),
+        "skipped_count": len(skipped),
+        "objects": exported,
+        "errors": errors,
+        "skipped": skipped,
+        "summary": {
+            "exported_object_count": len(exported),
+            "error_count": len(errors),
+            "skipped_count": len(skipped),
+            "total_vertex_count": sum(int(item.get("vertex_count") or 0) for item in exported.values()),
+            "total_face_count": sum(int(item.get("face_count") or 0) for item in exported.values()),
+        },
+        "notes": "Per-object GLBs are visual/runtime asset exports from semantic object meshes; they do not encode simulator physics or dynamic state.",
+    }
+    write_json(index_path, payload)
+    if args.update_manifest:
+        manifest.setdefault("artifacts", {})["semantic_object_glbs"] = str(index_path)
+        manifest.setdefault("external_stages", {})["semantic_object_glb_export"] = {
+            "status": payload["status"],
+            "source_manifest": str(mesh_index_path),
+            "output": str(index_path),
+            "exported_object_count": len(exported),
+            "error_count": len(errors),
+        }
+        save_manifest(project_root, manifest)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Exported {len(exported)} semantic object GLB(s): {index_path}")
+        if errors:
+            print(f"Errors: {len(errors)}")
+    if args.fail_on_empty and not exported:
+        return 1
+    if args.fail_on_failed and errors:
+        return 1
+    return 0
+
+
 def update_object_asset_json_with_collider(obj: dict[str, Any], project_root: Path) -> bool:
     object_asset_path = resolve_existing_path(obj.get("object_asset_json"), project_root)
     if not object_asset_path or not object_asset_path.exists():
@@ -20394,8 +21228,9 @@ def simfoundry_mesh_quantile_bbox_proxy(
     return proxy, fit_report
 
 
-def simfoundry_has_reviewed_collision_proxy(obj: dict[str, Any]) -> bool:
-    repair = obj.get("simfoundry_structural_repair") if isinstance(obj.get("simfoundry_structural_repair"), dict) else {}
+def simfoundry_reviewed_collision_proxy_reason(obj: dict[str, Any]) -> tuple[str, str] | None:
+    structural_repair = obj.get("simfoundry_structural_repair") if isinstance(obj.get("simfoundry_structural_repair"), dict) else {}
+    penetration_repair = obj.get("simfoundry_penetration_repair") if isinstance(obj.get("simfoundry_penetration_repair"), dict) else {}
     proxy = obj.get("collision_proxy") if isinstance(obj.get("collision_proxy"), dict) else {}
     physics = obj.get("physics") if isinstance(obj.get("physics"), dict) else {}
     physics_proxy = physics.get("collision_proxy") if isinstance(physics.get("collision_proxy"), dict) else {}
@@ -20403,7 +21238,15 @@ def simfoundry_has_reviewed_collision_proxy(obj: dict[str, Any]) -> bool:
         str(proxy.get("source") or ""),
         str(physics_proxy.get("source") or ""),
     }
-    return bool(repair) and "simfoundry_structural_repair_review_patch" in sources
+    if structural_repair and "simfoundry_structural_repair_review_patch" in sources:
+        return ("reviewed_structural_repair_collision_proxy", "simfoundry_structural_repair_import")
+    if penetration_repair and "simfoundry_penetration_repair_bbox_shrink" in sources:
+        return ("reviewed_penetration_repair_collision_proxy", "simfoundry_penetration_repair_variant")
+    return None
+
+
+def simfoundry_has_reviewed_collision_proxy(obj: dict[str, Any]) -> bool:
+    return simfoundry_reviewed_collision_proxy_reason(obj) is not None
 
 
 def simfoundry_bbox_shrink_report(original_obj: dict[str, Any], updated_obj: dict[str, Any]) -> dict[str, Any]:
@@ -20495,13 +21338,15 @@ def generate_simfoundry_tight_collider_variant(
         if asset_role == "background_structure" and not include_background:
             skipped[object_id] = {"reason": "background_structure", "asset_role": asset_role}
             continue
-        if simfoundry_has_reviewed_collision_proxy(obj):
+        reviewed_proxy = simfoundry_reviewed_collision_proxy_reason(obj)
+        if reviewed_proxy:
+            preserved_reason, preserved_stage = reviewed_proxy
             preserved[object_id] = {
-                "reason": "reviewed_structural_repair_collision_proxy",
+                "reason": preserved_reason,
                 "asset_role": asset_role,
                 "category": obj.get("category"),
                 "collision_proxy": obj.get("collision_proxy"),
-                "source_stage": "simfoundry_structural_repair_import",
+                "source_stage": preserved_stage,
             }
             continue
         mesh_path = object_visual_mesh_path(obj, project_root)
@@ -28926,9 +29771,17 @@ def sim_preflight_existing_path(path_value: Any, project_root: Path) -> Path | N
     return resolve_existing_path(str(path_value), project_root)
 
 
-def sim_preflight_adapter_root(project_root: Path, manifest: dict[str, Any], explicit: Path | None) -> Path:
+def sim_preflight_adapter_root(project_root: Path, manifest: dict[str, Any], explicit: Path | None, bundle_path: Path | None = None) -> Path:
     if explicit is not None:
         return explicit.resolve()
+    if bundle_path is not None:
+        candidates = [
+            bundle_path.parent / "adapters",
+            bundle_path.parent.parent / "adapters",
+        ]
+        for candidate in candidates:
+            if (candidate / "simulator_adapters.json").exists() or (candidate / "mujoco" / "scene.xml").exists():
+                return candidate.resolve()
     adapter_manifest = resolve_existing_path(manifest.get("artifacts", {}).get("simulator_adapters"), project_root)
     if adapter_manifest and adapter_manifest.exists():
         return adapter_manifest.parent
@@ -29391,7 +30244,7 @@ def cmd_simfoundry_simulator_smoke_test(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
     bundle_path = simulator_bundle_path(project_root, manifest, args.bundle)
-    adapter_root = sim_preflight_adapter_root(project_root, manifest, args.adapter_dir)
+    adapter_root = sim_preflight_adapter_root(project_root, manifest, args.adapter_dir, bundle_path)
     report = generate_simfoundry_simulator_smoke_report(
         project_root,
         manifest,
@@ -32428,6 +33281,16 @@ def simfoundry_reviewed_support_candidates(
     support = objects_by_id.get(support_key)
     if not support:
         return []
+    horizontal_axes = [idx for idx in [0, 1, 2] if idx != axis_index(axis_name)]
+    footprint_overlap = bbox_footprint_overlap_ratio(bbox, support, horizontal_axes)
+    allow_zero_overlap = bool(review.get("allow_zero_footprint_overlap") or review.get("force_support_relation"))
+    min_overlap = review.get("min_footprint_overlap")
+    try:
+        min_overlap_value = float(min_overlap) if min_overlap is not None else 1e-6
+    except (TypeError, ValueError):
+        min_overlap_value = 1e-6
+    if not allow_zero_overlap and footprint_overlap < max(0.0, min_overlap_value):
+        return []
     confidence = review.get("confidence")
     try:
         confidence_value = float(confidence) if confidence is not None else 0.7
@@ -32442,11 +33305,7 @@ def simfoundry_reviewed_support_candidates(
             "up_direction": normalize_axis_direction(up_direction),
             "vertical_gap": None,
             "abs_vertical_gap": None,
-            "footprint_overlap_over_smaller": bbox_footprint_overlap_ratio(
-                bbox,
-                support,
-                [idx for idx in [0, 1, 2] if idx != axis_index(axis_name)],
-            ),
+            "footprint_overlap_over_smaller": footprint_overlap,
             "penetrating_support": None,
             "source": "reviewed_support_relation",
             "decision": decision or "accepted",
@@ -51654,6 +52513,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, help="Output semantic PLY path.")
     p.set_defaults(func=cmd_export_splat_masks)
 
+    p = sub.add_parser("transfer-semantic-ply-to-splats", help="Recover semantic 3DGS labels from an existing semantic PLY by nearest XYZ transfer.")
+    add_common_project_arg(p)
+    p.add_argument("--semantic-source-ply", type=Path, required=True, help="Source PLY containing x/y/z/object_id and optional object_probability.")
+    p.add_argument("--splat-ply", type=Path, help="Target 3DGS/PLY to receive semantic labels. Defaults to artifacts.scene_3dgs_ply or scene.point_cloud.")
+    p.add_argument("--semantic-manifest", type=Path, help="Optional source semantic manifest for object id/name/category legend.")
+    p.add_argument("--max-transfer-distance", type=float, help="Optional nearest-neighbor distance cutoff; farther target vertices become background.")
+    p.add_argument("--include-probabilities", action=argparse.BooleanOptionalAction, default=True, help="Append object_probability from source semantic PLY when present.")
+    p.add_argument("--export-viewer-plys", action=argparse.BooleanOptionalAction, default=True, help="Also export semantic point-cloud and SuperSplat viewer PLYs.")
+    p.add_argument("--output", type=Path, help="Output semantic PLY path.")
+    p.add_argument("--manifest-output", type=Path, help="Output manifest path. Defaults beside --output.")
+    p.add_argument("--json", action="store_true", help="Print output manifest JSON.")
+    p.set_defaults(func=cmd_transfer_semantic_ply_to_splats)
+
     p = sub.add_parser("backproject-gaussian-probabilities", help="SVLGaussian-style ray-to-Gaussian semantic probability back-projection from 2D masks.")
     add_common_project_arg(p)
     p.add_argument("--splat-ply", type=Path, help="Registered 3DGS/PLY to receive object_id and object_probability. Defaults to artifacts.scene_3dgs_ply.")
@@ -52416,6 +53288,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fail-on-failed", action="store_true")
     p.add_argument("--fail-on-fallback", action="store_true")
     p.set_defaults(func=cmd_build_simfoundry_object_colliders)
+
+    p = sub.add_parser(
+        "export-simfoundry-scene-glb",
+        help="Export a visual scene-level GLB aggregate from a SimFoundry simulator asset bundle.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--bundle", type=Path, help="Optional simulator_asset_bundle.json path. Defaults to manifest artifact.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/scene_glb.")
+    p.add_argument("--output", type=Path, help="Defaults to output-dir/scene.glb.")
+    p.add_argument("--include-background", action=argparse.BooleanOptionalAction, default=True, help="Include background_structure object meshes when present.")
+    p.add_argument("--include-static-colliders", action=argparse.BooleanOptionalAction, default=False, help="Also include scene static collider meshes as GLB geometry for visual debugging.")
+    p.add_argument("--update-bundle", action=argparse.BooleanOptionalAction, default=True, help="Register scene_glb and scene_glb_manifest in the source bundle scene_assets.")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.set_defaults(func=cmd_export_simfoundry_scene_glb)
+
+    p = sub.add_parser(
+        "export-semantic-object-glbs",
+        help="Export one GLB per semantic object mesh from semantic_object_meshes.json.",
+    )
+    add_common_project_arg(p)
+    p.add_argument("--semantic-meshes", type=Path, help="semantic_object_meshes.json. Defaults to manifest artifact or simulator_assets/semantic_object_meshes/semantic_object_meshes.json.")
+    p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/semantic_object_glbs.")
+    p.add_argument("--include-background", action=argparse.BooleanOptionalAction, default=True, help="Include background_structure semantic meshes.")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--update-manifest", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--fail-on-empty", action="store_true")
+    p.add_argument("--fail-on-failed", action="store_true")
+    p.set_defaults(func=cmd_export_semantic_object_glbs)
 
     p = sub.add_parser(
         "prepare-simfoundry-provider-jobs",

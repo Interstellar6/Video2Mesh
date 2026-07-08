@@ -3,7 +3,7 @@ title: SimFoundry 调研与 Video2Mesh 吸收方案
 id: video2mesh-industrial-pipelines-simfoundry
 category: 调研目录
 visibility: public
-summary: 调研 NVIDIA SimFoundry 的 real-to-sim-to-real 系统、开源边界和 Video2Mesh 的可吸收部分，并记录当前已完成的 P0 collider 与 P1 static object scene 验收。
+summary: 调研 NVIDIA SimFoundry 的 real-to-sim-to-real 系统、开源边界和 Video2Mesh 的可吸收部分，并记录当前收口到资产生成六件套的复刻进度。
 tags:
   - 工业资产管线
   - Research Catalog
@@ -16,80 +16,71 @@ tags:
 
 检查日期：2026-07-08
 
-当前执行状态：Video2Mesh 已在 `codex/simfoundry-replica` 分支完成本轮 P0 collider-only scene 和 P1 static object scene 的本地复刻验收：P0 从真实 bedroom4 scene mesh 生成 scene-level static collider，P1 在同一 scene mesh + local face semantics 上生成 16 个静态语义对象、bbox collision proxy、物理 sidecar 和 MuJoCo / Unity / Isaac adapter。当前不声称完成 SimFoundry 全系统、动态物体释放、真实 provider 修复、digital cousins 或 policy learning。早前 P2/P4/P5 dynamic-readiness/repair 记录保留下来作为后续路线证据，但不是本轮验收口径。
+当前执行状态：Video2Mesh 已在 `codex/simfoundry-replica` 分支把本阶段目标收口到资产生成六件套：高质量 3DGS 点云、语义分割 3DGS 点云、高质量 mesh、语义分割 mesh、整个场景 GLB 和单个物体 GLB。当前不继续 Blender / Isaac / MuJoCo adapter，不验收动态仿真，也不声称完成 SimFoundry 全系统、真实尺度校准、真实 provider 修复、digital cousins 或 policy learning。历史 P0-P8 dynamic-readiness 和 support-pose sidecar 证据保留在下方，仅作为后续继续贴近 SimFoundry 的探索记录。
 
-## 最新复刻进度：2026-07-08
+## 最新复刻进度：2026-07-08 资产生成六件套
 
-当前按“先能放进仿真模拟器”的边界，已经从 P0 collider-only 推进到 P1 static object scene：
+当前按“先重建生成 collider 场景即可”的最小目标继续向资产层吸收：不追完整机器人学习闭环，先把 Video2Mesh 的重建输出整理成后续仿真器、编辑器和 Web viewer 能消费的 visual / semantic / GLB 资产。
 
 ```text
 bedroom4 COLMAP Delaunay mesh
-  -> scene_static_collider.obj
-  -> collider-only simulator bundle
-  -> local face semantics
-  -> 16 static semantic objects + bbox collision proxies
-  -> MuJoCo / Unity / Isaac adapters
-  -> MuJoCo runtime smoke
+  -> high-quality mesh
+  -> semantic object meshes
+  -> scene-level GLB
+  -> per-object GLB
+
+GraphDECO 30k clean 3DGS
+  -> high-quality 3DGS point cloud
+  -> semantic 3DGS by nearest semantic-mesh transfer
 ```
 
 最新产物：
 
-| 阶段 | 输出目录 | 状态 |
+| 资产 | 输出 | 状态 |
 |---|---|---|
-| P0 collider-only | `exports/simfoundry_bedroom4_step1_collider_scene_rebuild_p0_20260708_031553/` | MuJoCo load + 5-step pass |
-| P1 static object scene | `exports/simfoundry_bedroom4_step2_static_object_scene_rebuild_p1_20260708_031841/` | MuJoCo load + 5-step pass，16 objects all static |
+| 高质量 3DGS 点云 | `tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/3dgs_point_cloud_clean_iteration30000.ply` | 已有，971,305 vertices，约 230 MB |
+| 语义分割 3DGS 点云 | `exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/semantic_3dgs_from_semantic_mesh_transfer.ply` | 已有 baseline，971,305 vertices，含 `object_id` / `object_probability` |
+| 高质量 mesh 重建 | `tmp_remote_results/cli_dense_graphdeco30k_mesh_routes_20260702/mesh_recon_results/colmap_delaunay_dense/mesh.ply` | 已有，82,920 vertices / 167,082 faces |
+| 语义分割 mesh | `exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/semantic_object_meshes/semantic_object_meshes.json` | 已有，16 objects，73,970 vertices / 141,993 faces |
+| 整个场景 GLB | `exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/scene_glb/scene.glb` | 已有，16 objects，约 2.8 MB |
+| 单个物体 GLB | `exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/simulator_assets/semantic_object_glbs/semantic_object_glbs.json` | 已有，`status=semantic_object_glbs_exported`，16/16 objects，`error_count=0` |
 
-P0 当前证据：
-
-| 项 | 结果 |
-|---|---:|
-| scene static collider | 1 |
-| collider vertices / triangles | 82,920 / 167,082 |
-| objects | 0 |
-| object collision proxies | 0 |
-| adapter ready | 3 / 3 |
-| MuJoCo runtime | pass |
-| MuJoCo steps | 5 |
-| MuJoCo nbody / ngeom / nmesh | 2 / 2 / 1 |
-| required issues | 0 |
-| remaining warnings | 4 个非阻塞 warning：`scale_not_calibrated`、`up_axis_unknown` |
-| branch test | `tests/test_simfoundry_replica.py` 47 passed |
-
-P1 当前证据：
+当前资产证据：
 
 | 项 | 结果 |
 |---|---:|
-| P1 semantic object meshes | 16 |
-| P1 bbox collision proxies | 16 / 16 |
-| P1 body type | 16 static |
-| P1 foreground / background | 10 / 6 |
-| P1 object collider | 16 box |
-| P1 adapter ready | 3 / 3 |
-| P1 smoke required issues | 0 |
-| P1 smoke warnings | 2 个 `scale_not_calibrated` |
-| P1 MuJoCo nbody / ngeom / nmesh | 18 / 18 / 1 |
-| freejoint / dynamic scan | 0 命中 |
-| secret scan | 无 API credential / Authorization token 命中 |
+| source run | `exports/simfoundry_bedroom4_static_object_scene_p1_20260708_161534/` |
+| high-quality 3DGS vertices | 971,305 |
+| high-quality 3DGS format | binary little endian PLY |
+| semantic object meshes | 16 |
+| semantic 3DGS PLY | 971,305 vertices |
+| semantic 3DGS source | semantic mesh debug PLY, 501,246 semantic vertices |
+| semantic 3DGS method | nearest semantic PLY to 3DGS transfer baseline |
+| semantic 3DGS properties | `object_id`, `object_probability` |
+| semantic 3DGS nonzero objects | 16 |
+| high-quality mesh vertices / faces | 82,920 / 167,082 |
+| per-object semantic GLB | 16 / 16 |
+| scene-level visual GLB | `scene.glb`, 2.9 MB |
+| scene GLB vertices / triangles | 73,970 / 141,993 |
+| scene GLB exported objects | 16 / 16 |
+| branch test | `tests/test_simfoundry_replica.py` 54 passed |
 
-这一步吸收的是 SimFoundry 的 sim-ready asset contract：visual/object/collider/physics/adapter/preflight 分层。当前真正完成项到 P1 static object scene；P2/P4/P5 仍作为后续吸收路线的探索证据。不声称复刻了 NVIDIA 未完整公开的 foundation-model 编排或 policy-learning 闭环。
+关键文件：
 
-历史 P2 门禁证据：
+```text
+simulator_assets/simulator_asset_bundle.json
+simulator_assets/simfoundry_static_object_scene/static_object_scene_report.json
+simulator_assets/semantic_object_meshes/semantic_object_meshes.json
+simulator_assets/semantic_3dgs_from_semantic_mesh_transfer.ply
+simulator_assets/semantic_3dgs_from_semantic_mesh_transfer_manifest.json
+simulator_assets/semantic_object_glbs/semantic_object_glbs.json
+simulator_assets/semantic_object_glbs/<object_id>/<object_id>.glb
+simulator_assets/scene_glb/scene.glb
+simulator_assets/scene_glb/scene_glb_manifest.json
+simulator_assets/objects/<object_id>/object_asset.json
+```
 
-| 项 | 结果 |
-|---|---:|
-| readiness status | `dynamic_blocked` |
-| dynamic candidates | 8 |
-| accepted dynamic | 0 |
-| blocked candidates | 8 |
-| unsupported candidates | 6 |
-| penetration candidates | 8 |
-| unique penetration blockers | 10 |
-| sidecar body type | 16 static |
-| sidecar collider | 16 box |
-| sidecar smoke required issues | 0 |
-| sidecar smoke warnings | 2 个 `scale_not_calibrated` |
-| MuJoCo nbody / ngeom / nmesh | 18 / 18 / 1 |
-| freejoint / dynamic scan | 0 命中 |
+这一步吸收的是 SimFoundry 的 sim-ready asset contract 思路：把重建结果拆成视觉层、语义层、对象层和可交换 GLB，而不是把一整个扫描 mesh 当作唯一输出。当前真正完成项是资产六件套；历史动态门禁、provider review 和 support-pose sidecar 只能说明代码有继续推进的接口雏形，不混入本阶段完成口径。
 
 ## 资料入口
 
@@ -247,7 +238,7 @@ exports/simfoundry_bedroom4_step1_collider_scene_rebuild_20260707_195216/
 
 - `scale_not_calibrated`
 
-这说明当前可以作为结构 smoke 进入模拟器；`up_axis_unknown` 已在最新 P0.1 中消失，但还没有到真实物理尺度和动态交互阶段。
+这说明当前可以作为结构 smoke 进入模拟器；`up_axis_unknown` 已在历史 P0.1 中消失，但还没有到真实物理尺度和动态交互阶段。
 
 ## P0.1 已推进：up-axis / calibration sidecar
 
@@ -277,7 +268,7 @@ exports/simfoundry_bedroom4_step1_collider_scene_rebuild_20260707_195216/
 
 这里没有把 `scale_calibrated` 写成 true，因为当前没有真实量尺证据。这个选择很重要：它让 collider scene 可以继续进入模拟器做结构级验证，同时保留生产级物理仿真的硬门槛。
 
-最新 P0.1 证据文件：
+历史 P0.1 证据文件：
 
 ```text
 simulator_assets/simulator_calibration.json
@@ -496,7 +487,7 @@ exports/simfoundry_bedroom4_step2_static_object_scene_front_to_back_20260707_183
 | secret scan | 0 命中 |
 | branch test | `tests/test_simfoundry_replica.py` 46 passed |
 
-这个历史目录证明了“先做到能放进仿真模拟器”的 P1 路线：它已经是 simulator-ready static object scene，但还没有真实尺度标定，也没有进入 dynamic release 或真实 provider 修复。当前最新证据以上方 2026-07-08 P0/P1/P2 front-to-back run 为准。
+这个历史目录证明了“先做到能放进仿真模拟器”的 P1 路线：它已经是 simulator-ready static object scene，但还没有真实尺度标定，也没有进入 dynamic release 或真实 provider 修复。当前正式证据以上方 2026-07-08 P1 static object rebuild 为准，P2 作为后续探索证据保留。
 
 ## P1.1 已推进：真实尺度校准 job
 
@@ -823,7 +814,7 @@ simulator_assets/
   simulator_asset_bundle.json
 ```
 
-当前已完成并验收的是 P0 `colliders/`、collider-only bundle、`adapters/`，P1 static object `objects/`、bbox collision proxy、static physics sidecar 和三套 simulator adapter，以及 P2 dynamic-readiness gate sidecar。dynamic body release、真实 provider 修复和 task/cousin sidecar 仍不计入完成项。
+当前最新正式完成并验收的是资产生成六件套：高质量 3DGS、语义 3DGS、高质量 mesh、语义 mesh、整场景 GLB 和单物体 GLB。P0/P1 simulator adapter、P2/P3 dynamic-readiness、P7/P8 support-pose sidecar 等记录保留为历史探索；真实尺度校准、最终视觉摆放、真实 provider 修复、动态仿真和 task/cousin sidecar 都不计入本阶段完成项。
 
 ## 下一阶段怎么吸收
 
@@ -837,7 +828,7 @@ simulator_assets/
 
 ### P0.1 / P1.1: Scale and up-axis calibration
 
-当前 P1 已经把 `up_axis=y` 写入 bundle，并生成 16 个量尺候选；尺度仍未实测，所以 strict scale gate 仍应失败，这是正确行为。下一步要做真实量尺：
+下一步要做真实量尺；P0 collider-only 没有 object records，不能从这一层伪造床、门、桌面等 reference object。进入 P1 后可以使用 object/background 候选，但尺度仍必须来自实测或可信参考：
 
 - 选一个真实场景中的参考长度，比如床宽、门高、桌面高度。
 - 写入 `scale_calibration.json`。
@@ -846,7 +837,7 @@ simulator_assets/
 
 ### P1: Static object scene
 
-状态：已完成当前 P1 验收。
+状态：已完成本轮验收。
 
 在不覆盖 P0 基线的前提下，已接入 semantic mesh：
 
@@ -861,7 +852,7 @@ scene collider
 
 ### P2: Dynamic-readiness gate
 
-状态：已完成当前 P2 验收，但结果是 `dynamic_blocked`，accepted dynamic 为 0。
+状态：后续探索已跑通门禁链路，但结果是 `dynamic_blocked`，accepted dynamic 为 0；当前 P1 轮次不计入正式完成项。
 
 当前已经生成 tight collider variant、support / penetration gate、dynamic blocker report 和 sidecar adapters，并通过 MuJoCo load + step smoke。它证明门禁能运行，也证明现有几何还不能安全释放 dynamic body。
 
@@ -952,4 +943,4 @@ collider-only scene
   -> task/cousin sidecar
 ```
 
-当前验收已完成前三格：**collider-only scene rebuilt**、**static object scene rebuilt** 和 **dynamic-readiness gate**。三层都已导出 MuJoCo / Unity / Isaac adapter 或 sidecar adapter，并通过 MuJoCo runtime load + step smoke；dynamic gate 正确给出 `dynamic_blocked`，accepted dynamic 为 0。下一步重点是真实 scale calibration、object collider refinement / structural repair，然后再重跑 dynamic release retry。
+当前正式验收收口到资产生成六件套。P0/P1 adapter、P2 dynamic-readiness gate 和 P7/P8 support-pose sidecar 是后续探索证据，不混进本轮完成口径。下一步重点应是真实 scale calibration、semantic split refinement、object collider / physics sidecar，再决定是否重启动态门禁。
