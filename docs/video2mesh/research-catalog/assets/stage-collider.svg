@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <text x="50" y="62" font-family="Inter, Arial" font-size="30" font-weight="800" fill="#18211f">Collider 与物理代理</text>
+  <text x="52" y="92" font-family="Inter, Arial" font-size="15" fill="#66736f">碰撞代理优先稳定、轻量、可解释；不要求承担最终视觉效果</text>
+  <g font-family="Inter, Arial">
+    <rect x="84" y="148" width="190" height="150" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="112" y="188" font-size="18" font-weight="800" fill="#18211f">Static mesh</text>
+    <text x="112" y="218" font-size="14" fill="#66736f">floor / wall / room</text>
+    <polygon points="124,266 174,224 230,266" fill="#dcefeb" stroke="#0d776f" stroke-width="3"/>
+    <rect x="356" y="148" width="190" height="150" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="384" y="188" font-size="18" font-weight="800" fill="#18211f">Primitive proxy</text>
+    <text x="384" y="218" font-size="14" fill="#66736f">box / capsule / plane</text>
+    <rect x="404" y="246" width="92" height="38" fill="#fff0d8" stroke="#d98923" stroke-width="3"/>
+    <rect x="628" y="148" width="190" height="150" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="656" y="188" font-size="18" font-weight="800" fill="#18211f">Convex parts</text>
+    <text x="656" y="218" font-size="14" fill="#66736f">runtime physics body</text>
+    <polygon points="674,268 712,226 766,240 786,282 716,292" fill="#e8f8ef" stroke="#23845b" stroke-width="3"/>
+  </g>
+</svg>

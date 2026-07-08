@@ -1,17 +1,16 @@
 ---
 title: COLMAP Delaunay Dense 实验
 id: video2mesh-experiments-colmap-delaunay-experiment
-category: 调研目录
+category: 实验目录
 visibility: public
 summary: COLMAP dense + Delaunay mesher 生成场景级 mesh。
 tags:
   - 本项目实验
-  - Research Catalog
 ---
 
 # COLMAP Delaunay Dense 实验
 
-![COLMAP Delaunay dense mesh](../assets/03-colmap-delaunay-dense.png "COLMAP Delaunay dense mesh 视觉细节不如 3DGS，但几何轻量稳定，更适合场景级 static collision proxy")
+![COLMAP Delaunay dense mesh](assets/03-colmap-delaunay-dense.png "COLMAP Delaunay dense mesh 视觉细节不如 3DGS，但几何轻量稳定，更适合场景级 static collision proxy")
 
 ## 实验目的
 

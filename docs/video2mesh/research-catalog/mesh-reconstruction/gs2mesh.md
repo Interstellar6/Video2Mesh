@@ -45,7 +45,7 @@ GS2Mesh 解决的问题是：3DGS 的视觉渲染很好，但 Gaussian 本身是
 
 在当前项目实验中，GS2Mesh 的 raw mesh 大约 4.48M vertices / 8.09M triangles，原始文件约 333MB；减面后可以压到几 MB 级 GLB。结构上能保留床、窗帘、大型家具和房间轮廓，但墙面破碎、漂浮片和局部缺失仍明显。
 
-![本项目 GS2Mesh 输出](../assets/01-gs2mesh.png "Video2Mesh GS2Mesh 实验输出：保留了床和大结构，但墙面与局部表面仍不稳定")
+![本项目 GS2Mesh 输出](../../experiments/assets/01-gs2mesh.png "Video2Mesh GS2Mesh 实验输出：保留了床和大结构，但墙面与局部表面仍不稳定")
 
 ## 接入判断
 

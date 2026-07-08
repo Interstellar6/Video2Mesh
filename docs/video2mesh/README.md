@@ -44,6 +44,7 @@ scan video
 | 目录 | 内容边界 |
 |---|---|
 | [调研文档目录](research-catalog/overview.md) | 按输入位姿、3DGS、Mesh 重建、点云/背景补全、物体补全、语义、碰撞代理、仿真和工业管线拆分的技术调研 |
+| [实验目录](experiments/overview.md) | 本项目在 bedroom 场景上真实跑过的 mesh 重建、语义回灌、object split 和 visual/physics proxy demo 结果 |
 | [项目进度文档目录](progress/overview.md) | 当前 P0/P1 优先级、周报和可展示实验结果 |
 | [项目运行文档目录](project-docs/overview.md) | 项目简介、pipeline 合同、运行命令和本地/远端边界 |
 
@@ -73,4 +74,4 @@ P0 的目标是展示和交互闭环，不是最佳画质。当前最稳的场�
 
 ## 接入 relumeow.top 的规则
 
-Video2Mesh 仓库继续维护自己的文档、实验记录、资产说明和 README；relumeow.top 只负责统一首页、导航、主题、权限、构建、部署和后台覆盖层。新增内容应优先放入本目录下的三个顶层目录，站点会通过 `projects.yaml` 聚合。
+Video2Mesh 仓库继续维护自己的文档、实验记录、资产说明和 README；relumeow.top 只负责统一首页、导航、主题、权限、构建、部署和后台覆盖层。新增内容应优先放入本目录下的四个顶层目录，站点会通过 `projects.yaml` 聚合。

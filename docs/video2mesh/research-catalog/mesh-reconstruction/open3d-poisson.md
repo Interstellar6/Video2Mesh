@@ -41,7 +41,7 @@ baseline/fallback。3DGS center point cloud 上容易生成壳状伪影，因此
 
 本项目 `alpha005_sample500k` 实验输出约 100,965 vertices / 200,000 triangles，GLB 约 5.23MB。formal semantic run 中 Open3D Poisson dense fused voxel10 的 semantic coverage 只有 32.21%，unknown/background 高达 67.79%，说明它不适合承载主 semantic sidecar。
 
-![Open3D Poisson 实验输出](../assets/02-open3d-poisson-3dgs-alpha005-sample500k.png "3DGS center Poisson 输出体量可控，但有壳状伪影、粘连和漂浮面")
+![Open3D Poisson 实验输出](../../experiments/assets/02-open3d-poisson-3dgs-alpha005-sample500k.png "3DGS center Poisson 输出体量可控，但有壳状伪影、粘连和漂浮面")
 
 ## 接入判断
 

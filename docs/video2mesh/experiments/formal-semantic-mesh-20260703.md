@@ -1,17 +1,16 @@
 ---
 title: 正式 Semantic Mesh 结果 20260703
 id: video2mesh-experiments-formal-semantic-mesh-20260703
-category: 调研目录
+category: 实验目录
 visibility: public
 summary: 新训练输出位于 bedroom4_formal_semantic_mesh_results_20260703，相比早期 debug 投影更适合汇报展示。
 tags:
   - 本项目实验
-  - Research Catalog
 ---
 
 # 正式 Semantic Mesh 结果 20260703
 
-![bedroom4 formal semantic mesh](../assets/06-bedroom4-formal-semantic-mesh.png "正式 bedroom4 semantic mesh：相较早期 ray projection debug，主要语义区域更清晰，适合作为周报展示结果")
+![bedroom4 formal semantic mesh](assets/06-bedroom4-formal-semantic-mesh.png "正式 bedroom4 semantic mesh：相较早期 ray projection debug，主要语义区域更清晰，适合作为周报展示结果")
 
 ## 结果路径
 

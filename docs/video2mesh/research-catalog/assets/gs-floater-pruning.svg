@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" role="img" aria-labelledby="title desc">
+  <title id="title">3DGS floater pruning pipeline</title>
+  <desc id="desc">A diagram showing diagnostics, candidate scoring, protected deletion, and QA for Gaussian floater pruning.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f6f8fb"/>
+      <stop offset="100%" stop-color="#eef4f1"/>
+    </linearGradient>
+    <style>
+      .title{font:700 34px Inter,Arial,sans-serif;fill:#16202a}
+      .sub{font:500 18px Inter,Arial,sans-serif;fill:#52606d}
+      .box{fill:#ffffff;stroke:#cfd9e3;stroke-width:2;rx:8}
+      .box2{fill:#f9fbff;stroke:#85a4c8;stroke-width:2;rx:8}
+      .warn{fill:#fff7ed;stroke:#f0a35f;stroke-width:2;rx:8}
+      .ok{fill:#ecfdf3;stroke:#65b789;stroke-width:2;rx:8}
+      .label{font:700 20px Inter,Arial,sans-serif;fill:#1d2a35}
+      .text{font:500 15px Inter,Arial,sans-serif;fill:#52606d}
+      .arrow{stroke:#5d6f82;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .dot{fill:#ef6a5b;opacity:.85}
+      .dot2{fill:#2e7dd1;opacity:.8}
+      .dot3{fill:#4aa66a;opacity:.85}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5d6f82"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="520" fill="url(#bg)"/>
+  <text x="56" y="70" class="title">3DGS 漂浮点剔除：从可疑 Gaussian 到可回滚编辑</text>
+  <text x="56" y="104" class="sub">核心不是检测物体类别，而是用 Gaussian 属性、局部几何和多视角贡献共同判断哪些 splat 应被删除或降权。</text>
+
+  <rect x="54" y="160" width="220" height="190" class="box2"/>
+  <text x="78" y="202" class="label">1. 诊断渲染</text>
+  <text x="78" y="238" class="text">RGB / alpha / depth</text>
+  <text x="78" y="264" class="text">多视角可见性统计</text>
+  <circle cx="224" cy="252" r="10" class="dot"/>
+  <circle cx="196" cy="286" r="7" class="dot"/>
+  <circle cx="236" cy="300" r="5" class="dot"/>
+  <circle cx="146" cy="292" r="6" class="dot2"/>
+  <circle cx="164" cy="318" r="5" class="dot2"/>
+
+  <path d="M282 255 H354" class="arrow"/>
+
+  <rect x="366" y="160" width="240" height="190" class="box"/>
+  <text x="390" y="202" class="label">2. 候选打分</text>
+  <text x="390" y="238" class="text">opacity / scale / anisotropy</text>
+  <text x="390" y="264" class="text">kNN 距离与小连通分量</text>
+  <text x="390" y="290" class="text">depth residual 与 mask 贡献</text>
+
+  <path d="M614 255 H686" class="arrow"/>
+
+  <rect x="698" y="160" width="230" height="190" class="warn"/>
+  <text x="722" y="202" class="label">3. 保护与执行</text>
+  <text x="722" y="238" class="text">保护薄结构和支撑平面</text>
+  <text x="722" y="264" class="text">高置信 delete / attenuate</text>
+  <text x="722" y="290" class="text">写入 sidecar 可回滚</text>
+
+  <path d="M936 255 H1008" class="arrow"/>
+
+  <rect x="1020" y="160" width="210" height="190" class="ok"/>
+  <text x="1044" y="202" class="label">4. 多视角 QA</text>
+  <text x="1044" y="238" class="text">伪影面积下降</text>
+  <text x="1044" y="264" class="text">真实表面不破洞</text>
+  <text x="1044" y="290" class="text">不通过则回滚</text>
+
+  <path d="M1126 352 C1126 428 796 440 796 354" class="arrow"/>
+  <text x="470" y="432" class="sub">适合 P0/P1：先做规则系统，再用 SuperSplat 人工编辑日志训练 keep/delete 小模型。</text>
+</svg>

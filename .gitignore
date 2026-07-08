@@ -76,7 +76,10 @@ wandb/
 logs/
 tmp/
 temp/
+tmp_remote_results/
+remote_returns/
 supersplat_server/
+external_code_snapshots/
 
 # Unity generated state
 UnityProjectBedroom100/

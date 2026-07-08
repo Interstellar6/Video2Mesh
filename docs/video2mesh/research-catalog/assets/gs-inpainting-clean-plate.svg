@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
+  <title id="title">3DGS inpainting and clean plate pipeline</title>
+  <desc id="desc">A diagram showing foreground removal, multi-view inpainting, Gaussian or mesh update, and consistency QA.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fbfbf7"/>
+      <stop offset="100%" stop-color="#eef7fb"/>
+    </linearGradient>
+    <style>
+      .title{font:700 34px Inter,Arial,sans-serif;fill:#17212b}
+      .sub{font:500 18px Inter,Arial,sans-serif;fill:#5a6570}
+      .panel{fill:#fff;stroke:#d4dde4;stroke-width:2;rx:8}
+      .panel2{fill:#eef9f6;stroke:#75b9aa;stroke-width:2;rx:8}
+      .warn{fill:#fff8e8;stroke:#e5b564;stroke-width:2;rx:8}
+      .label{font:700 20px Inter,Arial,sans-serif;fill:#1b2630}
+      .text{font:500 15px Inter,Arial,sans-serif;fill:#5a6570}
+      .arrow{stroke:#667787;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .floor{fill:#dfe8de}
+      .wall{fill:#edf2f5}
+      .hole{fill:#f27c66;opacity:.55}
+      .patch{fill:#4ab590;opacity:.7}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667787"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="560" fill="url(#bg)"/>
+  <text x="56" y="70" class="title">3DGS Inpainting / Clean Plate：补背景时先保守、再生成</text>
+  <text x="56" y="104" class="sub">适合物体移除后的地面、墙面、柜体侧面等背景缺口；不应该把生成背景直接当物理真实 collider。</text>
+
+  <rect x="56" y="156" width="234" height="230" class="panel"/>
+  <text x="82" y="198" class="label">1. 移除前景</text>
+  <rect x="94" y="230" width="154" height="82" class="wall"/>
+  <polygon points="94,312 248,312 270,350 70,350" class="floor"/>
+  <ellipse cx="168" cy="300" rx="34" ry="50" fill="#8795a1"/>
+  <text x="82" y="360" class="text">foreground mask / object RoI</text>
+
+  <path d="M300 274 H370" class="arrow"/>
+
+  <rect x="382" y="156" width="234" height="230" class="warn"/>
+  <text x="408" y="198" class="label">2. 暴露缺口</text>
+  <rect x="420" y="230" width="154" height="82" class="wall"/>
+  <polygon points="420,312 574,312 596,350 396,350" class="floor"/>
+  <ellipse cx="498" cy="318" rx="42" ry="20" class="hole"/>
+  <text x="408" y="360" class="text">alpha hole / depth gap / mask border</text>
+
+  <path d="M626 274 H696" class="arrow"/>
+
+  <rect x="708" y="156" width="234" height="230" class="panel2"/>
+  <text x="734" y="198" class="label">3. 多视角补全</text>
+  <rect x="746" y="230" width="154" height="82" class="wall"/>
+  <polygon points="746,312 900,312 922,350 722,350" class="floor"/>
+  <ellipse cx="824" cy="318" rx="42" ry="20" class="patch"/>
+  <text x="734" y="360" class="text">copy-fill / diffusion / depth-aware refill</text>
+
+  <path d="M952 274 H1022" class="arrow"/>
+
+  <rect x="1034" y="156" width="190" height="230" class="panel"/>
+  <text x="1060" y="198" class="label">4. QA 与标注</text>
+  <text x="1060" y="238" class="text">跨视角不闪烁</text>
+  <text x="1060" y="264" class="text">新 splat 不离平面</text>
+  <text x="1060" y="290" class="text">synthetic provenance</text>
+  <text x="1060" y="316" class="text">失败回滚</text>
+
+  <text x="56" y="456" class="sub">推荐接入顺序：P1 平面 copy-fill 与 clean plate sidecar；P2 再评估 Inpaint360GS / SplatFill / 3DGIC 类生成式方法。</text>
+</svg>

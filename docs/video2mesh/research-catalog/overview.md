@@ -3,7 +3,7 @@ title: 场景扫描与可交互资产调研目录
 id: research-catalog
 doc_type: overview
 category: 调研目录
-summary: 按 Video2Mesh 流程阶段整理学术、工业和本项目实验路线，作为 relumeow.top 的可浏览调研目录入口。
+summary: 按 Video2Mesh 流程阶段整理学术和工业路线，作为 relumeow.top 的可浏览调研目录入口。
 tags:
   - Research Catalog
   - 3DGS
@@ -14,7 +14,7 @@ visibility: public
 
 # 场景扫描与可交互资产调研目录
 
-这个目录把本周调研内容按 Video2Mesh 的流程阶段重新组织。目标不是堆论文名，而是回答一个更工程化的问题：**从扫描视频到可交互仿真/游戏资产，每个阶段有哪些可借用模型、项目和产业方案，它们应该接在我们 pipeline 的什么位置。**
+这个目录把调研内容按 Video2Mesh 的流程阶段重新组织。目标不是堆论文名，而是回答一个更工程化的问题：**从扫描视频到可交互仿真/游戏资产，每个阶段有哪些可借用模型、项目和产业方案，它们应该接在我们 pipeline 的什么位置。**
 
 ![Video2Mesh 调研目录总览](assets/pipeline-overview.svg "Video2Mesh 从扫描视频到视觉层、mesh、补全、语义、碰撞代理、物体仿真和引擎适配的调研目录")
 
@@ -31,7 +31,6 @@ visibility: public
 | Collider 与物理代理 | [collider-physics-proxy](collider-physics-proxy/overview.md) | static collider、primitive proxy、convex decomposition、Rapier/Unity collision |
 | 物体仿真 | [object-simulation](object-simulation/overview.md) | rigid body、soft body、PhysSplat/Sim Anything、动态 Gaussian |
 | 工业资产管线 | [industrial-pipelines](industrial-pipelines/overview.md) | SimFoundry、World Labs / Icare、image-blaster、Spark viewer、GLB runtime asset convention |
-| 本项目实验 | [experiments](experiments/overview.md) | GS2Mesh、Open3D Poisson、COLMAP Delaunay、语义投影、Web visual/physics proxy demo |
 
 ## 当前总判断
 

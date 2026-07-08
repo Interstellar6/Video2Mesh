@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <text x="50" y="62" font-family="Inter, Arial" font-size="30" font-weight="800" fill="#18211f">3DGS 视觉代理</text>
+  <text x="52" y="92" font-family="Inter, Arial" font-size="15" fill="#66736f">Gaussian / Splat 负责视觉真实感；碰撞、导航和物理由独立 proxy 承担</text>
+  <g font-family="Inter, Arial">
+    <rect x="78" y="146" width="190" height="156" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="108" y="188" font-size="18" font-weight="800" fill="#18211f">GraphDECO</text>
+    <text x="108" y="218" font-size="14" fill="#66736f">training and splats</text>
+    <g fill="#0d776f">
+      <circle cx="122" cy="256" r="5"/><circle cx="150" cy="236" r="4"/><circle cx="178" cy="264" r="6"/><circle cx="210" cy="246" r="4"/>
+    </g>
+    <rect x="354" y="146" width="190" height="156" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="384" y="188" font-size="18" font-weight="800" fill="#18211f">Spark / viewer</text>
+    <text x="384" y="218" font-size="14" fill="#66736f">browser visual layer</text>
+    <path d="M406 268C424 236 480 236 500 268C480 292 426 292 406 268Z" fill="#dcefeb" stroke="#0d776f" stroke-width="3"/>
+    <rect x="630" y="146" width="190" height="156" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="660" y="188" font-size="18" font-weight="800" fill="#18211f">Surface-aware GS</text>
+    <text x="660" y="218" font-size="14" fill="#66736f">mesh extraction upgrade</text>
+    <polygon points="682,270 730,228 778,270" fill="#fff0d8" stroke="#d98923" stroke-width="3"/>
+  </g>
+</svg>

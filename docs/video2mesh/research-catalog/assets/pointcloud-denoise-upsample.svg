@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" role="img" aria-labelledby="title desc">
+  <title id="title">Point cloud denoising and upsampling pipeline</title>
+  <desc id="desc">A diagram showing noisy point cloud, learned denoising, upsampling, and transfer to Gaussian repair features.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f9fafb"/>
+      <stop offset="100%" stop-color="#f0f6ff"/>
+    </linearGradient>
+    <style>
+      .title{font:700 34px Inter,Arial,sans-serif;fill:#172033}
+      .sub{font:500 18px Inter,Arial,sans-serif;fill:#586576}
+      .panel{fill:#fff;stroke:#d1dbe7;stroke-width:2;rx:8}
+      .panel2{fill:#f1f7ff;stroke:#83aee2;stroke-width:2;rx:8}
+      .label{font:700 20px Inter,Arial,sans-serif;fill:#1e2935}
+      .text{font:500 15px Inter,Arial,sans-serif;fill:#586576}
+      .arrow{stroke:#657689;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .p{fill:#4c86ca;opacity:.8}
+      .n{fill:#ee6d5f;opacity:.8}
+      .u{fill:#4db27a;opacity:.85}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#657689"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="520" fill="url(#bg)"/>
+  <text x="56" y="70" class="title">学习式点云去噪 / 上采样：给 Gaussian 修复提供几何先验</text>
+  <text x="56" y="104" class="sub">PointCleanNet、score-based denoising、PU-Net 不能直接修好 3DGS，但它们的局部几何特征非常适合迁移到小模型。</text>
+
+  <rect x="62" y="158" width="250" height="210" class="panel"/>
+  <text x="88" y="200" class="label">1. 原始点云</text>
+  <circle cx="128" cy="260" r="6" class="p"/><circle cx="158" cy="244" r="6" class="p"/><circle cx="188" cy="232" r="6" class="p"/>
+  <circle cx="218" cy="238" r="6" class="p"/><circle cx="248" cy="256" r="6" class="p"/><circle cx="178" cy="286" r="6" class="p"/>
+  <circle cx="114" cy="322" r="5" class="n"/><circle cx="252" cy="302" r="5" class="n"/><circle cx="220" cy="196" r="5" class="n"/>
+  <text x="88" y="342" class="text">噪声、离群点、局部稀疏</text>
+
+  <path d="M322 263 H396" class="arrow"/>
+
+  <rect x="408" y="158" width="250" height="210" class="panel2"/>
+  <text x="434" y="200" class="label">2. 去噪 / 投影</text>
+  <circle cx="474" cy="262" r="6" class="p"/><circle cx="504" cy="248" r="6" class="p"/><circle cx="534" cy="238" r="6" class="p"/>
+  <circle cx="564" cy="244" r="6" class="p"/><circle cx="594" cy="262" r="6" class="p"/><circle cx="524" cy="292" r="6" class="p"/>
+  <path d="M456 306 C496 282 544 276 610 292" stroke="#4c86ca" stroke-width="3" fill="none"/>
+  <text x="434" y="342" class="text">outlier score / clean displacement</text>
+
+  <path d="M668 263 H742" class="arrow"/>
+
+  <rect x="754" y="158" width="250" height="210" class="panel"/>
+  <text x="780" y="200" class="label">3. 上采样 / 补局部</text>
+  <circle cx="824" cy="262" r="6" class="p"/><circle cx="854" cy="248" r="6" class="p"/><circle cx="884" cy="238" r="6" class="p"/>
+  <circle cx="914" cy="244" r="6" class="p"/><circle cx="944" cy="262" r="6" class="p"/><circle cx="874" cy="292" r="6" class="p"/>
+  <circle cx="840" cy="254" r="4" class="u"/><circle cx="870" cy="242" r="4" class="u"/><circle cx="900" cy="240" r="4" class="u"/>
+  <circle cx="930" cy="252" r="4" class="u"/><circle cx="892" cy="280" r="4" class="u"/>
+  <text x="780" y="342" class="text">PU-Net / PU-GAN 风格局部密度恢复</text>
+
+  <path d="M1014 263 H1088" class="arrow"/>
+
+  <rect x="1100" y="158" width="130" height="210" class="panel2"/>
+  <text x="1124" y="200" class="label">迁移</text>
+  <text x="1124" y="238" class="text">kNN 特征</text>
+  <text x="1124" y="264" class="text">PCA 平面性</text>
+  <text x="1124" y="290" class="text">outlier label</text>
+  <text x="1124" y="316" class="text">donor 采样</text>
+
+  <text x="56" y="440" class="sub">Video2Mesh 建议：把这些方法作为特征设计和合成训练数据来源，而不是直接替换 Gaussian PLY 的属性优化。</text>
+</svg>

@@ -1,17 +1,16 @@
 ---
 title: GS2Mesh 实验
 id: video2mesh-experiments-gs2mesh-experiment
-category: 调研目录
+category: 实验目录
 visibility: public
 summary: 本项目使用 GS2Mesh 路线测试从 3DGS 到 visual mesh 的可行性。
 tags:
   - 本项目实验
-  - Research Catalog
 ---
 
 # GS2Mesh 实验
 
-![GS2Mesh 输出效果](../assets/01-gs2mesh.png "本项目 GS2Mesh 输出：床、窗帘和大结构保留较好，但墙面破碎、漂浮片和局部缺失仍明显")
+![GS2Mesh 输出效果](assets/01-gs2mesh.png "本项目 GS2Mesh 输出：床、窗帘和大结构保留较好，但墙面破碎、漂浮片和局部缺失仍明显")
 
 ## 实验目的
 

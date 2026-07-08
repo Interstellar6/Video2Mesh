@@ -1,17 +1,16 @@
 ---
 title: Open3D Poisson 实验
 id: video2mesh-experiments-open3d-poisson-experiment
-category: 调研目录
+category: 实验目录
 visibility: public
 summary: 使用过滤后的 3DGS center point cloud 做 Poisson baseline。
 tags:
   - 本项目实验
-  - Research Catalog
 ---
 
 # Open3D Poisson 实验
 
-![Open3D Poisson 3DGS alpha005 sample500k](../assets/02-open3d-poisson-3dgs-alpha005-sample500k.png "Open3D Poisson 输出体量可控，但壳状伪影、粘连和漂浮面明显")
+![Open3D Poisson 3DGS alpha005 sample500k](assets/02-open3d-poisson-3dgs-alpha005-sample500k.png "Open3D Poisson 输出体量可控，但壳状伪影、粘连和漂浮面明显")
 
 ## 实验目的
 

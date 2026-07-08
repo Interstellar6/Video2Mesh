@@ -40,7 +40,7 @@ COLMAP dense + Delaunay mesher 能从传统 MVS workspace 生成比较稳定的�
 
 P0 scene collider 主路线，适合轻量静态碰撞代理。当前 bedroom4 实验里，COLMAP Delaunay 输出 82,920 vertices / 167,082 triangles，GLB 约 3.0MB；formal semantic run 的 local transfer 覆盖率 84.98%，能拆出 16 个 object mesh split。
 
-![COLMAP Delaunay dense mesh](../assets/03-colmap-delaunay-dense.png "COLMAP Delaunay mesh 视觉细节有限，但轻量稳定，适合作为隐藏 collider")
+![COLMAP Delaunay dense mesh](../../experiments/assets/03-colmap-delaunay-dense.png "COLMAP Delaunay mesh 视觉细节有限，但轻量稳定，适合作为隐藏 collider")
 
 ## 接入判断
 

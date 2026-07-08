@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="540" viewBox="0 0 1280 540" role="img" aria-labelledby="title desc">
+  <title id="title">Gaussian RoI editing pipeline</title>
+  <desc id="desc">A diagram showing image masks, Gaussian identity lifting, edit operations, and provenance for Gaussian region editing.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f7fafc"/>
+      <stop offset="100%" stop-color="#f3f0ff"/>
+    </linearGradient>
+    <style>
+      .title{font:700 34px Inter,Arial,sans-serif;fill:#172033}
+      .sub{font:500 18px Inter,Arial,sans-serif;fill:#596273}
+      .panel{fill:#fff;stroke:#d3dae7;stroke-width:2;rx:8}
+      .panel2{fill:#f8f6ff;stroke:#a995db;stroke-width:2;rx:8}
+      .label{font:700 20px Inter,Arial,sans-serif;fill:#1d2433}
+      .text{font:500 15px Inter,Arial,sans-serif;fill:#596273}
+      .arrow{stroke:#69758a;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .mask{fill:#ff7d62;opacity:.25;stroke:#ff7d62;stroke-width:3}
+      .g{fill:#5a8fd8;opacity:.85}
+      .sel{fill:#ff7d62;opacity:.9}
+      .keep{fill:#4aae76;opacity:.85}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#69758a"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="540" fill="url(#bg)"/>
+  <text x="56" y="70" class="title">Gaussian RoI 编辑：把 2D mask / 语言指令落到 Gaussian id</text>
+  <text x="56" y="104" class="sub">Gaussian Grouping、SAGA、LangSplat、GaussianEditor 的共同价值，是让“框选删除/局部补全”有稳定的 3D 对象身份。</text>
+
+  <rect x="56" y="156" width="252" height="224" class="panel"/>
+  <text x="82" y="198" class="label">1. 视图级选择</text>
+  <rect x="92" y="228" width="170" height="100" fill="#edf2f7" stroke="#c8d1dd"/>
+  <path d="M126 310 C122 272 148 246 184 252 C222 258 236 286 218 314 C194 328 154 332 126 310 Z" class="mask"/>
+  <text x="82" y="356" class="text">SAM / click / text prompt / 手动框选</text>
+
+  <path d="M318 268 H392" class="arrow"/>
+
+  <rect x="404" y="156" width="252" height="224" class="panel2"/>
+  <text x="430" y="198" class="label">2. 提升到 3D RoI</text>
+  <circle cx="470" cy="255" r="8" class="g"/>
+  <circle cx="506" cy="235" r="7" class="g"/>
+  <circle cx="536" cy="278" r="6" class="sel"/>
+  <circle cx="570" cy="255" r="9" class="sel"/>
+  <circle cx="590" cy="302" r="7" class="sel"/>
+  <circle cx="492" cy="310" r="6" class="keep"/>
+  <text x="430" y="356" class="text">用 mask vote / feature field 找 Gaussian ids</text>
+
+  <path d="M666 268 H740" class="arrow"/>
+
+  <rect x="752" y="156" width="220" height="224" class="panel"/>
+  <text x="778" y="198" class="label">3. 编辑动作</text>
+  <text x="778" y="238" class="text">delete / attenuate</text>
+  <text x="778" y="264" class="text">recolor / transform</text>
+  <text x="778" y="290" class="text">object removal</text>
+  <text x="778" y="316" class="text">局部 inpaint / refill</text>
+
+  <path d="M982 268 H1056" class="arrow"/>
+
+  <rect x="1068" y="156" width="160" height="224" class="panel"/>
+  <text x="1094" y="198" class="label">4. 记录</text>
+  <text x="1094" y="238" class="text">mask source</text>
+  <text x="1094" y="264" class="text">Gaussian id set</text>
+  <text x="1094" y="290" class="text">edit operation</text>
+  <text x="1094" y="316" class="text">QA renders</text>
+
+  <text x="56" y="452" class="sub">Video2Mesh 可借鉴：把现有 2D mask 回投升级成可训练/可审计的 Gaussian RoI sidecar，供删除、补点和人工确认共用。</text>
+</svg>

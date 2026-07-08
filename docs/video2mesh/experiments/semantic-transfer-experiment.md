@@ -1,17 +1,16 @@
 ---
 title: 语义投影融合实验
 id: video2mesh-experiments-semantic-transfer-experiment
-category: 调研目录
+category: 实验目录
 visibility: public
 summary: 早期 P1 ray projection debug 尝试把语义投到 mesh face/点上。
 tags:
   - 本项目实验
-  - Research Catalog
 ---
 
 # 语义投影融合实验
 
-![mesh 语义投影融合调试结果](../assets/05-mesh-semantic-transfer-ray-projection.png "早期 ray projection debug 覆盖更高，但床、墙、窗帘、地面之间存在明显串色")
+![mesh 语义投影融合调试结果](assets/05-mesh-semantic-transfer-ray-projection.png "早期 ray projection debug 覆盖更高，但床、墙、窗帘、地面之间存在明显串色")
 
 ## 实验位置
 

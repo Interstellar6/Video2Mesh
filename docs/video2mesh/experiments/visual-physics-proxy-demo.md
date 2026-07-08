@@ -1,17 +1,16 @@
 ---
 title: Visual / Physics Proxy Demo
 id: video2mesh-experiments-visual-physics-proxy-demo
-category: 调研目录
+category: 实验目录
 visibility: public
 summary: 本地 demo 验证 3DGS visual layer 与 GLB collider layer 可以完全分离。
 tags:
   - 本项目实验
-  - Research Catalog
 ---
 
 # Visual / Physics Proxy Demo
 
-![视觉代理 3DGS + 碰撞代理 mesh Demo](../assets/04-visual-physics-proxy-demo.png "Web demo 验证了 3DGS visual layer 与 mesh collision layer 可以分离")
+![视觉代理 3DGS + 碰撞代理 mesh Demo](assets/04-visual-physics-proxy-demo.png "Web demo 验证了 3DGS visual layer 与 mesh collision layer 可以分离")
 
 ## Demo 链接
 
