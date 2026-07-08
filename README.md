@@ -2,7 +2,8 @@
 
 Video2Mesh turns a scan video into layered 3D assets: 3DGS visual scene, semantic object masks, object meshes, collision proxies, physics metadata and simulator adapters.
 
-The canonical documentation is now in [docs/](docs/README.md).
+Read the published docs at [relumeow.top/video2mesh/](https://relumeow.top/video2mesh/).
+The source Markdown remains in [docs/](docs/README.md).
 
 ## Quick Start
 
