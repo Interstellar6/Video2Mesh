@@ -24,6 +24,7 @@ Current default route:
 video
   -> COLMAP poses and full point cloud
   -> GraphDECO 3DGS
+  -> GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback
   -> SAM2 masks
   -> 2D-to-3D semantic fusion
   -> COLMAP dense Delaunay scene collider mesh
