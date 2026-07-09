@@ -40,6 +40,33 @@ SuGaR 的目标是从 3D Gaussian Splatting 中快速抽取可编辑 mesh，并�
 
 输入：COLMAP 格式数据或已有 3DGS 训练结果。输出：coarse/refined mesh、surface-bound Gaussians、可选 textured mesh。
 
+## 点云 / Gaussian PLY 是怎么生成的
+
+这里说的“点云”要分两层理解：它不是传统 LiDAR 那种只有 `xyz/rgb/normal` 的稠密点云，而是 GraphDECO / SuGaR 风格的 Gaussian PLY。PLY 里每个 `vertex` 表示一个可渲染的 3D Gaussian primitive，除了位置 `x/y/z`，还带有 SH 颜色系数 `f_dc_*`、`f_rest_*`、不透明度 `opacity`、各向异性尺度 `scale_*` 和四元数旋转 `rot_*`。所以它在查看器里像点云，但本质上是可 splat 渲染的视觉层。
+
+生成过程可以拆成四步：
+
+1. 先由视频抽帧和 COLMAP 相机位姿提供输入坐标系。COLMAP 负责相机、稀疏点和训练视角，后面的 3DGS / SuGaR 都沿用这个坐标系。
+2. 训练 vanilla 3DGS warm-up。普通 3DGS 会根据多视角照片优化大量 Gaussians 的位置、尺度、旋转、不透明度和球谐颜色，让它们能从训练相机视角重渲染房间。这一步得到的是视觉质量较好的 splat 场，但 Gaussians 可能是漂浮、拉长或没有贴在真实表面上的。
+3. 做 SuGaR coarse optimization。SuGaR 在 3DGS 基础上加 surface alignment regularization，让 Gaussians 的短轴、密度场和局部表面方向更像真实 scene surface。文件名里的 `sdfestim02_sdfnorm02` 对应这类 SDF / normal 估计与约束配置；它的目的不是直接输出点云，而是把原本松散的 Gaussians 整理成更适合抽 surface 的状态。
+4. 做 SuGaR refinement。先用 coarse mesh 作为绑定表面，再按每个 mesh face 放置固定数量的 Gaussians，并继续通过 Gaussian splatting rendering 优化它们。当前 refined PLY 文件名里的 `normalconsistency01_gaussperface6` 表示 refinement 时启用了 normal consistency 配置，并且每个三角面绑定 6 个 Gaussians。
+
+这次 `bedroom_4` 的 refined PLY header 也能反推这个过程：coarse mesh 有 399,991 faces，而 refined PLY 有 2,399,946 个 Gaussian vertices，正好是 `399,991 * 6`。因此这个 refined PLY 更准确地说是“mesh surface-bound Gaussian set”，不是从 mesh 顶点简单采样出来的普通 RGB 点云。
+
+## Mesh 是怎么重建的
+
+SuGaR 的 mesh extraction 不是直接把 Gaussian center 连起来，也不是对普通点云做 Delaunay；它走的是“aligned Gaussian field -> surface samples -> oriented point cloud -> Poisson mesh”的路线。
+
+核心步骤如下：
+
+1. 从已优化的 Gaussians 构造一个可查询的密度 / SDF-like field。每个 Gaussian 都有位置、尺度、旋转和 opacity，SuGaR 利用这些参数估计哪里接近真实表面。
+2. 选择一个 surface level。本次文件名里的 `level03` 表示用约 0.3 的 surface level 抽取表面。level 过低会更容易吸进漂浮噪声，level 过高又可能漏掉薄结构。
+3. 在相机可见区域附近采样 surface points。SuGaR 会利用相机视角和 aligned Gaussian 的局部几何，在密度场的可见 level set 上采样点，而不是在完整 3D 体素网格里跑 Marching Cubes。这样对几百万小 Gaussians 更可扩展，也更贴近被照片观察到的表面。
+4. 给采样点估计法线，形成 oriented point cloud。Poisson reconstruction 对法线方向非常敏感：如果室内外面片的 normal/winding 不一致，后面就容易出现一侧看完整、另一侧被 backface culling 剔掉的现象。
+5. 用 Open3D / Poisson reconstruction 从 oriented samples 生成三角网格，再做 decimation。当前输出文件名里的 `decim200000` 是简化目标配置；实际导出的 coarse mesh header 为 216,384 vertices / 399,991 faces，并带 `x/y/z + nx/ny/nz + rgb + face indices`。
+
+所以这条 mesh 路线的强项是：可以从 3DGS 视觉层快速得到一个有颜色、有细节的 triangle surface，适合 visual mesh baseline 和 Blender/Unity 检查。弱点也很明确：它依赖采样点法线方向、Poisson 的壳面闭合倾向和后续 decimation；对 `bedroom_4` 这种室内薄墙、窗帘/窗框高亮、床品褶皱很多的场景，mesh 很容易产生薄片、错向面和碎片。
+
 ## bedroom_4 实测观察
 
 这次用 `bedroom_4` 片段跑通后，最有价值的结论是：SuGaR 的 refined PLY / Gaussian 视觉层已经有可用质量，但从它抽出来的 mesh 还不能直接当 Video2Mesh 的 visual mesh 或 collider。局部房间结构、床、窗、墙面和地板在 refined PLY 里都能被看出来，虽然仍有漂浮片、墙面糊成片和窗口高亮拉丝，整体已经明显比纯稀疏点云更像一个可检查的室内场景。
