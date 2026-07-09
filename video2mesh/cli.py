@@ -5290,11 +5290,17 @@ def export_viewer_plys(
         "vertex_count": int(data["means"].shape[0]),
         "notes": "The exported SuperSplat PLY was written without scale/rotation/opacity postprocessing.",
     }
-    write_scales = data["scales"]
-    write_quats = data["quats"]
-    write_opacities = data["opacities"]
+    raw_scales = data["scales"]
+    raw_quats = data["quats"]
+    raw_opacities = data["opacities"]
+    safe_scales = raw_scales
+    safe_quats = raw_quats
+    safe_opacities = raw_opacities
+    viewer_safe_supersplat_path = None
+    viewer_safe_label_sidecar = None
+    viewer_safe_exported_health = None
     if health_report.get("status") != "safe":
-        write_scales, write_quats, write_opacities, repair_report = make_viewer_safe_gaussian_arrays(
+        safe_scales, safe_quats, safe_opacities, repair_report = make_viewer_safe_gaussian_arrays(
             data["scales"],
             data["quats"],
             data["opacities"],
@@ -5302,20 +5308,22 @@ def export_viewer_plys(
         safety_report = {
             "schema_version": DEFAULT_SCHEMA_VERSION,
             "source_ply": str(source_ply),
-            "status": "viewer_safe_postprocessed",
+            "status": "source_unsafe_raw_exported_with_viewer_safe_companion",
             "raw_gaussian_health": health_report,
-            "viewer_safe_postprocessed": True,
+            "viewer_safe_postprocessed": False,
             "geometry_preserved": True,
             "vertex_count": int(data["means"].shape[0]),
             "viewer_safe_repair": repair_report,
             "notes": (
-                "The source Gaussian PLY failed the numeric SuperSplat safety audit, so this viewer export clamps "
-                "scale, elongation, rotation, and opacity for display. This is not proof that training produced a "
-                "healthy 3DGS; visual QA and/or retraining are still required."
+                "The source Gaussian PLY failed the numeric SuperSplat safety audit. The primary SuperSplat export "
+                "keeps raw Gaussian scale/rotation/opacity for visual QA, and a separate *_viewer_safe companion "
+                "contains clamped display-only values. Treat this run as requiring visual QA/retraining until the "
+                "raw export is inspected."
             ),
         }
     plain_path = output_dir / f"{prefix}_point_cloud.ply"
     supersplat_path = output_dir / f"{prefix}_supersplat.ply"
+    viewer_safe_supersplat_path = output_dir / f"{prefix}_supersplat_viewer_safe.ply"
     safety_report_path = output_dir / f"{prefix}_supersplat_viewer_safety_report.json"
     shape_preview_path = output_dir / f"{prefix}_supersplat_shape_preview.png"
     write_point_cloud_ascii_ply(plain_path, data["means"], display_colors)
@@ -5323,27 +5331,46 @@ def export_viewer_plys(
         supersplat_path,
         data["means"],
         display_colors,
-        write_opacities,
-        write_scales,
-        write_quats,
+        raw_opacities,
+        raw_scales,
+        raw_quats,
         labels=labels,
         probabilities=probabilities,
         normals=data.get("normals"),
         f_rest=f_rest,
     )
     label_sidecar = write_supersplat_label_sidecar(supersplat_path, labels, probabilities)
+    if health_report.get("status") != "safe":
+        write_supersplat_ply(
+            viewer_safe_supersplat_path,
+            data["means"],
+            display_colors,
+            safe_opacities,
+            safe_scales,
+            safe_quats,
+            labels=labels,
+            probabilities=probabilities,
+            normals=data.get("normals"),
+            f_rest=f_rest,
+        )
+        viewer_safe_label_sidecar = write_supersplat_label_sidecar(viewer_safe_supersplat_path, labels, probabilities)
+        viewer_safe_exported_health = audit_gaussian_health(safe_scales, safe_quats, safe_opacities)
+    else:
+        viewer_safe_supersplat_path = None
     safety_report["output_supersplat_ply"] = str(supersplat_path)
     safety_report["output_point_cloud_ply"] = str(plain_path)
     safety_report["label_sidecar"] = str(label_sidecar) if label_sidecar else None
-    exported_health = audit_gaussian_health(write_scales, write_quats, write_opacities)
+    safety_report["output_viewer_safe_supersplat_ply"] = str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None
+    safety_report["viewer_safe_label_sidecar"] = str(viewer_safe_label_sidecar) if viewer_safe_label_sidecar else None
+    exported_health = audit_gaussian_health(raw_scales, raw_quats, raw_opacities)
     try:
         shape_preview = write_gaussian_shape_preview(
             shape_preview_path,
             data["means"],
             data["scales"],
             data["quats"],
-            write_scales,
-            write_quats,
+            safe_scales,
+            safe_quats,
         )
     except Exception as exc:
         shape_preview = {"ok": False, "path": str(shape_preview_path), "error": str(exc)}
@@ -5377,7 +5404,19 @@ def export_viewer_plys(
             "geometry_preserved": True,
             "viewer_safety_report": str(safety_report_path),
             "shape_preview": shape_preview,
+            "viewer_safe_companion": str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None,
         },
+        "viewer_safe_supersplat_ply": str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None,
+        "viewer_safe_supersplat_ply_info": {
+            "path": str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else "",
+            "format": "graphdeco_supersplat_ply",
+            "encoding": "binary_little_endian",
+            "label_sidecar": str(viewer_safe_label_sidecar) if viewer_safe_label_sidecar else None,
+            "exported_gaussian_health_status": viewer_safe_exported_health.get("status") if viewer_safe_exported_health else None,
+            "exported_gaussian_health_ok": viewer_safe_exported_health.get("status") == "safe" if viewer_safe_exported_health else None,
+            "display_only": True,
+            "notes": "Generated only when the raw source fails the numeric viewer safety audit.",
+        } if viewer_safe_supersplat_path else None,
         "raw_gaussian_health": health_report,
         "source_gaussian_health_ok": health_report.get("status") == "safe",
         "exported_gaussian_health_ok": exported_health.get("status") == "safe",
@@ -5395,8 +5434,9 @@ def export_viewer_plys(
         "label_sidecar": str(label_sidecar) if label_sidecar else None,
         "notes": (
             "point_cloud_ply is a plain XYZ/RGB PLY for Preview/CloudCompare. "
-            "supersplat_ply is the recommended SuperSplat viewer file. If the source Gaussian audit is unsafe, "
-            "this file is viewer-safe postprocessed and the raw training PLY remains at source_ply. Semantic "
+            "supersplat_ply preserves raw Gaussian scale/rotation/opacity for visual QA. If the source Gaussian "
+            "audit is unsafe, viewer_safe_supersplat_ply is a separate display-only companion with clamped "
+            "scale/rotation/opacity; do not treat it as proof of reconstruction quality. Semantic "
             "object_id/object_probability metadata is stored in label_sidecar when present."
         ),
     }
