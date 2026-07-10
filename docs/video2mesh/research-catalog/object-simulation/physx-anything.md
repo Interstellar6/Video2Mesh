@@ -16,7 +16,7 @@ tags:
 
 检查日期：2026-07-11
 
-当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但 bedroom_4 只完成了单帧 smoke input 准备，尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。主要 blocker 是共享环境缺 PhysX-Anything 指定的 Qwen2.5-VL/flash-attn/qwen-vl-utils/TRELLIS decoder 权重与若干仿真依赖；隔离 venv 已补上部分上层包，但又暴露 PyTorch 2.2.2 与 Transformers 4.50.0 的 Qwen2.5-VL API 不兼容。`/data` 仅剩约 50 GB，不适合贸然下载全量权重和数据集。
+当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但 bedroom_4 只完成了单帧 smoke input 准备，尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。主要 blocker 是共享环境缺 PhysX-Anything 指定的 Qwen2.5-VL/flash-attn/qwen-vl-utils/TRELLIS decoder 权重与若干仿真依赖；复测时旧隔离 venv 和共享 Python 的 `torch import` 均在 25 秒 timeout 内未返回。干净 PyTorch 2.4 venv 尝试也受阻：系统 Python 是 3.7 且无 `ensurepip`，而 `/opt/envs/max/bin/python -m venv` 生成的仍是无 pip 的 Python 3.7 venv。Hugging Face API 显示 `Caoza/PhysX-Anything` 约 39.94 GB、`microsoft/TRELLIS-image-large` 约 3.30 GB；`/data` 仅剩约 49 GB，不适合贸然下载全量权重和编译缓存。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -197,6 +197,8 @@ bedroom_4 full room frame
 | New venv blocker | `Qwen2_5_VLForConditionalGeneration` import now reaches Qwen2.5-VL module but fails with `register_pytree_node() got an unexpected keyword argument flatten_with_keys_fn`, consistent with PyTorch 2.2.2 being older than the official PyTorch 2.4.0 recommendation |
 | Missing weights | `pretrain/vlm` and `pretrain/decoder` do not exist |
 | First real run blocker | Shared env fails before weight loading because current `transformers` lacks `Qwen2_5_VLForConditionalGeneration`; isolated venv then fails because PyTorch is still too old for the required Qwen2.5-VL import path |
+| Re-probe on 2026-07-11 | `/root/autodl-tmp/physx-anything-venv/bin/python` and `/opt/envs/max/bin/python` both timed out on a 25 second `torch import` smoke check; clean venv creation via system Python failed because Python 3.7 lacks `ensurepip`; clean venv creation via `/opt/envs/max/bin/python` produced a Python 3.7 venv without pip |
+| Weight size check | Hugging Face API reports `Caoza/PhysX-Anything` `usedStorage=39938791487` and `microsoft/TRELLIS-image-large` `usedStorage=3300497168`, so weights alone are about 43.24 GB before pip wheels, build cache, intermediate GLB/mesh outputs, and HF snapshot metadata |
 
 实测失败日志的关键点：
 
@@ -239,16 +241,16 @@ RuntimeError: register_pytree_node() got an unexpected keyword argument 'flatten
 
 下一步更稳的执行路线：
 
-1. 在 mil8 建隔离环境，不污染 `/opt/envs/max`：`/root/autodl-tmp/physx-anything-venv`，复用现有 CUDA PyTorch。
-2. 安装上层依赖：`transformers==4.50.0`、`qwen-vl-utils`、`trimesh`、`rembg`、`accelerate`，然后单独处理 `flash-attn`。
-3. 用 Hugging Face cache/resume 下载 `Caoza/PhysX-Anything` 和 `microsoft/TRELLIS-image-large`，下载前必须再次检查 `/data` 和 `/root` 可用空间。本轮 HF API 大小探针在 mil8 上连接 `huggingface.co` 超时，未拿到精确仓库总量。
+1. 先修复 mil8 的基础 Python runtime：需要一个可靠 Python 3.10 venv/conda/micromamba 环境，不能复用当前会 `torch import` timeout 的 `/opt/envs/max`。
+2. 在 `/root/autodl-tmp/physx-anything-torch24-venv` 或等价隔离路径安装 PyTorch 2.4.0 + CUDA wheel，再安装 `transformers==4.50.0`、`qwen-vl-utils`、`trimesh`、`rembg`、`accelerate`，然后单独处理 `flash-attn`。
+3. 用 Hugging Face cache/resume 下载 `Caoza/PhysX-Anything` 和 `microsoft/TRELLIS-image-large`，缓存优先放 `/root/autodl-tmp` 或其它空闲盘；下载前必须再次检查 `/data` 和 `/root` 可用空间。本轮本地 HF API 已确认这两个模型合计约 43.24 GB，不能直接压在 `/data` 49 GB 剩余空间上。
 4. 从 bedroom_4 语义结果中裁一个单物体，而不是直接喂整房间帧。
 5. 只在四步脚本真实生成 `basic_info.txt`、`sample.glb`、part meshes、`basic.urdf`/XML 后，才把它写成“bedroom_4 物体跑通”。
 
 ## 风险
 
-- **磁盘风险**：`/data` 只剩约 50 GB，而 PhysX-Anything 需要 Qwen2.5-VL/TRELLIS/decoder 权重和 CUDA 扩展缓存。若不清理或改用 `/root/autodl-tmp`/外部缓存，下载很容易中断。
-- **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；`xformers` 存在但 `flash_attn` 缺失，`setup.sh` 的 wheel 选择未必匹配。
+- **磁盘风险**：`/data` 只剩约 49 GB，而 PhysX-Anything 和 TRELLIS 权重合计约 43.24 GB，还不含 PyTorch wheels、CUDA 扩展、HF snapshot 缓存和中间结果。若不清理或改用 `/root/autodl-tmp`/外部缓存，下载很容易中断或把 `/data` 打满。
+- **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；复测时共享环境甚至在 `torch import` 上 timeout，`xformers` 存在但 `flash_attn` 缺失，`setup.sh` 的 wheel 选择未必匹配。
 - **输入风险**：PhysX-Anything 训练/推理假设单物体图像；`bedroom_4` full-room frame 会造成类别、尺度、部件和关节推理混乱。
 - **坐标风险**：即使生成 URDF/XML，也还需要把单物体坐标、尺度和姿态对齐回 Video2Mesh 的 COLMAP/scene coordinate。
 - **质量风险**：论文指标来自 PhysX-Mobility 和互联网单物体图像；不能直接外推到遮挡严重、背景复杂的室内扫描帧。
