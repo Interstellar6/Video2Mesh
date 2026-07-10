@@ -54,6 +54,73 @@ Holi-Spatial 的自动数据生成分三段：
 | Image-level Perception | 抽关键帧，用 VLM 发现开放词汇类别，再用 SAM3 生成每帧 instance masks | per-image class list, SAM3 masks, mask index |
 | Scene-level Lift and Refinement | 用深度、相机内参和位姿把 2D mask 回投到 3D；跨视角合并、过滤、生成 3D bbox/caption/grounding/QA | 3D bbox, instance caption, 3D grounding, spatial QA |
 
+### 组件分工与完整数据流
+
+Holi-Spatial 的关键不是某一个单模型，而是把多个组件串成自动标注 pipeline。DA3、SAM3、VLM、PGSR/3DGS 各自只负责一个边界清楚的中间环节：
+
+```text
+raw video / scene images
+  -> SfM / dataset camera metadata
+  -> DA3 depth prior and point cloud initialization
+  -> PGSR / 3DGS per-scene geometry optimization
+  -> rendered refined depth and mesh-guided depth evidence
+  -> VLM class-label memory from sampled keyframes
+  -> SAM3 text-prompted 2D instance masks
+  -> mask erosion + mesh-guided depth filtering
+  -> 2D mask pixels back-projected into 3D
+  -> initial OBB / bbox proposals
+  -> multi-view merge and floor-aligned postprocess
+  -> confidence filtering and VLM-agent verification
+  -> instance captions, 3D grounding pairs, spatial QA
+  -> LLaMA-Factory / VLM training and evaluation data
+```
+
+| 组件 | 输入 | 输出 | 在论文中的角色 | 不能误解成 |
+|---|---|---|---|---|
+| SfM / camera loader | 视频帧或数据集相机文件 | camera intrinsics / extrinsics | 给深度回投、3DGS 和 QA 提供坐标系 | 语义标注器 |
+| DA3 / Depth-Anything-V3 | 图像和相机上下文 | `depth_da3/*.npy`, `pointcloud_da3.ply` | 提供 dense depth prior 和初始点云 | 最终几何真值 |
+| PGSR / 3DGS | images, cameras, DA3 point/depth prior | optimized 3DGS, rendered depth, mesh | 多视角优化，压制 DA3 直接回投的 ghosting / floaters | 物体识别模型 |
+| VLM class discovery | sampled keyframes, class-label memory | per-image class list / region list | 发现开放词汇类别，并保持跨帧命名一致 | 精细分割器 |
+| SAM3 | image + text prompt label | 2D mask, bbox, score, RLE | 按 VLM 类别生成 open-set instance masks | 3D bbox 或 QA 生成器 |
+| Mask erosion | SAM3 2D mask | reliable interior mask | 去掉 mask 边缘误差，减少物体边界处深度噪声 | 新物体发现 |
+| Mesh-guided depth filtering | 3DGS depth, mesh depth, mask | filtered object point set | 过滤深度不连续处的 3D outliers | mesh 重建主算法 |
+| 2D-to-3D lifting | mask pixels, refined depth, intrinsics, extrinsics | object-local 3D points and initial OBB | 把 2D instance 变成 3D object proposal | 语言推理 |
+| Multi-view merge | 多帧同类 OBB proposals | merged instance bbox | 用类别和 3D IoU 合并同一物体的多视角观测 | 任意关系图构建 |
+| Floor-aligned postprocess | merged OBBs, floor/up axis | gravity-consistent AABB/OBB | 对齐重力方向，减少 roll/pitch 误差 | 自动修复错误语义 |
+| VLM-agent verification | highlighted object crops, zoom-in, SAM re-segmentation | accept/reject/correct label | 过滤低置信或错标实例 | 无需复核的真值来源 |
+| QA generation | camera poses, covisibility, bbox/caption | spatial QA JSON / training records | 用几何规则合成空间推理题和答案 | 大模型自由回答 |
+
+### DA3 的具体用法
+
+DA3 在第一阶段提供初始深度和点云。官方入口是 `run_da3.sh` 和 `inference_da3_scannetppv2.py`，脚本会加载 `depth-anything/DA3NESTED-GIANT-LARGE`，对 ScanNet v2、ScanNet++ 或 DL3DV 风格场景输出：
+
+```text
+<scene>/depth_da3/<image_stem>.npy
+<scene>/pointcloud_da3.ply
+```
+
+论文里没有把 DA3 depth 当最终结果。直接用 DA3 多视角回投会产生 ghosting artifacts 和 floaters；Holi-Spatial 后续用 PGSR/3DGS 的 per-scene optimization 和几何正则，把 depth / point cloud 变成更一致的 rendered refined depth，再用于 2D-to-3D lifting 和 bbox 估计。
+
+### SAM3 的具体用法
+
+SAM3 在第二阶段做 text-prompted instance segmentation。类别来自 VLM，而不是 SAM3 自己决定。官方 `classic_vllm.py` 先对 keyframes 生成开放词汇类别并维护 class-label memory；`sam3.py` 再对每个 image + label 调用：
+
+```python
+state = processor.set_image(image)
+output = processor.set_text_prompt(state=state, prompt=label)
+```
+
+输出会规范成 mask、box、score 和 RLE：
+
+```text
+mask_path
+mask_rle
+bbox
+score
+```
+
+这些 2D masks 随后会和 3DGS refined depth、camera intrinsics/extrinsics 结合，回投成 3D points。论文还特别处理 SAM3 的两类常见误差：2D mask 边缘不准，以及同一物体因遮挡被切成多个 instances。前者通过 mask erosion 和 mesh-guided filtering 缓解，后者通过 multi-view merge 和 VLM-agent verification 缓解。
+
 官方 README 对应的代码入口也基本按这个边界组织：
 
 | 官方入口 | 作用 |
@@ -148,6 +215,7 @@ Video2Mesh:
 
 Holi-Spatial-style extension:
   existing frames + cameras + masks + 3D bbox
+  -> optional DA3/SAM3/PGSR official rerun when resources permit
   -> floor-aligned bbox postprocess
   -> instance descriptions
   -> two-view spatial QA
@@ -224,6 +292,18 @@ cd /data/zyx/workspace/holi_spatial_runs/bedroom_4_smoke_20260709
 ```
 
 这两步是官方后处理和 QA 生成脚本。它们没有训练模型，也没有调用大 VLM 生成答案；QA 答案由相机位姿、共视矩阵、3D bbox 中心/边长和方向规则计算得到。
+
+和论文完整 pipeline 的对应关系：
+
+| 论文组件 | 完整 Holi-Spatial 应做 | 本次 `bedroom_4` smoke run |
+|---|---|---|
+| DA3 | 生成 `depth_da3/*.npy` 和 `pointcloud_da3.ply` | 未跑；源包没有 DA3 depth |
+| PGSR/3DGS | 用 DA3 / cameras / images 重训 per-scene optimized 3DGS | 未跑；复用 Video2Mesh GraphDECO PLY |
+| VLM class discovery | 通过 vLLM/Gemini/Qwen 逐帧发现类别并维护 label memory | 未跑；复用 Video2Mesh object labels |
+| SAM3 | 按类别 prompt 生成 per-image open-set masks | 未跑；复用 Video2Mesh GroundingDINO/SAM2 masks |
+| 2D-to-3D lifting | 用 refined depth 回投 SAM3 masks 并估计初始 OBB | 未跑完整官方脚本；用 Video2Mesh `object_masks.json` 转 schema |
+| AABB/OBB postprocess | 基于 floor/up axis 对齐 bbox | 已跑官方 `postprocess_3d_bbox_aabb.py` |
+| QA generation | 用 bbox、camera、covisibility 生成 spatial QA | 已跑官方 object-only `generate_two_view_qa.py` |
 
 ### 产物统计
 
