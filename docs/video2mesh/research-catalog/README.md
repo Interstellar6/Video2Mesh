@@ -21,9 +21,10 @@ visibility: public
 
 | 阶段 | 子目录 | 主要关注 |
 |---|---|---|
-| 输入、位姿与点云 | [input-pose-pointcloud](input-pose-pointcloud/overview.md) | COLMAP、MASt3R/DUSt3R/VGGT、MVS、稠密点云、尺度和坐标合同 |
+| 输入、位姿与点云 | [input-pose-pointcloud](input-pose-pointcloud/overview.md) | COLMAP、MASt3R/DUSt3R/VGGT、VGGT-Omega、MVS、稠密点云、尺度和坐标合同 |
 | 视觉重建 / 3DGS | [visual-3dgs](visual-3dgs/overview.md) | GraphDECO 3DGS、AnySplat、DepthSplat、Spark、SuperSplat、3DGS 作为 visual proxy |
 | Mesh 重建 | [mesh-reconstruction](mesh-reconstruction/overview.md) | COLMAP Delaunay、Poisson/Open3D、GS2Mesh、SuGaR、2DGS/GOF、GenRecon |
+| 动态 / 4D 重建 | [dynamic-4d-reconstruction](dynamic-4d-reconstruction/overview.md) | D4RT、动态 depth/camera/tracks、动态点云、per-object trajectory sidecar |
 | 点云/背景补全 | [pointcloud-completion](pointcloud-completion/overview.md) | 点云清理、背景 clean plate、inpainting、场景结构补全 |
 | 物体 Mesh 补全 | [object-mesh-completion](object-mesh-completion/overview.md) | Hunyuan3D、Meshy、TRELLIS、InstantMesh、Restore3D、image-blaster object jobs |
 | 语义与 Scene Graph | [semantic-scene-graph](semantic-scene-graph/overview.md) | SAM/Grounded-SAM、Holi-Spatial、2D-to-3D fusion、semantic splats、face sidecar |

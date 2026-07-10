@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 470">
+  <rect width="980" height="470" fill="#f8faf7"/>
+  <g font-family="Inter, Arial, sans-serif">
+    <text x="48" y="58" font-size="32" font-weight="800" fill="#18211f">VGGT-Omega 接入位置</text>
+    <text x="50" y="90" font-size="15" fill="#66736f">把视频帧转成 camera、depth、point cloud 和 register features；不直接输出 mesh/collider</text>
+  </g>
+  <g font-family="Inter, Arial, sans-serif">
+    <rect x="60" y="146" width="150" height="98" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="92" y="186" font-size="18" font-weight="800" fill="#18211f">Video frames</text>
+    <g fill="#0d776f">
+      <rect x="96" y="204" width="20" height="16" rx="2"/>
+      <rect x="124" y="204" width="20" height="16" rx="2" opacity=".72"/>
+      <rect x="152" y="204" width="20" height="16" rx="2" opacity=".44"/>
+    </g>
+
+    <rect x="270" y="146" width="150" height="98" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="306" y="184" font-size="18" font-weight="800" fill="#18211f">VGGT-Omega</text>
+    <text x="306" y="214" font-size="13" fill="#66736f">register attention</text>
+
+    <rect x="480" y="118" width="150" height="76" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="520" y="154" font-size="17" font-weight="800" fill="#18211f">Camera</text>
+    <text x="504" y="178" font-size="13" fill="#66736f">extrinsics / intrinsics</text>
+
+    <rect x="480" y="214" width="150" height="76" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="524" y="250" font-size="17" font-weight="800" fill="#18211f">Depth</text>
+    <text x="514" y="274" font-size="13" fill="#66736f">depth + confidence</text>
+
+    <rect x="690" y="118" width="190" height="76" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="730" y="154" font-size="17" font-weight="800" fill="#18211f">COLMAP-like prior</text>
+    <text x="724" y="178" font-size="13" fill="#66736f">fallback / initialization</text>
+
+    <rect x="690" y="214" width="190" height="76" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="744" y="250" font-size="17" font-weight="800" fill="#18211f">Point cloud</text>
+    <text x="724" y="274" font-size="13" fill="#66736f">unprojected geometry</text>
+
+    <rect x="160" y="336" width="660" height="66" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="198" y="375" font-size="17" font-weight="800" fill="#18211f">Video2Mesh contract</text>
+    <text x="368" y="375" font-size="14" fill="#66736f">record scale, axis, camera convention, confidence, and frame subset before any 3DGS / mesh / sidecar use</text>
+  </g>
+  <g stroke="#0d776f" stroke-width="3" fill="none">
+    <path d="M228 195H254"/>
+    <path d="M438 180C452 166 458 158 464 156"/>
+    <path d="M438 210C452 224 458 244 464 252"/>
+    <path d="M648 156H674"/>
+    <path d="M648 252H674"/>
+    <path d="M784 306V330"/>
+    <path d="M555 306V330"/>
+  </g>
+</svg>

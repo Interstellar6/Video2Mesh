@@ -28,6 +28,8 @@ DUSt3R 的核心是直接从图像对预测 3D point map，让深度、匹配、
 
 这组方法的共同价值是降低 COLMAP 对纹理、匹配和足够重叠视角的依赖；共同风险是输出坐标系、尺度、置信度和工程接口不一定和 COLMAP/GraphDECO 完全对齐。
 
+VGGT-Omega 已单独成页跟踪，见 [VGGT-Omega](vggt-omega.md)。它延续 VGGT 的 feed-forward geometry 方向，但进一步覆盖静态和动态场景，官方 README 给出 A100 推理显存表，并提供 512 resolution 和 256 text-alignment 两个 1B checkpoint。对 Video2Mesh 来说，它更适合作为 camera/depth/point cloud prior，而不是直接替代 mesh 或 3DGS 层。
+
 ## Pipeline
 
 | 方法 | Pipeline | 输出 |

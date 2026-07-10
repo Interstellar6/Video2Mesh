@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420">
+  <rect width="900" height="420" fill="#f8faf7"/>
+  <g font-family="Inter, Arial, sans-serif">
+    <text x="50" y="58" font-size="30" font-weight="800" fill="#18211f">动态 / 4D 重建</text>
+    <text x="52" y="88" font-size="15" fill="#66736f">从单段视频恢复时间相关的相机、深度、点云和 3D tracks，作为动态资产的前置层</text>
+  </g>
+  <g font-family="Inter, Arial, sans-serif">
+    <rect x="70" y="142" width="150" height="104" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="104" y="184" font-size="18" font-weight="800" fill="#18211f">Video</text>
+    <g fill="#0d776f">
+      <rect x="104" y="204" width="20" height="18" rx="2"/>
+      <rect x="132" y="204" width="20" height="18" rx="2" opacity=".75"/>
+      <rect x="160" y="204" width="20" height="18" rx="2" opacity=".5"/>
+    </g>
+    <text x="94" y="278" font-size="14" fill="#66736f">frames over time</text>
+
+    <rect x="282" y="142" width="150" height="104" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="312" y="184" font-size="18" font-weight="800" fill="#18211f">Encoder</text>
+    <path d="M320 222C342 184 374 184 396 222" fill="none" stroke="#0d776f" stroke-width="3"/>
+    <circle cx="334" cy="214" r="5" fill="#d98923"/>
+    <circle cx="384" cy="214" r="5" fill="#d98923"/>
+    <text x="306" y="278" font-size="14" fill="#66736f">global scene state</text>
+
+    <rect x="494" y="142" width="150" height="104" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="536" y="184" font-size="18" font-weight="800" fill="#18211f">Query</text>
+    <text x="520" y="218" font-size="14" fill="#18211f">(u, v, tsrc, ttgt)</text>
+    <text x="514" y="278" font-size="14" fill="#66736f">point in space-time</text>
+
+    <rect x="706" y="142" width="150" height="104" rx="8" fill="#ffffff" stroke="#cbd8d1"/>
+    <text x="742" y="184" font-size="18" font-weight="800" fill="#18211f">4D Asset</text>
+    <g stroke="#0d776f" stroke-width="3" fill="none">
+      <path d="M746 222C766 196 800 196 820 222"/>
+      <path d="M746 222C766 248 800 248 820 222"/>
+    </g>
+    <circle cx="746" cy="222" r="5" fill="#d98923"/>
+    <circle cx="820" cy="222" r="5" fill="#d98923"/>
+    <text x="728" y="278" font-size="14" fill="#66736f">depth, camera, tracks</text>
+  </g>
+  <g stroke="#0d776f" stroke-width="3" fill="none">
+    <path d="M238 194H266"/>
+    <path d="M450 194H478"/>
+    <path d="M662 194H690"/>
+  </g>
+  <g font-family="Inter, Arial, sans-serif" font-size="13" fill="#66736f">
+    <text x="92" y="340">静态层：可转 camera/depth/point cloud prior</text>
+    <text x="92" y="364">动态层：可生成 per-time 3D tracks，后续再接 mesh/collider/physics</text>
+  </g>
+</svg>
