@@ -16,7 +16,7 @@ tags:
 
 检查日期：2026-07-11
 
-当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但 bedroom_4 只完成了单帧 smoke input 准备，尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。主要 blocker 是共享环境缺 PhysX-Anything 指定的 Qwen2.5-VL/flash-attn/qwen-vl-utils/TRELLIS decoder 权重与若干仿真依赖；复测时旧隔离 venv 和共享 Python 的 `torch import` 均在 25 秒 timeout 内未返回。干净 PyTorch 2.4 venv 尝试也受阻：系统 Python 是 3.7 且无 `ensurepip`，而 `/opt/envs/max/bin/python -m venv` 生成的仍是无 pip 的 Python 3.7 venv。Hugging Face API 显示 `Caoza/PhysX-Anything` 约 39.94 GB、`microsoft/TRELLIS-image-large` 约 3.30 GB；`/data` 仅剩约 49 GB，不适合贸然下载全量权重和编译缓存。最新 SSH 诊断显示 `miljump` 可正常登录，但 `mil8` 经跳板转发到 `127.0.0.1:30013` 时卡在 SSH banner exchange；跳板上的 `frps` 监听 30013，但该端口没有返回 SSH banner，说明当前更像 AutoDL 实例/FRP 后端不可用，而不是本地密钥或文档构建问题。
+当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。`mil8` 曾短暂卡在 FRP/SSH banner exchange，后续已恢复登录；当前最新 blocker 是 mil8 到 Hugging Face 的 VLM 权重下载失败，`snapshot_download(repo_id="Caoza/PhysX-Anything", allow_patterns=["vlm/*"])` 报 `Network is unreachable`，因此 `pretrain/vlm` 仍未准备好。环境侧已经推进到：`/root/autodl-tmp/physx-anything-venv` 内 `transformers==4.50.0`、`qwen-vl-utils`、`trimesh`、`rembg` 可用；在 PyTorch 2.2.2 上通过运行时 `torch.utils._pytree.register_pytree_node` 兼容 shim 可以导入 `Qwen2_5_VLForConditionalGeneration`。同时已准备一个从 bedroom_4 真实帧裁出的 bedside/lamp/table heuristic crop，作为比 full-room frame 更接近单物体输入假设的 smoke input，但它仍不是 mask-clean 官方质量 crop。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -201,15 +201,20 @@ bedroom_4 full room frame
 | Weight size check | Hugging Face API reports `Caoza/PhysX-Anything` `usedStorage=39938791487` and `microsoft/TRELLIS-image-large` `usedStorage=3300497168`, so weights alone are about 43.24 GB before pip wheels, build cache, intermediate GLB/mesh outputs, and HF snapshot metadata |
 | SSH re-probe on 2026-07-11 | Local `ssh -G mil8` expands to `ProxyJump miljump`, `HostName localhost`, `Port 30013`; direct `ssh miljump` succeeds, `nc -vz localhost 30013` on the jump host reports the port open, but reading a banner from that port returns nothing and `ssh mil8` ends with `Connection timed out during banner exchange` |
 | FRP side evidence on 2026-07-11 | Both `mil8` and `8-3090` map to the same jump-host port `30013`; running `ssh -p 30013 root@localhost` on `miljump` also times out during SSH banner exchange. Jump-host port `8090` returns a Chinese "temporarily unavailable" safety-entry page, while FRP dashboard port `7500` is protected by Basic Auth. This leaves the current blocker outside the local repo: the AutoDL/FRP backend for port 30013 needs to recover before deployment can continue. |
+| Connectivity recovery on 2026-07-11 | A later `ssh mil8 'echo ok'` succeeded, so the FRP/SSH blocker was transient rather than final. |
+| Qwen shim check on 2026-07-11 | With a runtime wrapper that drops the unsupported `flatten_with_keys_fn` keyword from `torch.utils._pytree.register_pytree_node`, `Qwen2_5_VLForConditionalGeneration` imports successfully under the existing PyTorch 2.2.2 + Transformers 4.50.0 venv. |
+| PyTorch 2.4 attempt | A clean Python 3.10 venv at `/root/autodl-tmp/physx-anything-torch24-venv` was repaired, but downloading `torch==2.4.0+cu121` from `download.pytorch.org` was too slow and did not complete; the environment still has no `torch`, so the practical route remains the existing venv plus Qwen shim. |
+| Latest weight blocker | Downloading `Caoza/PhysX-Anything` VLM files to `/root/autodl-tmp/physx-anything-pretrain` failed with `Network is unreachable` when contacting `huggingface.co`; no VLM weights were written and `pretrain/vlm` remains unavailable. |
 
 实测失败日志的关键点：
 
 ```text
 ImportError: cannot import name 'Qwen2_5_VLForConditionalGeneration' from 'transformers'
 RuntimeError: register_pytree_node() got an unexpected keyword argument 'flatten_with_keys_fn'
+requests.exceptions.ConnectionError: Failed to establish a new connection: [Errno 101] Network is unreachable
 ```
 
-我没有把这个状态写成“跑通”。当前完成的是源码部署、环境审计、bedroom_4 输入准备和最小失败定位。
+我没有把这个状态写成“跑通”。当前完成的是源码部署、环境审计、bedroom_4 输入准备、Qwen import shim 验证和 VLM 权重下载 blocker 定位。
 
 ## bedroom_4 smoke input
 
@@ -229,6 +234,18 @@ RuntimeError: register_pytree_node() got an unexpected keyword argument 'flatten
 
 这个输入是 full-room frame，所以只能用于环境 smoke test。要做有效 PhysX-Anything 实验，下一步应该从 Video2Mesh 语义结果里挑一个清楚的单物体 crop，例如 cabinet、chair、laptop 或 door-like articulated object；最好带 mask/alpha 或干净背景，再设置 `--remove_bg True`。
 
+为了继续靠近单物体假设，本轮又从同一帧裁了一个右侧床头柜/台灯区域：
+
+![bedroom_4 bedside heuristic crop](../assets/physx-anything/bedroom4-physx-bedside-crop.png "bedroom_4 右床头柜/台灯 heuristic crop：比整房间帧更接近单物体输入，但仍包含床边、窗户、植物和桌面，不是 mask-clean 官方质量 crop")
+
+| 项 | 路径/结果 |
+|---|---|
+| Remote crop | `/data/zyx/workspace/physx_anything_bedroom4_20260711/object_crop_demo/demo/bedroom_4_bedside_lamp_table_crop.png` |
+| Remote manifest | `/data/zyx/workspace/physx_anything_bedroom4_20260711/object_crop_demo/crop_manifest.json` |
+| Crop box | `(614, 216, 947, 525)` in the original 1280 x 720 frame |
+| Local doc copy | `docs/video2mesh/research-catalog/assets/physx-anything/bedroom4-physx-bedside-crop.png` |
+| Caveat | Heuristic crop only; it should not be reported as an official object-level experiment result until a mask-clean crop or semantic object crop is used. |
+
 ## 接入判断
 
 短期建议是 **P1 research adapter，不进入主链路默认路径**：
@@ -243,16 +260,17 @@ RuntimeError: register_pytree_node() got an unexpected keyword argument 'flatten
 
 下一步更稳的执行路线：
 
-1. 先修复 mil8 的基础 Python runtime：需要一个可靠 Python 3.10 venv/conda/micromamba 环境，不能复用当前会 `torch import` timeout 的 `/opt/envs/max`。
-2. 在 `/root/autodl-tmp/physx-anything-torch24-venv` 或等价隔离路径安装 PyTorch 2.4.0 + CUDA wheel，再安装 `transformers==4.50.0`、`qwen-vl-utils`、`trimesh`、`rembg`、`accelerate`，然后单独处理 `flash-attn`。
-3. 用 Hugging Face cache/resume 下载 `Caoza/PhysX-Anything` 和 `microsoft/TRELLIS-image-large`，缓存优先放 `/root/autodl-tmp` 或其它空闲盘；下载前必须再次检查 `/data` 和 `/root` 可用空间。本轮本地 HF API 已确认这两个模型合计约 43.24 GB，不能直接压在 `/data` 49 GB 剩余空间上。
-4. 从 bedroom_4 语义结果中裁一个单物体，而不是直接喂整房间帧。
+1. 等 mil8 到 Hugging Face 网络恢复，或改用可访问的镜像/本地中转，把 `Caoza/PhysX-Anything` 的 `vlm/*` 下载到 `/root/autodl-tmp/physx-anything-pretrain/vlm` 并软链到 `pretrain/vlm`。
+2. 用 `/data/zyx/workspace/physx_anything_bedroom4_20260711/run_vlm_with_shim.py` 跑 VLM step；该 wrapper 只加 PyTorch 2.2 Qwen import shim、指定 bedside crop demo，不改官方源码。
+3. 单独处理 `flash-attn`：官方 `1_vlm_demo.py` 写死 `attn_implementation="flash_attention_2"`，如果安装 flash-attn 失败，后续只能把改用 `sdpa/eager` 标成 debug-only wrapper，不能称为原版官方推理。
+4. 再下载 `pretrain/decoder` 和 `microsoft/TRELLIS-image-large`，执行 `2_decoder.py -> 3_split.py -> 4_simready_gen.py`。
 5. 只在四步脚本真实生成 `basic_info.txt`、`sample.glb`、part meshes、`basic.urdf`/XML 后，才把它写成“bedroom_4 物体跑通”。
 
 ## 风险
 
 - **磁盘风险**：`/data` 只剩约 49 GB，而 PhysX-Anything 和 TRELLIS 权重合计约 43.24 GB，还不含 PyTorch wheels、CUDA 扩展、HF snapshot 缓存和中间结果。若不清理或改用 `/root/autodl-tmp`/外部缓存，下载很容易中断或把 `/data` 打满。
 - **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；复测时共享环境甚至在 `torch import` 上 timeout，`xformers` 存在但 `flash_attn` 缺失，`setup.sh` 的 wheel 选择未必匹配。
+- **网络风险**：当前 mil8 对 `huggingface.co` 出现 `[Errno 101] Network is unreachable`，VLM 权重下载未能开始；这比 Python import 更靠前阻塞真实推理。
 - **输入风险**：PhysX-Anything 训练/推理假设单物体图像；`bedroom_4` full-room frame 会造成类别、尺度、部件和关节推理混乱。
 - **坐标风险**：即使生成 URDF/XML，也还需要把单物体坐标、尺度和姿态对齐回 Video2Mesh 的 COLMAP/scene coordinate。
 - **质量风险**：论文指标来自 PhysX-Mobility 和互联网单物体图像；不能直接外推到遮挡严重、背景复杂的室内扫描帧。
