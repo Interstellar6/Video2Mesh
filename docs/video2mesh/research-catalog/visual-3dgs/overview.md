@@ -9,6 +9,7 @@ tags:
   - Feed-forward 3DGS
   - AnySplat
   - DepthSplat
+  - PGSR
   - Spark
   - SuperSplat
 visibility: public
@@ -25,6 +26,7 @@ visibility: public
 | 项目 / 方法 | 简介 | 适合承担 | 不适合承担 |
 |---|---|---|---|
 | GraphDECO 3D Gaussian Splatting | 经典 3DGS 训练实现，用 COLMAP 相机和点云初始化高斯场景 | 当前 P0/P1 真实场景视觉层，生成高质量 splat/PLY | 直接输出可靠 mesh topology 或 collider |
+| [PGSR](pgsr.md) | Planar-based Gaussian Splatting，把 3DGS 约束到更接近表面的局部平面，并渲染 depth/normal 做 TSDF mesh | P1/P2 surface-aware visual mesh、mask lifting depth、Holi-Spatial 几何后端候选 | 直接当作 simulator collider 或无需 QA 的 mesh 真值 |
 | [前馈 3DGS](feed-forward-3dgs.md) | 用预训练模型从少量 posed/unposed/unconstrained views 直接预测 Gaussians、depth 或 cameras | P1 快速 baseline、初始化、depth prior、候选视角分析 | 直接替代经过全局优化的 GraphDECO visual layer |
 | [AnySplat](anysplat.md) | 2025 年 unconstrained-view 前馈 3DGS，预测 Gaussians、depth 和 camera poses | P1 无位姿/弱位姿 baseline，GraphDECO 初始化候选 | 直接当作真实 COLMAP 世界坐标或 mesh/collider |
 | [DepthSplat](depthsplat.md) | CVPR 2025，连接 Gaussian Splatting 和 depth estimation，可导出 depth 与 Gaussian PLY | P1 前馈 3DGS / depth prior 实验；可接短程 GraphDECO refinement | 直接当作全局 fused scene、mesh source 或 collider |

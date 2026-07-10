@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 520">
+  <rect width="1120" height="520" fill="#f8faf7"/>
+  <text x="48" y="58" font-family="Inter, Arial, sans-serif" font-size="30" font-weight="800" fill="#18211f">PGSR surface-aware 3DGS pipeline</text>
+  <text x="50" y="90" font-family="Inter, Arial, sans-serif" font-size="15" fill="#66736f">Planar Gaussian, unbiased depth, geometric regularization, TSDF mesh extraction</text>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#55706b"/>
+    </marker>
+    <style>
+      .box { fill: #ffffff; stroke: #cbd8d1; stroke-width: 2; rx: 8; }
+      .title { font-family: Inter, Arial, sans-serif; font-size: 18px; font-weight: 800; fill: #18211f; }
+      .body { font-family: Inter, Arial, sans-serif; font-size: 13px; fill: #66736f; }
+      .small { font-family: Inter, Arial, sans-serif; font-size: 12px; fill: #5c6864; }
+      .arrow { stroke: #55706b; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <g>
+    <rect class="box" x="52" y="152" width="180" height="150"/>
+    <text class="title" x="80" y="192">Images + cameras</text>
+    <text class="body" x="80" y="224">multi-view RGB</text>
+    <text class="body" x="80" y="246">COLMAP / dataset poses</text>
+    <circle cx="96" cy="270" r="8" fill="#0d776f"/>
+    <circle cx="128" cy="270" r="8" fill="#d98923"/>
+    <circle cx="160" cy="270" r="8" fill="#7b5ed7"/>
+  </g>
+
+  <path class="arrow" d="M232 226 H286"/>
+
+  <g>
+    <rect class="box" x="286" y="132" width="198" height="190"/>
+    <text class="title" x="318" y="172">Planar Gaussians</text>
+    <text class="body" x="318" y="204">flatten Gaussian axes</text>
+    <text class="body" x="318" y="226">normal from smallest axis</text>
+    <ellipse cx="378" cy="264" rx="56" ry="13" fill="#dcefeb" stroke="#0d776f" stroke-width="3" transform="rotate(-14 378 264)"/>
+    <line x1="354" y1="238" x2="410" y2="296" stroke="#d98923" stroke-width="3"/>
+  </g>
+
+  <path class="arrow" d="M484 226 H538"/>
+
+  <g>
+    <rect class="box" x="538" y="132" width="222" height="190"/>
+    <text class="title" x="570" y="172">Depth / normal render</text>
+    <text class="body" x="570" y="204">plane distance map</text>
+    <text class="body" x="570" y="226">rendered normal map</text>
+    <text class="body" x="570" y="248">unbiased depth</text>
+    <rect x="586" y="268" width="48" height="24" fill="#0d776f" opacity="0.85"/>
+    <rect x="640" y="268" width="48" height="24" fill="#d98923" opacity="0.85"/>
+    <rect x="694" y="268" width="48" height="24" fill="#7b5ed7" opacity="0.85"/>
+  </g>
+
+  <path class="arrow" d="M760 226 H814"/>
+
+  <g>
+    <rect class="box" x="814" y="132" width="238" height="190"/>
+    <text class="title" x="846" y="172">Regularized training</text>
+    <text class="body" x="846" y="204">RGB reconstruction</text>
+    <text class="body" x="846" y="226">single-view normal consistency</text>
+    <text class="body" x="846" y="248">multi-view geometry + NCC</text>
+    <text class="body" x="846" y="270">opacity culling / trimming</text>
+  </g>
+
+  <path class="arrow" d="M384 322 V376 H558"/>
+  <path class="arrow" d="M934 322 V376 H790"/>
+
+  <g>
+    <rect class="box" x="558" y="354" width="232" height="114"/>
+    <text class="title" x="590" y="394">Outputs</text>
+    <text class="body" x="590" y="424">3DGS point_cloud.ply</text>
+    <text class="body" x="590" y="446">rendered depth / normal</text>
+    <text class="body" x="590" y="468">TSDF mesh post.ply</text>
+  </g>
+
+  <text class="small" x="52" y="474">Video2Mesh use: visual-surface mesh / depth evidence candidate; not a collider or physics body by itself.</text>
+</svg>
