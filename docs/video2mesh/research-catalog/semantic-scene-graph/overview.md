@@ -8,6 +8,7 @@ tags:
   - Semantics
   - Scene Graph
   - SAM
+  - SAM3
 visibility: public
 ---
 
@@ -22,6 +23,7 @@ visibility: public
 | 项目 / 方法 | 简介 | 对 Video2Mesh 的作用 | 风险 |
 |---|---|---|---|
 | Segment Anything / SAM | 通用 2D mask 生成/提示分割 | 生成 object masks，支持视频帧中的对象区域 | 无语义类别，需要 detector/VLM 命名 |
+| [SAM3 / SAM3.1](sam3.md) | Meta 的 promptable concept segmentation 模型，用文本、exemplar、点/框/mask 在图像和视频中检测、分割并跟踪开放词汇概念 | 可替代或增强 GroundingDINO+SAM2，给 Video2Mesh 提供带 identity 的 2D mask evidence | 权重 gated、CUDA 栈新；仍需相机/深度/多视角 fusion 才能进入 3D sidecar |
 | GroundingDINO / Grounded-SAM | 文本提示驱动检测 + mask | 开放词汇发现床、桌、椅、窗帘等对象 | 边界和类别稳定性需多帧融合 |
 | 2D-to-3D mask fusion | 将每帧 mask 投影/投票到 3D 点或 Gaussian | 生成 3D object masks、semantic/probability splats | 遮挡和深度误差会造成串色 |
 | [Holi-Spatial](holi-spatial.md) | 从 raw video 自动生成 3DGS、2D masks、3D bbox、caption、grounding 和 spatial QA | 给 Video2Mesh 增加空间 QA benchmark 和语义空间 sidecar schema | 完整链路重依赖 DA3/SAM3/PGSR/VLM；当前只完成 smoke run |

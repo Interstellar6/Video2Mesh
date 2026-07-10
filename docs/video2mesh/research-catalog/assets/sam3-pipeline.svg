@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">SAM3 in the Video2Mesh semantic pipeline</title>
+  <desc id="desc">A pipeline diagram showing text and visual prompts flowing into SAM3 detector and tracker, producing masks that are lifted into Video2Mesh 3D semantic sidecars.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.48" stop-color="#102530"/>
+      <stop offset="1" stop-color="#172018"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="0.5" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-30%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#a7f3d0"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="640" rx="0" fill="url(#bg)"/>
+  <rect x="44" y="42" width="1192" height="556" rx="18" fill="#071014" opacity="0.62" stroke="#24454a"/>
+  <text x="78" y="94" fill="#f8fafc" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700">SAM3 / SAM3.1 for Video2Mesh</text>
+  <text x="78" y="128" fill="#b6c8d2" font-family="Arial, Helvetica, sans-serif" font-size="18">Open-vocabulary concept masks in images and videos, then lifted into 3D sidecars</text>
+
+  <g filter="url(#shadow)">
+    <rect x="78" y="190" width="220" height="132" rx="14" fill="#0f172a" stroke="#3b82f6"/>
+    <text x="104" y="232" fill="#dbeafe" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">Prompts</text>
+    <text x="104" y="265" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">text: bed / lamp</text>
+    <text x="104" y="290" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">points, boxes, masks</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="78" y="366" width="220" height="116" rx="14" fill="#111827" stroke="#38bdf8"/>
+    <text x="104" y="407" fill="#e0f2fe" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">Video Frames</text>
+    <text x="104" y="440" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">sampled RGB frames</text>
+    <text x="104" y="465" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">optional keyframe list</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="382" y="180" width="282" height="310" rx="18" fill="#09241d" stroke="#34d399"/>
+    <text x="414" y="226" fill="#d1fae5" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700">SAM3 Core</text>
+    <rect x="414" y="258" width="218" height="64" rx="10" fill="#12362d" stroke="#6ee7b7"/>
+    <text x="436" y="297" fill="#ecfdf5" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700">shared vision encoder</text>
+    <rect x="414" y="346" width="218" height="52" rx="10" fill="#16213a" stroke="#93c5fd"/>
+    <text x="436" y="379" fill="#dbeafe" font-family="Arial, Helvetica, sans-serif" font-size="18">DETR detector</text>
+    <rect x="414" y="416" width="218" height="52" rx="10" fill="#2a1d12" stroke="#fbbf24"/>
+    <text x="436" y="449" fill="#fef3c7" font-family="Arial, Helvetica, sans-serif" font-size="18">memory video tracker</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="744" y="190" width="224" height="132" rx="14" fill="#102a28" stroke="#2dd4bf"/>
+    <text x="770" y="232" fill="#ccfbf1" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">2D Evidence</text>
+    <text x="770" y="265" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">instance masks</text>
+    <text x="770" y="290" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">boxes, scores, object ids</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="744" y="366" width="224" height="116" rx="14" fill="#211827" stroke="#c084fc"/>
+    <text x="770" y="407" fill="#f3e8ff" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">SAM3.1</text>
+    <text x="770" y="440" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">Object Multiplex</text>
+    <text x="770" y="465" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="16">faster multi-object video</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1044" y="230" width="164" height="212" rx="16" fill="#1f2215" stroke="#facc15"/>
+    <text x="1070" y="274" fill="#fef9c3" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">3D Lift</text>
+    <text x="1070" y="309" fill="#d9f99d" font-family="Arial, Helvetica, sans-serif" font-size="16">camera + depth</text>
+    <text x="1070" y="337" fill="#d9f99d" font-family="Arial, Helvetica, sans-serif" font-size="16">mask fusion</text>
+    <text x="1070" y="365" fill="#d9f99d" font-family="Arial, Helvetica, sans-serif" font-size="16">semantic splats</text>
+    <text x="1070" y="393" fill="#d9f99d" font-family="Arial, Helvetica, sans-serif" font-size="16">mesh face sidecar</text>
+  </g>
+
+  <path d="M300 256 C330 256 344 256 374 256" stroke="#a7f3d0" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+  <path d="M300 424 C330 424 344 424 374 424" stroke="#a7f3d0" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+  <path d="M666 256 C696 256 710 256 738 256" stroke="#a7f3d0" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+  <path d="M666 424 C696 424 710 424 738 424" stroke="#a7f3d0" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+  <path d="M970 256 C1000 270 1016 291 1038 320" stroke="#a7f3d0" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+  <path d="M970 424 C1000 410 1016 389 1038 360" stroke="#a7f3d0" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+
+  <rect x="78" y="532" width="1128" height="36" rx="18" fill="url(#accent)" opacity="0.18"/>
+  <text x="100" y="556" fill="#e2e8f0" font-family="Arial, Helvetica, sans-serif" font-size="16">Boundary: SAM3 creates 2D mask evidence. Video2Mesh still owns depth, cameras, 3D fusion, scene graph, mesh collider, and simulator assets.</text>
+</svg>
