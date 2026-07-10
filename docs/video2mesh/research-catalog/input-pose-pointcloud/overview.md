@@ -25,6 +25,7 @@ visibility: public
 | COLMAP dense stereo | 基于已知相机做 patch-match stereo 和 fusion | 输入 COLMAP sparse model，输出 fused.ply / dense workspace | 场景级 mesh/collider 的主输入，比直接使用 Gaussian center 更可靠 | 稠密点云仍会有空洞、噪声和漂浮点 |
 | MASt3R / DUSt3R | 学习式多视图几何，弱纹理/小基线下可作为传统 SfM 的补充 | 输入图像对或多视图，输出对应关系、深度/点云、相机关系 | 可作为 COLMAP 失败时的 pose/depth fallback，或为物体级 depth fusion 提供先验 | 输出坐标尺度和 COLMAP/3DGS 生态不完全一致，需要适配 |
 | VGGT 类 feed-forward 模型 | 端到端估计相机、深度、点云等 3D 表征 | 输入图片集合，输出 camera/depth/point map | 可作为快速预处理或弱纹理场景 fallback | 工程稳定性、尺度一致性和大场景鲁棒性需实测 |
+| [VGGT bedroom_4 no-cap 点云对比](vggt-bedroom4-no-cap-pointclouds.md) | 对本项目 bedroom_4 clean31 片段的 VGGT world-points 与 depth-unproject 全 valid-region 点云做实测对比 | 输入 31 帧 bedroom_4 图像，输出两份 4,656,820 点 RGB PLY 和 viewer-compatible Gaussian PLY 包装 | 说明取消 30 万点 cap 后点云质量明显改善，并区分模型 world point map 与 camera/depth 反投影路线 | 只是点云和 viewer wrapper，不是训练后的 3DGS 或可直接碰撞的 mesh |
 | [VGGT-Omega](vggt-omega.md) | 2026 年 VGGT 扩展版，加入 register attention、动态场景能力和 text-alignment checkpoint | 输入图片/视频帧，输出 camera、depth、depth confidence、register features | P1 learned geometry fallback、GraphDECO 初始化候选、动态视频 camera/depth prior | 权重需申请；输出不是标准 COLMAP workspace；scale/camera convention 必须审计 |
 | Open3D / CloudCompare 点云处理 | 点云过滤、法线估计、下采样、可视检查 | 输入 PLY/PCD，输出 cleaned point cloud / normals | 用于 mesh 前处理、debug 和人工检查 | 清理规则容易影响真实薄结构 |
 
