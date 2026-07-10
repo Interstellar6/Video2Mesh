@@ -16,7 +16,7 @@ tags:
 
 检查日期：2026-07-11
 
-当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但 bedroom_4 只完成了单帧 smoke input 准备，尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。主要 blocker 是共享环境缺 PhysX-Anything 指定的 Qwen2.5-VL/flash-attn/qwen-vl-utils/TRELLIS decoder 权重与若干仿真依赖；复测时旧隔离 venv 和共享 Python 的 `torch import` 均在 25 秒 timeout 内未返回。干净 PyTorch 2.4 venv 尝试也受阻：系统 Python 是 3.7 且无 `ensurepip`，而 `/opt/envs/max/bin/python -m venv` 生成的仍是无 pip 的 Python 3.7 venv。Hugging Face API 显示 `Caoza/PhysX-Anything` 约 39.94 GB、`microsoft/TRELLIS-image-large` 约 3.30 GB；`/data` 仅剩约 49 GB，不适合贸然下载全量权重和编译缓存。
+当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但 bedroom_4 只完成了单帧 smoke input 准备，尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。主要 blocker 是共享环境缺 PhysX-Anything 指定的 Qwen2.5-VL/flash-attn/qwen-vl-utils/TRELLIS decoder 权重与若干仿真依赖；复测时旧隔离 venv 和共享 Python 的 `torch import` 均在 25 秒 timeout 内未返回。干净 PyTorch 2.4 venv 尝试也受阻：系统 Python 是 3.7 且无 `ensurepip`，而 `/opt/envs/max/bin/python -m venv` 生成的仍是无 pip 的 Python 3.7 venv。Hugging Face API 显示 `Caoza/PhysX-Anything` 约 39.94 GB、`microsoft/TRELLIS-image-large` 约 3.30 GB；`/data` 仅剩约 49 GB，不适合贸然下载全量权重和编译缓存。最新 SSH 诊断显示 `miljump` 可正常登录，但 `mil8` 经跳板转发到 `127.0.0.1:30013` 时卡在 SSH banner exchange；跳板上的 `frps` 监听 30013，但该端口没有返回 SSH banner，说明当前更像 AutoDL 实例/FRP 后端不可用，而不是本地密钥或文档构建问题。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -199,6 +199,7 @@ bedroom_4 full room frame
 | First real run blocker | Shared env fails before weight loading because current `transformers` lacks `Qwen2_5_VLForConditionalGeneration`; isolated venv then fails because PyTorch is still too old for the required Qwen2.5-VL import path |
 | Re-probe on 2026-07-11 | `/root/autodl-tmp/physx-anything-venv/bin/python` and `/opt/envs/max/bin/python` both timed out on a 25 second `torch import` smoke check; clean venv creation via system Python failed because Python 3.7 lacks `ensurepip`; clean venv creation via `/opt/envs/max/bin/python` produced a Python 3.7 venv without pip |
 | Weight size check | Hugging Face API reports `Caoza/PhysX-Anything` `usedStorage=39938791487` and `microsoft/TRELLIS-image-large` `usedStorage=3300497168`, so weights alone are about 43.24 GB before pip wheels, build cache, intermediate GLB/mesh outputs, and HF snapshot metadata |
+| SSH re-probe on 2026-07-11 | Local `ssh -G mil8` expands to `ProxyJump miljump`, `HostName localhost`, `Port 30013`; direct `ssh miljump` succeeds, `nc -vz localhost 30013` on the jump host reports the port open, but reading a banner from that port returns nothing and `ssh mil8` ends with `Connection timed out during banner exchange` |
 
 实测失败日志的关键点：
 
