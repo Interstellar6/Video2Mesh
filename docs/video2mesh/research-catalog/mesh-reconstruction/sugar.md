@@ -71,12 +71,17 @@ SuGaR 的 mesh extraction 不是直接把 Gaussian center 连起来，也不是�
 
 这次用 `bedroom_4` 片段跑通后，最有价值的结论是：SuGaR 的 refined PLY / Gaussian 视觉层已经有可用质量，但从它抽出来的 mesh 还不能直接当 Video2Mesh 的 visual mesh 或 collider。局部房间结构、床、窗、墙面和地板在 refined PLY 里都能被看出来，虽然仍有漂浮片、墙面糊成片和窗口高亮拉丝，整体已经明显比纯稀疏点云更像一个可检查的室内场景。
 
+![SuGaR bedroom_4 本周对比视角](../assets/weekly-sugar-refined-ply.png "本周 viewer 对比中，SuGaR refined PLY 明显少于原版 3DGS 的远处漂浮伪影，但墙面和薄结构仍有破碎")
+
+和原版 GraphDECO 3DGS 对比时，SuGaR 的取舍很明显：原版 3DGS 渲染质量最好，但新视角下有大量拉丝、远处漂浮物和异常包围盒；SuGaR 去掉了不少远处伪影，Gaussian 更贴近表面，也可以抽 mesh，但新视角下墙体、窗边和薄片结构仍然破碎。因此它更适合作为 high-quality visual / mesh benchmark，而不是当前 P0 主 visual layer 或 collider。
+
 本次关键输出：
 
 | artifact | 本地路径 | 观察 |
 |---|---|---|
 | refined PLY / 3DGS layer | `/Users/zhangyuxiang/Desktop/worksplace/SuGaR/output/refined_ply/bedroom4_scene_only_sugar_source/sugarfine_3Dgs30000_sdfestim02_sdfnorm02_level03_decim200000_normalconsistency01_gaussperface6.ply` | 约 2,399,946 Gaussians，视觉效果不错，房间主体结构连贯 |
 | coarse mesh | `/Users/zhangyuxiang/Desktop/worksplace/SuGaR/output/coarse_mesh/bedroom4_scene_only_sugar_source/sugarmesh_3Dgs30000_sdfestim02_sdfnorm02_level03_decim200000.ply` | Open3D Poisson mesh，约 216,384 vertices / 399,991 faces，但存在明显正反面/可见性问题 |
+| double-sided coarse mesh | `/Users/zhangyuxiang/Desktop/worksplace/SuGaR/output/coarse_mesh/bedroom4_scene_only_sugar_source/sugarmesh_3Dgs30000_sdfestim02_sdfnorm02_level03_decim200000_double_sided.ply` | 复制反向面后约 432,768 vertices / 799,982 faces，室内视角可见性明显改善，但新视角空洞仍然存在 |
 
 ![SuGaR bedroom_4 refined PLY 正面视角](../assets/sugar-bedroom4-refined-ply-front.png "bedroom_4 refined PLY：床、墙、窗等主体结构已经能稳定辨认，但墙面与窗边仍有糊片和漂浮伪影")
 
@@ -86,7 +91,17 @@ SuGaR 的 mesh extraction 不是直接把 Gaussian center 连起来，也不是�
 
 ![SuGaR bedroom_4 mesh 正反面问题](../assets/sugar-bedroom4-mesh-backface-issue.png "bedroom_4 mesh：从室内视角看大量面片被剔除或碎裂，疑似 winding/normal 朝向与 one-sided rendering 组合导致的正反面问题")
 
-这会直接影响接入判断：当前 refined PLY 可以作为 `bedroom_4` 的 visual baseline 继续保留，但 mesh 必须先做双面渲染检查、normal/winding 翻转测试、法线重计算和破碎面清理，才能进入 Video2Mesh 的 simulator asset bundle。更严格地说，在修复前它不适合承担 collider、ground probe、camera collision 或室内第一人称浏览，因为这些 runtime 依赖稳定、双侧可解释且拓扑不太破碎的表面。
+把 mesh 改成 double-sided 之后，backface culling 引起的“室内视角看不见背面”问题基本缓解，床、窗、墙和房间外壳的整体观感比单面 mesh 好很多。这个版本说明 SuGaR mesh 的几何主体不是完全失败，作为 visual mesh baseline 是有价值的。
+
+![SuGaR bedroom_4 double-sided mesh 新视角](../assets/sugar-bedroom4-double-sided-mesh-new-view.png "double-sided mesh 后，房间主体结构更完整，床、窗和墙面都能看清；但顶部、墙边、窗边和地面边界仍有大量孔洞和碎片")
+
+但这个修复没有解决 3DGS-to-mesh 的核心问题：新视角里没有扫描到或没有足够多视角约束的区域仍然是空洞。图里顶部墙面、床头上方、窗框附近、右侧外墙和地面边界都出现破洞、薄片和漂浮碎片。refined PLY 的点云/高斯视觉层质量仍然可以，照片视角附近比 mesh 更自然；但当视角移动到训练/扫描覆盖之外，未观测区域同样会显露缺口和拉丝。
+
+![SuGaR bedroom_4 refined PLY 新视角空洞](../assets/sugar-bedroom4-refined-ply-new-view-holes.png "refined PLY 视觉层整体比 mesh 柔和，床、墙、窗仍可辨认；但新视角下未扫描区域会出现空洞、拉丝和漂浮高斯")
+
+和 Video2Mesh 默认的 COLMAP dense / TSDF 或 Poisson baseline 相比，SuGaR 的优势是视觉表面更贴近 3DGS，局部纹理和床/窗等主体更好看；劣势是它继承了 3DGS 新视角补全能力不足的问题。默认 COLMAP dense / TSDF / Poisson 路线虽然视觉上不一定漂亮，但几何来源更接近传统多视角重建，更适合做保守 collider 或几何 proxy；SuGaR mesh 更适合做可视化对照和高质量 visual mesh 实验，不能直接替代 P0 collider。
+
+这会直接影响接入判断：当前 refined PLY 可以作为 `bedroom_4` 的 visual baseline 继续保留，double-sided mesh 可以用于可视化检查；但 mesh 必须继续做 normal/winding 修复、hole filling、连通域清理、density/visibility 筛选，才能进入 Video2Mesh 的 simulator asset bundle。更严格地说，在修复前它不适合承担 collider、ground probe、camera collision 或室内第一人称浏览，因为这些 runtime 依赖稳定、双侧可解释且拓扑不太破碎的表面。
 
 ## 在 Video2Mesh 中的位置
 
