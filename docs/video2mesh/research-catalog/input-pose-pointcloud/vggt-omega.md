@@ -120,6 +120,57 @@ camera_and_register_tokens = predictions["camera_and_register_tokens"]
 
 该表使用 `VGGT-Omega-1B-512`、单张 A100、624x416 输入，并覆盖从加载权重到 forward pass 的端到端 peak memory。对 Video2Mesh 的 bedroom 级视频来说，RTX 3090/4090 理论上能跑几十到上百帧级别的测试，但真实吞吐、CUDA memory fragmentation、长视频分块和输出转换都要等本地/远端实测。
 
+## Video2Mesh bedroom_4 实测：点云和 mesh 重建
+
+这轮实测使用 `bedroom_4` clean31 片段，在远端 `mil8` 上跑通 VGGT-Omega 推理，并把输出的 depth、intrinsics、extrinsics 转成点云和 mesh。VGGT-Omega 官方代码里的 extrinsics 是 **camera-from-world OpenCV 坐标**，因此反投影时使用：
+
+```text
+X_cam = K^-1 [u, v, 1]^T * depth
+X_world = R.T @ (X_cam - t)
+```
+
+本次 VGGT-Omega 输出形状为：`extrinsics [1,31,3,4]`、`intrinsics [1,31,3,3]`、`depth [1,31,384,688,1]`、`depth_conf [1,31,384,688]`。这些是真实推理结果，不是手工伪造相机或合成位姿。
+
+### 主要产物
+
+本地产物目录：`tmp_remote_results/vggt_omega_bedroom_4_clean31_omega512_pointcloud_mesh_20260711_054752/`
+
+远端源目录：`/data/zyx/workspace/vggt_omega_runs/bedroom_4_clean31_omega512_full31_20260711_050958/`
+
+| 产物 | 文件 | 生成方法 | 规模 | 观察结论 |
+|---|---|---|---:|---|
+| 原始 RGB 点云 | `pointcloud_mesh_from_depth_light_20260711_054752/vggt_omega_depth_unproject_rgb_points.ply` | depth + camera 反投影，confidence 过滤，robust bbox 裁剪，导出 120 万点 | 1,200,000 points / 18.0 MB | 图五。渲染和重建质量最高，床、窗、墙、地板、床头柜等主体最完整，细节保留也最好。 |
+| voxel clean 点云 | `mesh_from_vggt_pointcloud_open3d_20260711_055739/vggt_omega_depth_pointcloud_voxel0012_clean.ply` | 120 万点 PLY 经 Open3D voxel downsample + statistical outlier removal | 38,104 points / 1.9 MB | 图二。结构仍清楚，但为了后续 BPA/Poisson 重建做了明显下采样，视觉细节低于原始 120 万点。 |
+| depth-grid mesh | `mesh_from_vggt_depth_grid_20260711_055635/vggt_omega_depth_grid_mesh_stride4.ply` | 每帧 depth 图按 stride=4 反投影，相邻有效像素连三角形 | 297,885 vertices / 539,272 faces / 11.5 MB | 图一。保留每帧局部表面，房间大结构完整，但多视角重叠和深度边缘会形成薄片、接缝和洞。 |
+| BPA mesh | `mesh_from_vggt_pointcloud_open3d_20260711_055739/vggt_omega_pointcloud_bpa_mesh_voxel0012.ply` | voxel clean 点云估计法线后 Ball Pivoting，radii=[0.018,0.03,0.048] | 38,104 vertices / 49,668 faces / 2.6 MB | 图三。局部表面更连续，形状比 depth-grid 更规整，但仍有孔洞和少量三角碎片。 |
+| Poisson mesh | `mesh_from_vggt_pointcloud_open3d_20260711_055739/vggt_omega_pointcloud_poisson_depth7_trim08_mesh.ply` | voxel clean 点云估计法线后 Poisson depth=7，并按 density 去掉最低 8% 顶点 | 26,747 vertices / 52,594 faces / 2.0 MB | 图四。mesh 版本里空洞最少、表面最干净，适合作为这轮 mesh baseline；但它比原始点云更平滑，局部细节被抹掉。 |
+
+![VGGT-Omega depth-grid mesh](../assets/vggt-omega-bedroom4-depth-mesh/depth-grid-mesh-stride4.jpg "图一：vggt_omega_depth_grid_mesh_stride4.ply。保留局部 depth surface，但多视角薄片和接缝更多。")
+
+![VGGT-Omega voxel clean point cloud](../assets/vggt-omega-bedroom4-depth-mesh/voxel-pointcloud-clean.jpg "图二：vggt_omega_depth_pointcloud_voxel0012_clean.ply。下采样点云适合 Open3D meshing，但视觉细节少于 120 万点原始点云。")
+
+![VGGT-Omega BPA mesh](../assets/vggt-omega-bedroom4-depth-mesh/bpa-mesh-voxel0012.jpg "图三：vggt_omega_pointcloud_bpa_mesh_voxel0012.ply。BPA 保留可见局部表面，但仍有孔洞和三角碎片。")
+
+![VGGT-Omega Poisson mesh](../assets/vggt-omega-bedroom4-depth-mesh/poisson-depth7-trim08-mesh.jpg "图四：vggt_omega_pointcloud_poisson_depth7_trim08_mesh.ply。mesh 版本里空洞最少、最干净。")
+
+![VGGT-Omega depth-unproject point cloud](../assets/vggt-omega-bedroom4-depth-mesh/depth-unproject-rgb-points.jpg "图五：vggt_omega_depth_unproject_rgb_points.ply。120 万点 RGB 点云的渲染和整体重建质量最高。")
+
+### 效果判断
+
+这次结果比预期干净：VGGT-Omega 的 camera/depth 合同在 `bedroom_4` clean31 上足以恢复卧室主体结构，床、床头板、床品褶皱、窗框、两侧墙面、地板和床头柜都能被点云或 mesh 表达出来。图五的 `vggt_omega_depth_unproject_rgb_points.ply` 是这一轮**渲染和整体重建质量最高**的产物，因为它保留了 120 万点原始几何和颜色；如果目标是展示、人工 QA 或给后续几何融合提供高密度输入，应优先看它。
+
+在 mesh 产物里，图四的 `vggt_omega_pointcloud_poisson_depth7_trim08_mesh.ply` 主观效果最好：空洞最少，表面最干净，床、墙和窗的连续性优于 depth-grid 和 BPA。但 Poisson 的平滑和补洞也意味着它会把部分细节平均掉，并可能在遮挡/缺数据处生成并非真实观测的封闭表面。因此它可以作为 **mesh baseline / visual proxy**，还不能直接声明为 simulator collider 或 physics-ready mesh。
+
+图一的 depth-grid mesh 更忠实于原始 depth 图，适合分析深度边界、相机对齐和多视角重叠问题；图三的 BPA mesh 更保守，倾向保留可见局部表面，少做全局补洞；图二是 Open3D 重建前的轻量点云中间产物。
+
+### 与 3DGS / collider 的边界
+
+这些 PLY 都不是 GraphDECO / 3DGS Gaussian PLY。它们没有 trained Gaussian 的 `scale`、`rotation`、`opacity`、SH features，也没有经过 3DGS photometric optimization。更准确的定位是：
+
+- `vggt_omega_depth_unproject_rgb_points.ply`：VGGT-Omega depth/camera prior 反投影得到的 RGB 点云，可做 QA、可视化、TSDF/Poisson/Delaunay/GraphDECO 初始化候选。
+- `vggt_omega_pointcloud_poisson_depth7_trim08_mesh.ply`：从上述点云下采样后重建的干净 mesh baseline，可做视觉 proxy 或后续 collider 清理的输入。
+- 若要变成 Video2Mesh 主链路资产，还需要 scale/camera audit、坐标合同固化、mesh cleanup/decimation、语义 sidecar transfer，以及碰撞/导航/物理用途的单独验证。
+
 ## 和已有 VGGT / AnySplat 的关系
 
 已有 [VGGT](vggt.md) 页把 VGGT 归为 learned pose/depth fallback，并记录了 bedroom_4 clean31 上 no-cap 点云实测。VGGT-Omega 应作为这个方向的升级版单独跟踪，因为它加入了动态场景、register attention、text alignment checkpoint 和更明确的 runtime memory 数据。
@@ -144,8 +195,8 @@ video frames
 
 ## 接入判断
 
-- P0：暂不替代 COLMAP 主链路，因为我们还没有对 Video2Mesh 数据做真实 scale/camera/mesh QA。
-- P1：作为 learned geometry fallback 和 GraphDECO 初始化候选，尤其适合 COLMAP 失败、输入视角少或纹理弱的片段。
+- P0：暂不替代 COLMAP 主链路，因为虽然 `bedroom_4` 点云和 Poisson mesh 已经很干净，但还没有完成 scale/camera audit、碰撞网格清理和 simulator collider 验证。
+- P1：作为 learned geometry fallback 和 GraphDECO 初始化候选，尤其适合 COLMAP 失败、输入视角少或纹理弱的片段；本次 120 万点 depth-unproject 点云说明它可以提供质量很高的 dense geometry prior。
 - P1：作为动态视频 camera/depth prior，和 D4RT 这类 4D tracking 方法配合。
 - P2：探索 text-aligned registers 是否能辅助 semantic sidecar 或自然语言场景查询。
-- 风险：权重访问需要申请；输出不是标准 COLMAP workspace；点云/mesh/collider 的坐标、尺度、confidence 必须额外记录。
+- 风险：权重访问需要申请；输出不是标准 COLMAP workspace；点云/mesh/collider 的坐标、尺度、confidence 必须额外记录；Poisson mesh 虽然空洞少，但会平滑和补全未观测区域，不能直接等同物理碰撞体。
