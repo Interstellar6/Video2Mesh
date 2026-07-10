@@ -61,3 +61,11 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 ![SceneVerse++ / PQ3D bedroom_4 semantic mesh](assets/sceneversepp-pq3d-bedroom4-semantic-mesh.png "SceneVerse++ / PQ3D bedroom_4 semantic mesh：语义着色清楚，建模结果适合归档和展示；点云部分仍需后续提升")
 
 结论：mesh 值得作为 semantic scene understanding 结果保存；点云暂时只作为基础几何输入/检查，不应写成高质量 3DGS 或最终 visual layer。
+
+## 实验七：Web Demo Blender-like 视口与机器人交互
+
+[Web Demo: Blender-like 视口与机器人交互](web-demo-blender-gizmo-20260711.md) 记录了 `relumeow.top/video2mesh/web-demo/` 的交互升级：右侧 `Rotate / Pan` 球用于旋转和平移观察目标，画布滚轮缩放，`W/A/S/D` 控制机器人在 semantic mesh collider 上移动。
+
+![Video2Mesh Web Demo Blender-like gizmo](assets/07-web-demo-blender-gizmo.png "本次 demo 使用真实 AnySplat 3DGS PLY 和 semantic mesh PLY，验证视觉代理、碰撞代理和交互代理可以分层工作")
+
+结论：这次更新没有改变 3DGS / mesh 的真实配准，只增强浏览器端探索能力；本地验证已确认 `1,313,391` visual splats、`142,219` collider faces、gizmo 拖动、滚轮缩放和 WASD 机器人控制均可用。
