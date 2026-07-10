@@ -342,6 +342,54 @@ QA 类型分布：
 | object size | `000040.png` -> `000042.png` | lamp 与 desk 哪个最长 | D, desk |
 | object direction | `000040.png` -> `000042.png` | desk 相对 image B 的方向 | C, North |
 
+### 2026-07-11 adapter 输出与可视化 QA
+
+7 月 11 日补跑的 `bedroom_4_holi_adapter_20260711_041347` 主要验证“Video2Mesh 现有输出能否被整理成 Holi-Spatial 风格产物并继续生成 semantic PLY / bbox / QA”。这次不是完整 Holi-Spatial 复现：DA3 没有跑，PGSR/3DGS 没有重训，SAM3 没有跑，VLM class discovery 也没有换成 Holi-Spatial 官方 VLM；这里的 GroundingDINO 是 Video2Mesh baseline 里本来就有的 object discovery，不是 Holi-Spatial 新增能力。
+
+| 阶段 | 本次状态 | 说明 |
+|---|---|---|
+| DA3 | Not run | `/data/wzj/Depth-Anything-3` 存在，但当前环境缺少依赖，没有生成 `depth_da3/*.npy` 或 DA3 point cloud |
+| 3DGS | Reused | 复用 Video2Mesh GraphDECO `point_cloud_clean_strict.ply`，未做官方 PGSR/3DGS 重训 |
+| VLM / object discovery | Reused baseline | 使用 Video2Mesh baseline 的 GroundingDINO object prompts；不是新增 VLM 语义发现 |
+| SAM3 | Proxy | 本地/当前环境没有跑 SAM3，用 Video2Mesh 的 SAM2 masks 适配成 `sam3_masks_scannetppv2_new` |
+| 2D-to-3D lifting | Adapter route | 复用 Video2Mesh mask fusion / object bbox，再转换为 Holi-Spatial bbox schema |
+| AABB postprocess | Passed | 跑通官方 `postprocess_3d_bbox_aabb.py`，输出 17 个 bbox |
+| QA generation | Passed | 跑通官方 `generate_two_view_qa.py`，输出 15 条 QA |
+
+本地结果目录：
+
+```text
+/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/holi_spatial_runs/bedroom_4_holi_adapter_20260711_041347
+```
+
+本次统计：
+
+| 项 | 数量/大小 |
+|---|---:|
+| frames | 80 |
+| GroundingDINO candidates | 104 |
+| GroundingDINO objects | 20 |
+| SAM2 objects / masks | 20 / 1600 |
+| fused 3D objects / points | 17 / 36,389 |
+| `mask_index.json` items | 1,360 |
+| AABB bbox instances | 17 |
+| QA records | 15 |
+| QA 类型 | `cam_translation` 8, `cam_rotation` 4, `object_distance` 1, `object_height_or_length` 1, `object_cross_direction` 1 |
+
+主要 PLY 输出：
+
+| 文件 | 格式/规模 | 可视化 QA 结论 |
+|---|---|---|
+| `ply/scene_mesh_tsdf_fusion_post.ply` | binary PLY, 94,249 vertices, 190,085 faces, 约 3.4-4.3MB | 网格与 Video2Mesh baseline / COLMAP Delaunay mesh 几乎一致，床、墙、柜体的大体结构可辨认，但三角面粗糙、噪声多，没有体现 Holi-Spatial 官方几何优化收益 |
+| `ply/holi_point_cloud.ply` | binary little endian PLY, 966,618 vertices, 约 229MB | 与原 GraphDECO/3DGS 重建类似，仍有大量拉丝、漂浮 splats、高亮伪影和外扩结构；适合记录为复用 3DGS 源资产，不适合作为质量提升结果 |
+| `ply/semantic_splats.ply` | ASCII PLY, 966,618 vertices, 额外包含 `object_id` 和 `object_probability`，约 668MB | 文件太大且是 ASCII；普通 SuperSplat 打开会卡死/崩溃，常规 viewer 也看不到语义着色或语义交互信息，因此当前不适合作为可交互展示资产 |
+
+![Holi-Spatial adapter mesh QA](../assets/holi-spatial-bedroom4-adapter-mesh-baseline-like.png "2026-07-11 `scene_mesh_tsdf_fusion_post.ply` QA：几何形态与 Video2Mesh baseline mesh 接近，结构可辨认但噪声和粗三角面明显")
+
+![Holi-Spatial adapter 3DGS artifacts](../assets/holi-spatial-bedroom4-adapter-3dgs-artifacts.png "2026-07-11 `holi_point_cloud.ply` / semantic splat 视图 QA：画面存在大面积高亮拖影、漂浮 splats 和外扩伪影")
+
+这次真正补齐的是 **adapter 输出的可视化 QA**，不是完整 Holi-Spatial 质量提升。`semantic_splats.ply` 虽然把语义字段挂到了 Gaussian 顶点上，但它目前只是数据层 sidecar 的粗基线；SuperSplat 不会自动把 `object_id` / `object_probability` 显示成可解释语义，而且 668MB ASCII PLY 会让浏览器端加载不可用。下一步需要单独做 viewer-safe 的语义导出：例如按 object / probability 过滤和降采样、转 binary PLY 或 compressed splat、生成独立 semantic palette sidecar，并在 Web viewer 中显式支持按 `object_id` 着色/筛选。
+
 ### 已完成和未完成
 
 | 状态 | 内容 |
@@ -382,6 +430,6 @@ QA 类型分布：
 
 ## 2026-07-11 当前状态
 
-本周 Holi-Spatial 仍处在部署与适配阶段。已经确认 Video2Mesh 的 `bedroom_4` 现有 frames、cameras、object masks 和 3D bbox 可以被整理成 Holi-Spatial 风格 run package，并跑通官方 AABB postprocess 与 object-only two-view QA；但 DA3 depth、PGSR official retraining、SAM3 mask inference、Qwen/VLM object discovery 和 instance caption 都还没有跑。
+本周 Holi-Spatial 仍处在部署与适配阶段。已经确认 Video2Mesh 的 `bedroom_4` 现有 frames、cameras、object masks 和 3D bbox 可以被整理成 Holi-Spatial 风格 run package，并跑通官方 AABB postprocess 与 object-only two-view QA；7 月 11 日 adapter 还生成了 `scene_mesh_tsdf_fusion_post.ply`、`holi_point_cloud.ply` 和 `semantic_splats.ply` 三类 3D 输出。但可视化 QA 结论比较保守：mesh 基本等同 Video2Mesh baseline，`holi_point_cloud.ply` 与原始 3DGS 重建类似且伪影很多，`semantic_splats.ply` 因 668MB ASCII PLY 太大导致 SuperSplat 打开卡死，并且普通 viewer 看不到语义信息。
 
-因此当前适合写成“schema smoke run / 空间 QA 适配成功”，不适合写成“完整复现 Holi-Spatial”。后续优先级是加 QA verifier 和 VLM evaluation，把这 24 条 QA 从静态产物变成可比较的空间推理评测样本。
+因此当前适合写成“schema smoke run / 空间 QA 适配成功 + 输出质量已审计”，不适合写成“完整复现 Holi-Spatial”。后续优先级是加 QA verifier、VLM evaluation、semantic splat viewer-safe export 和语义着色/筛选 viewer，把这批 QA 与 semantic PLY 从静态产物变成可比较、可查看的空间推理评测样本。
