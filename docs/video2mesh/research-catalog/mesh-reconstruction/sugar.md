@@ -69,11 +69,11 @@ SuGaR 的 mesh extraction 不是直接把 Gaussian center 连起来，也不是�
 
 ## bedroom_4 实测观察
 
-这次用 `bedroom_4` 片段跑通后，最有价值的结论是：SuGaR 的 refined PLY / Gaussian 视觉层已经有可用质量，但从它抽出来的 mesh 还不能直接当 Video2Mesh 的 visual mesh 或 collider。局部房间结构、床、窗、墙面和地板在 refined PLY 里都能被看出来，虽然仍有漂浮片、墙面糊成片和窗口高亮拉丝，整体已经明显比纯稀疏点云更像一个可检查的室内场景。
+这次用 `bedroom_4` 片段跑通后，最有价值的结论是：SuGaR 的 refined PLY / Gaussian 视觉层已经有可用质量，mesh 重建在关闭 backface culling 或改成 double-sided 后观感也不错。局部房间结构、床、窗、墙面和地板都能被看出来，整体已经明显比纯稀疏点云更像一个可检查的室内场景。
 
-![SuGaR bedroom_4 本周对比视角](../assets/weekly-sugar-refined-ply.png "本周 viewer 对比中，SuGaR refined PLY 明显少于原版 3DGS 的远处漂浮伪影，但墙面和薄结构仍有破碎")
+![SuGaR bedroom_4 double-sided mesh 新视角](../assets/sugar-bedroom4-double-sided-mesh-new-view.png "double-sided / disabled backface culling 后，房间主体结构更完整，床、窗和墙面都能看清；主要问题是顶部、墙边、窗边和地面边界的新视角空洞")
 
-和原版 GraphDECO 3DGS 对比时，SuGaR 的取舍很明显：原版 3DGS 渲染质量最好，但新视角下有大量拉丝、远处漂浮物和异常包围盒；SuGaR 去掉了不少远处伪影，Gaussian 更贴近表面，也可以抽 mesh，但新视角下墙体、窗边和薄片结构仍然破碎。因此它更适合作为 high-quality visual / mesh benchmark，而不是当前 P0 主 visual layer 或 collider。
+和原版 GraphDECO 3DGS 对比时，SuGaR 的取舍很明显：原版 3DGS 渲染质量最好，但新视角下有大量拉丝、远处漂浮物和异常包围盒；SuGaR 去掉了不少远处伪影，Gaussian 更贴近表面，也可以抽出可看的 mesh。更准确的限制是：它比默认 COLMAP dense / TSDF / Poisson 路线更容易暴露 3DGS-to-mesh 的新视角空洞，未扫描到或约束不足的区域会出现孔洞、薄片和碎片。因此它更适合作为 high-quality visual / mesh benchmark，而不是当前 P0 主 collider。
 
 本次关键输出：
 
@@ -87,13 +87,11 @@ SuGaR 的 mesh extraction 不是直接把 Gaussian center 连起来，也不是�
 
 ![SuGaR bedroom_4 refined PLY 斜侧视角](../assets/sugar-bedroom4-refined-ply-oblique.png "换到斜侧视角后，refined PLY 的房间外壳仍较完整，说明 Gaussian 视觉层本身有继续优化和作为展示 baseline 的价值")
 
-真正的问题出在 mesh：从一个外侧/特定方向看，mesh 外壳显得还比较完整；但是把视角切到室内方向后，大片表面会碎裂、消失或只剩零散三角片。这不是单纯“几何不够细”的问题，更像 mesh triangle winding / normal 朝向 / 单面材质可见性出了问题：如果查看器启用了 backface culling，朝向反了的室内墙面、床面和窗边面片会被剔掉，于是图三里看起来像正反弄反了，室内视角变得很碎甚至不显示。
+最初对 mesh 的负面判断有一部分来自查看方式：从一个外侧/特定方向看，mesh 外壳显得还比较完整；把视角切到室内方向后，大片表面会碎裂、消失或只剩零散三角片。这更像 mesh triangle winding / normal 朝向 / 单面材质可见性与 backface culling 叠加造成的误判：如果查看器启用了 backface culling，朝向反了的室内墙面、床面和窗边面片会被剔掉，于是图里看起来像正反弄反了，室内视角变得很碎甚至不显示。
 
 ![SuGaR bedroom_4 mesh 正反面问题](../assets/sugar-bedroom4-mesh-backface-issue.png "bedroom_4 mesh：从室内视角看大量面片被剔除或碎裂，疑似 winding/normal 朝向与 one-sided rendering 组合导致的正反面问题")
 
-把 mesh 改成 double-sided 之后，backface culling 引起的“室内视角看不见背面”问题基本缓解，床、窗、墙和房间外壳的整体观感比单面 mesh 好很多。这个版本说明 SuGaR mesh 的几何主体不是完全失败，作为 visual mesh baseline 是有价值的。
-
-![SuGaR bedroom_4 double-sided mesh 新视角](../assets/sugar-bedroom4-double-sided-mesh-new-view.png "double-sided mesh 后，房间主体结构更完整，床、窗和墙面都能看清；但顶部、墙边、窗边和地面边界仍有大量孔洞和碎片")
+把 mesh 改成 double-sided，或者在查看器里关闭 backface culling 之后，“室内视角看不见背面”的问题基本缓解，床、窗、墙和房间外壳的整体观感比单面 mesh 好很多。这个版本说明 SuGaR mesh 重建质量其实不错，作为 visual mesh baseline 是有价值的。
 
 但这个修复没有解决 3DGS-to-mesh 的核心问题：新视角里没有扫描到或没有足够多视角约束的区域仍然是空洞。图里顶部墙面、床头上方、窗框附近、右侧外墙和地面边界都出现破洞、薄片和漂浮碎片。refined PLY 的点云/高斯视觉层质量仍然可以，照片视角附近比 mesh 更自然；但当视角移动到训练/扫描覆盖之外，未观测区域同样会显露缺口和拉丝。
 

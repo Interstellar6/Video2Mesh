@@ -22,11 +22,11 @@ visibility: public
 | 阶段 | 子目录 | 主要关注 |
 |---|---|---|
 | 输入、位姿与点云 | [input-pose-pointcloud](input-pose-pointcloud/overview.md) | COLMAP、MASt3R/DUSt3R/VGGT、MVS、稠密点云、尺度和坐标合同 |
-| 视觉重建 / 3DGS | [visual-3dgs](visual-3dgs/overview.md) | GraphDECO 3DGS、Spark、SuperSplat、3DGS 作为 visual proxy |
+| 视觉重建 / 3DGS | [visual-3dgs](visual-3dgs/overview.md) | GraphDECO 3DGS、AnySplat、DepthSplat、Spark、SuperSplat、3DGS 作为 visual proxy |
 | Mesh 重建 | [mesh-reconstruction](mesh-reconstruction/overview.md) | COLMAP Delaunay、Poisson/Open3D、GS2Mesh、SuGaR、2DGS/GOF、GenRecon |
 | 点云/背景补全 | [pointcloud-completion](pointcloud-completion/overview.md) | 点云清理、背景 clean plate、inpainting、场景结构补全 |
 | 物体 Mesh 补全 | [object-mesh-completion](object-mesh-completion/overview.md) | Hunyuan3D、Meshy、TRELLIS、InstantMesh、Restore3D、image-blaster object jobs |
-| 语义与 Scene Graph | [semantic-scene-graph](semantic-scene-graph/overview.md) | SAM/Grounded-SAM、2D-to-3D fusion、semantic splats、face sidecar |
+| 语义与 Scene Graph | [semantic-scene-graph](semantic-scene-graph/overview.md) | SAM/Grounded-SAM、Holi-Spatial、2D-to-3D fusion、semantic splats、face sidecar |
 | Collider 与物理代理 | [collider-physics-proxy](collider-physics-proxy/overview.md) | static collider、primitive proxy、convex decomposition、Rapier/Unity collision |
 | 物体仿真 | [object-simulation](object-simulation/overview.md) | rigid body、soft body、PhysSplat/Sim Anything、动态 Gaussian |
 | 工业资产管线 | [industrial-pipelines](industrial-pipelines/overview.md) | SimFoundry、World Labs / Icare、image-blaster、Spark viewer、GLB runtime asset convention |

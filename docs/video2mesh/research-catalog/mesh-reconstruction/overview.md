@@ -26,7 +26,7 @@ Mesh 重建不能只问“哪个方法画面最好”，还要区分目标：场
 | Open3D Poisson / BPA | 点云 + normals 到 watertight-ish mesh 的自动化 baseline | baseline / fallback / debug | 对 3DGS center point cloud 容易生成壳状伪影和漂浮面 |
 | CloudCompare / PoissonRecon | 点云人工检查、法线估计、Poisson 建面工具链 | 人工检查和传统建面对照 | 快速可视化好用，但不应直接作为唯一生产路线 |
 | GS2Mesh | 从训练后 3DGS 渲染 stereo/multiview，再估深并 TSDF fusion | P1/P2 object visual mesh benchmark | 思路比直接 Gaussian center 连面更合理；raw mesh 很大，需减面和清理 |
-| SuGaR | surface-aligned Gaussians + mesh extraction + editable mesh | P2 高质量 visual mesh 对照 | 需要额外环境和优化，短期不放进 P0 主链路 |
+| SuGaR | surface-aligned Gaussians + mesh extraction + editable mesh | P2 高质量 visual mesh 对照 | double-sided / 关闭 backface culling 后 mesh 主体效果不错；新视角未扫描区域仍有 3DGS-to-mesh 空洞 |
 | 2DGS / GOF | 从 Gaussian 表面约束角度改训练或优化形式 | P2/P3 研究升级 | 有潜力减少后处理 mesh 问题，但工程替换成本高 |
 | GenRecon | 将 Trellis.2 生成先验扩展到场景级，从 posed RGB images 和 sparse point cloud 生成完整 PBR mesh | P2/P3 生成式场景 visual mesh / PBR asset 对照 | 很适合补 Video2Mesh 的高质量 visual layer，但不应短期替代 P0 collider |
 | Neural SDF / NeuS / VolSDF | 神经隐式表面重建 | P3 离线高质量资产 | 训练成本高，和当前 3DGS 主链路并行成本大 |

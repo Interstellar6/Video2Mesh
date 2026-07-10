@@ -58,6 +58,29 @@ scan video
 
 GenRecon 可以补上当前链路里最弱的一块：**场景级完整、可编辑、带材质的 visual mesh**。如果未来要从“可碰撞场景”进一步升级到“可编辑 PBR 场景资产”，它是值得重点跟踪的路线。它的输入已经假设有相机位姿和 sparse point cloud，这与 Video2Mesh 的 COLMAP/MASt3R-SLAM 前端比较匹配。
 
+## bedroom_4 实测结果：能跑出模型，但真实性不足
+
+这周把 GenRecon 部署起来后，做了两类实验：一类是将 Video2Mesh 的 `bedroom_4` 片段整理成 bed-focused 输入；另一类是跑官方 SAGE-10k 小场景复现，用来排除“只是我们参数或视角太少”的问题。
+
+`bedroom_4` final run 的输入是 24 个 bed-heavy frames，iPhone two-crop 扩成 48 张 scene images；点云选择 300,000 points，其中 bed semantic points 约 204,000，context points 约 96,000。输出包包含 `mesh.ply`、`clean_points.ply`、`scene.glb`、两个 chunk GLB、chunk layout、cond2d 图和日志。
+
+| 产物 | 大小 / 数量 | 说明 |
+|---|---:|---|
+| `mesh.ply` | 53,947,019 bytes，1,179,479 vertices / 2,516,622 faces | 场景级 mesh 输出 |
+| `clean_points.ply` | 3,559,014 bytes，296,571 points | 清理后的点云 |
+| `scene.glb` | 183,726,232 bytes | 整场景 GLB |
+| `chunk_000.glb` / `chunk_001.glb` | 97,788,468 / 85,938,044 bytes | 两个 chunk 的 GLB |
+
+![GenRecon bedroom_4 输出视角一](../assets/genrecon-bedroom4-output-no-bed-front.png "GenRecon bedroom_4 输出：地板、墙片和柜体等局部生成出来了，但核心床主体没有正常重建")
+
+![GenRecon bedroom_4 输出视角二](../assets/genrecon-bedroom4-output-oblique.png "从斜侧视角看，输出更像生成式拼块：墙片、窗、柜体和地板存在，但床缺失且结构漂浮破碎")
+
+定性结果比较差：生成出的场景和原始 `bedroom_4` 差别很大，最关键的床目标没有正常重建出来，只剩一些墙片、柜体、窗、地板和漂浮/破碎物体。这个问题不能简单归因于“床没有被输入覆盖”，因为输入本身已经是 bed-focused，且 bed semantic points 占比较高。
+
+官方小场景复现也说明 GenRecon 更偏生成式场景资产路线。SAGE-10k 小场景 `aec38adc` 用官方默认 `num_imgs_per_scene=32`、`seed=42`、`pipeline=512` 跑通，输出 `mesh.ply` 约 169MB、`scene.glb` 约 311MB、4 个 chunk GLB；另一个较大官方场景 `e9121011` 渲染了 160 images，但 full-scene inference 产生 80 chunks，并在 31.47 GiB GPU 上 `joint_decode_shape` OOM。
+
+因此，GenRecon 当前可以保留为 P2/P3 的生成式 visual mesh / PBR asset 对照，但不进入 P0/P1 主链路。对 Video2Mesh 近期目标来说，它不能替代 GraphDECO 3DGS，也不能替代 COLMAP Delaunay collider，更不能把它的补全结果当作真实场景几何。
+
 ## 接入位置
 
 ```text

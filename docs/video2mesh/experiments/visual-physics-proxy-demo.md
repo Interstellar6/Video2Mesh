@@ -45,6 +45,18 @@ tags:
 
 图四显示 demo 已能表达分层代理思想：用户看到视觉场景，但实际交互可绑定到碰撞代理。下一步应把 formal semantic mesh 的 face sidecar 接进去，让点击 collider 后能返回 object id、label、material 和可交互属性。
 
+## 2026-07-11 更新
+
+本周对 demo 的定位进一步明确为三个代理/层次：
+
+| 层 | 职责 |
+|---|---|
+| 视觉代理 | 负责 3DGS、splat 或 visual mesh 的前端展示 |
+| 碰撞代理 | 负责 mesh collider / primitive proxy、raycast、ground probe 和 movement blocking |
+| scene graph / semantic sidecar | 负责 object id、label、material、关系、affordance，以及点云/mesh face 的语义索引 |
+
+这个边界避免把 3DGS 当作 collider，也避免把语义强行塞进会被简化或替换的 mesh。后续 demo 应优先接真实 `simulator_asset_bundle.json`、semantic splats / mesh face sidecar 和 object-level GLB，而不是只展示单一模型。
+
 ## 接入判断
 
 - P0：作为架构验证，不阻塞重建主线。

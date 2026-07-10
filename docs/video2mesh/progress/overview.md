@@ -4,7 +4,7 @@ id: video2mesh-progress-overview
 doc_type: overview
 category: 进度目录
 visibility: public
-summary: Video2Mesh 当前 P0/P1 进度、周报和实验结果入口。
+summary: Video2Mesh 当前 P0/P1 进度、周报、高质量重建路线探索和实验结果入口。
 tags:
   - Progress
   - Weekly
@@ -23,4 +23,5 @@ tags:
 | 文档 | 内容 |
 |---|---|
 | [P0/P1 模块优先级](p0-p1-priority.md) | 当前路线、下一步、风险和验收标准 |
+| [2026-07-11 周报](weekly-2026-07-11.md) | 高质量 3DGS/mesh 路线、SimFoundry 资产六件套、GenRecon/Holi-Spatial 部署和 demo 更新 |
 | [2026-07-03 周报](weekly-2026-07-03.md) | 本周调研、mesh 实验、语义 mesh 新结果和下周计划 |
