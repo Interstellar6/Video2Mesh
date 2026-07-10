@@ -1,37 +1,84 @@
 ---
-title: VGGT bedroom_4 no-cap 点云对比
-id: video2mesh-input-pose-pointcloud-vggt-bedroom4-no-cap-pointclouds
+title: VGGT
+id: video2mesh-input-pose-pointcloud-vggt
 category: 调研目录
 research_stage: input-pose-pointcloud
 visibility: public
-summary: 记录 bedroom_4 clean31 片段上取消 30 万点 cap 后导出的 VGGT world-points 与 depth-unproject 两种全 valid-region 点云，比较生成路径、字段、质量和后续接入边界。
+summary: VGGT 是 feed-forward 几何模型，可从单张、少量或多视图图像预测相机、深度、point maps 和 3D tracks；本页合并记录 bedroom_4 clean31 取消 30 万点 cap 后的 world-points 与 depth-unproject 点云实测。
 tags:
   - 输入、位姿与点云
   - VGGT
+  - Feed-forward 3D Reconstruction
   - Point Cloud
-  - SuperSplat
   - bedroom_4
   - Research Catalog
 ---
 
-# VGGT bedroom_4 no-cap 点云对比
+# VGGT
 
 ![SuperSplat 叠加检查](../assets/vggt-bedroom4-no-cap/supersplat-world-and-depth-overlay-01.png "两个 no-cap VGGT 点云在 SuperSplat 中叠加查看：房间主体、床、窗、墙面和地板大结构基本对齐，但前景/边界区域仍有漂浮点和薄片化。")
 
 ## 链接
 
-- 关联方法页：[MASt3R / DUSt3R / VGGT](mast3r-dust3r-vggt.md)
-- 关联扩展模型页：[VGGT-Omega](vggt-omega.md)
-- 本地 run 根目录：`/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/bedroom_4_clean31_vggt_no_point_cap_20260711_012753`
-- 远端 run 根目录：`/data/zyx/workspace/vggt_runs/bedroom_4_clean31_vggt_no_point_cap_20260711_012753`
+- Project: https://vgg-t.github.io/
+- GitHub: https://github.com/facebookresearch/vggt
+- Paper: https://arxiv.org/abs/2503.11651
+- 扩展模型页：[VGGT-Omega](vggt-omega.md)
+- 同阶段方法：[MASt3R](mast3r.md)、[DUSt3R](dust3r.md)
+- 本地 bedroom_4 no-cap run：`/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/bedroom_4_clean31_vggt_no_point_cap_20260711_012753`
+- 远端 bedroom_4 no-cap run：`/data/zyx/workspace/vggt_runs/bedroom_4_clean31_vggt_no_point_cap_20260711_012753`
 
 ## 一句话结论
 
-这两个点云质量都不错，是因为它们来自同一次 VGGT-1B 推理、同一批 31 张 bedroom_4 有效图像区域、同一套 RGB 采样，并且都取消了旧导出里的 30 万点上限。差别不在视觉纹理，而在 **3D 坐标生成路径**：`world_points` 使用模型直接预测的全局 point map；`depth_unproject` 使用模型深度、相机内外参和像素坐标反投影得到 3D 点。
+VGGT 是 feed-forward 几何模型，目标是从单张、少量或大量视图中一次性预测 camera、depth、point maps 和 3D point tracks。它很适合放在 Video2Mesh 的 **输入、位姿与点云阶段**：作为 COLMAP 失败时的 camera/depth/point cloud fallback，也可以给 GraphDECO 初始化、mesh depth fusion 和弱纹理片段 QA 提供先验。
 
-实际观察上，`depth_unproject` 更像相机/深度合同下的几何审计版本，置信度中位数更高、Z 方向包围盒略短；`world_points` 更接近模型直接给出的世界点图，Z 方向范围更大，边界/遮挡处会保留一些 point-map 自身的偏差。二者都还不是训练优化后的 GraphDECO 3DGS，也不是可直接用于碰撞的 mesh。
+本项目 bedroom_4 clean31 实测说明：取消旧导出里的 30 万点上限、只保留 valid image-region 后，VGGT `world_points` 和 `depth_unproject` 两份 4,656,820 点 RGB PLY 都能恢复出比较完整的卧室主体结构。它们质量都不错，但仍然只是点云，不是训练后的 3DGS，也不是可直接碰撞的 mesh。
 
-## 本次 run 背景
+## 摘要要点
+
+VGGT 和 MASt3R / DUSt3R 都属于 learned geometry，但工作重心不同：
+
+| 方法 | 更偏向 | 对 Video2Mesh 的主要价值 |
+|---|---|---|
+| [DUSt3R](dust3r.md) | 从图像对预测 3D point maps | COLMAP 失败时的 point-map / pose prior |
+| [MASt3R](mast3r.md) | 3D grounded matching | 更稳的 matching、SfM/SLAM helper |
+| VGGT | 多视图 feed-forward camera/depth/points/tracks | 快速预测相机、深度和稠密点云候选 |
+
+VGGT 的工程价值是降低对传统特征匹配和 bundle adjustment 的依赖。它的工程风险也来自这里：输出坐标系、尺度、置信度、相机 convention 和 COLMAP/GraphDECO 生态并不天然等价，必须通过项目自己的转换和 QA 层接回主链路。
+
+## Pipeline
+
+```text
+video frames / selected images
+  -> VGGT feed-forward inference
+  -> predicted cameras / depth / world point maps / point tracks / confidence
+  -> route A: direct world-points point cloud
+  -> route B: depth + camera unprojection point cloud
+  -> QA: scale, reprojection, bbox, confidence, viewer inspection
+  -> optional: COLMAP-like export / GraphDECO initialization / mesh fusion input
+```
+
+| 阶段 | 作用 | Video2Mesh 消费方式 |
+|---|---|---|
+| Multi-view inference | 一次性预测相机、深度、点图和 tracks | 生成 learned geometry prior |
+| World point map export | 直接读取模型预测的世界点图 | 诊断模型认为每个像素对应哪里 |
+| Depth unprojection | 用模型深度和相机把像素反投影 | 更贴近 camera/depth 合同，便于 mesh fusion |
+| Point cloud QA | 统计点数、bbox、confidence、漂浮点和重影 | 决定是否接后续优化/融合 |
+| Downstream conversion | 转成 GraphDECO、TSDF、Poisson、Delaunay 候选输入 | 不能跳过坐标和尺度审计 |
+
+## 输入与输出
+
+输入是图像集合或视频抽帧。输出应分层保存，避免把不同用途的 PLY 混成一个“最终资产”：
+
+| 输出 | 含义 | 是否最终资产 |
+|---|---|---|
+| predicted cameras | 模型估计的相机参数 | 否，需要 scale/convention QA |
+| depth / depth confidence | 每帧 learned depth 和置信度 | 否，可作为 fusion prior |
+| world point maps | 模型直接预测的全局点图 | 否，可导出 RGB point cloud |
+| depth-unprojected point cloud | camera + depth 反投影点云 | 否，可作为 mesh 输入候选 |
+| viewer Gaussian wrapper | 为 SuperSplat/3DGS viewer 包装的字段 | 否，不是训练 3DGS |
+
+## bedroom_4 no-cap 实测背景
 
 本次实验针对 `bedroom_4` clean31 片段重新跑 VGGT inference，核心修复是取消旧导出的 `top300k` 点数上限，并只导出有效图像区域。旧 `top300k` 文件按 confidence 截取，容易过度选择局部高置信表面，而且没有 valid image-region mask，可能混入方形 padding 区域几何。
 

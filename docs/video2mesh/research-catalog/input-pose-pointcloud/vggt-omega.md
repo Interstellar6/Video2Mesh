@@ -122,7 +122,7 @@ camera_and_register_tokens = predictions["camera_and_register_tokens"]
 
 ## 和已有 VGGT / AnySplat 的关系
 
-已有 [MASt3R / DUSt3R / VGGT](mast3r-dust3r-vggt.md) 页把 VGGT 归为 learned pose/depth fallback。VGGT-Omega 应作为这个方向的升级版单独跟踪，因为它加入了动态场景、register attention、text alignment checkpoint 和更明确的 runtime memory 数据。
+已有 [VGGT](vggt.md) 页把 VGGT 归为 learned pose/depth fallback，并记录了 bedroom_4 clean31 上 no-cap 点云实测。VGGT-Omega 应作为这个方向的升级版单独跟踪，因为它加入了动态场景、register attention、text alignment checkpoint 和更明确的 runtime memory 数据。
 
 AnySplat 页面里提到使用 pretrained VGGT 作为 pseudo-geometry prior。VGGT-Omega 未来也可能扮演类似角色：先给 video frames 估相机和深度，再把这些几何线索交给前馈 3DGS 或 GraphDECO refinement。但这仍然属于 prior / initialization，不是最终 visual/collider asset。
 

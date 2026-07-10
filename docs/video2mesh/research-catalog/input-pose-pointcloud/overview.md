@@ -2,7 +2,7 @@
 title: 输入、位姿与点云阶段
 id: input-pose-pointcloud
 category: 调研目录
-summary: 调研从扫描视频获得相机、稠密点云和统一坐标系的模型与项目，包括 COLMAP、MASt3R/DUSt3R/VGGT 和 MVS。
+summary: 调研从扫描视频获得相机、稠密点云和统一坐标系的模型与项目，包括 COLMAP、MASt3R、DUSt3R、VGGT 和 MVS。
 tags:
   - Research Catalog
   - COLMAP
@@ -23,9 +23,9 @@ visibility: public
 |---|---|---|---|---|
 | COLMAP SfM/MVS | 经典摄影测量工具链，估计相机位姿、稀疏点云和稠密 workspace | 输入多帧图片，输出 cameras/images/points3D、dense fused point cloud | 当前最稳的 P0 位姿和 dense geometry 来源，能直接接 GraphDECO 3DGS、Delaunay mesher 和 Poisson baseline | 纹理弱、反光、重复图案时可能失败；需要较好帧覆盖 |
 | COLMAP dense stereo | 基于已知相机做 patch-match stereo 和 fusion | 输入 COLMAP sparse model，输出 fused.ply / dense workspace | 场景级 mesh/collider 的主输入，比直接使用 Gaussian center 更可靠 | 稠密点云仍会有空洞、噪声和漂浮点 |
-| MASt3R / DUSt3R | 学习式多视图几何，弱纹理/小基线下可作为传统 SfM 的补充 | 输入图像对或多视图，输出对应关系、深度/点云、相机关系 | 可作为 COLMAP 失败时的 pose/depth fallback，或为物体级 depth fusion 提供先验 | 输出坐标尺度和 COLMAP/3DGS 生态不完全一致，需要适配 |
-| VGGT 类 feed-forward 模型 | 端到端估计相机、深度、点云等 3D 表征 | 输入图片集合，输出 camera/depth/point map | 可作为快速预处理或弱纹理场景 fallback | 工程稳定性、尺度一致性和大场景鲁棒性需实测 |
-| [VGGT bedroom_4 no-cap 点云对比](vggt-bedroom4-no-cap-pointclouds.md) | 对本项目 bedroom_4 clean31 片段的 VGGT world-points 与 depth-unproject 全 valid-region 点云做实测对比 | 输入 31 帧 bedroom_4 图像，输出两份 4,656,820 点 RGB PLY 和 viewer-compatible Gaussian PLY 包装 | 说明取消 30 万点 cap 后点云质量明显改善，并区分模型 world point map 与 camera/depth 反投影路线 | 只是点云和 viewer wrapper，不是训练后的 3DGS 或可直接碰撞的 mesh |
+| [MASt3R](mast3r.md) | 学习式 3D grounded matching，弱纹理/小基线下可作为传统 SfM 的匹配补充 | 输入图像对或多视图，输出 dense matches、pose/track 辅助 | 可作为 COLMAP 失败时的 matching / pose fallback | 输出坐标尺度和 COLMAP/3DGS 生态不完全一致，需要适配 |
+| [DUSt3R](dust3r.md) | 直接从图像对预测 3D point maps，把深度、匹配和相机关系统一到 learned geometry 表示中 | 输入图像对或多视图，输出 point maps、depth、camera relation prior | 可作为 COLMAP 失败时的 point cloud / pose prior，或为物体级 depth fusion 提供先验 | pairwise 几何合并时可能有尺度漂移，不能直接当最终 mesh |
+| [VGGT](vggt.md) | 端到端估计相机、深度、点云和 3D tracks；已合并 bedroom_4 no-cap 点云实测 | 输入图片集合，输出 camera/depth/world points/depth-unproject point cloud | 可作为快速预处理或弱纹理场景 fallback；depth-unproject 更适合作为工程审计输入 | 只是 learned geometry prior，不是训练后的 3DGS 或可直接碰撞的 mesh |
 | [VGGT-Omega](vggt-omega.md) | 2026 年 VGGT 扩展版，加入 register attention、动态场景能力和 text-alignment checkpoint | 输入图片/视频帧，输出 camera、depth、depth confidence、register features | P1 learned geometry fallback、GraphDECO 初始化候选、动态视频 camera/depth prior | 权重需申请；输出不是标准 COLMAP workspace；scale/camera convention 必须审计 |
 | Open3D / CloudCompare 点云处理 | 点云过滤、法线估计、下采样、可视检查 | 输入 PLY/PCD，输出 cleaned point cloud / normals | 用于 mesh 前处理、debug 和人工检查 | 清理规则容易影响真实薄结构 |
 
