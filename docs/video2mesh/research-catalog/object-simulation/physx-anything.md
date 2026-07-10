@@ -200,6 +200,7 @@ bedroom_4 full room frame
 | Re-probe on 2026-07-11 | `/root/autodl-tmp/physx-anything-venv/bin/python` and `/opt/envs/max/bin/python` both timed out on a 25 second `torch import` smoke check; clean venv creation via system Python failed because Python 3.7 lacks `ensurepip`; clean venv creation via `/opt/envs/max/bin/python` produced a Python 3.7 venv without pip |
 | Weight size check | Hugging Face API reports `Caoza/PhysX-Anything` `usedStorage=39938791487` and `microsoft/TRELLIS-image-large` `usedStorage=3300497168`, so weights alone are about 43.24 GB before pip wheels, build cache, intermediate GLB/mesh outputs, and HF snapshot metadata |
 | SSH re-probe on 2026-07-11 | Local `ssh -G mil8` expands to `ProxyJump miljump`, `HostName localhost`, `Port 30013`; direct `ssh miljump` succeeds, `nc -vz localhost 30013` on the jump host reports the port open, but reading a banner from that port returns nothing and `ssh mil8` ends with `Connection timed out during banner exchange` |
+| FRP side evidence on 2026-07-11 | Both `mil8` and `8-3090` map to the same jump-host port `30013`; running `ssh -p 30013 root@localhost` on `miljump` also times out during SSH banner exchange. Jump-host port `8090` returns a Chinese "temporarily unavailable" safety-entry page, while FRP dashboard port `7500` is protected by Basic Auth. This leaves the current blocker outside the local repo: the AutoDL/FRP backend for port 30013 needs to recover before deployment can continue. |
 
 实测失败日志的关键点：
 
