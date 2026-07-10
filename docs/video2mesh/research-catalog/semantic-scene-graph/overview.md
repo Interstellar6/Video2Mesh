@@ -9,6 +9,7 @@ tags:
   - Scene Graph
   - SAM
   - SAM3
+  - SceneVerse++
 visibility: public
 ---
 
@@ -27,6 +28,7 @@ visibility: public
 | GroundingDINO / Grounded-SAM | 文本提示驱动检测 + mask | 开放词汇发现床、桌、椅、窗帘等对象 | 边界和类别稳定性需多帧融合 |
 | 2D-to-3D mask fusion | 将每帧 mask 投影/投票到 3D 点或 Gaussian | 生成 3D object masks、semantic/probability splats | 遮挡和深度误差会造成串色 |
 | [Holi-Spatial](holi-spatial.md) | 从 raw video 自动生成 3DGS、2D masks、3D bbox、caption、grounding 和 spatial QA | 给 Video2Mesh 增加空间 QA benchmark 和语义空间 sidecar schema | 完整链路重依赖 DA3/SAM3/PGSR/VLM；当前只完成 smoke run |
+| [SceneVerse++ / PQ3D / SpatialLM](sceneversepp-pq3d-spatiallm.md) | SceneVerse++ 中的 PQ3D 做 3D instance segmentation，SpatialLM 做 layout / object detection / structured indoor modeling | 接到 semantic sidecar、object bbox、scene graph 和 spatial QA 层，补结构化 3D scene understanding | 它们消费已有 `mesh.ply` / `metadata.json`，不是从视频生成 mesh 或 3DGS 的重建模型 |
 | Semantic splats | 给 3DGS/point cloud 携带 object probability | 支持可视化、hover、语义筛选和 mesh 回灌 | 不等同于 mesh face 语义 |
 | Mesh face sidecar | 按 triangle index 保存 label/probability/material/affordance | 点击 collider 后直接查 object_id 和交互属性 | mesh 简化/替换时需要重建索引或映射 |
 | Scene graph / VLM relation QA | 物体关系、支撑关系、可交互属性推理 | 给 simulator asset bundle 补 affordance、support、material | VLM 输出必须可复核 |
