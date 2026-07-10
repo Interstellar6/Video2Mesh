@@ -53,3 +53,11 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 ![视觉代理 3DGS + 碰撞代理 mesh Demo](assets/04-visual-physics-proxy-demo.png "Web demo 验证了 3DGS visual layer 与 mesh collision layer 可以分离")
 
 结论：该 demo 已验证最小架构闭环，后续应拆成 object-level collider，并接入 face/object semantics 和物理材质。
+
+## 实验六：SceneVerse++ / PQ3D bedroom_4 原始 Mesh
+
+[SceneVerse++ / PQ3D bedroom_4 原始 Mesh 结果归档](sceneversepp-pq3d-bedroom4.md) 记录了从 `mil8` 传回本地的原始 PQ3D / SpatialLM PLY。这里的重点是区分 mesh 和点云：semantic mesh 建模效果很好，床、墙面、柜体和大结构都能清楚辨认；但 SpatialLM 的 `bedroom_4.ply` 只是普通 XYZ 点云，只有 91,412 vertices，没有颜色、normal、语义或 Gaussian 字段。
+
+![SceneVerse++ / PQ3D bedroom_4 semantic mesh](assets/sceneversepp-pq3d-bedroom4-semantic-mesh.png "SceneVerse++ / PQ3D bedroom_4 semantic mesh：语义着色清楚，建模结果适合归档和展示；点云部分仍需后续提升")
+
+结论：mesh 值得作为 semantic scene understanding 结果保存；点云暂时只作为基础几何输入/检查，不应写成高质量 3DGS 或最终 visual layer。
