@@ -3,12 +3,14 @@ title: PGSR
 id: video2mesh-visual-3dgs-pgsr
 category: 调研目录
 visibility: public
-summary: PGSR 是面向表面重建的 Planar-based Gaussian Splatting；本页记录论文方法、官方代码、Holi-Spatial 用法，以及它在 Video2Mesh 中作为几何/mesh 升级候选的边界。
+summary: PGSR 是面向表面重建的 Planar-based Gaussian Splatting；本页记录论文方法、官方代码、Holi-Spatial 用法、Video2Mesh 接入边界，以及 bedroom_4 120 iter smoke 的真实 PLY/mesh 输出质量。
+updated: 2026-07-11
 tags:
   - 视觉重建与 3DGS
   - Surface-aware GS
   - Mesh Reconstruction
   - Holi-Spatial
+  - PGSR
   - Research Catalog
 ---
 
@@ -86,7 +88,7 @@ PGSR 生成几何的路径可以拆成三层：
 | DTU | Chamfer Distance mean，越低越好 | 0.47 | 0.5h |
 | Tanks and Temples | F1 mean，越高越好 | 0.51 | 45m |
 
-这些数字只说明 PGSR 在官方数据和 protocol 下的 surface reconstruction 能力，不等于 Video2Mesh `bedroom_4` 的本地指标。本次任务是调研和文档发布，没有实际重训 PGSR，也没有为 `bedroom_4` 计算 Chamfer、F-score、PSNR、SSIM 或 LPIPS。
+这些数字只说明 PGSR 在官方数据和 protocol 下的 surface reconstruction 能力，不等于 Video2Mesh `bedroom_4` 的本地指标。下面的 smoke 结果只验证了部署、训练、render 和 TSDF export 链路，不代表完整 PGSR 30k 训练质量。
 
 ## 安装与硬件需求
 
@@ -186,6 +188,49 @@ frames + cameras
 | P0 collider 主链路 | PGSR mesh 仍需碰撞 QA，不能天然保证 watertight、低面数、稳定接触 |
 | 全量 Holi-Spatial 批处理 | 依赖 DA3/SAM3/VLM/PGSR 多组件和大磁盘，不适合一口气塞进主 pipeline |
 | 直接替换 GraphDECO | 当前 Video2Mesh 已有 GraphDECO 资产和 viewer 合同；PGSR 要先做同场景 A/B QA |
+
+## bedroom_4 smoke 实测（2026-07-11）
+
+这次实际部署跑的是 **smoke test**，不是完整 PGSR 30k 训练，也不是 Holi-Spatial 官方全量复现。目标是确认 PGSR 能在 `mil8` 上安装、编译 CUDA extension、读取 `bedroom_4` 数据、训练出 Gaussian PLY，并从 rendered depth 导出 TSDF mesh。
+
+![PGSR bedroom_4 120 iter Gaussian PLY](../assets/pgsr-bedroom4-smoke-point-cloud-poor.png "Gaussian PLY：可见床和窗，但雾状 splats、漂浮团和外侧噪声明显")
+
+| 项目 | 真实配置 / 指标 |
+|---|---|
+| 远端环境 | `mil8`，PGSR repo `/data/zyx/workspace/third_party/PGSR`，venv `/data/zyx/workspace/pgsr_env`，复用 `/opt/envs/max` 的 Torch 2.2.2 + CUDA 12.1 |
+| 输入 | 80 张 `bedroom_4` 图像，采样 80,000 个真实 COLMAP 点 |
+| 训练 | 120 iterations；保存 `iteration_60` 和 `iteration_120`；几何项日志中已出现 `Single / Geo / Pho` |
+| smoke metric | iter 60: L1 0.1470 / train PSNR 16.37；iter 120: L1 0.1347 / train PSNR 17.70 |
+| 渲染产物 | 80 张 RGB render、80 张 depth、80 张 normal |
+
+`17.70 dB` 只是 120 iter train-view smoke 指标，不能当作 benchmark PSNR，也不能和完整 GraphDECO/PGSR 训练直接比较。
+
+### 主要产物
+
+| 产物 | 规模 | 本地路径 | 远端路径 | 视觉判断 |
+|---|---:|---|---|---|
+| Gaussian PLY | 97,381 vertices / 24,152,018 bytes | `tmp_remote_results/bedroom_4_pgsr_smoke_20260711_025236/full_assets/bedroom_4_pgsr_smoke_iter120_point_cloud.ply` | `output/point_cloud/iteration_120/point_cloud.ply` | 不太行：床、窗和部分家具轮廓可辨，但上半场景有大片黄褐色雾状 splats，右侧窗边和外侧有白色漂浮团，不能作为当前 visual layer 主资产。 |
+| TSDF fusion post mesh | 903,694 vertices / 1,703,876 faces / 46,550,396 bytes | `tmp_remote_results/bedroom_4_pgsr_smoke_20260711_025236/full_assets/bedroom_4_pgsr_smoke_tsdf_fusion_post.ply` | `output/mesh/tsdf_fusion_post.ply` | 一般般：床和窗的大结构保住了，后处理去掉了一部分碎片，但墙面、窗边、床边仍有薄片、粘连、破洞和漂浮面。 |
+| TSDF fusion raw mesh | 1,091,652 vertices / 1,975,303 faces / 55,153,814 bytes | `tmp_remote_results/bedroom_4_pgsr_smoke_20260711_025236/full_assets/bedroom_4_pgsr_smoke_tsdf_fusion_raw.ply` | `output/mesh/tsdf_fusion.ply` | 一般般：比 post 版本保留更多碎片和外侧漂浮面，细节更多但噪声也更多；保真度提高不等于可用度提高。 |
+
+### 截图证据
+
+![PGSR bedroom_4 TSDF fusion post mesh](../assets/pgsr-bedroom4-smoke-tsdf-post-fair.png "TSDF post mesh：主体可辨，但墙窗边和床边薄片、粘连、破洞仍明显")
+
+![PGSR bedroom_4 TSDF fusion raw mesh](../assets/pgsr-bedroom4-smoke-tsdf-raw-fair.png "TSDF raw mesh：保留更多细节，也保留更多漂浮面和外侧碎片")
+
+### 效果分析
+
+这次结果的正面意义是：PGSR 环境、训练、render、depth/normal 输出和 TSDF mesh export 都跑通了；几何项也确实进入训练日志，说明不是只跑了普通 3DGS fallback。
+
+问题同样明显：
+
+- 120 iter 远低于 PGSR/3DGS 常规收敛迭代数，Gaussian 还处在粗糙覆盖阶段。
+- 初始点云只采样了 80,000 个 COLMAP 点，足够 smoke，但不足以支撑稳定 room-scale 表面。
+- TSDF fusion 消费的是早期 rendered depth；depth 里一旦有雾状 Gaussian 或漂浮块，mesh 就会变成薄片、粘连和外侧碎片。
+- 后处理版 `tsdf_fusion_post.ply` 能减少一部分小碎片，但没有解决窗边、墙面和床边的系统性噪声。
+
+所以这次 smoke 只应该记为 **部署通过、质量未达可用线**。PGSR 可以继续留作 P1/P2 geometry-aware 3DGS 候选，但这三份 `bedroom_4` 120 iter 产物不应替换当前 GraphDECO visual layer，也不应进入 collider、navigation mesh 或 simulator physics body。
 
 ## 推荐实验路线
 
