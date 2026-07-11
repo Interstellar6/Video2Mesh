@@ -14,9 +14,9 @@ tags:
 
 # PhysX-Anything
 
-检查日期：2026-07-11
+检查日期：2026-07-11；最新续跑：2026-07-12
 
-当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，VLM/decoder/TRELLIS 权重已放在 `/root/autodl-tmp` 并软链到 repo 的 `pretrain/`。官方原版四步 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 仍未完整跑通：官方 `1_vlm_demo.py` 硬编码 `attn_implementation="flash_attention_2"`，而当前环境没有 `flash_attn`；debug wrapper 通过 PyTorch pytree shim 和 Qwen `sdpa` monkeypatch 已在 bedroom_4 bedside crop 上跑出 VLM 结构化物理描述和 part voxel。decoder 侧还没有产出可验证的 `sample.glb`、part mesh、URDF 或 XML；最新可核验证据是低纹理 debug run 停在 `TrellisImageTo3DPipeline.from_pretrained("./pretrain/decoder_abs_debug")`，分段加载 probe 也停在 `import torch`，mil8 负载升高且 `/data` 仍接近满盘。因此本页只把 VLM debug 结果记为通过，不把 bedroom_4 写成官方端到端跑通。
+当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，VLM/decoder/TRELLIS 权重已放在 `/root/autodl-tmp` 并软链到 repo 的 `pretrain/`。官方原版四步仍未完整通过：官方 `1_vlm_demo.py` 硬编码 `attn_implementation="flash_attention_2"`，而当前环境没有 `flash_attn`；官方 `2_decoder.py` 期望导出 textured `sample.glb`，本轮 debug decoder 在 GLB texture/postprocess 后段卡住，未生成官方质量 `sample.glb`。但 bedroom_4 bedside crop 已通过一条明确标注的 **debug/proxy chain**：VLM debug wrapper 生成结构化物理描述和 part voxel；decoder debug 生成 geometry OBJ；该 OBJ 转成 geometry-only proxy GLB 后，官方 `3_split.py` 和 `4_simready_gen.py` 已生成 part OBJ、`basic.urdf` 和 `basic.xml`。因此本页把它记为“bedroom_4 proxy sim-ready artifact generated”，不写成官方 textured decoder 端到端复现。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -206,7 +206,11 @@ bedroom_4 full room frame
 | Debug VLM result | 通过 pytree shim + Qwen `sdpa` monkeypatch，`bedroom_4_bedside_lamp_table_crop` 已生成 `basic_info.txt`、`coord_*.txt`、`ind_*.npy/.ply` 和 `allind.npy` |
 | PyTorch 2.4 attempt | A clean Python 3.10 venv at `/root/autodl-tmp/physx-anything-torch24-venv` was repaired, but downloading `torch==2.4.0+cu121` from `download.pytorch.org` was too slow and did not complete; the environment still has no `torch`, so the practical route remains the existing venv plus Qwen shim. |
 | Decoder config fix | 官方 decoder `pipeline.json` 的相对路径会触发 HFValidationError；debug copy `/root/autodl-tmp/physx-anything-decoder-abs-debug/pipeline.json` 已把子模型改成绝对路径 |
-| Decoder latest blocker | `decoder_lowtex_debug_run.log` 停在 `loading pipeline ./pretrain/decoder_abs_debug`；同一时段分段加载 probe `probe_pipeline_load.log` 停在 `import torch`，机器 load average 升至约 60；没有生成 `sample_lowtex.glb`、geometry OBJ 或官方 `sample.glb` |
+| Pipeline load re-probe | 2026-07-12 `TrellisImageTo3DPipeline.from_pretrained("./pretrain/decoder_abs_debug")` 用本地 DINOv2 cache 成功，`from_pretrained` 44.4 s，`.cuda()` 1.3 s |
+| Decoder debug result | low-texture debug run 成功完成 `run_control(formats=["mesh", "gaussian"])`，mesh `343214` vertices / `686376` faces，并导出 `/root/autodl-tmp/physx-anything-outputs/bedroom_4_bedside_lamp_table_crop/sample_lowtex_geometry.obj`，size `27499041` bytes |
+| Decoder GLB blocker | `postprocessing_utils.to_glb(..., texture_size=512)` 已完成 decimate、rasterizing、remove invisible faces，日志到 `After remove invisible faces: 148637 vertices, 297262 faces` 后长时间无输出；最终手动终止，没有生成 `sample_lowtex.glb` |
+| Proxy GLB | 用 geometry OBJ 导出 geometry-only `/root/autodl-tmp/physx-anything-outputs/bedroom_4_bedside_lamp_table_crop/sample_geometry_proxy.glb`，size `12355984` bytes，并软链为 `test_demo/bedroom_4_bedside_lamp_table_crop/sample.glb` 供官方 split 脚本读取 |
+| Split + simready proxy result | 官方 `3_split.py` 基于 proxy GLB 生成 `objs/0/0.obj`、`objs/1/1.obj`、`objs/2/2.obj`；官方 `4_simready_gen.py --voxel_define 32 --basepath ./test_demo --process 0 --fixed_base 0 --deformable 0` 生成 `basic_info.json`、`basic.urdf`、`basic.xml` |
 
 实测失败日志的关键点：
 
@@ -214,11 +218,12 @@ bedroom_4 full room frame
 ImportError: cannot import name 'Qwen2_5_VLForConditionalGeneration' from 'transformers'
 RuntimeError: register_pytree_node() got an unexpected keyword argument 'flatten_with_keys_fn'
 1_vlm_demo.py: attn_implementation="flash_attention_2" but flash_attn is not installed
-2_decoder.py / debug wrapper: loading pipeline ./pretrain/decoder_abs_debug
-probe_pipeline_load.py: [load-probe] import torch
+2_decoder.py official textured sample.glb: not verified
+low-texture debug: to_glb reached "After remove invisible faces" but did not export GLB
+geometry-only proxy GLB: used only to validate split and simready stages
 ```
 
-我没有把这个状态写成“官方跑通”。当前完成的是源码部署、环境审计、权重就位、bedroom_4 单物体 crop 准备、debug VLM 输出验证；尚未完成 decoder GLB、part split、URDF/XML 和仿真 smoke test。
+我没有把这个状态写成“官方 textured decoder 跑通”。当前完成的是源码部署、环境审计、权重就位、bedroom_4 单物体 crop 准备、debug VLM 输出、debug geometry decoder、proxy split、proxy URDF/XML；尚未完成官方 `flash_attention_2` VLM、official `2_decoder.py` textured `sample.glb`、以及真实 simulator smoke test。
 
 ## bedroom_4 smoke input
 
@@ -258,10 +263,12 @@ probe_pipeline_load.py: [load-probe] import torch
 |---|---|---|
 | `1_vlm_demo.py` official | Blocked | 官方代码第 146 行硬编码 `attn_implementation="flash_attention_2"`；当前 venv 没有 `flash_attn` |
 | VLM debug wrapper | Passed | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/` 已生成 `basic_info.txt`、`coord_0..2.txt`、`ind_0..2.npy/.ply`、`allind.npy` |
-| `2_decoder.py` official | Not passed | 默认 decoder 会导出 `sample.glb`，但当前目录没有 `sample.glb` |
-| Decoder low-texture debug | Blocked | `/root/autodl-tmp/physx-anything-outputs/decoder_lowtex_debug_run.log` 停在 `loading pipeline ./pretrain/decoder_abs_debug`；未生成 `sample_lowtex.glb` 或 `sample_lowtex_geometry.obj` |
-| `3_split.py` | Not run | 需要 `sample.glb`，目前没有可验证 GLB |
-| `4_simready_gen.py` | Not run | 需要 part mesh `objs/`，目前没有可验证 part mesh |
+| `2_decoder.py` official | Not passed | 官方脚本默认 textured `sample.glb` 尚未验证通过 |
+| Decoder low-texture debug | Partial passed | `run_control` 生成 mesh `343214` vertices / `686376` faces；geometry OBJ 已导出；textured GLB export 卡在后处理末段 |
+| Geometry-only proxy GLB | Passed as proxy | `sample_geometry_proxy.glb` 由 geometry OBJ 转出，12 MB，并软链为 `test_demo/.../sample.glb` |
+| `3_split.py` official on proxy GLB | Passed as proxy | 生成 3 个 part OBJ：board-like `0.obj`、tiny `1.obj`、vase-like `2.obj` |
+| `4_simready_gen.py` official on proxy split | Passed as proxy | 生成 `basic_info.json`、`basic.urdf`、`basic.xml`；XML/URDF 已解析验证，OBJ 引用均存在 |
+| Simulator smoke test | Not tested | 尚未用 MuJoCo/PyBullet 实际加载或仿真 |
 
 VLM 对 bedside crop 的结构化理解如下：
 
@@ -285,7 +292,20 @@ VLM 对 bedside crop 的结构化理解如下：
 | `ind_1.npy` / table_base | `(435, 3)` | `int64` | `[2, 17, 1]` | `[30, 31, 1]` |
 | `ind_2.npy` / vase | `(92, 3)` | `int64` | `[14, 14, 15]` | `[19, 20, 18]` |
 
-这个结果说明 VLM 已能把 bedroom_4 crop 转成可被 decoder 使用的 coarse physical representation；但它把复杂 crop 理解成“桌子+花瓶”，没有恢复台灯/床头柜的真实语义，也没有经过 decoder、split 和 simulator QA。因此它只能算 **bedroom_4 crop 的 VLM smoke pass**，不能算 sim-ready asset pass。
+decoder / split / simready 的 proxy 产物如下：
+
+| 产物 | 路径 | 大小/规模 | 说明 |
+|---|---|---|---|
+| Geometry OBJ | `/root/autodl-tmp/physx-anything-outputs/bedroom_4_bedside_lamp_table_crop/sample_lowtex_geometry.obj` | `27499041` bytes；`343214` V / `686376` F；not watertight | debug decoder mesh 输出，未带官方 texture |
+| Proxy GLB | `/root/autodl-tmp/physx-anything-outputs/bedroom_4_bedside_lamp_table_crop/sample_geometry_proxy.glb` | `12355984` bytes | geometry-only GLB，用于喂给官方 `3_split.py`；不是官方 textured `sample.glb` |
+| Part 0 OBJ | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/objs/0/0.obj` | `336794` V / `673544` F；`27207161` bytes | 主体几何，吸收了绝大多数 faces |
+| Part 1 OBJ | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/objs/1/1.obj` | `24` V / `27` F；`1231` bytes | 很小，说明 crop/VLM/proxy split 的 part 质量不稳定 |
+| Part 2 OBJ | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/objs/2/2.obj` | `6415` V / `12805` F；`445593` bytes | vase-like 子部件 |
+| URDF | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic.urdf` | `2233` bytes | XML parser 通过，引用 3 个 OBJ 均存在 |
+| MJCF/XML | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic.xml` | `2847` bytes | root 为 `mujoco`，引用 3 个 OBJ 均存在 |
+| Structured JSON | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic_info.json` | `1576` bytes | 由 `basic_info.txt` 转换出的结构化物理描述 |
+
+这个结果说明 VLM 已能把 bedroom_4 crop 转成 coarse physical representation，debug decoder 能产出可分割几何，官方 split/simready 代码也能在 geometry-only proxy GLB 上走到 URDF/XML。但它把复杂 crop 理解成“桌子+花瓶”，没有恢复台灯/床头柜的真实语义；part 1 只有 24 个 vertices；mesh 非 watertight；且 textured `sample.glb` 与真实 simulator smoke test 仍缺失。因此它可以算 **bedroom_4 proxy sim-ready artifact generated**，不能算官方质量的 PhysX-Anything 端到端复现。
 
 ## 接入判断
 
@@ -295,23 +315,23 @@ VLM 对 bedside crop 的结构化理解如下：
 |---|---|---|
 | P0 room reconstruction | 不进入 | 不是多视角房间重建器 |
 | P1 object asset enrichment | 可以小规模试 | 能输出 part mesh、URDF/XML、物理属性，正好补 Video2Mesh object sidecar |
-| P1 simulator QA | 需要真实跑通后再接 | 当前未有本地/mil8 输出 URDF；不能提前承诺 |
+| P1 simulator QA | 需要 QA 后再接 | proxy URDF/XML 已生成，但还没有 MuJoCo/PyBullet 加载、碰撞和 joint smoke test |
 | P2 articulated object library | 值得跟踪 | 对柜门、抽屉、笔记本、箱子、龙头等 articulated objects 很有价值 |
 | P2 deformable object | 暂不做 | 官方 README 也建议 deformable flag 设为 0 以获得更可靠的 simulation |
 
 下一步更稳的执行路线：
 
-1. 先稳定 Python/CUDA 初始化：清掉本轮 probe 残留进程后，单独跑 `/root/autodl-tmp/probe_physx_pipeline_load.py`，逐个加载 `sparse_structure_decoder`、`sparse_structure_flow_model`、`slat_decoder_mesh/gs/rf` 和 DINOv2，定位卡在 torch import、denoiser `.pt`、DINO cache 还是某个 TRELLIS safetensors。
-2. 如果目标是“官方原版”，优先安装或编译 `flash-attn`，再重跑 `1_vlm_demo.py`；如果继续用 `sdpa` wrapper，需要在报告和产物名里保留 `debug` 标记。
-3. decoder 重试时继续把大输出放在 `/root/autodl-tmp/physx-anything-outputs/`，只在 `sample_lowtex.glb` 小于 `/data` 可承受范围时复制到 `test_demo/<name>/sample.glb` 以运行 `3_split.py`。
-4. 如果 GLB export 再次失败，先保底导出 mesh-only OBJ/PLY，并把它标为 decoder geometry debug artifact；不要跳过 GLB/part split 直接生成 URDF。
-5. 只在真实生成并验证 `basic_info.txt`、`sample.glb`、`objs/<part>/<part>.obj`、`basic.urdf` 和 `basic.xml` 后，才把它写成“bedroom_4 物体跑通”。
+1. 若目标是官方原版复现，优先安装或编译 `flash-attn`，再重跑未改源码的 `1_vlm_demo.py`。
+2. 继续定位 textured GLB export：降低 `texture_size`/`simplify`，或单独 profile `postprocessing_utils.to_glb` 在 `After remove invisible faces` 后的卡点；只有真实导出 `sample.glb` 后，才把 decoder 写成官方质量通过。
+3. 用 MuJoCo 或 PyBullet 加载当前 proxy `basic.xml` / `basic.urdf`，做最小 simulator smoke test：文件可加载、mesh path 正确、质量/惯性不崩、关节/固定关系不报错。
+4. 换一个 mask-clean 单物体 crop，优先选真实 articulated object，例如柜门/抽屉/椅子，而不是这个混合了桌面、花瓶、床边背景的 heuristic crop。
+5. 若要接入 Video2Mesh，只把当前结果作为 adapter baseline：`object crop -> PhysX debug/proxy asset -> object_asset.json`，并保留 `source=physx_anything_proxy` 和 QA 状态。
 
 ## 风险
 
 - **磁盘风险**：`/data` 只剩约 25-27 GB 且 Use% 100%；权重已尽量放到 `/root/autodl-tmp`，但 decoder 中间 GLB/mesh/texture 仍可能因为 `/data` 满盘失败。
 - **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；`xformers` 可用但 `flash_attn` 缺失，官方 VLM 原版仍不通过。
-- **运行时风险**：本轮 `TrellisImageTo3DPipeline.from_pretrained` 长时间卡在 pipeline load；分段 probe 也停在 `import torch`，说明当前远端 Python/CUDA 初始化状态不稳定。
+- **GLB export 风险**：pipeline load 和 sampling 已恢复，但 `to_glb` 在 texture/postprocess 后段仍会长时间卡住；当前可用的是 geometry-only proxy GLB，不是官方 textured output。
 - **debug 标记风险**：pytree shim、Qwen `sdpa` monkeypatch、absolute-path decoder config 和 minimal `kaolin` stub 都是 debug workaround，不能写成官方复现。
 - **输入风险**：PhysX-Anything 训练/推理假设单物体图像；`bedroom_4` full-room frame 会造成类别、尺度、部件和关节推理混乱。
 - **坐标风险**：即使生成 URDF/XML，也还需要把单物体坐标、尺度和姿态对齐回 Video2Mesh 的 COLMAP/scene coordinate。
