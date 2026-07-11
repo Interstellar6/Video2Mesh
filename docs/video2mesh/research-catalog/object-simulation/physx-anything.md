@@ -16,7 +16,7 @@ tags:
 
 检查日期：2026-07-11
 
-当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，但尚未完成官方 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 推理链路。`mil8` 曾短暂卡在 FRP/SSH banner exchange，后续已恢复登录；当前最新 blocker 是 mil8 到 Hugging Face 的 VLM 权重下载失败，`snapshot_download(repo_id="Caoza/PhysX-Anything", allow_patterns=["vlm/*"])` 报 `Network is unreachable`，因此 `pretrain/vlm` 仍未准备好。环境侧已经推进到：`/root/autodl-tmp/physx-anything-venv` 内 `transformers==4.50.0`、`qwen-vl-utils`、`trimesh`、`rembg` 可用；在 PyTorch 2.2.2 上通过运行时 `torch.utils._pytree.register_pytree_node` 兼容 shim 可以导入 `Qwen2_5_VLForConditionalGeneration`。同时已准备一个从 bedroom_4 真实帧裁出的 bedside/lamp/table heuristic crop，作为比 full-room frame 更接近单物体输入假设的 smoke input，但它仍不是 mask-clean 官方质量 crop。
+当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，VLM/decoder/TRELLIS 权重已放在 `/root/autodl-tmp` 并软链到 repo 的 `pretrain/`。官方原版四步 `1_vlm_demo.py -> 2_decoder.py -> 3_split.py -> 4_simready_gen.py` 仍未完整跑通：官方 `1_vlm_demo.py` 硬编码 `attn_implementation="flash_attention_2"`，而当前环境没有 `flash_attn`；debug wrapper 通过 PyTorch pytree shim 和 Qwen `sdpa` monkeypatch 已在 bedroom_4 bedside crop 上跑出 VLM 结构化物理描述和 part voxel。decoder 侧还没有产出可验证的 `sample.glb`、part mesh、URDF 或 XML；最新可核验证据是低纹理 debug run 停在 `TrellisImageTo3DPipeline.from_pretrained("./pretrain/decoder_abs_debug")`，分段加载 probe 也停在 `import torch`，mil8 负载升高且 `/data` 仍接近满盘。因此本页只把 VLM debug 结果记为通过，不把 bedroom_4 写成官方端到端跑通。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -178,43 +178,47 @@ bedroom_4 full room frame
 
 ## mil8 部署审计
 
-本轮在 mil8 做了真实部署探针：
+本轮在 mil8 做了真实部署与 bedroom_4 探针：
 
 | 项 | 结果 |
 |---|---|
 | Host | `mil8` |
-| GPU | 8 x NVIDIA GeForce RTX 3090, each 24 GB, probe 时均空闲 |
-| Disk | `/data` 3.5 TB，已用 3.3 TB，仅约 50 GB 可用；`/` 440 GB，约 86 GB 可用 |
+| GPU | 8 x NVIDIA GeForce RTX 3090, each 24 GB；最近探针时 decoder 指定 `CUDA_VISIBLE_DEVICES=0` |
+| Disk | `/data` 3.5 TB，已用约 3.3 TB，仅约 25-27 GB 可用，Use% 100%；`/` 440 GB，约 57 GB 可用 |
 | Official repo | `/data/zyx/workspace/PhysX-Anything` |
 | Repo commit | `e221826` |
 | Repo size | 55 MB |
 | Shared Python | `/opt/envs/max/bin/python`, Python 3.10.0 |
 | PyTorch | 2.2.2+cu121，CUDA 12.1，`torch.cuda.is_available=True`，8 GPUs visible |
-| Existing required packages | `torch`, `torchvision`, `transformers`, `huggingface_hub`, `PIL`, `numpy`, `scipy`, `cv2` |
-| Missing packages in shared env | `qwen_vl_utils`, `trimesh`, `rembg`, `flash_attn`, `kaolin`, `nvdiffrast`, `spconv`, `mujoco`, `pybullet` |
+| Existing required packages | `torch`, `torchvision`, `transformers`, `huggingface_hub`, `PIL`, `numpy`, `scipy`, `cv2` 等 |
+| Initially missing packages | `qwen_vl_utils`, `trimesh`, `rembg`, `flash_attn`, `kaolin`, `nvdiffrast`, `spconv`, `mujoco`, `pybullet` |
 | Isolated venv | `/root/autodl-tmp/physx-anything-venv`, created with `--system-site-packages` to reuse CUDA PyTorch |
-| Packages added in isolated venv | `transformers==4.50.0`, `qwen-vl-utils==0.0.14`, `trimesh`, `rembg`, `accelerate`, `huggingface-hub` |
-| New venv blocker | `Qwen2_5_VLForConditionalGeneration` import now reaches Qwen2.5-VL module but fails with `register_pytree_node() got an unexpected keyword argument flatten_with_keys_fn`, consistent with PyTorch 2.2.2 being older than the official PyTorch 2.4.0 recommendation |
-| Missing weights | `pretrain/vlm` and `pretrain/decoder` do not exist |
-| First real run blocker | Shared env fails before weight loading because current `transformers` lacks `Qwen2_5_VLForConditionalGeneration`; isolated venv then fails because PyTorch is still too old for the required Qwen2.5-VL import path |
-| Re-probe on 2026-07-11 | `/root/autodl-tmp/physx-anything-venv/bin/python` and `/opt/envs/max/bin/python` both timed out on a 25 second `torch import` smoke check; clean venv creation via system Python failed because Python 3.7 lacks `ensurepip`; clean venv creation via `/opt/envs/max/bin/python` produced a Python 3.7 venv without pip |
+| Packages added in isolated venv | `transformers==4.50.0`, `qwen-vl-utils==0.0.14`, `trimesh`, `rembg`, `accelerate`, `huggingface-hub`, `xformers`, `spconv-cu120` 等 |
+| CUDA extensions | `nvdiffrast` 已从 `/root/autodl-tmp/nvdiffrast-src` 编译安装；`EasternJournalist/utils3d` 已按 TRELLIS 需要安装；`numpy==1.26.4`、`scipy==1.11.4` 已回退到可用版本 |
+| Debug-only compatibility | PyTorch 2.2.2 需要 pytree shim 才能导入 Qwen2.5-VL；缺少官方 `kaolin`，当前只有极小 debug stub 满足 `kaolin.utils.testing.check_tensor` |
 | Weight size check | Hugging Face API reports `Caoza/PhysX-Anything` `usedStorage=39938791487` and `microsoft/TRELLIS-image-large` `usedStorage=3300497168`, so weights alone are about 43.24 GB before pip wheels, build cache, intermediate GLB/mesh outputs, and HF snapshot metadata |
-| SSH re-probe on 2026-07-11 | Local `ssh -G mil8` expands to `ProxyJump miljump`, `HostName localhost`, `Port 30013`; direct `ssh miljump` succeeds, `nc -vz localhost 30013` on the jump host reports the port open, but reading a banner from that port returns nothing and `ssh mil8` ends with `Connection timed out during banner exchange` |
-| FRP side evidence on 2026-07-11 | Both `mil8` and `8-3090` map to the same jump-host port `30013`; running `ssh -p 30013 root@localhost` on `miljump` also times out during SSH banner exchange. Jump-host port `8090` returns a Chinese "temporarily unavailable" safety-entry page, while FRP dashboard port `7500` is protected by Basic Auth. This leaves the current blocker outside the local repo: the AutoDL/FRP backend for port 30013 needs to recover before deployment can continue. |
-| Connectivity recovery on 2026-07-11 | A later `ssh mil8 'echo ok'` succeeded, so the FRP/SSH blocker was transient rather than final. |
-| Qwen shim check on 2026-07-11 | With a runtime wrapper that drops the unsupported `flatten_with_keys_fn` keyword from `torch.utils._pytree.register_pytree_node`, `Qwen2_5_VLForConditionalGeneration` imports successfully under the existing PyTorch 2.2.2 + Transformers 4.50.0 venv. |
+| Weight placement | `pretrain/vlm -> /root/autodl-tmp/physx-anything-pretrain/vlm`；`pretrain/decoder -> /root/autodl-tmp/physx-anything-pretrain/decoder`；`pretrain/trellis -> /root/autodl-tmp/physx-anything-trellis`；`pretrain/decoder_abs_debug -> /root/autodl-tmp/physx-anything-decoder-abs-debug` |
+| VLM weights | four `model-00001..00004-of-00004.safetensors` present under `/root/autodl-tmp/physx-anything-pretrain/vlm` |
+| Decoder weights | `/root/autodl-tmp/physx-anything-pretrain/decoder/ckpt_new/denoiser_step0350000.pt`, size 3.47 GB |
+| TRELLIS weights | `ckpts/*.safetensors` present under `/root/autodl-tmp/physx-anything-trellis`; DINOv2 cached at `/root/.cache/torch/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth` |
+| SSH note | `mil8` 曾短暂卡在 FRP/SSH banner exchange，后续恢复；当前 blocker 不是登录，而是 Python/CUDA/TRELLIS 加载稳定性与 `/data` 满盘压力 |
+| Official VLM blocker | `1_vlm_demo.py` line 146 hardcodes `attn_implementation="flash_attention_2"`；当前没有 `flash_attn`，所以官方原版 VLM 尚未通过 |
+| Debug VLM result | 通过 pytree shim + Qwen `sdpa` monkeypatch，`bedroom_4_bedside_lamp_table_crop` 已生成 `basic_info.txt`、`coord_*.txt`、`ind_*.npy/.ply` 和 `allind.npy` |
 | PyTorch 2.4 attempt | A clean Python 3.10 venv at `/root/autodl-tmp/physx-anything-torch24-venv` was repaired, but downloading `torch==2.4.0+cu121` from `download.pytorch.org` was too slow and did not complete; the environment still has no `torch`, so the practical route remains the existing venv plus Qwen shim. |
-| Latest weight blocker | Downloading `Caoza/PhysX-Anything` VLM files to `/root/autodl-tmp/physx-anything-pretrain` failed with `Network is unreachable` when contacting `huggingface.co`; no VLM weights were written and `pretrain/vlm` remains unavailable. |
+| Decoder config fix | 官方 decoder `pipeline.json` 的相对路径会触发 HFValidationError；debug copy `/root/autodl-tmp/physx-anything-decoder-abs-debug/pipeline.json` 已把子模型改成绝对路径 |
+| Decoder latest blocker | `decoder_lowtex_debug_run.log` 停在 `loading pipeline ./pretrain/decoder_abs_debug`；同一时段分段加载 probe `probe_pipeline_load.log` 停在 `import torch`，机器 load average 升至约 60；没有生成 `sample_lowtex.glb`、geometry OBJ 或官方 `sample.glb` |
 
 实测失败日志的关键点：
 
 ```text
 ImportError: cannot import name 'Qwen2_5_VLForConditionalGeneration' from 'transformers'
 RuntimeError: register_pytree_node() got an unexpected keyword argument 'flatten_with_keys_fn'
-requests.exceptions.ConnectionError: Failed to establish a new connection: [Errno 101] Network is unreachable
+1_vlm_demo.py: attn_implementation="flash_attention_2" but flash_attn is not installed
+2_decoder.py / debug wrapper: loading pipeline ./pretrain/decoder_abs_debug
+probe_pipeline_load.py: [load-probe] import torch
 ```
 
-我没有把这个状态写成“跑通”。当前完成的是源码部署、环境审计、bedroom_4 输入准备、Qwen import shim 验证和 VLM 权重下载 blocker 定位。
+我没有把这个状态写成“官方跑通”。当前完成的是源码部署、环境审计、权重就位、bedroom_4 单物体 crop 准备、debug VLM 输出验证；尚未完成 decoder GLB、part split、URDF/XML 和仿真 smoke test。
 
 ## bedroom_4 smoke input
 
@@ -246,6 +250,43 @@ requests.exceptions.ConnectionError: Failed to establish a new connection: [Errn
 | Local doc copy | `docs/video2mesh/research-catalog/assets/physx-anything/bedroom4-physx-bedside-crop.png` |
 | Caveat | Heuristic crop only; it should not be reported as an official object-level experiment result until a mask-clean crop or semantic object crop is used. |
 
+## bedroom_4 实测结果
+
+这次实测只把 VLM debug wrapper 记为通过。该 wrapper 没有改官方 repo 源码，但绕开了两个环境问题：PyTorch 2.2.2 的 Qwen pytree 兼容问题，以及官方 `flash_attention_2` 依赖缺失问题。因此它是 debug path，不是官方原版 `1_vlm_demo.py`。
+
+| 阶段 | 状态 | 证据 |
+|---|---|---|
+| `1_vlm_demo.py` official | Blocked | 官方代码第 146 行硬编码 `attn_implementation="flash_attention_2"`；当前 venv 没有 `flash_attn` |
+| VLM debug wrapper | Passed | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/` 已生成 `basic_info.txt`、`coord_0..2.txt`、`ind_0..2.npy/.ply`、`allind.npy` |
+| `2_decoder.py` official | Not passed | 默认 decoder 会导出 `sample.glb`，但当前目录没有 `sample.glb` |
+| Decoder low-texture debug | Blocked | `/root/autodl-tmp/physx-anything-outputs/decoder_lowtex_debug_run.log` 停在 `loading pipeline ./pretrain/decoder_abs_debug`；未生成 `sample_lowtex.glb` 或 `sample_lowtex_geometry.obj` |
+| `3_split.py` | Not run | 需要 `sample.glb`，目前没有可验证 GLB |
+| `4_simready_gen.py` | Not run | 需要 part mesh `objs/`，目前没有可验证 part mesh |
+
+VLM 对 bedside crop 的结构化理解如下：
+
+| 项 | 值 |
+|---|---|
+| Name | Decorative Table with Vase |
+| Category | Furniture |
+| Dimension | `90*90*75` |
+| Part 0 | `board`, Wood, density `0.65 g/cm^3`, Young's modulus `10.0`, Poisson ratio `0.3` |
+| Part 1 | `table_base`, Wood, density `0.65 g/cm^3`, Young's modulus `10.0`, Poisson ratio `0.3` |
+| Part 2 | `vase`, Ceramic, density `2.4 g/cm^3`, Young's modulus `300.0`, Poisson ratio `0.24` |
+| Group 0 | `['l_0', 'l_1']`, equivalent/fixed group |
+| Group 1 | `['l_2']`, attached relative to `group_0` |
+
+对应 voxel 输出：
+
+| 文件 | shape | dtype | min xyz | max xyz |
+|---|---:|---|---|---|
+| `allind.npy` | `(2693, 3)` | `int64` | `[0, 0, 1]` | `[31, 31, 26]` |
+| `ind_0.npy` / board | `(2166, 3)` | `int64` | `[0, 0, 24]` | `[31, 31, 26]` |
+| `ind_1.npy` / table_base | `(435, 3)` | `int64` | `[2, 17, 1]` | `[30, 31, 1]` |
+| `ind_2.npy` / vase | `(92, 3)` | `int64` | `[14, 14, 15]` | `[19, 20, 18]` |
+
+这个结果说明 VLM 已能把 bedroom_4 crop 转成可被 decoder 使用的 coarse physical representation；但它把复杂 crop 理解成“桌子+花瓶”，没有恢复台灯/床头柜的真实语义，也没有经过 decoder、split 和 simulator QA。因此它只能算 **bedroom_4 crop 的 VLM smoke pass**，不能算 sim-ready asset pass。
+
 ## 接入判断
 
 短期建议是 **P1 research adapter，不进入主链路默认路径**：
@@ -260,17 +301,18 @@ requests.exceptions.ConnectionError: Failed to establish a new connection: [Errn
 
 下一步更稳的执行路线：
 
-1. 等 mil8 到 Hugging Face 网络恢复，或改用可访问的镜像/本地中转，把 `Caoza/PhysX-Anything` 的 `vlm/*` 下载到 `/root/autodl-tmp/physx-anything-pretrain/vlm` 并软链到 `pretrain/vlm`。
-2. 用 `/data/zyx/workspace/physx_anything_bedroom4_20260711/run_vlm_with_shim.py` 跑 VLM step；该 wrapper 只加 PyTorch 2.2 Qwen import shim、指定 bedside crop demo，不改官方源码。
-3. 单独处理 `flash-attn`：官方 `1_vlm_demo.py` 写死 `attn_implementation="flash_attention_2"`，如果安装 flash-attn 失败，后续只能把改用 `sdpa/eager` 标成 debug-only wrapper，不能称为原版官方推理。
-4. 再下载 `pretrain/decoder` 和 `microsoft/TRELLIS-image-large`，执行 `2_decoder.py -> 3_split.py -> 4_simready_gen.py`。
-5. 只在四步脚本真实生成 `basic_info.txt`、`sample.glb`、part meshes、`basic.urdf`/XML 后，才把它写成“bedroom_4 物体跑通”。
+1. 先稳定 Python/CUDA 初始化：清掉本轮 probe 残留进程后，单独跑 `/root/autodl-tmp/probe_physx_pipeline_load.py`，逐个加载 `sparse_structure_decoder`、`sparse_structure_flow_model`、`slat_decoder_mesh/gs/rf` 和 DINOv2，定位卡在 torch import、denoiser `.pt`、DINO cache 还是某个 TRELLIS safetensors。
+2. 如果目标是“官方原版”，优先安装或编译 `flash-attn`，再重跑 `1_vlm_demo.py`；如果继续用 `sdpa` wrapper，需要在报告和产物名里保留 `debug` 标记。
+3. decoder 重试时继续把大输出放在 `/root/autodl-tmp/physx-anything-outputs/`，只在 `sample_lowtex.glb` 小于 `/data` 可承受范围时复制到 `test_demo/<name>/sample.glb` 以运行 `3_split.py`。
+4. 如果 GLB export 再次失败，先保底导出 mesh-only OBJ/PLY，并把它标为 decoder geometry debug artifact；不要跳过 GLB/part split 直接生成 URDF。
+5. 只在真实生成并验证 `basic_info.txt`、`sample.glb`、`objs/<part>/<part>.obj`、`basic.urdf` 和 `basic.xml` 后，才把它写成“bedroom_4 物体跑通”。
 
 ## 风险
 
-- **磁盘风险**：`/data` 只剩约 49 GB，而 PhysX-Anything 和 TRELLIS 权重合计约 43.24 GB，还不含 PyTorch wheels、CUDA 扩展、HF snapshot 缓存和中间结果。若不清理或改用 `/root/autodl-tmp`/外部缓存，下载很容易中断或把 `/data` 打满。
-- **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；复测时共享环境甚至在 `torch import` 上 timeout，`xformers` 存在但 `flash_attn` 缺失，`setup.sh` 的 wheel 选择未必匹配。
-- **网络风险**：当前 mil8 对 `huggingface.co` 出现 `[Errno 101] Network is unreachable`，VLM 权重下载未能开始；这比 Python import 更靠前阻塞真实推理。
+- **磁盘风险**：`/data` 只剩约 25-27 GB 且 Use% 100%；权重已尽量放到 `/root/autodl-tmp`，但 decoder 中间 GLB/mesh/texture 仍可能因为 `/data` 满盘失败。
+- **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；`xformers` 可用但 `flash_attn` 缺失，官方 VLM 原版仍不通过。
+- **运行时风险**：本轮 `TrellisImageTo3DPipeline.from_pretrained` 长时间卡在 pipeline load；分段 probe 也停在 `import torch`，说明当前远端 Python/CUDA 初始化状态不稳定。
+- **debug 标记风险**：pytree shim、Qwen `sdpa` monkeypatch、absolute-path decoder config 和 minimal `kaolin` stub 都是 debug workaround，不能写成官方复现。
 - **输入风险**：PhysX-Anything 训练/推理假设单物体图像；`bedroom_4` full-room frame 会造成类别、尺度、部件和关节推理混乱。
 - **坐标风险**：即使生成 URDF/XML，也还需要把单物体坐标、尺度和姿态对齐回 Video2Mesh 的 COLMAP/scene coordinate。
 - **质量风险**：论文指标来自 PhysX-Mobility 和互联网单物体图像；不能直接外推到遮挡严重、背景复杂的室内扫描帧。
