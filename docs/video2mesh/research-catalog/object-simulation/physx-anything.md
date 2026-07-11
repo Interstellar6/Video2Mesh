@@ -16,7 +16,7 @@ tags:
 
 检查日期：2026-07-11；最新续跑：2026-07-12
 
-当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，VLM/decoder/TRELLIS 权重已放在 `/root/autodl-tmp` 并软链到 repo 的 `pretrain/`。官方原版四步仍未完整通过：官方 `1_vlm_demo.py` 硬编码 `attn_implementation="flash_attention_2"`，而当前环境没有 `flash_attn`；官方 `2_decoder.py` 期望导出 textured `sample.glb`，本轮 debug decoder 在 GLB texture/postprocess 后段卡住，未生成官方质量 `sample.glb`。但 bedroom_4 bedside crop 已通过一条明确标注的 **debug/proxy chain**：VLM debug wrapper 生成结构化物理描述和 part voxel；decoder debug 生成 geometry OBJ；该 OBJ 转成 geometry-only proxy GLB 后，官方 `3_split.py` 和 `4_simready_gen.py` 已生成 part OBJ、`basic.urdf` 和 `basic.xml`。因此本页把它记为“bedroom_4 proxy sim-ready artifact generated”，不写成官方 textured decoder 端到端复现。
+当前执行状态：论文 PDF、项目页、GitHub README 和 mil8 部署探针已完成；官方源码已克隆到 mil8，VLM/decoder/TRELLIS 权重已放在 `/root/autodl-tmp` 并软链到 repo 的 `pretrain/`。官方原版四步仍未完整通过：官方 `1_vlm_demo.py` 硬编码 `attn_implementation="flash_attention_2"`，而当前环境没有 `flash_attn`；官方 `2_decoder.py` 期望导出 textured `sample.glb`，本轮 debug decoder 在 GLB texture/postprocess 后段卡住，未生成官方质量 `sample.glb`。bedroom_4 bedside crop 只留下了一条 **debug/proxy/smoke 证据链**：VLM debug wrapper 生成结构化物理描述和 part voxel；decoder debug 生成 geometry OBJ；该 OBJ 转成 geometry-only proxy GLB 后，官方 `3_split.py` 和 `4_simready_gen.py` 能继续产出 part OBJ、`basic.urdf` 和 `basic.xml`。这只能说明部分代码路径与文件格式转换链路可执行，不能证明 bedroom_4 物体跑通，也不能作为有效复现实验结果。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -178,7 +178,7 @@ bedroom_4 full room frame
 
 ## mil8 部署审计
 
-本轮在 mil8 做了真实部署与 bedroom_4 探针：
+本轮在 mil8 做的是环境部署审计与 bedroom_4 debug/proxy 探针；下面记录的是排障证据，不是有效 bedroom_4 实验结论：
 
 | 项 | 结果 |
 |---|---|
@@ -210,7 +210,7 @@ bedroom_4 full room frame
 | Decoder debug result | low-texture debug run 成功完成 `run_control(formats=["mesh", "gaussian"])`，mesh `343214` vertices / `686376` faces，并导出 `/root/autodl-tmp/physx-anything-outputs/bedroom_4_bedside_lamp_table_crop/sample_lowtex_geometry.obj`，size `27499041` bytes |
 | Decoder GLB blocker | `postprocessing_utils.to_glb(..., texture_size=512)` 已完成 decimate、rasterizing、remove invisible faces，日志到 `After remove invisible faces: 148637 vertices, 297262 faces` 后长时间无输出；最终手动终止，没有生成 `sample_lowtex.glb` |
 | Proxy GLB | 用 geometry OBJ 导出 geometry-only `/root/autodl-tmp/physx-anything-outputs/bedroom_4_bedside_lamp_table_crop/sample_geometry_proxy.glb`，size `12355984` bytes，并软链为 `test_demo/bedroom_4_bedside_lamp_table_crop/sample.glb` 供官方 split 脚本读取 |
-| Split + simready proxy result | 官方 `3_split.py` 基于 proxy GLB 生成 `objs/0/0.obj`、`objs/1/1.obj`、`objs/2/2.obj`；官方 `4_simready_gen.py --voxel_define 32 --basepath ./test_demo --process 0 --fixed_base 0 --deformable 0` 生成 `basic_info.json`、`basic.urdf`、`basic.xml` |
+| Split + simready proxy path | 官方 `3_split.py` 基于 proxy GLB 生成 `objs/0/0.obj`、`objs/1/1.obj`、`objs/2/2.obj`；官方 `4_simready_gen.py --voxel_define 32 --basepath ./test_demo --process 0 --fixed_base 0 --deformable 0` 生成 `basic_info.json`、`basic.urdf`、`basic.xml`。这只说明 proxy 输入能穿过这两个脚本，不说明 decoder 官方输出或仿真质量通过 |
 
 实测失败日志的关键点：
 
@@ -223,7 +223,9 @@ low-texture debug: to_glb reached "After remove invisible faces" but did not exp
 geometry-only proxy GLB: used only to validate split and simready stages
 ```
 
-我没有把这个状态写成“官方 textured decoder 跑通”。当前完成的是源码部署、环境审计、权重就位、bedroom_4 单物体 crop 准备、debug VLM 输出、debug geometry decoder、proxy split、proxy URDF/XML；尚未完成官方 `flash_attention_2` VLM、official `2_decoder.py` textured `sample.glb`、以及真实 simulator smoke test。
+结论边界：当前完成的是源码部署、环境审计、权重就位、bedroom_4 heuristic crop 准备、debug VLM 输出、debug geometry decoder、proxy split、proxy URDF/XML。尚未完成官方 `flash_attention_2` VLM、official `2_decoder.py` textured `sample.glb`、以及真实 simulator smoke test；因此不能写成“官方 textured decoder 跑通”、不能写成“bedroom_4 跑通”，也不能把 proxy URDF/XML 当作项目有效实验结果。
+
+本地已回传的调试产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_anything_bedroom4_proxy_20260712`。该目录仅用于复查日志、文件头、OBJ 规模和 XML 引用，不进入 Git，也不作为正式复现实验资产。
 
 ## bedroom_4 smoke input
 
@@ -255,19 +257,21 @@ geometry-only proxy GLB: used only to validate split and simready stages
 | Local doc copy | `docs/video2mesh/research-catalog/assets/physx-anything/bedroom4-physx-bedside-crop.png` |
 | Caveat | Heuristic crop only; it should not be reported as an official object-level experiment result until a mask-clean crop or semantic object crop is used. |
 
-## bedroom_4 实测结果
+## bedroom_4 debug/proxy 记录
+
+> 注意：本节只记录 debug/proxy/smoke evidence，不能作为 PhysX-Anything 在 bedroom_4 上的有效复现实验；它只证明部分代码路径和文件格式生成链路可执行。
 
 这次实测只把 VLM debug wrapper 记为通过。该 wrapper 没有改官方 repo 源码，但绕开了两个环境问题：PyTorch 2.2.2 的 Qwen pytree 兼容问题，以及官方 `flash_attention_2` 依赖缺失问题。因此它是 debug path，不是官方原版 `1_vlm_demo.py`。
 
 | 阶段 | 状态 | 证据 |
 |---|---|---|
 | `1_vlm_demo.py` official | Blocked | 官方代码第 146 行硬编码 `attn_implementation="flash_attention_2"`；当前 venv 没有 `flash_attn` |
-| VLM debug wrapper | Passed | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/` 已生成 `basic_info.txt`、`coord_0..2.txt`、`ind_0..2.npy/.ply`、`allind.npy` |
+| VLM debug wrapper | Debug evidence only | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/` 已生成 `basic_info.txt`、`coord_0..2.txt`、`ind_0..2.npy/.ply`、`allind.npy` |
 | `2_decoder.py` official | Not passed | 官方脚本默认 textured `sample.glb` 尚未验证通过 |
-| Decoder low-texture debug | Partial passed | `run_control` 生成 mesh `343214` vertices / `686376` faces；geometry OBJ 已导出；textured GLB export 卡在后处理末段 |
-| Geometry-only proxy GLB | Passed as proxy | `sample_geometry_proxy.glb` 由 geometry OBJ 转出，12 MB，并软链为 `test_demo/.../sample.glb` |
-| `3_split.py` official on proxy GLB | Passed as proxy | 生成 3 个 part OBJ：board-like `0.obj`、tiny `1.obj`、vase-like `2.obj` |
-| `4_simready_gen.py` official on proxy split | Passed as proxy | 生成 `basic_info.json`、`basic.urdf`、`basic.xml`；XML/URDF 已解析验证，OBJ 引用均存在 |
+| Decoder low-texture debug | Partial debug evidence | `run_control` 生成 mesh `343214` vertices / `686376` faces；geometry OBJ 已导出；textured GLB export 卡在后处理末段 |
+| Geometry-only proxy GLB | Proxy artifact only | `sample_geometry_proxy.glb` 由 geometry OBJ 转出，12 MB，并软链为 `test_demo/.../sample.glb`；不是官方 decoder 输出 |
+| `3_split.py` official on proxy GLB | Proxy path executed | 生成 3 个 part OBJ：board-like `0.obj`、tiny `1.obj`、vase-like `2.obj`；输入不是官方 textured `sample.glb` |
+| `4_simready_gen.py` official on proxy split | Proxy path executed, not sim-validated | 生成 `basic_info.json`、`basic.urdf`、`basic.xml`；XML/URDF 已解析验证，OBJ 引用均存在，但没有仿真加载或动力学验证 |
 | Simulator smoke test | Not tested | 尚未用 MuJoCo/PyBullet 实际加载或仿真 |
 
 VLM 对 bedside crop 的结构化理解如下：
@@ -292,7 +296,7 @@ VLM 对 bedside crop 的结构化理解如下：
 | `ind_1.npy` / table_base | `(435, 3)` | `int64` | `[2, 17, 1]` | `[30, 31, 1]` |
 | `ind_2.npy` / vase | `(92, 3)` | `int64` | `[14, 14, 15]` | `[19, 20, 18]` |
 
-decoder / split / simready 的 proxy 产物如下：
+decoder / split / simready 脚本路径的 proxy 产物如下，只用于排障复查：
 
 | 产物 | 路径 | 大小/规模 | 说明 |
 |---|---|---|---|
@@ -301,11 +305,11 @@ decoder / split / simready 的 proxy 产物如下：
 | Part 0 OBJ | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/objs/0/0.obj` | `336794` V / `673544` F；`27207161` bytes | 主体几何，吸收了绝大多数 faces |
 | Part 1 OBJ | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/objs/1/1.obj` | `24` V / `27` F；`1231` bytes | 很小，说明 crop/VLM/proxy split 的 part 质量不稳定 |
 | Part 2 OBJ | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/objs/2/2.obj` | `6415` V / `12805` F；`445593` bytes | vase-like 子部件 |
-| URDF | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic.urdf` | `2233` bytes | XML parser 通过，引用 3 个 OBJ 均存在 |
-| MJCF/XML | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic.xml` | `2847` bytes | root 为 `mujoco`，引用 3 个 OBJ 均存在 |
+| URDF | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic.urdf` | `2233` bytes | XML parser 通过，引用 3 个 OBJ 均存在；未做 simulator smoke test |
+| MJCF/XML | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic.xml` | `2847` bytes | root 为 `mujoco`，引用 3 个 OBJ 均存在；未做 simulator smoke test |
 | Structured JSON | `/data/zyx/workspace/PhysX-Anything/test_demo/bedroom_4_bedside_lamp_table_crop/basic_info.json` | `1576` bytes | 由 `basic_info.txt` 转换出的结构化物理描述 |
 
-这个结果说明 VLM 已能把 bedroom_4 crop 转成 coarse physical representation，debug decoder 能产出可分割几何，官方 split/simready 代码也能在 geometry-only proxy GLB 上走到 URDF/XML。但它把复杂 crop 理解成“桌子+花瓶”，没有恢复台灯/床头柜的真实语义；part 1 只有 24 个 vertices；mesh 非 watertight；且 textured `sample.glb` 与真实 simulator smoke test 仍缺失。因此它可以算 **bedroom_4 proxy sim-ready artifact generated**，不能算官方质量的 PhysX-Anything 端到端复现。
+这个记录只能说明 VLM debug wrapper 能把 bedroom_4 crop 转成 coarse physical representation，debug decoder 能产出一份可供脚本继续读取的几何，官方 split/simready 代码也能在 geometry-only proxy GLB 上走到 URDF/XML 文件生成。它没有证明 bedroom_4 物体被正确重建：复杂 crop 被理解成“桌子+花瓶”，没有恢复台灯/床头柜的真实语义；part 1 只有 24 个 vertices；mesh 非 watertight；官方 textured `sample.glb` 与真实 simulator smoke test 都缺失。因此这不是 bedroom_4 有效跑通，也不是可用于项目结论的 sim-ready 资产。
 
 ## 接入判断
 
@@ -314,8 +318,8 @@ decoder / split / simready 的 proxy 产物如下：
 | 层级 | 判断 | 原因 |
 |---|---|---|
 | P0 room reconstruction | 不进入 | 不是多视角房间重建器 |
-| P1 object asset enrichment | 可以小规模试 | 能输出 part mesh、URDF/XML、物理属性，正好补 Video2Mesh object sidecar |
-| P1 simulator QA | 需要 QA 后再接 | proxy URDF/XML 已生成，但还没有 MuJoCo/PyBullet 加载、碰撞和 joint smoke test |
+| P1 object asset enrichment | 需要重新做干净单物体实验 | 理论上能输出 part mesh、URDF/XML、物理属性；当前 bedroom_4 proxy 记录不能作为该能力在本项目上的有效证据 |
+| P1 simulator QA | 未通过 | 当前只有 proxy URDF/XML 文件生成，没有 MuJoCo/PyBullet 加载、碰撞和 joint smoke test |
 | P2 articulated object library | 值得跟踪 | 对柜门、抽屉、笔记本、箱子、龙头等 articulated objects 很有价值 |
 | P2 deformable object | 暂不做 | 官方 README 也建议 deformable flag 设为 0 以获得更可靠的 simulation |
 
@@ -323,9 +327,9 @@ decoder / split / simready 的 proxy 产物如下：
 
 1. 若目标是官方原版复现，优先安装或编译 `flash-attn`，再重跑未改源码的 `1_vlm_demo.py`。
 2. 继续定位 textured GLB export：降低 `texture_size`/`simplify`，或单独 profile `postprocessing_utils.to_glb` 在 `After remove invisible faces` 后的卡点；只有真实导出 `sample.glb` 后，才把 decoder 写成官方质量通过。
-3. 用 MuJoCo 或 PyBullet 加载当前 proxy `basic.xml` / `basic.urdf`，做最小 simulator smoke test：文件可加载、mesh path 正确、质量/惯性不崩、关节/固定关系不报错。
+3. 如果继续保留当前 proxy 产物，只能把它作为排障输入，用 MuJoCo 或 PyBullet 做最小 simulator smoke test：文件可加载、mesh path 正确、质量/惯性不崩、关节/固定关系不报错；即便通过，也仍只是 proxy QA，不等于官方复现。
 4. 换一个 mask-clean 单物体 crop，优先选真实 articulated object，例如柜门/抽屉/椅子，而不是这个混合了桌面、花瓶、床边背景的 heuristic crop。
-5. 若要接入 Video2Mesh，只把当前结果作为 adapter baseline：`object crop -> PhysX debug/proxy asset -> object_asset.json`，并保留 `source=physx_anything_proxy` 和 QA 状态。
+5. 若要接入 Video2Mesh，当前记录最多只能作为 adapter 排障 trace；正式 baseline 应重新从 mask-clean 单物体输入开始，并保留 `source`、`official_step_status`、`qa_status`，避免把 debug/proxy 产物混入有效实验结果。
 
 ## 风险
 
