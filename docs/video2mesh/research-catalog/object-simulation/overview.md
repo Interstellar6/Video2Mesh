@@ -14,7 +14,7 @@ visibility: public
 
 # 物体仿真阶段
 
-物体仿真应分为刚体、软体、VLM 物理资产生成和 dynamic Gaussian 四条线。它们消费的资产合同不同，不应强行合并成一个 mesh。
+物体仿真应分为刚体、软体、VLM 物理资产生成、sim-ready world engine 和 dynamic Gaussian 几条线。它们消费的资产合同不同，不应强行合并成一个 mesh。
 
 ![物体仿真](../assets/stage-simulation.svg "刚体、软体和 dynamic Gaussian 三种物体仿真路径")
 
@@ -24,6 +24,7 @@ visibility: public
 |---|---|---|---|
 | Rigid body simulation | 刚体 + collider + mass/friction/restitution | 桌椅、杯子、柜门、盒子 | P1 物体交互闭环，最容易进入 Unity/MuJoCo/Isaac |
 | Soft body / cloth | 布料、枕头、被子、植物叶片等形变对象 | pillow、blanket、curtain、plant | 需要比刚体更复杂的材质和 solver |
+| [EmbodiedGen V2](../industrial-pipelines/embodiedgen-v2.md) | 生成 sim-ready object/world，带 visual/collision/inertial/affordance 合同和 URDF/MJCF/USD 导出 | 任务驱动机器人训练场景、跨仿真器资产包、Vibe Coding 编辑 | 对 Video2Mesh 是 simulator_asset_bundle 设计参考，不替代视频重建 |
 | [PhysX-Anything](physx-anything.md) | 单图生成 part mesh、URDF/XML、关节和物理属性 | cabinet、laptop、faucet、eyeglass 等单物体 | P1/P2 单物体补全与 physics sidecar；不替代房间级重建 |
 | [PhysSplat / Sim Anything](physsplat-sim-anything.md) | MLLM 估计物理属性，粒子/高斯动态模拟，动态 splat 渲染 | 非刚体、局部形变、动态视觉展示 | P2 研究旁线，可为物理属性估计和 dynamic Gaussian 提供启发 |
 | VLM physical property inference | 用 VLM/MLLM 估计材质、质量范围、摩擦、可移动性 | 所有 object metadata | 可作为 simulator_asset_bundle 的初稿，但必须 QA |

@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">EmbodiedGen V2 and Video2Mesh contract</title>
+  <desc id="desc">A pipeline diagram mapping EmbodiedGen V2 sim-ready world generation modules to Video2Mesh layered asset responsibilities.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101827"/>
+      <stop offset="0.54" stop-color="#15223a"/>
+      <stop offset="1" stop-color="#241b33"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" x2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#60a5fa"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" x2="1">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#a3e635"/>
+    </linearGradient>
+    <linearGradient id="rose" x1="0" x2="1">
+      <stop offset="0" stop-color="#fb7185"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" x2="1">
+      <stop offset="0" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#f0abfc"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <text x="64" y="72" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="36" font-weight="700">EmbodiedGen V2 -> Video2Mesh: sim-ready asset contract</text>
+  <text x="64" y="108" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="18">EmbodiedGen V2 is most useful to Video2Mesh as a world/asset contract and validation layer, not as a replacement for scan reconstruction.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="64" y="166" width="248" height="166" rx="14" fill="#0f172a" stroke="#334155"/>
+    <rect x="64" y="166" width="248" height="7" fill="url(#cyan)"/>
+    <text x="88" y="214" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Video2Mesh scan</text>
+    <text x="88" y="250" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">frames + cameras</text>
+    <text x="88" y="278" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">COLMAP / 3DGS / mesh</text>
+    <text x="88" y="306" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">semantic sidecars</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="64" y="392" width="248" height="166" rx="14" fill="#0f172a" stroke="#334155"/>
+    <rect x="64" y="392" width="248" height="7" fill="url(#green)"/>
+    <text x="88" y="440" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">EmbodiedGen V2</text>
+    <text x="88" y="476" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">sim-ready objects</text>
+    <text x="88" y="504" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">affordance labels</text>
+    <text x="88" y="532" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">scene graph + Vibe Coding</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="414" y="134" width="454" height="132" rx="14" fill="#0f172a" stroke="#334155"/>
+    <rect x="414" y="134" width="454" height="7" fill="url(#violet)"/>
+    <text x="442" y="182" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Layered asset package</text>
+    <text x="442" y="220" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">visual mesh / splat, collision mesh, inertial params, material, affordance, pose</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="414" y="304" width="454" height="132" rx="14" fill="#0f172a" stroke="#334155"/>
+    <rect x="414" y="304" width="454" height="7" fill="url(#rose)"/>
+    <text x="442" y="352" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Validation and repair</text>
+    <text x="442" y="390" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">generate -> verify -> retry, mesh fixing, convex decomposition, physics settling</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="414" y="474" width="454" height="132" rx="14" fill="#0f172a" stroke="#334155"/>
+    <rect x="414" y="474" width="454" height="7" fill="url(#green)"/>
+    <text x="442" y="522" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Stateful world editing</text>
+    <text x="442" y="560" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">typed scene graph, bounded deltas, skill history, parse-ground-invoke-commit</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="972" y="160" width="244" height="392" rx="14" fill="#0f172a" stroke="#334155"/>
+    <rect x="972" y="160" width="244" height="7" fill="#38bdf8"/>
+    <text x="1000" y="208" fill="#f8fafc" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Adapters</text>
+    <text x="1000" y="248" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">URDF</text>
+    <text x="1000" y="278" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">MJCF / XML</text>
+    <text x="1000" y="308" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">USD</text>
+    <text x="1000" y="352" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">SAPIEN / PyBullet</text>
+    <text x="1000" y="380" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">MuJoCo / Genesis</text>
+    <text x="1000" y="408" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="15">Isaac Gym / Isaac Sim</text>
+    <text x="1000" y="462" fill="#fef3c7" font-family="Inter, Arial, sans-serif" font-size="15">Video2Mesh should export</text>
+    <text x="1000" y="488" fill="#fef3c7" font-family="Inter, Arial, sans-serif" font-size="15">the same layered contract.</text>
+  </g>
+
+  <path d="M312 248 C358 248 362 200 414 200" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M312 476 C362 476 360 540 414 540" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M868 200 C920 200 924 264 972 264" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M868 370 C920 370 924 352 972 352" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M868 540 C920 540 924 444 972 444" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="64" y="632" width="1152" height="44" rx="12" fill="#111827" stroke="#334155"/>
+  <text x="88" y="660" fill="#dbeafe" font-family="Inter, Arial, sans-serif" font-size="16" font-weight="700">Boundary:</text>
+  <text x="172" y="660" fill="#cbd5e1" font-family="Inter, Arial, sans-serif" font-size="16">EmbodiedGen V2 starts from prompts/images/tasks/assets; Video2Mesh starts from scan videos. The common point is the sim-ready package contract.</text>
+</svg>
