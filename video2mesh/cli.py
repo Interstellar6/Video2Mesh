@@ -14572,6 +14572,46 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
     gaussian_points = np.asarray(gaussian_data["means"], dtype=np.float64)
     if gaussian_points.shape[0] == 0:
         raise RuntimeError(f"No Gaussian centers found in {source_ply}")
+    source_file_geometry = gaussian_geometry_fingerprint(gaussian_data)
+    active_scene_geometry = None
+    geometry_matches_active_scene = source_path_matches_active_scene
+    if active_scene_ply is not None:
+        if source_path_matches_active_scene:
+            active_scene_geometry = source_file_geometry
+        else:
+            # A primary semantic PLY must be attached to the active visual
+            # geometry. Compare the Gaussian fields rather than trusting a
+            # copied path with the same filename or file size.
+            active_scene_geometry = gaussian_geometry_fingerprint(read_gsplat_ply(active_scene_ply))
+        geometry_matches_active_scene = bool(
+            active_scene_geometry["sha256"] == source_file_geometry["sha256"]
+        )
+        source_contract.update(
+            {
+                "source_geometry_matches_active_scene_3dgs": geometry_matches_active_scene,
+                "source_matches_active_scene_3dgs": geometry_matches_active_scene,
+                "active_scene_geometry": active_scene_geometry,
+            }
+        )
+    require_active_scene_geometry = bool(getattr(args, "require_active_scene_geometry", True))
+    register_artifacts = bool(getattr(args, "register_artifacts", True))
+    if require_active_scene_geometry and register_artifacts and active_scene_ply is None:
+        raise RuntimeError(
+            "Refusing to register a primary semantic PLY without artifacts.scene_3dgs_ply. "
+            "Register the visual 3DGS first, or use --no-register-artifacts for an isolated route."
+        )
+    if (
+        require_active_scene_geometry
+        and register_artifacts
+        and active_scene_ply is not None
+        and not geometry_matches_active_scene
+    ):
+        raise RuntimeError(
+            "Refusing to register a primary semantic PLY whose Gaussian geometry does not match "
+            f"artifacts.scene_3dgs_ply. source={source_ply}; active={active_scene_ply}; "
+            f"source_sha={source_file_geometry['sha256']}; active_sha={active_scene_geometry['sha256']}. "
+            "Use --no-require-active-scene-geometry only for an explicitly audited migration."
+        )
     max_gaussians = int(args.max_gaussians or 0)
     selected_gaussian_indices = None
     if max_gaussians > 0 and gaussian_points.shape[0] > max_gaussians:
@@ -14675,26 +14715,6 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         }
 
     source_geometry = gaussian_geometry_fingerprint(geometry_source)
-    source_file_geometry = source_geometry if selected_gaussian_indices is None else gaussian_geometry_fingerprint(gaussian_data)
-    active_scene_geometry = None
-    if active_scene_ply is not None:
-        if source_path_matches_active_scene:
-            active_scene_geometry = source_file_geometry
-        elif active_scene_ply.stat().st_size == source_ply.stat().st_size:
-            # A pipeline may register a copied clean PLY under scene/3dgs while
-            # an explicit route points at the GraphDECO training directory.
-            # Compare geometry, not only paths, before calling that a mismatch.
-            active_scene_geometry = gaussian_geometry_fingerprint(read_gsplat_ply(active_scene_ply))
-        geometry_matches_active_scene = bool(
-            active_scene_geometry and active_scene_geometry["sha256"] == source_file_geometry["sha256"]
-        )
-        source_contract.update(
-            {
-                "source_geometry_matches_active_scene_3dgs": geometry_matches_active_scene,
-                "source_matches_active_scene_3dgs": geometry_matches_active_scene,
-                "active_scene_geometry": active_scene_geometry,
-            }
-        )
     output_geometry = gaussian_geometry_fingerprint(read_gsplat_ply(output_ply))
     geometry_identity_verified = source_geometry["sha256"] == output_geometry["sha256"]
     if not geometry_identity_verified:
@@ -14705,10 +14725,17 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
 
     viewer_exports = None
     try:
+        viewer_output_dir = getattr(args, "viewer_output_dir", None)
+        viewer_output_dir = (
+            resolve_project_relative_path(viewer_output_dir, project_root)
+            if viewer_output_dir
+            else output_ply.parent
+        )
+        viewer_prefix = str(getattr(args, "viewer_prefix", "") or f"{output_ply.stem}_2d_probability")
         viewer_exports = export_viewer_plys(
             output_ply,
-            output_ply.parent,
-            "semantic_gaussian_probability",
+            viewer_output_dir,
+            viewer_prefix,
             include_labels=True,
             export_point_cloud=False,
             export_full_semantic_supersplat=bool(
@@ -14717,6 +14744,24 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         viewer_exports = {"error": str(exc)}
+
+    semantic_overlay_ply = (
+        viewer_exports.get("semantic_overlay_supersplat_ply")
+        if isinstance(viewer_exports, dict)
+        else None
+    )
+    viewer_contract = {
+        "visual_base_ply": str(source_ply),
+        "semantic_core_ply": str(output_ply),
+        "semantic_overlay_ply": semantic_overlay_ply,
+        "recommended_supersplat_inputs": [path for path in (str(source_ply), semantic_overlay_ply) if path],
+        "do_not_open_as_standalone_scene": [str(output_ply)],
+        "semantic_core_behavior": "preserves source RGB and Gaussian geometry; object_id/object_probability are sidecar properties",
+        "overlay_behavior": "bounded semantic-color overlay; load together with visual_base_ply for inspection",
+        "full_semantic_supersplat_exported": bool(
+            isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply")
+        ),
+    }
 
     report = {
         "schema_version": DEFAULT_SCHEMA_VERSION,
@@ -14759,6 +14804,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             "min_probability": float(args.min_probability),
             "output_min_probability": float(args.output_min_probability),
             "occlusion_filter": bool(args.occlusion_filter),
+            "require_active_scene_geometry": require_active_scene_geometry,
             "merge_background_structure_masks": bool(getattr(args, "merge_background_structure_masks", False)),
             "background_max_transfer_distance": getattr(args, "background_max_transfer_distance", None),
             "background_overwrite_existing": bool(getattr(args, "background_overwrite_existing", False)),
@@ -14770,6 +14816,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         "skipped_objects": skipped_objects,
         "background_structure_mask_merge": background_merge_report,
         "viewer_exports": viewer_exports,
+        "viewer_contract": viewer_contract,
         "property": "object_id",
         "probability_property": "object_probability",
         "includes_object_probability": True,
@@ -14780,7 +14827,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         ),
     }
     write_json(manifest_path, report)
-    if bool(getattr(args, "register_artifacts", True)):
+    if register_artifacts:
         manifest.setdefault("artifacts", {})["semantic_splats_ply"] = str(output_ply)
         manifest["artifacts"]["semantic_splats_manifest"] = str(manifest_path)
         manifest["artifacts"]["gaussian_probabilities_manifest"] = str(manifest_path)
@@ -14807,6 +14854,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             "manifest": str(manifest_path),
             "object_count": len(object_reports),
             "semantic_source": "2d_mask_probability_projection",
+            "viewer_contract": viewer_contract,
         }
         save_manifest(project_root, manifest)
     print(f"Wrote Gaussian semantic probabilities: {output_ply}")
@@ -42399,6 +42447,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
+    p.add_argument("--require-active-scene-geometry", action=argparse.BooleanOptionalAction, default=True, help="For a registered primary asset, fail unless the source Gaussian geometry matches artifacts.scene_3dgs_ply. Independent AnySplat/SuGaR routes use --no-register-artifacts.")
+    p.add_argument("--viewer-output-dir", type=Path, help="Directory for bounded semantic overlay exports. Defaults to the semantic core PLY directory.")
+    p.add_argument("--viewer-prefix", help="Prefix for semantic overlay viewer files. Defaults to <semantic-core-stem>_2d_probability.")
     p.add_argument("--export-full-semantic-supersplat", action="store_true", help="Also write the full semantic SuperSplat duplicate. Disabled by default; use the lightweight overlay with the source scene instead.")
     p.add_argument("--register-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Update manifest semantic_splats artifacts. Use --no-register-artifacts for independent AnySplat/SuGaR route outputs.")
     p.add_argument("--seed", type=int, default=7)

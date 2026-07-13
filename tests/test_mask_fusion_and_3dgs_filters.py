@@ -313,12 +313,60 @@ def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_p
     assert report["source_contract"]["source_geometry_matches_active_scene_3dgs"] is True
     assert report["source_contract"]["source_matches_active_scene_3dgs"] is True
     assert report["geometry_identity"]["verified"] is True
+    assert report["viewer_contract"]["visual_base_ply"].endswith("point_cloud.ply")
+    assert report["viewer_contract"]["semantic_core_ply"].endswith("semantic_anysplat.ply")
+    assert report["viewer_contract"]["full_semantic_supersplat_exported"] is False
     assert report["objects"][1]["object_id"] == "bed"
     assert report["objects"][1]["point_count"] == 1
     assert report["background_structure_mask_merge"]["enabled"] is False
     saved_manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
     assert saved_manifest["artifacts"]["scene_3dgs_ply"].endswith("point_cloud.ply")
     assert "semantic_splats_ply" not in saved_manifest["artifacts"]
+
+
+def test_primary_semantic_backprojection_rejects_mismatched_visual_geometry(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    project_root = tmp_path / "project"
+    active_ply = project_root / "scene" / "active_scene.ply"
+    external_ply = project_root / "external" / "other_scene.ply"
+    write_json(
+        project_root / "manifest.json",
+        {
+            "schema_version": 1,
+            "scene_id": "tiny",
+            "scene": {
+                "point_cloud": "scene/point_cloud.ply",
+                "camera_info": "scene/cameras/camera_info.json",
+            },
+            "masks": {"mask_2d_dir": "masks/2d", "mask_3d_dir": "masks/3d"},
+            "simulator_assets_dir": "simulator_assets",
+            "artifacts": {"scene_3dgs_ply": str(active_ply)},
+        },
+    )
+    for path, point in ((active_ply, [0.0, 0.0, 2.0]), (external_ply, [1.0, 0.0, 2.0])):
+        write_supersplat_ply(
+            path,
+            np.asarray([point], dtype=np.float32),
+            np.asarray([[0.8, 0.2, 0.1]], dtype=np.float32),
+            np.asarray([0.8], dtype=np.float32),
+            np.asarray([[0.02, 0.02, 0.02]], dtype=np.float32),
+            np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+        )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        cmd_backproject_gaussian_probabilities(
+            Namespace(
+                project_root=project_root,
+                splat_ply=external_ply,
+                camera_info=None,
+                mask_root=None,
+                output=None,
+                output_dir=None,
+                manifest_output=None,
+                register_artifacts=True,
+                require_active_scene_geometry=True,
+            )
+        )
 
 
 def test_prepare_3dgs_source_reuses_real_colmap_sparse_then_filters(tmp_path: Path):
@@ -1708,6 +1756,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     backproject = parser.parse_args(["backproject-gaussian-probabilities", "--project-root", "proj"])
     assert backproject.merge_background_structure_masks is False
     assert backproject.register_artifacts is True
+    assert backproject.require_active_scene_geometry is True
+    assert backproject.viewer_output_dir is None
     external_route = parser.parse_args(
         [
             "backproject-gaussian-probabilities",
