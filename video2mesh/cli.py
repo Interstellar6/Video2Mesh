@@ -3372,6 +3372,51 @@ def scene_bbox_cluster_keep_mask(
     return keep, report
 
 
+def mean_knn_distances(points, neighbor_count: int) -> tuple[Any, str]:
+    """Return mean distances to the nearest non-self neighbors without Open3D.
+
+    The cleaner runs in the GraphDECO/AnySplat environments as well as the
+    mesh environment. Some otherwise usable environments import Open3D but
+    crash inside KDTreeFlann, so this path deliberately prefers SciPy.
+    """
+    np = import_numpy()
+    points_np = np.asarray(points, dtype=np.float64)
+    count = int(points_np.shape[0])
+    if count <= 1:
+        return np.zeros(count, dtype=np.float64), "disabled"
+
+    neighbor_count = min(max(1, int(neighbor_count)), count - 1)
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+
+        tree = cKDTree(points_np)
+        try:
+            distances, _indices = tree.query(points_np, k=neighbor_count + 1, workers=-1)
+        except TypeError:  # SciPy before the workers argument.
+            distances, _indices = tree.query(points_np, k=neighbor_count + 1)
+        distances = np.asarray(distances, dtype=np.float64)
+        if distances.ndim == 1:
+            distances = distances[:, None]
+        return distances[:, 1:].mean(axis=1), "scipy_ckdtree"
+    except Exception as scipy_error:
+        # Keep the dependency-free fallback bounded. A dense NxN distance
+        # matrix is inappropriate for a real million-Gaussian scene.
+        if count > 50_000:
+            raise RuntimeError(
+                "Geometric 3DGS cleanup for more than 50k Gaussians requires scipy.spatial.cKDTree."
+            ) from scipy_error
+
+    chunk_size = max(1, min(count, 8_000_000 // max(1, count)))
+    result = np.empty(count, dtype=np.float64)
+    for start in range(0, count, chunk_size):
+        end = min(count, start + chunk_size)
+        delta = points_np[start:end, None, :] - points_np[None, :, :]
+        distances2 = np.einsum("ijk,ijk->ij", delta, delta)
+        nearest2 = np.partition(distances2, neighbor_count, axis=1)[:, 1 : neighbor_count + 1]
+        result[start:end] = np.sqrt(nearest2).mean(axis=1)
+    return result, "numpy_chunked"
+
+
 def clean_3dgs_floaters(
     input_ply: Path,
     output_ply: Path,
@@ -3413,7 +3458,6 @@ def clean_3dgs_floaters(
     background_seed: int = 7,
 ) -> dict[str, Any]:
     np = import_numpy()
-    o3d = import_open3d()
     data = read_gsplat_ply(input_ply)
     means = np.asarray(data["means"], dtype=np.float64)
     opacities = np.asarray(data["opacities"], dtype=np.float64).reshape(-1)
@@ -3429,15 +3473,9 @@ def clean_3dgs_floaters(
     median_distance = 0.0
     mad = 0.0
     distance_threshold = float("inf")
+    neighbor_query_engine = "disabled"
     if geometric_outliers and count > 1:
-        mean_neighbor_distance = np.zeros(count, dtype=np.float64)
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(means)
-        tree = o3d.geometry.KDTreeFlann(pcd)
-        for idx in range(count):
-            _found, _indices, distances2 = tree.search_knn_vector_3d(pcd.points[idx], neighbor_count + 1)
-            values = np.sqrt(np.asarray(distances2[1:], dtype=np.float64)) if len(distances2) > 1 else np.asarray([], dtype=np.float64)
-            mean_neighbor_distance[idx] = float(values.mean()) if values.size else 0.0
+        mean_neighbor_distance, neighbor_query_engine = mean_knn_distances(means, neighbor_count)
         median_distance = float(np.median(mean_neighbor_distance))
         mad = float(np.median(np.abs(mean_neighbor_distance - median_distance)))
         robust_sigma = 1.4826 * mad if mad > 0 else float(np.std(mean_neighbor_distance))
@@ -3539,6 +3577,7 @@ def clean_3dgs_floaters(
         "background_plane_protection": background_plane_report,
         "geometry_outlier": {
             "enabled": bool(geometric_outliers),
+            "neighbor_query_engine": neighbor_query_engine,
             "removed_count": int(geometric_outlier.sum()),
             "median_mean_neighbor_distance": median_distance,
             "mad": mad,

@@ -194,6 +194,20 @@ bash tools/rerun_bedroom4_semantic_assets.sh \
 
 脚本已真实生成 GraphDECO V4 primary semantic core / overlay / semantic mesh，及 AnySplat V3 isolated semantic core / overlay / semantic mesh；两条 raw mesh 都补有 `*_double_sided.ply` display companion。GraphDECO semantic mesh 为 94,021 vertices / 189,760 faces，其中 113,948 faces 获得语义；AnySplat semantic mesh 为 148,660 vertices / 297,172 faces，其中 46,039 faces 获得语义。AnySplat 的语义 mesh 因原始几何与可见性不足仍有较大 unknown 区域，当前仅保留作对照。
 
+## 运行时验证
+
+mil8 的项目源码镜像已同步到当前 `codex/dev` 实现。`clean_3dgs_floaters` 的几何离群点 KNN 现优先使用 `scipy.spatial.cKDTree`，不再无条件调用 Open3D 的 `KDTreeFlann`；背景平面保护仍是项目内的 Numpy RANSAC。这个改变不修改已经生成的 GraphDECO V4 或 AnySplat V3 语义资产，它们的 2D probability source contract 和几何 SHA 保持不变，但会避免后续默认 clean 在不稳定 Open3D 环境中直接段错误。
+
+在 `/data/anaconda3/envs/3dgs` 的 Python 3.9 / Open3D 0.18 环境中，以下回归组真实通过：`61 passed in 3.08s`：
+
+```text
+tests/test_anysplat_semantic_projection.py
+tests/test_mask_fusion_and_3dgs_filters.py
+tests/test_mesh_semantic_transfer.py
+```
+
+mil8 的 `vggt_x` 环境可运行 AnySplat/视觉相关依赖，但它的 Open3D 在 `gaussian_occupancy_mesh` 的着色步骤中仍会段错误。因此后续 3DGS clean 可以留在任一带 SciPy 的环境执行，所有需要 Open3D mesh/Poisson/occupancy 的阶段应固定使用 `3dgs` 环境，不能把 `vggt_x` 当作 Open3D mesh runtime。
+
 ## 未解决项
 
 1. AnySplat 新视角丝状条带仍需单独的 geometry-aware trimming/regularization 实验。

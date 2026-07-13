@@ -1099,8 +1099,14 @@ def test_filter_points_by_gaussian_attributes_can_return_keep_mask():
     assert keep.tolist() == [True, False, True]
 
 
-def test_clean_3dgs_floaters_removes_outliers_and_elongated_low_opacity(tmp_path: Path):
+def test_clean_3dgs_floaters_removes_outliers_and_elongated_low_opacity(tmp_path: Path, monkeypatch):
     np = pytest.importorskip("numpy")
+    pytest.importorskip("scipy")
+
+    def unexpected_open3d():
+        raise AssertionError("3DGS cleaner must not require Open3D for KNN outlier filtering")
+
+    monkeypatch.setattr("video2mesh.cli.import_open3d", unexpected_open3d)
     source = tmp_path / "splats.ply"
     output = tmp_path / "splats_clean.ply"
     means = np.array(
@@ -1143,6 +1149,7 @@ def test_clean_3dgs_floaters_removes_outliers_and_elongated_low_opacity(tmp_path
     assert report["input_count"] == 6
     assert report["kept_count"] == 4
     assert report["geometry_outlier"]["removed_count"] >= 1
+    assert report["geometry_outlier"]["neighbor_query_engine"] == "scipy_ckdtree"
     assert report["elongated_low_opacity"]["removed_count"] == 1
     assert header["vertex_count"] == 4
 
