@@ -4,7 +4,7 @@ id: video2mesh-industrial-pipelines-embodiedgen-v2
 category: 调研目录
 visibility: public
 summary: 调研 Horizon Robotics / WuwenAI 的 EmbodiedGen V2：从任务描述、图片和资产生成 sim-ready 3D 世界，支持跨仿真器导出、Vibe Coding 编辑和机器人策略训练。
-updated: 2026-07-13
+updated: 2026-07-14
 tags:
   - 工业资产管线
   - EmbodiedGen
@@ -358,6 +358,47 @@ tmp_remote_results/embodiedgen_v2_bedroom4_all_targets_trellis_20260713/
 远端对应目录为：`mil8:/root/autodl-tmp/embodiedgen_v2_bedroom4_all_targets_trellis_20260713/`。本地与远端的 **12/12 PLY SHA-256 全部一致**；每份均含 `x/y/z`、`f_dc_*`、`opacity`、`scale_*`、`rot_*`，全部属性 finite，四元数范数中位数约为 `1.0`。这验证的是全目标的单图 Gaussian 生成和文件合同，不验证真实尺度回对、mesh/collider、URDF、物理属性、碰撞或仿真可用性。
 
 这批结果给 Video2Mesh 的直接工程结论是：对大且清晰的 instance crop，TRELLIS 可以提供 object visual completion candidate；对小物体、遮挡物体或 instance mask 不干净的类别，必须在送入生成器前执行最小像素尺寸、alpha 面积、单实例纯度和多视角一致性门槛。生成器输出不能自动替换扫描层，更不能自动标为 sim-ready asset。
+
+### 窗扇实例修复（2026-07-14）
+
+上一轮 `sam3_window_01` 的 `483 x 612` RGBA 实际包含一整组双联窗，因此 TRELLIS 合理地把两个窗扇补成一个连体资产。问题不在采样 seed，而在上游把 `window` 作为**类别 mask**合并：对应 3D cloud 也已经跨过中间立柱，单靠 3D 连通域或扩大文字描述都无法可靠断开两件物体。
+
+![双联窗拆分后的左窗扇输入](../assets/embodiedgen-v2-bedroom4-window-left-pane-input.png "SAM3 window 文本提示加左侧正向框得到的单独左窗扇 RGBA；床、床头柜和右窗扇不进入 alpha")
+![双联窗拆分后的右窗扇输入](../assets/embodiedgen-v2-bedroom4-window-right-pane-input.png "SAM3 window 文本提示加右侧正向框得到的单独右窗扇 RGBA；与左窗扇 alpha 互斥")
+
+修复链路明确拆开了三个职责：
+
+```text
+SAM3 semantic text "window" + positive geometric box
+  -> per-pane mask candidates
+  -> prompt-box constraint + shared-mullion overlap removal
+  -> one RGBA crop and one instance contract per pane
+  -> TRELLIS image-only Gaussian generation
+  -> PLY field / finite / quaternion QA
+```
+
+每个物体合同都要求描述可见材质、框体、玻璃、百叶、朝向、遮挡和边界，同时明确禁止合并 `adjacent window pane`、共享框之外的结构、墙、床、床头柜和植物。这个详细 prompt 用于支持文本条件的通用 VLM 或物理资产描述器；本次 TRELLIS `run_old` 接口本身只接收 RGBA，不能把文字直接作为生成条件，所以真正改善精度的是先把文字语义落成 SAM3 的实例级几何约束。
+
+本机缓存的 PhysX-Anything Qwen2.5-VL 权重也做了真实探测：它是专用 voxel decoder fine-tune，面对通用 JSON 审核提示会输出体素编号序列，而不是实例描述。代码因此将此输出识别为 `unsupported_voxel_sequence` 并 fail-closed，绝不把它误报为 VLM 已完成窗扇识别。后续接入通用 instruction-following VLM 时，可直接复用相同的 JSON instance contract；当前可复现实验则依赖 SAM3 文本加正向框。
+
+| 新实例 | 独立 RGBA | Gaussian 数 / 用时 | PLY QA | SHA-256 前缀 |
+|---|---:|---:|---|---|
+| `sam3_window_01_left_pane` | `227 x 392`，alpha `33,653` | `538,656` / `14.75 s` | Passed，全部必需字段 finite，四元数中位数 `1.0` | `3332d894a3d3` |
+| `sam3_window_01_right_pane` | `250 x 495`，alpha `71,358` | `213,856` / `9.36 s` | Passed，全部必需字段 finite，四元数中位数 `1.0` | `6f7d6dae2bf5` |
+
+![拆分后两扇窗的 TRELLIS Gaussian QA](../assets/embodiedgen-v2-bedroom4-window-panes-trellis-preview.png "分别由独立 left/right RGBA 生成的 Gaussian 三视图；用于结构比较，不代替真实 Gaussian renderer")
+
+两份原始 PLY 仅保存在本地实验目录：
+
+```text
+tmp_remote_results/embodiedgen_v2_bedroom4_instance_refinement_20260714/
+  prompted_panes/input/   # 两张互斥 alpha、详细实例合同
+  prompted_panes/output/  # 两份 Gaussian PLY，不进 Git、不上传网站
+  prompted_panes/qa/      # PLY QA JSON 和预览图
+  sam3_probes/            # text / text+box instance-mask probe 证据
+```
+
+这证明“每扇窗独立生成”已经完成，但仍只是一对 visual completion candidates：没有回填真实世界坐标、mesh、collider、玻璃物理、铰链、URDF 或仿真验证。
 
 ## 风险
 

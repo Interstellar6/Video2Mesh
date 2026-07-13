@@ -49,6 +49,25 @@ def vertex_count(path: Path) -> int | None:
     return None
 
 
+def reviewed_specs(path: Path) -> dict[str, dict[str, Any]]:
+    report = read_json(path)
+    results = report.get("results")
+    if not isinstance(results, list):
+        raise ValueError(f"Missing results in VLM spec manifest: {path}")
+    specs: dict[str, dict[str, Any]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        object_id = result.get("object_id")
+        spec_path = result.get("spec_path")
+        if not isinstance(object_id, str) or not isinstance(spec_path, str):
+            continue
+        spec = read_json(Path(spec_path))
+        if spec.get("object_id") == object_id:
+            specs[object_id] = spec
+    return specs
+
+
 def gaussian_only_weight_root(weights: Path, output_root: Path) -> Path:
     config = read_json(weights / "pipeline.json")
     args = config.get("args")
@@ -122,6 +141,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--objects", nargs="*")
+    parser.add_argument(
+        "--vlm-spec-manifest",
+        type=Path,
+        help="Validated instance-contract review. Entries without generation_allowed=true are blocked.",
+    )
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
@@ -140,11 +164,36 @@ def main() -> int:
     output_root = args.output_root.resolve()
     output_dir = output_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-    pipeline, torch = load_pipeline(args.trellis_root.resolve(), args.weights.resolve(), output_root, args.dino_source.resolve())
-    from PIL import Image
-
+    specs = reviewed_specs(args.vlm_spec_manifest.resolve()) if args.vlm_spec_manifest else {}
     results: list[dict[str, Any]] = []
-    for index, item in enumerate(jobs):
+    allowed_jobs: list[dict[str, Any]] = []
+    for item in jobs:
+        object_id = str(item["object_id"])
+        if not args.vlm_spec_manifest:
+            allowed_jobs.append(item)
+            continue
+        spec = specs.get(object_id)
+        if spec and spec.get("generation_allowed") is True:
+            allowed_jobs.append(item)
+            continue
+        results.append(
+            {
+                "object_id": object_id,
+                "input": str(item.get("rgba_path") or ""),
+                "status": "blocked_by_vlm_instance_contract",
+                "vlm_spec_manifest": str(args.vlm_spec_manifest.resolve()),
+                "vlm_decision": spec.get("decision") if spec else "missing_review",
+                "reason": "TRELLIS accepts only reviewed single-instance inputs when --vlm-spec-manifest is supplied.",
+            }
+        )
+        print(f"blocked {object_id}: VLM review did not allow single-instance generation", flush=True)
+    pipeline: Any | None = None
+    torch: Any | None = None
+    if allowed_jobs:
+        pipeline, torch = load_pipeline(args.trellis_root.resolve(), args.weights.resolve(), output_root, args.dino_source.resolve())
+        from PIL import Image
+
+    for index, item in enumerate(allowed_jobs):
         object_id = str(item["object_id"])
         input_path = Path(str(item["rgba_path"]))
         ply_path = output_dir / f"{object_id}_trellis_gaussian.ply"
@@ -156,6 +205,9 @@ def main() -> int:
             "formats": ["gaussian"],
             "preprocess_image": True,
         }
+        if args.vlm_spec_manifest:
+            entry["vlm_spec_manifest"] = str(args.vlm_spec_manifest.resolve())
+            entry["vlm_decision"] = specs[object_id].get("decision")
         if args.skip_existing and ply_path.is_file() and ply_path.stat().st_size > 0:
             entry.update({
                 "status": "skipped_existing",
@@ -167,6 +219,8 @@ def main() -> int:
             continue
         started = time.perf_counter()
         try:
+            if pipeline is None or torch is None:
+                raise RuntimeError("TRELLIS pipeline was not initialized for an allowed job")
             torch.cuda.reset_peak_memory_stats()
             image = Image.open(input_path).convert("RGBA")
             outputs = pipeline.run_old(
@@ -208,13 +262,16 @@ def main() -> int:
         "trellis_root": str(args.trellis_root.resolve()),
         "dino_source": str(args.dino_source.resolve()),
         "job_count": len(jobs),
+        "allowed_job_count": len(allowed_jobs),
+        "vlm_spec_manifest": str(args.vlm_spec_manifest.resolve()) if args.vlm_spec_manifest else None,
         "results": results,
     }
     worker_manifest_path = output_dir / f"worker_gpu{args.gpu}_manifest.json"
     write_json(worker_manifest_path, worker_manifest)
     completed = sum(item.get("status") == "completed" for item in results)
     failed = sum(item.get("status") == "failed" for item in results)
-    print(f"worker gpu={args.gpu}: completed={completed} failed={failed} manifest={worker_manifest_path}", flush=True)
+    blocked = sum(item.get("status") == "blocked_by_vlm_instance_contract" for item in results)
+    print(f"worker gpu={args.gpu}: completed={completed} blocked={blocked} failed={failed} manifest={worker_manifest_path}", flush=True)
     return 1 if failed else 0
 
 
