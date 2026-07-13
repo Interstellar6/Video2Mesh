@@ -28,8 +28,8 @@ video
   -> scene-only 3DGS cleanup: COLMAP dense bbox + DBSCAN detached-cluster filter + background plane protection
   -> GroundingDINO bbox prompts, with SAM/OpenCV auto prompts as fallback
   -> SAM2 masks
-  -> 2D-to-3D semantic fusion
-  -> semantic 3DGS / SuperSplat export
+  -> 2D mask probability directly backprojected onto the clean GraphDECO 3DGS
+  -> binary semantic 3DGS core + lightweight SuperSplat semantic overlay
   -> conservative object-fragment merge suggestions/applied small components
   -> COLMAP dense Delaunay scene collider mesh
   -> mesh semantic transfer and semantic object mesh splitting
@@ -42,9 +42,19 @@ Simulator adapters are skipped by default in the quick pipeline while mesh and
 collider quality is still being tuned. Re-enable them explicitly with
 `RUN_SIMULATOR_ADAPTERS=1`.
 
-The slower Gaussian probability backprojection route is also optional now; the
-default route uses semantic splats directly for mesh semantic transfer. Re-enable
-the projected probability experiment with `GAUSSIAN_BACKPROJECT=1`.
+Gaussian probability backprojection is the default semantic route. It writes
+`object_id` and `object_probability` onto the same clean GraphDECO Gaussian
+geometry, with a geometry fingerprint check over means, opacity, scale, and
+rotation. The full binary `semantic_splats.ply` is a pipeline core for mesh
+semantic transfer, not a SuperSplat input. For visual inspection, load the
+scene 3DGS together with the generated lightweight
+`*_semantic_overlay_supersplat.ply`.
+
+Use the legacy 3D point-mask transfer only as an explicit comparison:
+
+```bash
+GAUSSIAN_BACKPROJECT=0 bash run.sh dataset/<video>.mp4
+```
 
 If the GraphDECO 3DGS run is available but the lightweight gsplat preview
 dependencies are not installed, keep the visual/mesh pipeline moving with

@@ -52,6 +52,8 @@ RUN_SIMULATOR_ADAPTERS=1 bash run.sh dataset/<video>.mp4
 
 Gaussian probability backprojection 现在是 quick run 默认路线。它会直接把 2D mask probability 投到 clean GraphDECO 3DGS，同一份 Gaussian 的 `means/opacities/scales/quats` 在 semantic core 写出前后会进行几何指纹校验。`semantic_splats.ply` 是 binary pipeline core，供 mesh transfer 使用；SuperSplat 应打开 scene visual PLY 和轻量 `semantic_*_overlay_supersplat.ply`，不要直接导入 full semantic core。
 
+默认不会再复制一份完整 semantic SuperSplat PLY。overlay 只保留 `object_probability >= 0.55` 的 Gaussian，最多 180,000 个；小类别先保留最少 2,048 个候选，再按置信度选取，避免墙/地板吞掉床、灯、植物。需要排查完整 semantic viewer 副本时才显式使用 `export-viewer-plys --full-semantic-supersplat` 或 `backproject-gaussian-probabilities --export-full-semantic-supersplat`。
+
 ```bash
 # 仅做旧 baseline 对照时可关闭（默认已开启）
 GAUSSIAN_BACKPROJECT=0 bash run.sh dataset/<video>.mp4

@@ -220,6 +220,9 @@ DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_ELONGATION = 12.0
 DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MIN = -8.0
 DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MAX = 5.0
 DEFAULT_SEMANTIC_LABEL_SIDECAR_INLINE_MAX_VERTICES = 50000
+DEFAULT_SEMANTIC_OVERLAY_MIN_PROBABILITY = 0.55
+DEFAULT_SEMANTIC_OVERLAY_MAX_VERTICES = 180000
+DEFAULT_SEMANTIC_OVERLAY_MIN_VERTICES_PER_LABEL = 2048
 PLY_NUMPY_DTYPES = {
     "char": "i1",
     "int8": "i1",
@@ -5370,12 +5373,114 @@ def read_supersplat_label_sidecar(path: Path) -> tuple[list[Any] | None, list[fl
     return None, None, None
 
 
+def select_lightweight_semantic_overlay_indices(
+    labels,
+    probabilities,
+    *,
+    min_probability: float = DEFAULT_SEMANTIC_OVERLAY_MIN_PROBABILITY,
+    max_vertices: int = DEFAULT_SEMANTIC_OVERLAY_MAX_VERTICES,
+    min_vertices_per_label: int = DEFAULT_SEMANTIC_OVERLAY_MIN_VERTICES_PER_LABEL,
+):
+    """Select a bounded, high-confidence semantic overlay without changing the core PLY."""
+    np = import_numpy()
+    labels_np = np.asarray(labels, dtype=np.int64).reshape(-1)
+    probabilities_np = np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    if labels_np.shape != probabilities_np.shape:
+        raise ValueError("semantic labels and probabilities must have matching shapes")
+
+    candidates = np.flatnonzero(
+        (labels_np > 0) & (probabilities_np >= float(min_probability))
+    ).astype(np.int64)
+    candidate_count = int(candidates.size)
+    limit = int(max_vertices)
+    report: dict[str, Any] = {
+        "min_probability": float(min_probability),
+        "candidate_vertex_count": candidate_count,
+        "max_vertices": limit,
+        "min_vertices_per_label": int(min_vertices_per_label),
+        "selection": "all_candidates" if limit <= 0 or candidate_count <= limit else "probability_ranked_per_label",
+        "selected_by_label": {},
+    }
+    if limit <= 0 or candidate_count <= limit:
+        selected = candidates
+        for label in np.unique(labels_np[selected]):
+            report["selected_by_label"][str(int(label))] = int((labels_np[selected] == label).sum())
+        report["selected_vertex_count"] = int(selected.size)
+        return selected, report
+
+    unique_labels, label_counts = np.unique(labels_np[candidates], return_counts=True)
+    label_count = int(unique_labels.size)
+    if label_count == 0:
+        report["selected_vertex_count"] = 0
+        return candidates, report
+
+    # Preserve small instances first, then divide the remaining budget by the
+    # square root of each label's support so floors/walls do not crowd out beds,
+    # lamps, or plants in the display-only overlay.
+    quotas = np.minimum(
+        label_counts.astype(np.int64),
+        max(1, int(min_vertices_per_label)),
+    )
+    if int(quotas.sum()) > limit:
+        quotas = np.zeros(label_count, dtype=np.int64)
+        if limit > 0:
+            # A pathological label table can contain more categories than the
+            # display budget. Keep one sample from the most represented labels
+            # instead of exceeding the caller's hard memory cap.
+            keep_order = np.argsort(-label_counts, kind="stable")[:limit]
+            quotas[keep_order] = 1
+        remaining = max(0, limit - int(quotas.sum()))
+    else:
+        remaining = int(limit - quotas.sum())
+    capacities = label_counts.astype(np.int64) - quotas
+    while remaining > 0 and int(capacities.sum()) > 0:
+        weights = np.sqrt(np.maximum(capacities, 0).astype(np.float64))
+        weights[capacities <= 0] = 0.0
+        weight_sum = float(weights.sum())
+        if weight_sum <= 0.0:
+            break
+        additions = np.minimum(
+            capacities,
+            np.floor(remaining * (weights / weight_sum)).astype(np.int64),
+        )
+        added = int(additions.sum())
+        if added == 0:
+            order = np.argsort(-weights, kind="stable")
+            for index in order:
+                if remaining <= 0:
+                    break
+                if capacities[index] > 0:
+                    additions[index] += 1
+                    added += 1
+                    remaining -= 1
+        else:
+            remaining -= added
+        quotas += additions
+        capacities -= additions
+
+    selections = []
+    for label, quota in zip(unique_labels.tolist(), quotas.tolist()):
+        members = candidates[labels_np[candidates] == int(label)]
+        if int(quota) < int(members.size):
+            # Confidence ranking avoids turning the overlay into a low-probability
+            # halo; the original scene PLY remains the complete visual layer.
+            order = np.lexsort((members, -probabilities_np[members]))
+            members = members[order[: int(quota)]]
+        selections.append(members)
+        report["selected_by_label"][str(int(label))] = int(members.size)
+    selected = np.sort(np.concatenate(selections).astype(np.int64)) if selections else np.empty((0,), dtype=np.int64)
+    report["selected_vertex_count"] = int(selected.size)
+    return selected, report
+
+
 def export_viewer_plys(
     source_ply: Path,
     output_dir: Path,
     prefix: str,
     include_labels: bool = False,
     export_point_cloud: bool = True,
+    export_full_semantic_supersplat: bool = False,
+    semantic_overlay_max_vertices: int = DEFAULT_SEMANTIC_OVERLAY_MAX_VERTICES,
 ) -> dict[str, Any]:
     np = import_numpy()
     data = read_gsplat_ply(source_ply)
@@ -5411,6 +5516,8 @@ def export_viewer_plys(
     semantic_overlay_path = None
     semantic_overlay_label_sidecar = None
     semantic_overlay_count = 0
+    semantic_overlay_selection: dict[str, Any] | None = None
+    write_full_supersplat = not include_labels or bool(export_full_semantic_supersplat)
     if health_report.get("status") != "safe":
         safe_scales, safe_quats, safe_opacities, repair_report = make_viewer_safe_gaussian_arrays(
             data["scales"],
@@ -5440,19 +5547,21 @@ def export_viewer_plys(
     shape_preview_path = output_dir / f"{prefix}_supersplat_shape_preview.png"
     if plain_path is not None:
         write_point_cloud_ascii_ply(plain_path, data["means"], display_colors)
-    write_supersplat_ply(
-        supersplat_path,
-        data["means"],
-        display_colors,
-        raw_opacities,
-        raw_scales,
-        raw_quats,
-        labels=labels,
-        probabilities=probabilities,
-        normals=data.get("normals"),
-        f_rest=f_rest,
-    )
-    label_sidecar = write_supersplat_label_sidecar(supersplat_path, labels, probabilities)
+    label_sidecar = None
+    if write_full_supersplat:
+        write_supersplat_ply(
+            supersplat_path,
+            data["means"],
+            display_colors,
+            raw_opacities,
+            raw_scales,
+            raw_quats,
+            labels=labels,
+            probabilities=probabilities,
+            normals=data.get("normals"),
+            f_rest=f_rest,
+        )
+        label_sidecar = write_supersplat_label_sidecar(supersplat_path, labels, probabilities)
     if labels is not None:
         labels_np = np.asarray(labels, dtype=np.int64)
         probabilities_np = (
@@ -5460,28 +5569,32 @@ def export_viewer_plys(
             if probabilities is not None
             else np.ones(labels_np.shape[0], dtype=np.float32)
         )
-        overlay_mask = (labels_np > 0) & (probabilities_np >= 0.55)
-        semantic_overlay_count = int(overlay_mask.sum())
+        overlay_indices, semantic_overlay_selection = select_lightweight_semantic_overlay_indices(
+            labels_np,
+            probabilities_np,
+            max_vertices=semantic_overlay_max_vertices,
+        )
+        semantic_overlay_count = int(overlay_indices.size)
         if semantic_overlay_count:
             semantic_overlay_path = output_dir / f"{prefix}_semantic_overlay_supersplat.ply"
             write_supersplat_ply(
                 semantic_overlay_path,
-                data["means"][overlay_mask],
-                display_colors[overlay_mask],
-                raw_opacities[overlay_mask],
-                raw_scales[overlay_mask],
-                raw_quats[overlay_mask],
-                normals=data.get("normals")[overlay_mask] if data.get("normals") is not None else None,
+                data["means"][overlay_indices],
+                display_colors[overlay_indices],
+                raw_opacities[overlay_indices],
+                raw_scales[overlay_indices],
+                raw_quats[overlay_indices],
+                normals=data.get("normals")[overlay_indices] if data.get("normals") is not None else None,
                 # The overlay carries category color only; the base scene PLY
                 # keeps the full SH appearance below it.
                 f_rest=None,
             )
             semantic_overlay_label_sidecar = write_supersplat_label_sidecar(
                 semantic_overlay_path,
-                labels_np[overlay_mask],
-                probabilities_np[overlay_mask],
+                labels_np[overlay_indices],
+                probabilities_np[overlay_indices],
             )
-    if health_report.get("status") != "safe":
+    if write_full_supersplat and health_report.get("status") != "safe":
         write_supersplat_ply(
             viewer_safe_supersplat_path,
             data["means"],
@@ -5498,7 +5611,8 @@ def export_viewer_plys(
         viewer_safe_exported_health = audit_gaussian_health(safe_scales, safe_quats, safe_opacities)
     else:
         viewer_safe_supersplat_path = None
-    safety_report["output_supersplat_ply"] = str(supersplat_path)
+    safety_report["output_supersplat_ply"] = str(supersplat_path) if write_full_supersplat else None
+    safety_report["full_semantic_supersplat_exported"] = bool(write_full_supersplat)
     safety_report["output_point_cloud_ply"] = str(plain_path) if plain_path else None
     safety_report["label_sidecar"] = str(label_sidecar) if label_sidecar else None
     safety_report["output_viewer_safe_supersplat_ply"] = str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None
@@ -5506,6 +5620,7 @@ def export_viewer_plys(
     safety_report["semantic_overlay_supersplat_ply"] = str(semantic_overlay_path) if semantic_overlay_path else None
     safety_report["semantic_overlay_label_sidecar"] = str(semantic_overlay_label_sidecar) if semantic_overlay_label_sidecar else None
     safety_report["semantic_overlay_vertex_count"] = semantic_overlay_count
+    safety_report["semantic_overlay_selection"] = semantic_overlay_selection
     exported_health = audit_gaussian_health(raw_scales, raw_quats, raw_opacities)
     try:
         shape_preview = write_gaussian_shape_preview(
@@ -5532,10 +5647,10 @@ def export_viewer_plys(
             "includes_object_probability": False,
             "exported": plain_path is not None,
         },
-        "supersplat_ply": str(supersplat_path),
-        "recommended_supersplat_ply": str(semantic_overlay_path) if semantic_overlay_path else str(supersplat_path),
+        "supersplat_ply": str(supersplat_path) if write_full_supersplat else None,
+        "recommended_supersplat_ply": str(semantic_overlay_path) if semantic_overlay_path else (str(supersplat_path) if write_full_supersplat else None),
         "supersplat_ply_info": {
-            "path": str(supersplat_path),
+            "path": str(supersplat_path) if write_full_supersplat else "",
             "format": "graphdeco_supersplat_ply",
             "encoding": "binary_little_endian",
             "includes_object_id": False,
@@ -5551,6 +5666,13 @@ def export_viewer_plys(
             "viewer_safety_report": str(safety_report_path),
             "shape_preview": shape_preview,
             "viewer_safe_companion": str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None,
+            "exported": bool(write_full_supersplat),
+            "notes": (
+                "Full semantic SuperSplat export is opt-in because it duplicates the scene Gaussian set. "
+                "Use the lightweight semantic overlay with the original scene 3DGS by default."
+                if include_labels and not write_full_supersplat
+                else "Full Gaussian viewer export."
+            ),
         },
         "viewer_safe_supersplat_ply": str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None,
         "viewer_safe_supersplat_ply_info": {
@@ -5573,6 +5695,7 @@ def export_viewer_plys(
             "label_sidecar": str(semantic_overlay_label_sidecar) if semantic_overlay_label_sidecar else None,
             "display_mode": "load with the original scene 3DGS PLY as a semantic color overlay",
             "geometry_source": str(source_ply),
+            "selection": semantic_overlay_selection,
         } if semantic_overlay_path else None,
         "source_gaussian_health_ok": health_report.get("status") == "safe",
         "exported_gaussian_health_ok": exported_health.get("status") == "safe",
@@ -14495,6 +14618,9 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             "semantic_gaussian_probability",
             include_labels=True,
             export_point_cloud=False,
+            export_full_semantic_supersplat=bool(
+                getattr(args, "export_full_semantic_supersplat", False)
+            ),
         )
     except Exception as exc:
         viewer_exports = {"error": str(exc)}
@@ -14570,9 +14696,12 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             manifest["artifacts"].pop("semantic_point_cloud_ply", None)
         if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
             manifest["artifacts"]["semantic_supersplat_full_ply"] = str(viewer_exports["supersplat_ply"])
-            manifest["artifacts"]["semantic_supersplat_ply"] = str(
-                viewer_exports.get("recommended_supersplat_ply") or viewer_exports["supersplat_ply"]
-            )
+        else:
+            manifest["artifacts"].pop("semantic_supersplat_full_ply", None)
+        if isinstance(viewer_exports, dict) and viewer_exports.get("recommended_supersplat_ply"):
+            manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["recommended_supersplat_ply"])
+        else:
+            manifest["artifacts"].pop("semantic_supersplat_ply", None)
         if isinstance(viewer_exports, dict) and viewer_exports.get("semantic_overlay_supersplat_ply"):
             manifest["artifacts"]["semantic_supersplat_overlay_ply"] = str(viewer_exports["semantic_overlay_supersplat_ply"])
         manifest.setdefault("external_stages", {})["semantic_probability_backprojection"] = {
@@ -19220,6 +19349,9 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
                 "semantic",
                 include_labels=True,
                 export_point_cloud=False,
+                export_full_semantic_supersplat=bool(
+                    getattr(args, "export_full_semantic_supersplat", False)
+                ),
             )
         except Exception as exc:
             viewer_exports = {"error": str(exc)}
@@ -19258,15 +19390,20 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
         manifest["artifacts"].pop("semantic_point_cloud_ply", None)
     if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
         manifest["artifacts"]["semantic_supersplat_full_ply"] = str(viewer_exports["supersplat_ply"])
-        manifest["artifacts"]["semantic_supersplat_ply"] = str(
-            viewer_exports.get("recommended_supersplat_ply") or viewer_exports["supersplat_ply"]
-        )
+    else:
+        manifest["artifacts"].pop("semantic_supersplat_full_ply", None)
+    if isinstance(viewer_exports, dict) and viewer_exports.get("recommended_supersplat_ply"):
+        manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["recommended_supersplat_ply"])
+    else:
+        manifest["artifacts"].pop("semantic_supersplat_ply", None)
     if isinstance(viewer_exports, dict) and viewer_exports.get("semantic_overlay_supersplat_ply"):
         manifest["artifacts"]["semantic_supersplat_overlay_ply"] = str(viewer_exports["semantic_overlay_supersplat_ply"])
     save_manifest(project_root, manifest)
     print(f"Wrote semantic PLY: {output_ply}")
-    if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
-        print(f"Wrote semantic SuperSplat PLY: {viewer_exports['supersplat_ply']}")
+    if isinstance(viewer_exports, dict) and viewer_exports.get("recommended_supersplat_ply"):
+        print(f"Wrote recommended semantic SuperSplat overlay: {viewer_exports['recommended_supersplat_ply']}")
+        if viewer_exports.get("supersplat_ply"):
+            print(f"Wrote full semantic SuperSplat PLY: {viewer_exports['supersplat_ply']}")
         if viewer_exports.get("point_cloud_ply"):
             print(f"Wrote semantic point-cloud PLY: {viewer_exports['point_cloud_ply']}")
         if viewer_exports.get("semantic_overlay_supersplat_ply"):
@@ -19321,6 +19458,9 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
                 prefix,
                 include_labels=include_labels,
                 export_point_cloud=not include_labels,
+                export_full_semantic_supersplat=bool(
+                    include_labels and getattr(args, "full_semantic_supersplat", False)
+                ),
             )
             exported["ok"] = True
             results["exports"][name] = exported
@@ -19345,10 +19485,14 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
     semantic_export = results["exports"].get("semantic")
     if isinstance(semantic_export, dict) and semantic_export.get("ok"):
         manifest["artifacts"].pop("semantic_point_cloud_ply", None)
-        manifest["artifacts"]["semantic_supersplat_full_ply"] = semantic_export.get("supersplat_ply")
-        manifest["artifacts"]["semantic_supersplat_ply"] = (
-            semantic_export.get("recommended_supersplat_ply") or semantic_export.get("supersplat_ply")
-        )
+        if semantic_export.get("supersplat_ply"):
+            manifest["artifacts"]["semantic_supersplat_full_ply"] = semantic_export.get("supersplat_ply")
+        else:
+            manifest["artifacts"].pop("semantic_supersplat_full_ply", None)
+        if semantic_export.get("recommended_supersplat_ply"):
+            manifest["artifacts"]["semantic_supersplat_ply"] = semantic_export.get("recommended_supersplat_ply")
+        else:
+            manifest["artifacts"].pop("semantic_supersplat_ply", None)
         if semantic_export.get("semantic_overlay_supersplat_ply"):
             manifest["artifacts"]["semantic_supersplat_overlay_ply"] = semantic_export.get("semantic_overlay_supersplat_ply")
     save_manifest(project_root, manifest)
@@ -42139,6 +42283,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
+    p.add_argument("--export-full-semantic-supersplat", action="store_true", help="Also write the full semantic SuperSplat duplicate. Disabled by default; use the lightweight overlay with the source scene instead.")
     p.add_argument("--register-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Update manifest semantic_splats artifacts. Use --no-register-artifacts for independent AnySplat/SuGaR route outputs.")
     p.add_argument("--seed", type=int, default=7)
     p.set_defaults(func=cmd_backproject_gaussian_probabilities)
@@ -42310,6 +42455,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, help="Defaults to simulator_assets/viewer_plys.")
     p.add_argument("--prefix", help="Output filename prefix. Defaults to scene_3dgs/semantic_3dgs or source stem.")
     p.add_argument("--include-labels", action="store_true", help="Preserve object_id from a custom semantic source PLY when present.")
+    p.add_argument("--full-semantic-supersplat", action="store_true", help="Opt in to a full semantic Gaussian duplicate. Default semantic viewer export writes only the lightweight overlay.")
     p.set_defaults(func=cmd_export_viewer_plys)
 
     p = sub.add_parser("render-semantic-preview", help="Color semantic splats and project object masks into source frames for QA.")

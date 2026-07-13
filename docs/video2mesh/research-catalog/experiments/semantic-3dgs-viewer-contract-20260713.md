@@ -62,6 +62,12 @@ GraphDECO clean 3DGS 的视觉底图仍是当前 P0 visual layer：墙面和地�
 
 这种方式保留原始 SH visual appearance，同时让语义层只承载标签色，不重复存整份场景。
 
+### V4 内存保护规则
+
+在卧室场景中，完整 semantic core 和完整 semantic SuperSplat 都会重复近百万 Gaussian，浏览器会把二进制 PLY 解包成更大的 CPU/GPU 缓冲，足以让 SuperSplat 卡死。现在默认不再导出完整 semantic SuperSplat 副本：只写 overlay，并限定为 `object_probability >= 0.55`、最多 180,000 个 Gaussian。选择过程先给每个 semantic id 保留最多 2,048 个候选配额，再按置信度划分剩余预算，因此墙和地板不会挤掉床、灯、植物。
+
+`semantic_splats.ply` 仍是完整 binary pipeline core，保留给 mesh semantic transfer 和 object split；它不是 SuperSplat 的输入。需要完整 viewer 副本时必须显式加 `--full-semantic-supersplat`，以免误把高内存调试资产当作默认结果。
+
 ## GraphDECO V2/V3 实验
 
 远端 run：`/data/zyx/workspace/Video2MeshWorkspace/video2mesh_runs/bedroom_4_fresh_full_cpu_seq30_8gpu_dense_20260711_0600`。

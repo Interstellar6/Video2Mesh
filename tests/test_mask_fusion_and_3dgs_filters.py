@@ -51,6 +51,7 @@ from video2mesh.cli import (
     resolve_export_record_path,
     scaled_intrinsic_for_size,
     scene_bbox_cluster_keep_mask,
+    select_lightweight_semantic_overlay_indices,
     select_colmap_sparse_model,
     source_labels_from_object_masks,
     write_json,
@@ -489,7 +490,18 @@ def test_export_viewer_plys_keeps_semantic_labels_out_of_supersplat_ply(tmp_path
         encoding="utf-8",
     )
 
-    report = export_viewer_plys(source, tmp_path, "semantic", include_labels=True)
+    default_report = export_viewer_plys(source, tmp_path, "semantic", include_labels=True)
+    assert default_report["supersplat_ply"] is None
+    assert Path(default_report["recommended_supersplat_ply"]).exists()
+    assert default_report["semantic_overlay_supersplat_ply_info"]["vertex_count"] == 2
+
+    report = export_viewer_plys(
+        source,
+        tmp_path,
+        "semantic_full",
+        include_labels=True,
+        export_full_semantic_supersplat=True,
+    )
 
     header = parse_ply_vertex_header(Path(report["supersplat_ply"]))
     property_names = [name for name, _prop_type in header["properties"]]
@@ -546,7 +558,14 @@ def test_large_semantic_sidecar_uses_compressed_npz(tmp_path: Path):
     labels = np.arange(count, dtype=np.int32) % 5
     probabilities = np.linspace(0.0, 1.0, count, dtype=np.float32)
 
-    report = export_viewer_plys(source, tmp_path, "semantic_large", include_labels=True, export_point_cloud=False)
+    report = export_viewer_plys(
+        source,
+        tmp_path,
+        "semantic_large",
+        include_labels=True,
+        export_point_cloud=False,
+        export_full_semantic_supersplat=True,
+    )
 
     # This first export has no labels in its source, so inject a compact sidecar
     # and ensure the generic reader can consume it on a binary SuperSplat PLY.
@@ -581,6 +600,31 @@ def test_double_sided_mesh_preview_has_reversed_face_companion(tmp_path: Path):
     assert report["source_face_count"] == 1
     assert report["display_face_count"] == 2
     assert face_element["count"] == 2
+
+
+def test_lightweight_semantic_overlay_cap_preserves_each_label():
+    np = pytest.importorskip("numpy")
+    labels = np.repeat(np.asarray([1, 2, 3], dtype=np.int64), 100)
+    probabilities = np.concatenate(
+        [
+            np.linspace(0.56, 0.99, 100, dtype=np.float32),
+            np.linspace(0.60, 0.98, 100, dtype=np.float32),
+            np.linspace(0.70, 0.97, 100, dtype=np.float32),
+        ]
+    )
+
+    selected, report = select_lightweight_semantic_overlay_indices(
+        labels,
+        probabilities,
+        max_vertices=60,
+        min_vertices_per_label=10,
+    )
+
+    assert selected.size == 60
+    assert report["candidate_vertex_count"] == 300
+    assert report["selected_vertex_count"] == 60
+    assert set(labels[selected].tolist()) == {1, 2, 3}
+    assert all(count >= 10 for count in report["selected_by_label"].values())
 
 
 def test_gaussian_health_flags_supersplat_streak_risk():
@@ -681,7 +725,13 @@ def test_export_viewer_plys_reads_semantic_label_sidecar_for_binary_supersplat(t
         {"schema_version": 1, "object_id": [7, 8], "object_probability": [0.7, 0.8]},
     )
 
-    report = export_viewer_plys(source, tmp_path, "semantic_3dgs_repaired", include_labels=True)
+    report = export_viewer_plys(
+        source,
+        tmp_path,
+        "semantic_3dgs_repaired",
+        include_labels=True,
+        export_full_semantic_supersplat=True,
+    )
 
     assert report["includes_object_id"] is True
     assert report["source_label_sidecar"].endswith("semantic_3dgs_supersplat_labels.json")
