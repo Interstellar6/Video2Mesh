@@ -3,7 +3,7 @@ title: Holi-Spatial 调研与 bedroom_4 实验报告
 id: video2mesh-semantic-scene-graph-holi-spatial
 category: 调研目录
 visibility: public
-summary: 调研 Holi-Spatial 的自动 3D 空间数据生成 pipeline、公开模型与数据集，并记录 Video2Mesh bedroom_4 的 Holi-Spatial 兼容 smoke run。
+summary: 调研 Holi-Spatial 的自动 3D 空间数据生成 pipeline、公开模型与数据集，并记录 Video2Mesh bedroom_4 的历史 smoke run 与 2026-07-13 真实 DA3、SAM3、PGSR 重跑。
 tags:
   - 语义与 Scene Graph
   - Holi-Spatial
@@ -14,7 +14,7 @@ tags:
 
 # Holi-Spatial 调研与 bedroom_4 实验报告
 
-这份报告记录 Holi-Spatial 论文、官方仓库、公开模型/数据集状态，以及 Video2Mesh `bedroom_4` 片段接入 Holi-Spatial 后处理和 spatial QA 的实际实验结果。这里的实验是 **Holi-Spatial-compatible smoke run**，不是完整官方 DA3/SAM3/PGSR 重跑。
+这份报告记录 Holi-Spatial 论文、官方仓库、公开模型/数据集状态，以及 Video2Mesh `bedroom_4` 片段接入 Holi-Spatial 后处理和 spatial QA 的实际实验结果。文中保留历史 **Holi-Spatial-compatible smoke run**，并在末尾新增 2026-07-13 的真实 DA3、SAM3、PGSR 运行；两者不能混为一条实验结论。
 
 ![Holi-Spatial 官方 teaser](../assets/holi-spatial-teaser.jpg "官方 Holi-Spatial teaser：从视频流构建几何、语义、3D grounding 和 spatial QA 数据")
 
@@ -433,3 +433,89 @@ QA 类型分布：
 本周 Holi-Spatial 仍处在部署与适配阶段。已经确认 Video2Mesh 的 `bedroom_4` 现有 frames、cameras、object masks 和 3D bbox 可以被整理成 Holi-Spatial 风格 run package，并跑通官方 AABB postprocess 与 object-only two-view QA；7 月 11 日 adapter 还生成了 `scene_mesh_tsdf_fusion_post.ply`、`holi_point_cloud.ply` 和 `semantic_splats.ply` 三类 3D 输出。但可视化 QA 结论比较保守：mesh 基本等同 Video2Mesh baseline，`holi_point_cloud.ply` 与原始 3DGS 重建类似且伪影很多，`semantic_splats.ply` 因 668MB ASCII PLY 太大导致 SuperSplat 打开卡死，并且普通 viewer 看不到语义信息。
 
 因此当前适合写成“schema smoke run / 空间 QA 适配成功 + 输出质量已审计”，不适合写成“完整复现 Holi-Spatial”。后续优先级是加 QA verifier、VLM evaluation、semantic splat viewer-safe export 和语义着色/筛选 viewer，把这批 QA 与 semantic PLY 从静态产物变成可比较、可查看的空间推理评测样本。
+
+## 2026-07-13：真实 DA3、SAM3、PGSR 与 Video2Mesh lifting 重跑
+
+这一节是独立的新实验，远端目录为：
+
+```text
+mil8:/data/zyx/workspace/holi_spatial_runs/bedroom_4_full_da3_sam3_pgsr_20260713_155751
+```
+
+它替代了上文的“DA3/SAM3/PGSR 未跑”状态，但没有替代或改写旧 smoke-run 的历史记录。目标是对 `bedroom_4` 的 80 帧片段执行真实 DA3 depth、真实 SAM3 文本分割、官方 PGSR 训练和 mesh 提取，并按 Video2Mesh 自身的多视角概率投影融合完成 2D-to-3D lifting 与 3D bbox 后处理。
+
+### 实际链路与边界
+
+```text
+80 frames + corrected cameras
+  -> official DA3NESTED-GIANT-LARGE depth + 4M-point cloud
+  -> GroundingDINO query-bank category filtering
+  -> SAM3 text prompt -> bbox, score, 2D instance masks
+  -> class probability masks
+  -> Video2Mesh projection + visibility filtering + multi-view votes
+  -> DBSCAN instance split + robust AABB/PCA OBB
+  -> official PGSR 30k optimization + TSDF mesh
+  -> nearest semantic transfer from DA3 fused points to PGSR Gaussians
+```
+
+| 阶段 | 本次执行 | 状态 | 证据 |
+|---|---|---|---|
+| 相机与数据包 | 80 个相机、OpenGL/Colmap 坐标约定校正 | Passed | 相机 round-trip 最大误差 `1.33e-15` |
+| DA3 | 官方 Holi-Spatial DA3 inference，`depth-anything/DA3NESTED-GIANT-LARGE` | Passed | 80 张 depth、4,000,000 点 `pointcloud_da3.ply` |
+| 类别筛选 | Video2Mesh 已有 GroundingDINO query bank | Passed，但不是官方 VLM | 66 candidates -> 24 prompts -> 11 categories |
+| SAM3 | 真实 checkpoint text-prompt inference | Passed | 977 instance masks；11 类提示中 9 类有有效 mask |
+| 2D-to-3D lifting | Video2Mesh probability fusion，不使用论文的 lifting 脚本 | Passed | 630 class-frame probability masks；遮挡过滤、`p >= 0.6`、至少 2 次多视角投票 |
+| 3D instance/bbox | voxel `0.04`、DBSCAN `eps=0.12`、0.5% robust AABB、PCA OBB | Passed | 15 条 3D 记录 |
+| PGSR / mesh | 官方 PGSR 单场景训练至 iteration 30,000，随后官方 render/TSDF | Passed | 877,848 Gaussians；TSDF mesh 703,028 vertices / 1,362,793 faces |
+| caption / 官方 QA | 未在这轮真实重跑中执行 | Not tested | 不把旧 smoke-run QA 计入本轮 |
+
+GroundingDINO 在这次运行中没有向 SAM3 传入任何 detection box。它只从预设 query bank 里保留类别名称；SAM3 用这些文本类别直接预测自己的 `bbox + score + mask`。因此它不是 SAM3 的技术依赖：类别已知时可直接 SAM3；类别未知时，正式 Holi-Spatial 应由 VLM 发现类别，GroundingDINO 仅可作为候选筛选或 baseline 对照。
+
+### 真实产物与数值
+
+| 产物 | 规模 | 说明 |
+|---|---:|---|
+| DA3 depth | 80 个 `.npy` | 真实 DA3 深度；DA3 直接回投产出 4M 点初始几何 |
+| DA3 semantic PLY | 4,000,000 vertices，binary，约 92MB | 含 `object_id` 与 `object_probability`；这是 Video2Mesh 三维投影融合的直接结果 |
+| SAM3 masks | 977 instances / 630 merged class-frame masks | `table`、`wall art` 没有有效 mask；其余 9 类产生实际结果 |
+| 3D instances | 15 | bed 1、ceiling 1、door 2、floor 1、lamp 2、nightstand 2、plant 3、wall 1、window 2 |
+| PGSR 30k | 877,848 Gaussians，约 208MB raw PLY | 最终训练 L1 `0.0117173`、PSNR `33.3479 dB`、缺失 depth warning 为 0 |
+| PGSR TSDF mesh | 703,028 vertices / 1,362,793 faces，约 36MB | 原始 TSDF 768,324 vertices，最大连通域过滤后得到该 mesh |
+| PGSR semantic transfer | 877,848 Gaussians | DA3 语义点到 PGSR Gaussian 的最近邻迁移；平均距离 `0.0484` scene units，不设置距离截断 |
+
+本地交付目录：
+
+```text
+/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/holi_spatial_bedroom4_full_20260713
+```
+
+其中 `semantic_da3_points.ply`、`pgsr_30k_raw.ply`、`tsdf_fusion_post.ply` 和 `object_masks_3d/` 是原始实验输出。完整 ASCII `semantic_pgsr_30k.ply` 约 608MB，保留在远端用于审计；本地提供等价语义标签的 viewer 包：
+
+| viewer 文件 | 大小 | 用途 |
+|---|---:|---|
+| `viewer_plys_pgsr_30k/semantic_pgsr_30k_point_cloud.ply` | 约 38MB | 带语义调色板的普通点云，适合 CloudCompare/Preview |
+| `viewer_plys_pgsr_30k/semantic_pgsr_30k_supersplat.ply` | 约 208MB，binary | SuperSplat 显示用的 3DGS PLY |
+| `viewer_plys_pgsr_30k/semantic_pgsr_30k_supersplat_labels.json` | 约 24MB | 与 viewer PLY 按顶点顺序对应的 `object_id/object_probability` sidecar |
+
+viewer PLY 为解决 ASCII 文件过大和 viewer 崩溃而生成。它保留 Gaussian center 与语义标签，但为了安全显示裁剪了 scale、归一化 rotation、限制 opacity；因此它是 **显示用派生产物**，不是原始 PGSR Gaussian 的无损替代。原始 PGSR 的数值审计中，scale p99 为 `0.6649`，elongation p99 为 `6.23e11`，存在明显长条 splat 风险；viewer-safe 版本将最大 scale 限制为 `0.04`、elongation 限制为 `12`。这能改善加载/显示，不应被解释为训练几何质量已经修复。
+
+### 投影与视觉 QA
+
+![SAM3 2D masks](../assets/holi-spatial-bedroom4-sam3-contact-sheet-20260713.jpg "真实 SAM3 80 帧采样的 2D mask contact sheet")
+
+![DA3 三维 bbox](../assets/holi-spatial-bedroom4-da3-bbox-20260713.png "Video2Mesh 概率融合和 DBSCAN 后生成的 DA3 三维 bbox 顶视图")
+
+![PGSR semantic overlay](../assets/holi-spatial-bedroom4-semantic-overlay-20260713.png "PGSR semantic PLY 回投到原始视角的 overlay；用于检查语义几何一致性")
+
+定量投影检查中，DA3 semantic preview 抽查 10 帧全部有效，平均 projected foreground ratio 为 `0.9710`、平均 visible foreground ratio 为 `0.7163`；PGSR semantic preview 的对应值为 `0.9848` / `0.7910`。这些数字只说明投影与遮挡筛选没有静默失效，并不等于类别 IoU 或 3D detection AP。
+
+定性结果需要保守解读：
+
+- 2D SAM3 对床、窗、灯、床头柜的识别和边界总体可用；`table`、`wall art` 未检测到，door/ceiling 跨帧稳定性较弱。
+- DA3 语义回投能正确覆盖床、窗、墙、地板等大结构，但点云仍有多视角浮点、边缘泄漏和室内大平面覆盖问题。
+- `bed`、`door` 等三维 bbox 会吸收到相邻结构，尺寸明显偏大；`door`、`ceiling` 应标记为低可信，不能直接作为碰撞盒或物理尺寸真值。
+- PGSR TSDF mesh 是真实官方 PGSR 输出，但视觉层的原始 Gaussian 仍有长条 splat 风险。mesh 适合作为几何检查产物，语义 viewer 适合审阅，不足以证明可直接进入 simulator 的干净视觉资产。
+
+### 与论文完整复现的差异
+
+这轮已经不再是 DA3/SAM2/旧 3DGS 的 proxy 路线：DA3、SAM3、PGSR、mesh 以及 Video2Mesh 的 2D-to-3D projection fusion 都真实执行了。不过它仍不应写成“完整官方 Holi-Spatial 复现”：类别发现使用的是 GroundingDINO query-bank filtering 而非官方 VLM/vLLM，lifting 与 bbox 使用用户指定的 Video2Mesh 实现而非论文脚本，instance caption、VLM-agent verification、官方 spatial QA、LLaMA-Factory 转换和论文 benchmark 也未运行。

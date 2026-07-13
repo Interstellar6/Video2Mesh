@@ -14764,38 +14764,25 @@ def semantic_preview_color(label: int) -> tuple[int, int, int]:
 
 def read_semantic_ply(path: Path):
     np = import_numpy()
-    header, properties, rows = read_ascii_ply_table(path)
-    del header
-    property_to_index = {name: idx for idx, name in enumerate(properties)}
+    vertex_data = read_ply_vertex_data(path)
+    data = vertex_data["data"]
+    properties = [name for name, _prop_type in vertex_data["properties"]]
     required = {"x", "y", "z", "object_id"}
-    missing = sorted(required - set(property_to_index))
+    missing = sorted(required - set(properties))
     if missing:
         raise RuntimeError(f"Semantic PLY is missing required properties {missing}: {path}")
-    points = np.array(
+    points = np.stack(
         [
-            [
-                float(row[property_to_index["x"]]),
-                float(row[property_to_index["y"]]),
-                float(row[property_to_index["z"]]),
-            ]
-            for row in rows
+            np.asarray(data["x"], dtype=np.float64),
+            np.asarray(data["y"], dtype=np.float64),
+            np.asarray(data["z"], dtype=np.float64),
         ],
-        dtype=np.float64,
+        axis=1,
     )
-    labels = np.array([int(float(row[property_to_index["object_id"]])) for row in rows], dtype=np.int64)
-    colors = None
-    if {"red", "green", "blue"}.issubset(property_to_index):
-        colors = np.array(
-            [
-                [
-                    float(row[property_to_index["red"]]) / 255.0,
-                    float(row[property_to_index["green"]]) / 255.0,
-                    float(row[property_to_index["blue"]]) / 255.0,
-                ]
-                for row in rows
-            ],
-            dtype=np.float64,
-        )
+    labels = np.asarray(data["object_id"], dtype=np.int64)
+    colors = ply_color_channels_to_rgb(data, set(properties))
+    if colors is not None:
+        colors = np.asarray(colors, dtype=np.float64)
     return points, labels, colors
 
 
@@ -14930,47 +14917,28 @@ def semantic_colors_for_labels(labels):
 
 def read_semantic_ply_with_probabilities(path: Path):
     np = import_numpy()
-    parsed = parse_ply_vertex_header(path)
-    if parsed.get("format") != "ascii":
-        raise RuntimeError(f"Only ASCII semantic PLY is supported: {path}")
-    properties = [name for name, _prop_type in parsed.get("properties", [])]
-    property_to_index = {name: idx for idx, name in enumerate(properties)}
+    vertex_data = read_ply_vertex_data(path)
+    data = vertex_data["data"]
+    properties = [name for name, _prop_type in vertex_data["properties"]]
     required = {"x", "y", "z", "object_id"}
-    missing = sorted(required - set(property_to_index))
+    missing = sorted(required - set(properties))
     if missing:
         raise RuntimeError(f"Semantic PLY is missing required properties {missing}: {path}")
-    vertex_count = int(parsed["vertex_count"])
-    points = np.zeros((vertex_count, 3), dtype=np.float64)
-    labels = np.zeros((vertex_count,), dtype=np.int64)
-    probabilities = np.ones((vertex_count,), dtype=np.float64) if "object_probability" in property_to_index else None
-    colors = np.zeros((vertex_count, 3), dtype=np.float64) if {"red", "green", "blue"}.issubset(property_to_index) else None
-    x_col = property_to_index["x"]
-    y_col = property_to_index["y"]
-    z_col = property_to_index["z"]
-    label_col = property_to_index["object_id"]
-    probability_col = property_to_index.get("object_probability")
-    red_col = property_to_index.get("red")
-    green_col = property_to_index.get("green")
-    blue_col = property_to_index.get("blue")
-    with path.open("rb") as f:
-        f.seek(int(parsed["data_offset"]))
-        for row_index in range(vertex_count):
-            raw_line = f.readline()
-            if not raw_line:
-                raise RuntimeError(f"PLY ended before all semantic vertices were read: {path}")
-            row = raw_line.decode("ascii", errors="ignore").strip().split()
-            if len(row) < len(properties):
-                raise RuntimeError(f"Semantic PLY vertex row has too few values: {path}")
-            points[row_index, 0] = float(row[x_col])
-            points[row_index, 1] = float(row[y_col])
-            points[row_index, 2] = float(row[z_col])
-            labels[row_index] = int(float(row[label_col]))
-            if probabilities is not None and probability_col is not None:
-                probabilities[row_index] = min(1.0, max(0.0, float(row[probability_col])))
-            if colors is not None and red_col is not None and green_col is not None and blue_col is not None:
-                colors[row_index, 0] = float(row[red_col]) / 255.0
-                colors[row_index, 1] = float(row[green_col]) / 255.0
-                colors[row_index, 2] = float(row[blue_col]) / 255.0
+    points = np.stack(
+        [
+            np.asarray(data["x"], dtype=np.float64),
+            np.asarray(data["y"], dtype=np.float64),
+            np.asarray(data["z"], dtype=np.float64),
+        ],
+        axis=1,
+    )
+    labels = np.asarray(data["object_id"], dtype=np.int64)
+    probabilities = None
+    if "object_probability" in data:
+        probabilities = np.clip(np.asarray(data["object_probability"], dtype=np.float64), 0.0, 1.0)
+    colors = ply_color_channels_to_rgb(data, set(properties))
+    if colors is not None:
+        colors = np.asarray(colors, dtype=np.float64)
     return points, labels, probabilities, colors
 
 
@@ -19337,8 +19305,10 @@ def cmd_render_semantic_preview(args: argparse.Namespace) -> int:
     if points.shape[0] == 0:
         raise RuntimeError(f"No points found in semantic PLY: {semantic_splats_ply}")
     colors_u8 = semantic_colors_for_labels(labels)
-    colored_ply_path = output_dir / "semantic_splats_colored.ply"
-    write_colored_semantic_ply(colored_ply_path, points, labels, colors_u8)
+    write_colored_ply = bool(getattr(args, "write_colored_ply", True))
+    colored_ply_path = output_dir / "semantic_splats_colored.ply" if write_colored_ply else None
+    if colored_ply_path is not None:
+        write_colored_semantic_ply(colored_ply_path, points, labels, colors_u8)
     legend = semantic_legend_from_manifest(semantic_manifest, labels)
 
     frame_reports = []
@@ -19422,7 +19392,7 @@ def cmd_render_semantic_preview(args: argparse.Namespace) -> int:
         "project_root": str(project_root),
         "semantic_splats_ply": str(semantic_splats_ply),
         "semantic_splats_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
-        "colored_semantic_ply": str(colored_ply_path),
+        "colored_semantic_ply": str(colored_ply_path) if colored_ply_path is not None else None,
         "frames_dir": str(frames_dir),
         "camera_info": str(camera_info_path),
         "output_dir": str(output_dir),
@@ -19435,11 +19405,13 @@ def cmd_render_semantic_preview(args: argparse.Namespace) -> int:
     }
     write_json(preview_manifest_path, preview_manifest)
     manifest["artifacts"]["semantic_preview"] = str(preview_manifest_path)
-    manifest["artifacts"]["semantic_splats_colored_ply"] = str(colored_ply_path)
+    if colored_ply_path is not None:
+        manifest["artifacts"]["semantic_splats_colored_ply"] = str(colored_ply_path)
     save_manifest(project_root, manifest)
     print(f"Rendered {len(valid_reports)} semantic preview frame(s) to {output_dir}")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"Colored semantic PLY: {colored_ply_path}")
+    if colored_ply_path is not None:
+        print(f"Colored semantic PLY: {colored_ply_path}")
     print(f"Preview manifest: {preview_manifest_path}")
     return 0
 
@@ -19455,7 +19427,11 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
     mask_3d_dir = project_root / manifest["masks"]["mask_3d_dir"]
     objects_dir = project_root / manifest["objects_dir"]
     output_ply = args.output or (project_root / "simulator_assets" / "semantic_splats.ply")
-    manifest_path = project_root / "simulator_assets" / "semantic_splats_manifest.json"
+    manifest_path = (
+        resolve_project_cli_path(args.manifest_output, project_root)
+        if getattr(args, "manifest_output", None)
+        else project_root / "simulator_assets" / "semantic_splats_manifest.json"
+    )
 
     target_points, _colors = read_point_cloud(source_ply)
     mask_source_ply = infer_mask_source_ply(project_root, manifest, mask_3d_dir, args.mask_source_ply)
@@ -52627,6 +52603,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-probabilities", action=argparse.BooleanOptionalAction, default=True, help="Append object_probability from fused point_probabilities.npz when available.")
     p.add_argument("--export-viewer-plys", action=argparse.BooleanOptionalAction, default=True, help="Also export semantic point-cloud and SuperSplat viewer PLYs.")
     p.add_argument("--output", type=Path, help="Output semantic PLY path.")
+    p.add_argument("--manifest-output", type=Path, help="Output semantic manifest path. Defaults to simulator_assets/semantic_splats_manifest.json.")
     p.set_defaults(func=cmd_export_splat_masks)
 
     p = sub.add_parser("transfer-semantic-ply-to-splats", help="Recover semantic 3DGS labels from an existing semantic PLY by nearest XYZ transfer.")
@@ -52921,6 +52898,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
     p.add_argument("--include-background", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--write-colored-ply", action=argparse.BooleanOptionalAction, default=True, help="Write a full ASCII semantic-color PLY beside the frame overlays.")
     p.set_defaults(func=cmd_render_semantic_preview)
 
     p = sub.add_parser("export-object-mask-clouds", help="Export each object's 3D mask as its own PLY point cloud.")

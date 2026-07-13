@@ -1,4 +1,5 @@
 import json
+import struct
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,8 @@ from video2mesh.cli import (
     quantile_bounds_from_points,
     read_colmap_text_images,
     read_point_cloud,
+    read_semantic_ply,
+    read_semantic_ply_with_probabilities,
     read_gsplat_ply,
     resolve_export_record_path,
     scaled_intrinsic_for_size,
@@ -599,6 +602,43 @@ def test_export_viewer_plys_reads_semantic_label_sidecar_for_binary_supersplat(t
     sidecar = json.loads(Path(report["label_sidecar"]).read_text(encoding="utf-8"))
     assert sidecar["object_id"] == [7, 8]
     assert sidecar["object_probability"] == [0.699999988079071, 0.800000011920929]
+
+
+def test_read_semantic_ply_supports_binary_vertices(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "semantic_binary.ply"
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "element vertex 2\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "property int object_id\n"
+        "property float object_probability\n"
+        "end_header\n"
+    ).encode("ascii")
+    body = b"".join(
+        [
+            struct.pack("<fffBBBif", 1.0, 2.0, 3.0, 255, 0, 64, 7, 0.75),
+            struct.pack("<fffBBBif", -1.0, 4.0, 5.0, 0, 128, 255, 8, 0.5),
+        ]
+    )
+    path.write_bytes(header + body)
+
+    points, labels, colors = read_semantic_ply(path)
+    points_with_prob, labels_with_prob, probabilities, colors_with_prob = read_semantic_ply_with_probabilities(path)
+
+    assert np.allclose(points, [[1.0, 2.0, 3.0], [-1.0, 4.0, 5.0]])
+    assert labels.tolist() == [7, 8]
+    assert np.allclose(colors, [[1.0, 0.0, 64.0 / 255.0], [0.0, 128.0 / 255.0, 1.0]])
+    assert np.array_equal(points_with_prob, points)
+    assert np.array_equal(labels_with_prob, labels)
+    assert np.allclose(probabilities, [0.75, 0.5])
+    assert np.allclose(colors_with_prob, colors)
 
 
 def test_scaled_intrinsic_for_size_scales_focal_length_and_principal_point():
