@@ -4,6 +4,7 @@ id: video2mesh-industrial-pipelines-embodiedgen-v2
 category: 调研目录
 visibility: public
 summary: 调研 Horizon Robotics / WuwenAI 的 EmbodiedGen V2：从任务描述、图片和资产生成 sim-ready 3D 世界，支持跨仿真器导出、Vibe Coding 编辑和机器人策略训练。
+updated: 2026-07-13
 tags:
   - 工业资产管线
   - EmbodiedGen
@@ -262,6 +263,58 @@ scene_bundle/
 | 存储 | generated object assets、collision meshes、multi-world layouts、logs、validation reports |
 
 本地 Mac 适合调研、写 adapter、检查小 GLB/JSON、构建网站；不适合完整复现实验。`mil8` 这类多 GPU 服务器可以跑单场景或小规模 smoke，但若要下载多个大模型和跑 policy training，需要先确认磁盘、CUDA、SAPIEN/MuJoCo/Isaac 环境和具体任务 protocol。
+
+## mil8 bedroom_4 实测（2026-07-13）
+
+这次实际跑的是 **EmbodiedGen V2 所接 TRELLIS image-to-3D 后端的 Gaussian-only smoke**，不是完整 `img3d-cli` 成功复现，更不是全屋重建或 sim-ready asset 的验证。目标是检验 `mil8` 能否从真实 Video2Mesh `bedroom_4` 帧中的一个 SAM3 实例 mask，生成结构正确、可读的 3D Gaussian PLY。
+
+运行使用 `mil8` 的物理 GPU 1（RTX 3090 24GB）、Python 3.11、PyTorch 2.5.1 + CUDA 12.1、xFormers 和 spconv。模型权重与 DINOv2 都是机器上已有的本地缓存；远端当前无法直连 Docker Hub / GitHub / Hugging Face，因而没有下载新权重。TRELLIS 使用现有 PhysX-Anything checkout 的 backend 源码，但只读导入，不修改该工作区。
+
+![bedroom_4 bed mask 的 TRELLIS Gaussian QA 预览](../assets/embodiedgen-v2-bedroom4-bed-trellis-preview.png "真实 bedroom_4 帧加 SAM3 bed mask 的 TRELLIS Gaussian-only 输出；三视图点投影中床架、床垫和靠枕整体轮廓可辨，但仍有背景残片")
+
+![bedroom_4 lamp mask 的 TRELLIS Gaussian QA 预览](../assets/embodiedgen-v2-bedroom4-lamp-trellis-preview.png "同一帧的微小 lamp mask 输出退化为扁平条带，说明单图实例尺寸和 mask 质量直接决定生成可用性")
+
+### 输入、产物与数值 QA
+
+两个输入都来自真实 `bedroom_4` 的同一张 resized-undistorted frame `000000.png`，并复用已有 SAM3 mask，不把 mask 写成 EmbodiedGen 自己的分割结果：
+
+| 实例 | 输入 mask bbox（1280 x 720） | TRELLIS Gaussian | 用时 / 峰值显存 | PLY SHA-256 | 结论 |
+|---|---:|---:|---:|---|---|
+| `bed` | `(592, 203, 1004, 624)`，SAM3 score `0.936` | `278,304` vertices，`18,925,088` bytes | `37.163 s` / `3.836 GB` | `dafc309bd434182ed2c565a45a48017184620d749c72b7d77d6b8d005a0cb411` | **Passed（Gaussian generation）**；床的主体轮廓可辨，但仍有底部/background residue |
+| `lamp` | `(671, 257, 709, 320)`，SAM3 score `0.883` | `152,224` vertices，`10,351,648` bytes | `39.734 s` / `3.748 GB` | `4e07269586a439d67374e1d90ed05f6e53a76bf7568efd1ca0def928b55ea7f6` | **Passed（文件与数值合同）但质量不通过**；小 mask 输出为扁平条带，不能作为灯资产 |
+
+两份 PLY 都具有 `x/y/z`、`f_dc_*`、`opacity`、`scale_*`、`rot_*` 的 GraphDECO/SuperSplat 风格 Gaussian 字段。二进制 QA 检查到所有 vertex position 和属性均为 finite，四元数范数的中位数均为 `1.0`；bed 的坐标 bbox 为约 `[-0.480, -0.258, -0.473] -> [0.499, 0.265, 0.474]`。页面中图片是按 `f_dc` 色彩和 opacity 绘制的三视图点投影，用于结构 QA，不是 photorealistic Gaussian renderer 的结果。
+
+本地完整审计包（原始 PLY 不进 Git）在：
+
+```text
+tmp_remote_results/embodiedgen_v2_bedroom4_trellis_smoke_20260713/
+  input/      # RGBA frame + SAM3 mask provenance
+  output/     # two Gaussian PLYs + run manifests
+  qa/         # PLY finite/scale/quaternion report + orthographic previews
+  logs/       # deployment, loader fallback, and successful local-only run logs
+```
+
+远端原始目录为：`mil8:/root/autodl-tmp/embodiedgen_v2_bedroom4_trellis_smoke_20260713/`。本地与远端的两个 PLY 已分别按上表 SHA-256 校验一致。
+
+### 官方 pipeline 对照
+
+| 官方阶段 | 本次实际执行 | 状态 | 边界 |
+|---|---|---|---|
+| image segmentation / background removal | 复用 Video2Mesh / SAM3 的 `bed`、`lamp` alpha mask | Reused | 不是 EmbodiedGen 内置 rembg 或 part segmentation 的结果 |
+| image-to-3D Gaussian generation | TRELLIS 25 + 25 sampling steps，seed `42` | Passed | 仅单帧、单实例、Gaussian 输出 |
+| mesh / radiance-field decoding | 未运行 | Not tested | 现有 Kaolin binary 需要 `GLIBC_2.29`，而 `mil8` Debian 10 只有 `GLIBC_2.28`；本轮刻意不把 mesh path 标为成功 |
+| quality checking / physical recovery | 未运行 | Not tested | 缺少配置好的 GPT/OpenAI-compatible provider |
+| URDF、convex decomposition、mass/friction | 未运行 | Not tested | 没有 sim-ready canonical package |
+| SAPIEN grasp、collision、drop/settle | 未运行 | Not tested | 没有 collision proxy 或 physics material |
+| layout、Vibe Coding、RL | 未运行 | Not tested | 这不是 world-generation 或 policy experiment |
+
+### 实测判断
+
+- `mil8` 的 24GB RTX 3090 足以跑这条 TRELLIS 核心 Gaussian 路径，实际峰值不到 4GB；因此“单物体 image-to-3D smoke”是可行的。
+- 生成质量强依赖实例 mask：大而清晰的 bed mask 能保住可辨主体；仅约 `38 x 63` 像素的 lamp mask 即使命令成功，也无法得到可用物体。这说明接入 Video2Mesh 时需要对 mask 面积、bbox 占比和视觉质量设门槛，而不能将每个实例自动送入生成器。
+- bed 输出仍是单图生成先验，不应覆盖真实扫描几何，也不能直接作为 collider、navigation mesh 或 simulator rigid body。它最多可作为 object visual candidate / geometry repair seed，之后仍需 mesh、尺度、碰撞和物理验证闭环。
+- 当前 `mil8` 的 `/data` 只有约 `20GB` 可用且默认 Docker pull 超时；完整官方 stack 还需要解决 Docker/HF 网络、Python/CUDA 版本、Kaolin/GLIBC、GPT provider 和 SAPIEN/MuJoCo 环境，不能写成“EmbodiedGen V2 已完整部署”。
 
 ## 风险
 
