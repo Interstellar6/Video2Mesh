@@ -14704,6 +14704,8 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             manifest["artifacts"].pop("semantic_supersplat_ply", None)
         if isinstance(viewer_exports, dict) and viewer_exports.get("semantic_overlay_supersplat_ply"):
             manifest["artifacts"]["semantic_supersplat_overlay_ply"] = str(viewer_exports["semantic_overlay_supersplat_ply"])
+        else:
+            manifest["artifacts"].pop("semantic_supersplat_overlay_ply", None)
         manifest.setdefault("external_stages", {})["semantic_probability_backprojection"] = {
             "status": "svlgaussian_style_backprojection_completed",
             "source_ply": str(source_ply),
@@ -19398,6 +19400,8 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
         manifest["artifacts"].pop("semantic_supersplat_ply", None)
     if isinstance(viewer_exports, dict) and viewer_exports.get("semantic_overlay_supersplat_ply"):
         manifest["artifacts"]["semantic_supersplat_overlay_ply"] = str(viewer_exports["semantic_overlay_supersplat_ply"])
+    else:
+        manifest["artifacts"].pop("semantic_supersplat_overlay_ply", None)
     save_manifest(project_root, manifest)
     print(f"Wrote semantic PLY: {output_ply}")
     if isinstance(viewer_exports, dict) and viewer_exports.get("recommended_supersplat_ply"):
@@ -19495,6 +19499,8 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
             manifest["artifacts"].pop("semantic_supersplat_ply", None)
         if semantic_export.get("semantic_overlay_supersplat_ply"):
             manifest["artifacts"]["semantic_supersplat_overlay_ply"] = semantic_export.get("semantic_overlay_supersplat_ply")
+        else:
+            manifest["artifacts"].pop("semantic_supersplat_overlay_ply", None)
     save_manifest(project_root, manifest)
 
     current_items = {
