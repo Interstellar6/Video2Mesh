@@ -219,6 +219,7 @@ DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_SCALE = 0.04
 DEFAULT_GAUSSIAN_VIEWER_SAFE_MAX_ELONGATION = 12.0
 DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MIN = -8.0
 DEFAULT_GAUSSIAN_VIEWER_SAFE_OPACITY_LOGIT_MAX = 5.0
+DEFAULT_SEMANTIC_LABEL_SIDECAR_INLINE_MAX_VERTICES = 50000
 PLY_NUMPY_DTYPES = {
     "char": "i1",
     "int8": "i1",
@@ -1374,6 +1375,10 @@ def write_supersplat_ply(
         raise ValueError("f_rest must have shape (N, 45)")
     del labels_np, probabilities_np
 
+    # DC-only Gaussian PLYs are valid SuperSplat input. Do not silently add
+    # 45 all-zero SH coefficients: for million-Gaussian semantic previews that
+    # multiplies disk size and memory use without restoring appearance.
+    f_rest_names = [f"f_rest_{idx}" for idx in range(45)] if f_rest_np is not None else []
     dtype = np.dtype(
         [
             ("x", "<f4"),
@@ -1385,7 +1390,7 @@ def write_supersplat_ply(
             ("f_dc_0", "<f4"),
             ("f_dc_1", "<f4"),
             ("f_dc_2", "<f4"),
-            *[(f"f_rest_{idx}", "<f4") for idx in range(45)],
+            *[(name, "<f4") for name in f_rest_names],
             ("opacity", "<f4"),
             ("scale_0", "<f4"),
             ("scale_1", "<f4"),
@@ -1408,8 +1413,8 @@ def write_supersplat_ply(
     rows["f_dc_1"] = dc_np[:, 1]
     rows["f_dc_2"] = dc_np[:, 2]
     if f_rest_np is not None:
-        for idx in range(45):
-            rows[f"f_rest_{idx}"] = f_rest_np[:, idx]
+        for idx, name in enumerate(f_rest_names):
+            rows[name] = f_rest_np[:, idx]
     rows["opacity"] = opacities_np
     rows["scale_0"] = scales_np[:, 0]
     rows["scale_1"] = scales_np[:, 1]
@@ -1436,7 +1441,7 @@ def write_supersplat_ply(
             "f_dc_0",
             "f_dc_1",
             "f_dc_2",
-            *[f"f_rest_{idx}" for idx in range(45)],
+            *f_rest_names,
             "opacity",
             "scale_0",
             "scale_1",
@@ -1473,12 +1478,25 @@ def write_supersplat_label_sidecar(path: Path, labels, probabilities=None) -> Pa
         "vertex_count": vertex_count,
         "notes": "Per-vertex semantic metadata kept outside the SuperSplat PLY for viewer compatibility.",
     }
+    write_compact_arrays = vertex_count > DEFAULT_SEMANTIC_LABEL_SIDECAR_INLINE_MAX_VERTICES
+    if write_compact_arrays:
+        npz_path = sidecar.with_suffix(".npz")
+        arrays: dict[str, Any] = {}
+        if labels_np is not None:
+            arrays["object_id"] = labels_np
+        if probabilities_np is not None:
+            arrays["object_probability"] = probabilities_np
+        np.savez_compressed(npz_path, **arrays)
+        payload["data_npz"] = npz_path.name
+        payload["storage"] = "npz_compressed"
     if labels_np is not None:
         unique, counts = np.unique(labels_np, return_counts=True)
-        payload["object_id"] = labels_np.astype(int).tolist()
         payload["object_id_distribution"] = {str(int(label)): int(count) for label, count in zip(unique, counts)}
+        if not write_compact_arrays:
+            payload["object_id"] = labels_np.astype(int).tolist()
     if probabilities_np is not None:
-        payload["object_probability"] = [float(value) for value in probabilities_np]
+        if not write_compact_arrays:
+            payload["object_probability"] = [float(value) for value in probabilities_np]
     write_json(sidecar, payload)
     return sidecar
 
@@ -4864,6 +4882,8 @@ def write_ascii_triangle_mesh_ply(
     vertices,
     colors,
     faces: list[list[int]],
+    *,
+    double_sided: bool = False,
 ) -> None:
     np = import_numpy()
     vertices_np = np.asarray(vertices, dtype=np.float64)
@@ -4889,7 +4909,8 @@ def write_ascii_triangle_mesh_ply(
         f.write("property uchar red\n")
         f.write("property uchar green\n")
         f.write("property uchar blue\n")
-        f.write(f"element face {len(faces)}\n")
+        face_count = len(faces) * (2 if double_sided else 1)
+        f.write(f"element face {face_count}\n")
         f.write("property list uchar int vertex_indices\n")
         f.write("end_header\n")
         for vertex, color in zip(vertices_np, colors_np):
@@ -4899,6 +4920,10 @@ def write_ascii_triangle_mesh_ply(
             )
         for face in faces:
             f.write(f"{len(face)} {' '.join(str(int(index)) for index in face)}\n")
+        if double_sided:
+            for face in faces:
+                reversed_face = list(reversed(face))
+                f.write(f"{len(reversed_face)} {' '.join(str(int(index)) for index in reversed_face)}\n")
 
 
 def extract_triangle_submesh_from_indices(
@@ -5134,6 +5159,50 @@ def write_vertex_data_ascii_ply(
     return vertex_count
 
 
+def write_vertex_data_binary_ply(
+    path: Path,
+    properties: list[tuple[str, str]],
+    data: dict[str, Any],
+    extra_properties: list[tuple[str, str, list[Any]]] | None = None,
+) -> int:
+    """Write scalar PLY vertex properties without changing their values.
+
+    Semantic 3DGS files are often close to one million Gaussians. Rewriting a
+    binary GraphDECO source to ASCII makes the same data several times larger
+    and can make a viewer run out of memory before it reaches the splats.
+    """
+    np = import_numpy()
+    ensure_dir(path.parent)
+    extras = extra_properties or []
+    if not properties and not extras:
+        raise ValueError("No PLY properties to write")
+    vertex_count = len(next(iter(data.values()))) if properties else len(extras[0][2])
+    all_properties = [*properties, *[(name, prop_type) for name, prop_type, _values in extras]]
+    dtype_fields = []
+    for name, prop_type in all_properties:
+        dtype_code = PLY_NUMPY_DTYPES.get(prop_type)
+        if dtype_code is None:
+            raise RuntimeError(f"Unsupported PLY property type {prop_type!r}: {path}")
+        dtype_fields.append((name, np.dtype("<" + dtype_code)))
+    rows = np.empty(vertex_count, dtype=np.dtype(dtype_fields))
+    for name, prop_type in properties:
+        if name not in data:
+            raise ValueError(f"Missing source PLY property {name!r}")
+        rows[name] = np.asarray(data[name], dtype=np.dtype("<" + PLY_NUMPY_DTYPES[prop_type]))
+    for name, prop_type, values in extras:
+        if len(values) != vertex_count:
+            raise ValueError("Extra PLY property length does not match vertex count")
+        rows[name] = np.asarray(values, dtype=np.dtype("<" + PLY_NUMPY_DTYPES[prop_type]))
+    with path.open("wb") as f:
+        header_lines = ["ply", "format binary_little_endian 1.0", f"element vertex {vertex_count}"]
+        for name, prop_type in all_properties:
+            header_lines.append(f"property {prop_type} {name}")
+        header_lines.append("end_header")
+        f.write(("\n".join(header_lines) + "\n").encode("ascii"))
+        rows.tofile(f)
+    return int(vertex_count)
+
+
 def read_gsplat_ply(path: Path) -> dict[str, Any]:
     np = import_numpy()
     vertex_data = read_ply_vertex_data(path)
@@ -5241,6 +5310,31 @@ def read_ascii_ply_float_property(path: Path, property_name: str) -> list[float]
     return values
 
 
+def read_ply_property(path: Path, property_name: str) -> list[Any] | None:
+    """Read a scalar vertex property from ASCII or binary PLY."""
+    try:
+        vertex_data = read_ply_vertex_data(path)
+    except Exception:
+        return None
+    values = vertex_data.get("data", {}).get(property_name)
+    if values is None:
+        return None
+    try:
+        return values.tolist()
+    except Exception:
+        return None
+
+
+def read_ply_float_property(path: Path, property_name: str) -> list[float] | None:
+    values = read_ply_property(path, property_name)
+    if values is None:
+        return None
+    try:
+        return [float(value) for value in values]
+    except Exception:
+        return None
+
+
 def read_supersplat_label_sidecar(path: Path) -> tuple[list[Any] | None, list[float] | None, Path | None]:
     candidates = [
         path.with_name(f"{path.stem}_labels.json"),
@@ -5257,6 +5351,20 @@ def read_supersplat_label_sidecar(path: Path) -> tuple[list[Any] | None, list[fl
         probabilities = payload.get("object_probability")
         labels_out = list(labels) if isinstance(labels, list) else None
         probabilities_out = [float(value) for value in probabilities] if isinstance(probabilities, list) else None
+        if labels_out is None and probabilities_out is None and isinstance(payload.get("data_npz"), str):
+            npz_path = Path(payload["data_npz"])
+            if not npz_path.is_absolute():
+                npz_path = candidate.parent / npz_path
+            try:
+                np = import_numpy()
+                with np.load(npz_path, allow_pickle=False) as arrays:
+                    if "object_id" in arrays:
+                        labels_out = arrays["object_id"].tolist()
+                    if "object_probability" in arrays:
+                        probabilities_out = [float(value) for value in arrays["object_probability"].tolist()]
+            except Exception:
+                labels_out = None
+                probabilities_out = None
         if labels_out is not None or probabilities_out is not None:
             return labels_out, probabilities_out, candidate
     return None, None, None
@@ -5267,11 +5375,12 @@ def export_viewer_plys(
     output_dir: Path,
     prefix: str,
     include_labels: bool = False,
+    export_point_cloud: bool = True,
 ) -> dict[str, Any]:
     np = import_numpy()
     data = read_gsplat_ply(source_ply)
-    labels = read_ascii_ply_property(source_ply, "object_id") if include_labels else None
-    probabilities = read_ascii_ply_float_property(source_ply, "object_probability") if include_labels else None
+    labels = read_ply_property(source_ply, "object_id") if include_labels else None
+    probabilities = read_ply_float_property(source_ply, "object_probability") if include_labels else None
     source_label_sidecar = None
     if include_labels and labels is None and probabilities is None:
         labels, probabilities, source_label_sidecar = read_supersplat_label_sidecar(source_ply)
@@ -5299,6 +5408,9 @@ def export_viewer_plys(
     viewer_safe_supersplat_path = None
     viewer_safe_label_sidecar = None
     viewer_safe_exported_health = None
+    semantic_overlay_path = None
+    semantic_overlay_label_sidecar = None
+    semantic_overlay_count = 0
     if health_report.get("status") != "safe":
         safe_scales, safe_quats, safe_opacities, repair_report = make_viewer_safe_gaussian_arrays(
             data["scales"],
@@ -5321,12 +5433,13 @@ def export_viewer_plys(
                 "raw export is inspected."
             ),
         }
-    plain_path = output_dir / f"{prefix}_point_cloud.ply"
+    plain_path = output_dir / f"{prefix}_point_cloud.ply" if export_point_cloud else None
     supersplat_path = output_dir / f"{prefix}_supersplat.ply"
     viewer_safe_supersplat_path = output_dir / f"{prefix}_supersplat_viewer_safe.ply"
     safety_report_path = output_dir / f"{prefix}_supersplat_viewer_safety_report.json"
     shape_preview_path = output_dir / f"{prefix}_supersplat_shape_preview.png"
-    write_point_cloud_ascii_ply(plain_path, data["means"], display_colors)
+    if plain_path is not None:
+        write_point_cloud_ascii_ply(plain_path, data["means"], display_colors)
     write_supersplat_ply(
         supersplat_path,
         data["means"],
@@ -5340,6 +5453,34 @@ def export_viewer_plys(
         f_rest=f_rest,
     )
     label_sidecar = write_supersplat_label_sidecar(supersplat_path, labels, probabilities)
+    if labels is not None:
+        labels_np = np.asarray(labels, dtype=np.int64)
+        probabilities_np = (
+            np.asarray(probabilities, dtype=np.float32)
+            if probabilities is not None
+            else np.ones(labels_np.shape[0], dtype=np.float32)
+        )
+        overlay_mask = (labels_np > 0) & (probabilities_np >= 0.55)
+        semantic_overlay_count = int(overlay_mask.sum())
+        if semantic_overlay_count:
+            semantic_overlay_path = output_dir / f"{prefix}_semantic_overlay_supersplat.ply"
+            write_supersplat_ply(
+                semantic_overlay_path,
+                data["means"][overlay_mask],
+                display_colors[overlay_mask],
+                raw_opacities[overlay_mask],
+                raw_scales[overlay_mask],
+                raw_quats[overlay_mask],
+                normals=data.get("normals")[overlay_mask] if data.get("normals") is not None else None,
+                # The overlay carries category color only; the base scene PLY
+                # keeps the full SH appearance below it.
+                f_rest=None,
+            )
+            semantic_overlay_label_sidecar = write_supersplat_label_sidecar(
+                semantic_overlay_path,
+                labels_np[overlay_mask],
+                probabilities_np[overlay_mask],
+            )
     if health_report.get("status") != "safe":
         write_supersplat_ply(
             viewer_safe_supersplat_path,
@@ -5358,10 +5499,13 @@ def export_viewer_plys(
     else:
         viewer_safe_supersplat_path = None
     safety_report["output_supersplat_ply"] = str(supersplat_path)
-    safety_report["output_point_cloud_ply"] = str(plain_path)
+    safety_report["output_point_cloud_ply"] = str(plain_path) if plain_path else None
     safety_report["label_sidecar"] = str(label_sidecar) if label_sidecar else None
     safety_report["output_viewer_safe_supersplat_ply"] = str(viewer_safe_supersplat_path) if viewer_safe_supersplat_path else None
     safety_report["viewer_safe_label_sidecar"] = str(viewer_safe_label_sidecar) if viewer_safe_label_sidecar else None
+    safety_report["semantic_overlay_supersplat_ply"] = str(semantic_overlay_path) if semantic_overlay_path else None
+    safety_report["semantic_overlay_label_sidecar"] = str(semantic_overlay_label_sidecar) if semantic_overlay_label_sidecar else None
+    safety_report["semantic_overlay_vertex_count"] = semantic_overlay_count
     exported_health = audit_gaussian_health(raw_scales, raw_quats, raw_opacities)
     try:
         shape_preview = write_gaussian_shape_preview(
@@ -5380,14 +5524,16 @@ def export_viewer_plys(
     write_json(safety_report_path, safety_report)
     return {
         "source_ply": str(source_ply),
-        "point_cloud_ply": str(plain_path),
+        "point_cloud_ply": str(plain_path) if plain_path else None,
         "point_cloud_ply_info": {
-            "path": str(plain_path),
+            "path": str(plain_path) if plain_path else "",
             "format": "plain_xyzrgb_ply",
             "includes_object_id": False,
             "includes_object_probability": False,
+            "exported": plain_path is not None,
         },
         "supersplat_ply": str(supersplat_path),
+        "recommended_supersplat_ply": str(semantic_overlay_path) if semantic_overlay_path else str(supersplat_path),
         "supersplat_ply_info": {
             "path": str(supersplat_path),
             "format": "graphdeco_supersplat_ply",
@@ -5418,6 +5564,16 @@ def export_viewer_plys(
             "notes": "Generated only when the raw source fails the numeric viewer safety audit.",
         } if viewer_safe_supersplat_path else None,
         "raw_gaussian_health": health_report,
+        "semantic_overlay_supersplat_ply": str(semantic_overlay_path) if semantic_overlay_path else None,
+        "semantic_overlay_supersplat_ply_info": {
+            "path": str(semantic_overlay_path) if semantic_overlay_path else "",
+            "format": "graphdeco_supersplat_ply",
+            "encoding": "binary_little_endian",
+            "vertex_count": semantic_overlay_count,
+            "label_sidecar": str(semantic_overlay_label_sidecar) if semantic_overlay_label_sidecar else None,
+            "display_mode": "load with the original scene 3DGS PLY as a semantic color overlay",
+            "geometry_source": str(source_ply),
+        } if semantic_overlay_path else None,
         "source_gaussian_health_ok": health_report.get("status") == "safe",
         "exported_gaussian_health_ok": exported_health.get("status") == "safe",
         "viewer_safety_status": safety_report["status"],
@@ -5433,11 +5589,12 @@ def export_viewer_plys(
         "source_label_sidecar": str(source_label_sidecar) if source_label_sidecar else None,
         "label_sidecar": str(label_sidecar) if label_sidecar else None,
         "notes": (
-            "point_cloud_ply is a plain XYZ/RGB PLY for Preview/CloudCompare. "
+            "point_cloud_ply is an optional plain XYZ/RGB PLY for Preview/CloudCompare. "
             "supersplat_ply preserves raw Gaussian scale/rotation/opacity for visual QA. If the source Gaussian "
             "audit is unsafe, viewer_safe_supersplat_ply is a separate display-only companion with clamped "
             "scale/rotation/opacity; do not treat it as proof of reconstruction quality. Semantic "
-            "object_id/object_probability metadata is stored in label_sidecar when present."
+            "object_id/object_probability metadata is stored in label_sidecar when present. For the closest "
+            "match to the original visual 3DGS, load the original scene PLY plus semantic_overlay_supersplat_ply."
         ),
     }
 
@@ -13557,15 +13714,18 @@ def write_semantic_ply_with_labels(
             raise ValueError(f"Label count {len(labels)} does not match PLY vertex count {len(next(iter(data.values())))}.")
         extra_names = {name for name, _prop_type, _values in extra_properties}
         filtered_properties = [(name, prop_type) for name, prop_type in properties if name not in extra_names]
-        vertex_count = write_vertex_data_ascii_ply(
+        vertex_count = write_vertex_data_binary_ply(
             output_ply,
             filtered_properties,
             data,
             extra_properties,
         )
-        return vertex_count, "ply_vertex_rewrite"
-    except Exception:
-        pass
+        return vertex_count, "binary_little_endian_vertex_rewrite"
+    except Exception as binary_error:
+        # A large semantic Gaussian export must never silently fall back to an
+        # ASCII rewrite: that is the failure mode that produced multi-GB PLYs.
+        if len(labels) > DEFAULT_SEMANTIC_LABEL_SIDECAR_INLINE_MAX_VERTICES:
+            raise RuntimeError(f"Binary semantic PLY rewrite failed: {source_ply}") from binary_error
 
     try:
         header, _properties, rows = read_ascii_ply_table(source_ply)
@@ -13914,6 +14074,24 @@ def semantic_ids_from_gaussian_probabilities(best_object, best_probability) -> t
     labels[probabilities <= 0.0] = 0
     probabilities[labels <= 0] = 0.0
     return [int(value) for value in labels.tolist()], [float(value) for value in probabilities.tolist()]
+
+
+def gaussian_geometry_fingerprint(gaussian_data: dict[str, Any]) -> dict[str, Any]:
+    """Fingerprint the fields that define a rendered Gaussian's geometry."""
+    np = import_numpy()
+    digest = sha256()
+    vertex_count = int(np.asarray(gaussian_data["means"]).shape[0])
+    for name in ("means", "opacities", "scales", "quats"):
+        array = np.ascontiguousarray(np.asarray(gaussian_data[name], dtype=np.float32))
+        digest.update(name.encode("ascii"))
+        digest.update(array.shape.__repr__().encode("ascii"))
+        digest.update(array.tobytes())
+    return {
+        "vertex_count": vertex_count,
+        "sha256": digest.hexdigest(),
+        "fields": ["means", "opacities", "scales", "quats"],
+        "notes": "Semantic export may append labels or recolor a display preview, but these geometry fields must remain unchanged.",
+    }
 
 
 def accumulate_mask_pixels_to_projected_gaussians(
@@ -14283,6 +14461,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
     if selected_gaussian_indices is None:
         vertex_count, export_mode = write_semantic_ply_with_labels(source_ply, output_ply, labels, probabilities)
         output_source_ply = source_ply
+        geometry_source = gaussian_data
     else:
         write_gsplat_ply(
             output_ply,
@@ -14294,10 +14473,29 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         )
         vertex_count, export_mode = write_semantic_ply_with_labels(output_ply, output_ply, labels, probabilities)
         output_source_ply = output_ply
+        geometry_source = {
+            name: np.asarray(gaussian_data[name])[selected_gaussian_indices]
+            for name in ("means", "opacities", "scales", "quats")
+        }
+
+    source_geometry = gaussian_geometry_fingerprint(geometry_source)
+    output_geometry = gaussian_geometry_fingerprint(read_gsplat_ply(output_ply))
+    geometry_identity_verified = source_geometry["sha256"] == output_geometry["sha256"]
+    if not geometry_identity_verified:
+        raise RuntimeError(
+            "Semantic PLY geometry changed while appending labels. "
+            f"source={source_geometry['sha256']} output={output_geometry['sha256']}"
+        )
 
     viewer_exports = None
     try:
-        viewer_exports = export_viewer_plys(output_ply, output_ply.parent, "semantic_gaussian_probability", include_labels=True)
+        viewer_exports = export_viewer_plys(
+            output_ply,
+            output_ply.parent,
+            "semantic_gaussian_probability",
+            include_labels=True,
+            export_point_cloud=False,
+        )
     except Exception as exc:
         viewer_exports = {"error": str(exc)}
 
@@ -14310,6 +14508,12 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         "output_source_ply": str(output_source_ply),
         "vertex_count": int(vertex_count),
         "export_mode": export_mode,
+        "geometry_identity": {
+            "verified": geometry_identity_verified,
+            "source": source_geometry,
+            "output": output_geometry,
+            "source_ply": str(output_source_ply),
+        },
         "method": "svlgaussian_style_ray_to_gaussian_probability_backprojection",
         "paper": {
             "title": SVLGAUSSIAN_TITLE,
@@ -14362,8 +14566,15 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         manifest["artifacts"]["gaussian_probabilities_manifest"] = str(manifest_path)
         if isinstance(viewer_exports, dict) and viewer_exports.get("point_cloud_ply"):
             manifest["artifacts"]["semantic_point_cloud_ply"] = str(viewer_exports["point_cloud_ply"])
+        else:
+            manifest["artifacts"].pop("semantic_point_cloud_ply", None)
         if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
-            manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["supersplat_ply"])
+            manifest["artifacts"]["semantic_supersplat_full_ply"] = str(viewer_exports["supersplat_ply"])
+            manifest["artifacts"]["semantic_supersplat_ply"] = str(
+                viewer_exports.get("recommended_supersplat_ply") or viewer_exports["supersplat_ply"]
+            )
+        if isinstance(viewer_exports, dict) and viewer_exports.get("semantic_overlay_supersplat_ply"):
+            manifest["artifacts"]["semantic_supersplat_overlay_ply"] = str(viewer_exports["semantic_overlay_supersplat_ply"])
         manifest.setdefault("external_stages", {})["semantic_probability_backprojection"] = {
             "status": "svlgaussian_style_backprojection_completed",
             "source_ply": str(source_ply),
@@ -14832,38 +15043,25 @@ def semantic_preview_color(label: int) -> tuple[int, int, int]:
 
 def read_semantic_ply(path: Path):
     np = import_numpy()
-    header, properties, rows = read_ascii_ply_table(path)
-    del header
-    property_to_index = {name: idx for idx, name in enumerate(properties)}
+    vertex_data = read_ply_vertex_data(path)
+    properties = [name for name, _prop_type in vertex_data["properties"]]
+    data = vertex_data["data"]
     required = {"x", "y", "z", "object_id"}
-    missing = sorted(required - set(property_to_index))
+    missing = sorted(required - set(properties))
     if missing:
         raise RuntimeError(f"Semantic PLY is missing required properties {missing}: {path}")
-    points = np.array(
+    points = np.stack(
         [
-            [
-                float(row[property_to_index["x"]]),
-                float(row[property_to_index["y"]]),
-                float(row[property_to_index["z"]]),
-            ]
-            for row in rows
+            np.asarray(data["x"], dtype=np.float64),
+            np.asarray(data["y"], dtype=np.float64),
+            np.asarray(data["z"], dtype=np.float64),
         ],
-        dtype=np.float64,
+        axis=1,
     )
-    labels = np.array([int(float(row[property_to_index["object_id"]])) for row in rows], dtype=np.int64)
-    colors = None
-    if {"red", "green", "blue"}.issubset(property_to_index):
-        colors = np.array(
-            [
-                [
-                    float(row[property_to_index["red"]]) / 255.0,
-                    float(row[property_to_index["green"]]) / 255.0,
-                    float(row[property_to_index["blue"]]) / 255.0,
-                ]
-                for row in rows
-            ],
-            dtype=np.float64,
-        )
+    labels = np.asarray(data["object_id"], dtype=np.int64)
+    colors = ply_color_channels_to_rgb(data, set(properties))
+    if colors is not None:
+        colors = np.asarray(colors, dtype=np.float64)
     return points, labels, colors
 
 
@@ -14927,47 +15125,28 @@ def semantic_colors_for_labels(labels):
 
 def read_semantic_ply_with_probabilities(path: Path):
     np = import_numpy()
-    parsed = parse_ply_vertex_header(path)
-    if parsed.get("format") != "ascii":
-        raise RuntimeError(f"Only ASCII semantic PLY is supported: {path}")
-    properties = [name for name, _prop_type in parsed.get("properties", [])]
-    property_to_index = {name: idx for idx, name in enumerate(properties)}
+    vertex_data = read_ply_vertex_data(path)
+    properties = [name for name, _prop_type in vertex_data["properties"]]
+    data = vertex_data["data"]
     required = {"x", "y", "z", "object_id"}
-    missing = sorted(required - set(property_to_index))
+    missing = sorted(required - set(properties))
     if missing:
         raise RuntimeError(f"Semantic PLY is missing required properties {missing}: {path}")
-    vertex_count = int(parsed["vertex_count"])
-    points = np.zeros((vertex_count, 3), dtype=np.float64)
-    labels = np.zeros((vertex_count,), dtype=np.int64)
-    probabilities = np.ones((vertex_count,), dtype=np.float64) if "object_probability" in property_to_index else None
-    colors = np.zeros((vertex_count, 3), dtype=np.float64) if {"red", "green", "blue"}.issubset(property_to_index) else None
-    x_col = property_to_index["x"]
-    y_col = property_to_index["y"]
-    z_col = property_to_index["z"]
-    label_col = property_to_index["object_id"]
-    probability_col = property_to_index.get("object_probability")
-    red_col = property_to_index.get("red")
-    green_col = property_to_index.get("green")
-    blue_col = property_to_index.get("blue")
-    with path.open("rb") as f:
-        f.seek(int(parsed["data_offset"]))
-        for row_index in range(vertex_count):
-            raw_line = f.readline()
-            if not raw_line:
-                raise RuntimeError(f"PLY ended before all semantic vertices were read: {path}")
-            row = raw_line.decode("ascii", errors="ignore").strip().split()
-            if len(row) < len(properties):
-                raise RuntimeError(f"Semantic PLY vertex row has too few values: {path}")
-            points[row_index, 0] = float(row[x_col])
-            points[row_index, 1] = float(row[y_col])
-            points[row_index, 2] = float(row[z_col])
-            labels[row_index] = int(float(row[label_col]))
-            if probabilities is not None and probability_col is not None:
-                probabilities[row_index] = min(1.0, max(0.0, float(row[probability_col])))
-            if colors is not None and red_col is not None and green_col is not None and blue_col is not None:
-                colors[row_index, 0] = float(row[red_col]) / 255.0
-                colors[row_index, 1] = float(row[green_col]) / 255.0
-                colors[row_index, 2] = float(row[blue_col]) / 255.0
+    points = np.stack(
+        [
+            np.asarray(data["x"], dtype=np.float64),
+            np.asarray(data["y"], dtype=np.float64),
+            np.asarray(data["z"], dtype=np.float64),
+        ],
+        axis=1,
+    )
+    labels = np.asarray(data["object_id"], dtype=np.int64)
+    probabilities = None
+    if "object_probability" in properties:
+        probabilities = np.clip(np.asarray(data["object_probability"], dtype=np.float64), 0.0, 1.0)
+    colors = ply_color_channels_to_rgb(data, set(properties))
+    if colors is not None:
+        colors = np.asarray(colors, dtype=np.float64)
     return points, labels, probabilities, colors
 
 
@@ -15172,7 +15351,7 @@ def smooth_face_labels(labels, probabilities, adjacency: list[list[int]], iterat
     return smoothed, probs
 
 
-def write_face_semantic_debug_ply(path: Path, vertices, triangles, face_labels, face_probabilities) -> None:
+def write_face_semantic_debug_ply(path: Path, vertices, triangles, face_labels, face_probabilities, *, double_sided: bool = True) -> None:
     ensure_dir(path.parent)
     colors = semantic_colors_for_labels(face_labels)
     with path.open("w", encoding="utf-8") as f:
@@ -15189,7 +15368,7 @@ def write_face_semantic_debug_ply(path: Path, vertices, triangles, face_labels, 
         f.write("property int object_id\n")
         f.write("property float object_probability\n")
         f.write("property int source_face\n")
-        f.write(f"element face {int(triangles.shape[0])}\n")
+        f.write(f"element face {int(triangles.shape[0]) * (2 if double_sided else 1)}\n")
         f.write("property list uchar int vertex_indices\n")
         f.write("end_header\n")
         for face_index, tri in enumerate(triangles):
@@ -15206,6 +15385,10 @@ def write_face_semantic_debug_ply(path: Path, vertices, triangles, face_labels, 
         for face_index in range(int(triangles.shape[0])):
             base = face_index * 3
             f.write(f"3 {base} {base + 1} {base + 2}\n")
+        if double_sided:
+            for face_index in range(int(triangles.shape[0])):
+                base = face_index * 3
+                f.write(f"3 {base + 2} {base + 1} {base}\n")
 
 
 GLTF_COMPONENT_DTYPES = {
@@ -15361,6 +15544,44 @@ def read_triangle_mesh_for_semantic_transfer(path: Path):
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     triangles = np.asarray(mesh.triangles, dtype=np.int64)
     return vertices, triangles, "open3d"
+
+
+def write_double_sided_mesh_preview(source_mesh: Path, output_ply: Path) -> dict[str, Any]:
+    """Create a display PLY with both triangle windings.
+
+    PLY has no material-level doubleSided flag. A reversed-face preview is the
+    portable way to make a mesh inspectable from either side while retaining
+    the original single-sided mesh for collision and topology consumers.
+    """
+    np = import_numpy()
+    vertices, triangles, reader = read_triangle_mesh_for_semantic_transfer(source_mesh)
+    colors = None
+    if source_mesh.suffix.lower() == ".ply":
+        try:
+            mesh_data = read_ply_triangle_mesh_light(source_mesh)
+            vertex_data = mesh_data["vertex_data"]
+            if {"red", "green", "blue"}.issubset(vertex_data):
+                colors = np.stack(
+                    [
+                        np.asarray(vertex_data["red"]),
+                        np.asarray(vertex_data["green"]),
+                        np.asarray(vertex_data["blue"]),
+                    ],
+                    axis=1,
+                )
+        except Exception:
+            colors = None
+    write_ascii_triangle_mesh_ply(output_ply, vertices, colors, triangles.tolist(), double_sided=True)
+    return {
+        "source_mesh": str(source_mesh),
+        "output_mesh": str(output_ply),
+        "mesh_reader": reader,
+        "vertex_count": int(vertices.shape[0]),
+        "source_face_count": int(triangles.shape[0]),
+        "display_face_count": int(triangles.shape[0]) * 2,
+        "double_sided": True,
+        "notes": "Display-only reversed-face companion. The original source mesh remains the collider/topology artifact.",
+    }
 
 
 def downsample_semantic_transfer_source(points, labels, probabilities, max_points: int, min_points_per_label: int, seed: int):
@@ -18210,10 +18431,18 @@ def write_scene_semantic_object_mesh(path: Path, vertices, triangles, face_indic
             face.append(remap[old_index])
         sub_faces.append(face)
     colors = np.tile(np.asarray(color, dtype=np.uint8).reshape(1, 3), (len(sub_vertices), 1))
-    write_ascii_triangle_mesh_ply(path, np.asarray(sub_vertices, dtype=np.float64), colors, sub_faces)
+    write_ascii_triangle_mesh_ply(
+        path,
+        np.asarray(sub_vertices, dtype=np.float64),
+        colors,
+        sub_faces,
+        double_sided=True,
+    )
     return {
         "vertex_count": int(len(sub_vertices)),
-        "face_count": int(len(sub_faces)),
+        "face_count": int(len(sub_faces)) * 2,
+        "source_face_count": int(len(sub_faces)),
+        "double_sided": True,
         "bbox": bbox_for_points(np.asarray(sub_vertices, dtype=np.float64)),
     }
 
@@ -18447,6 +18676,19 @@ def cmd_reconstruct_scene_meshes(args: argparse.Namespace) -> int:
     if not output_path.exists():
         raise RuntimeError(f"COLMAP delaunay_mesher did not create output mesh: {output_path}")
 
+    double_sided_preview_path = output_dir / f"{output_path.stem}_double_sided.ply"
+    double_sided_preview = None
+    if bool(getattr(args, "write_double_sided_preview", True)):
+        if not double_sided_preview_path.exists() or bool(args.overwrite):
+            double_sided_preview = write_double_sided_mesh_preview(output_path, double_sided_preview_path)
+        else:
+            double_sided_preview = {
+                "source_mesh": str(output_path),
+                "output_mesh": str(double_sided_preview_path),
+                "double_sided": True,
+                "status": "reused_existing",
+            }
+
     input_copies: dict[str, str] = {}
     dense_fused = resolve_existing_path(artifacts.get("colmap_dense_fused_ply"), project_root)
     if args.copy_input_point_cloud and dense_fused and dense_fused.exists():
@@ -18473,11 +18715,14 @@ def cmd_reconstruct_scene_meshes(args: argparse.Namespace) -> int:
         "colmap_dense_workspace": str(dense_workspace),
         "input_copies": input_copies,
         "stats": mesh_stats,
+        "double_sided_preview": double_sided_preview,
     }
     write_json(report_path, report)
     manifest.setdefault("artifacts", {})["scene_mesh_ply"] = str(output_path)
     manifest["artifacts"]["scene_collider_mesh_ply"] = str(output_path)
     manifest["artifacts"]["colmap_delaunay_mesh_ply"] = str(output_path)
+    if double_sided_preview_path.exists():
+        manifest["artifacts"]["scene_mesh_double_sided_preview_ply"] = str(double_sided_preview_path)
     manifest["artifacts"]["scene_mesh_reconstruction"] = str(report_path)
     manifest.setdefault("external_stages", {})["scene_mesh_reconstruction"] = {
         "status": "completed",
@@ -18489,6 +18734,19 @@ def cmd_reconstruct_scene_meshes(args: argparse.Namespace) -> int:
     save_manifest(project_root, manifest)
     print(f"Reconstructed scene mesh: {output_path}")
     print(f"Scene mesh report: {report_path}")
+    return 0
+
+
+def cmd_export_double_sided_mesh_preview(args: argparse.Namespace) -> int:
+    source_mesh = args.mesh.resolve()
+    if not source_mesh.exists():
+        raise FileNotFoundError(f"Missing mesh: {source_mesh}")
+    output = args.output.resolve() if args.output else source_mesh.with_name(f"{source_mesh.stem}_double_sided.ply")
+    report = write_double_sided_mesh_preview(source_mesh, output)
+    report_path = args.report.resolve() if args.report else output.with_suffix(".json")
+    write_json(report_path, report)
+    print(f"Wrote double-sided mesh preview: {output}")
+    print(f"Report: {report_path}")
     return 0
 
 
@@ -18956,7 +19214,13 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
     viewer_exports = None
     if bool(getattr(args, "export_viewer_plys", True)):
         try:
-            viewer_exports = export_viewer_plys(output_ply, output_ply.parent, "semantic", include_labels=True)
+            viewer_exports = export_viewer_plys(
+                output_ply,
+                output_ply.parent,
+                "semantic",
+                include_labels=True,
+                export_point_cloud=False,
+            )
         except Exception as exc:
             viewer_exports = {"error": str(exc)}
     else:
@@ -18990,13 +19254,23 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
     manifest["artifacts"]["semantic_splats_manifest"] = str(manifest_path)
     if isinstance(viewer_exports, dict) and viewer_exports.get("point_cloud_ply"):
         manifest["artifacts"]["semantic_point_cloud_ply"] = str(viewer_exports["point_cloud_ply"])
+    else:
+        manifest["artifacts"].pop("semantic_point_cloud_ply", None)
     if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
-        manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["supersplat_ply"])
+        manifest["artifacts"]["semantic_supersplat_full_ply"] = str(viewer_exports["supersplat_ply"])
+        manifest["artifacts"]["semantic_supersplat_ply"] = str(
+            viewer_exports.get("recommended_supersplat_ply") or viewer_exports["supersplat_ply"]
+        )
+    if isinstance(viewer_exports, dict) and viewer_exports.get("semantic_overlay_supersplat_ply"):
+        manifest["artifacts"]["semantic_supersplat_overlay_ply"] = str(viewer_exports["semantic_overlay_supersplat_ply"])
     save_manifest(project_root, manifest)
     print(f"Wrote semantic PLY: {output_ply}")
     if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
         print(f"Wrote semantic SuperSplat PLY: {viewer_exports['supersplat_ply']}")
-        print(f"Wrote semantic point-cloud PLY: {viewer_exports['point_cloud_ply']}")
+        if viewer_exports.get("point_cloud_ply"):
+            print(f"Wrote semantic point-cloud PLY: {viewer_exports['point_cloud_ply']}")
+        if viewer_exports.get("semantic_overlay_supersplat_ply"):
+            print(f"Wrote semantic overlay PLY: {viewer_exports['semantic_overlay_supersplat_ply']}")
     print(f"Wrote semantic manifest: {manifest_path}")
     return 0
 
@@ -19041,7 +19315,13 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
             results["exports"][name] = {"ok": False, "error": f"missing source file: {source_value}"}
             return
         try:
-            exported = export_viewer_plys(source_path, output_dir, prefix, include_labels=include_labels)
+            exported = export_viewer_plys(
+                source_path,
+                output_dir,
+                prefix,
+                include_labels=include_labels,
+                export_point_cloud=not include_labels,
+            )
             exported["ok"] = True
             results["exports"][name] = exported
         except Exception as exc:
@@ -19064,8 +19344,13 @@ def cmd_export_viewer_plys(args: argparse.Namespace) -> int:
         manifest["artifacts"]["scene_3dgs_supersplat_ply"] = scene_export.get("supersplat_ply")
     semantic_export = results["exports"].get("semantic")
     if isinstance(semantic_export, dict) and semantic_export.get("ok"):
-        manifest["artifacts"]["semantic_point_cloud_ply"] = semantic_export.get("point_cloud_ply")
-        manifest["artifacts"]["semantic_supersplat_ply"] = semantic_export.get("supersplat_ply")
+        manifest["artifacts"].pop("semantic_point_cloud_ply", None)
+        manifest["artifacts"]["semantic_supersplat_full_ply"] = semantic_export.get("supersplat_ply")
+        manifest["artifacts"]["semantic_supersplat_ply"] = (
+            semantic_export.get("recommended_supersplat_ply") or semantic_export.get("supersplat_ply")
+        )
+        if semantic_export.get("semantic_overlay_supersplat_ply"):
+            manifest["artifacts"]["semantic_supersplat_overlay_ply"] = semantic_export.get("semantic_overlay_supersplat_ply")
     save_manifest(project_root, manifest)
 
     current_items = {
@@ -40397,6 +40682,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     colmap_binary=args.scene_mesh_colmap_binary or args.colmap_binary,
                     overwrite=args.scene_mesh_overwrite,
                     copy_input_point_cloud=args.scene_mesh_copy_input_point_cloud,
+                    write_double_sided_preview=args.scene_mesh_write_double_sided_preview,
                     mode=args.mode,
                 )
             )
@@ -41994,8 +42280,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colmap-binary", default="colmap")
     p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--copy-input-point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Copy COLMAP dense fused.ply beside the mesh for later inspection.")
+    p.add_argument("--write-double-sided-preview", action=argparse.BooleanOptionalAction, default=True, help="Write a reversed-face display PLY so mesh viewers do not cull interior surfaces.")
     p.add_argument("--mode", choices=["copy", "symlink"], default="copy")
     p.set_defaults(func=cmd_reconstruct_scene_meshes)
+
+    p = sub.add_parser("export-double-sided-mesh-preview", help="Write a display PLY with reversed faces so viewers do not cull either side.")
+    p.add_argument("--mesh", type=Path, required=True)
+    p.add_argument("--output", type=Path, help="Defaults to <mesh>_double_sided.ply.")
+    p.add_argument("--report", type=Path, help="Defaults beside the output PLY.")
+    p.set_defaults(func=cmd_export_double_sided_mesh_preview)
 
     p = sub.add_parser("split-mesh-by-semantics", help="Split one face-annotated scene mesh into one PLY mesh per semantic object label.")
     add_common_project_arg(p)
@@ -43211,6 +43504,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scene-mesh-colmap-binary", default=None)
     p.add_argument("--scene-mesh-overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--scene-mesh-copy-input-point-cloud", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--scene-mesh-write-double-sided-preview", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--transfer-scene-mesh-semantics", action="store_true", help="Backfill face semantics onto the scene mesh after semantic splat export.")
     p.add_argument("--scene-mesh-semantic-route", choices=["local", "projected-splats", "nearest"], default="local")
     p.add_argument("--scene-mesh-semantic-output-dir", type=Path)

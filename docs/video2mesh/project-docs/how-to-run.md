@@ -35,9 +35,9 @@ video
   -> GroundingDINO bbox prompts
      - GroundingDINO 缺权重/环境时 fallback 到 auto-prompts
   -> SAM2/2D mask tracking
-  -> 2D-to-3D semantic fusion
+  -> SVLGaussian-style 2D probability -> clean 3DGS semantic core (binary PLY)
   -> 保守 object-fragment merge
-  -> semantic splats / viewer PLY
+  -> semantic splats core + lightweight SuperSplat semantic overlay
   -> COLMAP dense Delaunay scene mesh
   -> mesh semantic transfer + object PLY split
   -> object PLY mesh reconstruction
@@ -50,10 +50,11 @@ video
 RUN_SIMULATOR_ADAPTERS=1 bash run.sh dataset/<video>.mp4
 ```
 
-Gaussian probability backprojection 现在也不作为 quick run 默认阻塞项。默认路线直接用 `semantic_splats.ply` 对 scene mesh 做 local multi-sample semantic transfer；需要复现实验性的投影概率融合时再显式打开：
+Gaussian probability backprojection 现在是 quick run 默认路线。它会直接把 2D mask probability 投到 clean GraphDECO 3DGS，同一份 Gaussian 的 `means/opacities/scales/quats` 在 semantic core 写出前后会进行几何指纹校验。`semantic_splats.ply` 是 binary pipeline core，供 mesh transfer 使用；SuperSplat 应打开 scene visual PLY 和轻量 `semantic_*_overlay_supersplat.ply`，不要直接导入 full semantic core。
 
 ```bash
-GAUSSIAN_BACKPROJECT=1 bash run.sh dataset/<video>.mp4
+# 仅做旧 baseline 对照时可关闭（默认已开启）
+GAUSSIAN_BACKPROJECT=0 bash run.sh dataset/<video>.mp4
 ```
 
 如果 GraphDECO 30k 已经正常输出，但当前环境没有安装 `torch + gsplat` 预览依赖，可以只跳过 gsplat preview，不影响 3DGS PLY、semantic splats、Delaunay mesh 和 simulator bundle：

@@ -54,3 +54,7 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 ![视觉代理 3DGS + 碰撞代理 mesh Demo](../assets/04-visual-physics-proxy-demo.png "Web demo 验证了 3DGS visual layer 与 mesh collision layer 可以分离")
 
 结论：该 demo 已验证最小架构闭环，后续应拆成 object-level collider，并接入 face/object semantics 和物理材质。
+
+## 实验六：语义 3DGS Viewer 合同与 AnySplat 坐标修复
+
+[bedroom_4 语义 3DGS、SuperSplat 与双面 Mesh 修复](semantic-3dgs-viewer-contract-20260713.md) 记录了一个必须固定下来的资产合同：语义 full PLY 是 binary pipeline core，SuperSplat 使用轻量 semantic overlay，不直接加载 full semantic PLY；GraphDECO 语义投影强制验证 Gaussian geometry SHA；AnySplat 必须使用自己的 predicted cameras 和 448x448 crop mask，不能与 COLMAP 80 帧 camera_info 混用。该实验也将 PLY mesh 的双面查看副本纳入默认输出，避免 backface culling 造成正反面质量误判。

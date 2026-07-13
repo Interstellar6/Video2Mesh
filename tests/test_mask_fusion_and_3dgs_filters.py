@@ -39,12 +39,15 @@ from video2mesh.cli import (
     make_viewer_safe_gaussian_arrays,
     mesh_support_quality_report,
     parse_ply_vertex_header,
+    parse_ply_header,
     postprocess_mesh_with_point_support,
     prepare_3dgs_colmap_source,
     quantile_bounds_from_points,
     read_colmap_text_images,
     read_point_cloud,
     read_gsplat_ply,
+    read_semantic_ply_with_probabilities,
+    read_supersplat_label_sidecar,
     resolve_export_record_path,
     scaled_intrinsic_for_size,
     scene_bbox_cluster_keep_mask,
@@ -52,6 +55,9 @@ from video2mesh.cli import (
     source_labels_from_object_masks,
     write_json,
     write_point_cloud_ascii_ply,
+    write_ascii_triangle_mesh_ply,
+    write_double_sided_mesh_preview,
+    write_semantic_ply_with_labels,
     write_supersplat_ply,
 )
 
@@ -488,13 +494,93 @@ def test_export_viewer_plys_keeps_semantic_labels_out_of_supersplat_ply(tmp_path
     header = parse_ply_vertex_header(Path(report["supersplat_ply"]))
     property_names = [name for name, _prop_type in header["properties"]]
     assert header["format"] == "binary_little_endian"
-    assert "f_rest_44" in property_names
+    assert "f_rest_44" not in property_names
     assert "object_id" not in property_names
     assert "object_probability" not in property_names
     sidecar = Path(report["label_sidecar"])
     payload = json.loads(sidecar.read_text(encoding="utf-8"))
     assert payload["object_id"] == [3, 4]
     assert payload["object_probability"] == [0.8999999761581421, 0.800000011920929]
+
+
+def test_semantic_binary_rewrite_preserves_gaussian_geometry(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    source = tmp_path / "scene.ply"
+    means = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]], dtype=np.float32)
+    colors = np.array([[0.1, 0.2, 0.3], [0.8, 0.7, 0.6]], dtype=np.float32)
+    opacities = np.array([0.2, 0.9], dtype=np.float32)
+    scales = np.array([[0.01, 0.02, 0.03], [0.04, 0.05, 0.06]], dtype=np.float32)
+    quats = np.array([[1.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5]], dtype=np.float32)
+    write_supersplat_ply(source, means, colors, opacities, scales, quats)
+
+    output = tmp_path / "semantic.ply"
+    count, mode = write_semantic_ply_with_labels(source, output, [4, 7], [0.9, 0.6])
+
+    assert count == 2
+    assert mode == "binary_little_endian_vertex_rewrite"
+    header = parse_ply_vertex_header(output)
+    assert header["format"] == "binary_little_endian"
+    assert {"object_id", "object_probability"}.issubset({name for name, _kind in header["properties"]})
+    original = read_gsplat_ply(source)
+    semantic = read_gsplat_ply(output)
+    for field in ("means", "opacities", "scales", "quats"):
+        assert np.array_equal(original[field], semantic[field])
+    semantic_points, semantic_labels, semantic_probabilities, _colors = read_semantic_ply_with_probabilities(output)
+    assert np.array_equal(semantic_points, means.astype(np.float64))
+    assert semantic_labels.tolist() == [4, 7]
+    assert semantic_probabilities.tolist() == pytest.approx([0.9, 0.6])
+
+
+def test_large_semantic_sidecar_uses_compressed_npz(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    count = 50001
+    source = tmp_path / "semantic_source.ply"
+    write_supersplat_ply(
+        source,
+        np.zeros((count, 3), dtype=np.float32),
+        np.full((count, 3), 0.5, dtype=np.float32),
+        np.full(count, 0.5, dtype=np.float32),
+        np.full((count, 3), 0.02, dtype=np.float32),
+        np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (count, 1)),
+    )
+    labels = np.arange(count, dtype=np.int32) % 5
+    probabilities = np.linspace(0.0, 1.0, count, dtype=np.float32)
+
+    report = export_viewer_plys(source, tmp_path, "semantic_large", include_labels=True, export_point_cloud=False)
+
+    # This first export has no labels in its source, so inject a compact sidecar
+    # and ensure the generic reader can consume it on a binary SuperSplat PLY.
+    from video2mesh.cli import write_supersplat_label_sidecar
+
+    sidecar = write_supersplat_label_sidecar(Path(report["supersplat_ply"]), labels, probabilities)
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["storage"] == "npz_compressed"
+    assert not isinstance(payload.get("object_id"), list)
+    assert (sidecar.parent / payload["data_npz"]).exists()
+    loaded_labels, loaded_probabilities, loaded_sidecar = read_supersplat_label_sidecar(Path(report["supersplat_ply"]))
+    assert loaded_sidecar == sidecar
+    assert loaded_labels[:4] == [0, 1, 2, 3]
+    assert loaded_probabilities[-1] == pytest.approx(1.0)
+
+
+def test_double_sided_mesh_preview_has_reversed_face_companion(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    source = tmp_path / "source.ply"
+    write_ascii_triangle_mesh_ply(
+        source,
+        np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64),
+        np.asarray([[255, 0, 0], [0, 255, 0], [0, 0, 255]], dtype=np.uint8),
+        [[0, 1, 2]],
+    )
+    output = tmp_path / "double_sided.ply"
+
+    report = write_double_sided_mesh_preview(source, output)
+
+    header = parse_ply_header(output)
+    face_element = next(item for item in header["elements"] if item["name"] == "face")
+    assert report["source_face_count"] == 1
+    assert report["display_face_count"] == 2
+    assert face_element["count"] == 2
 
 
 def test_gaussian_health_flags_supersplat_streak_risk():
@@ -558,18 +644,20 @@ def test_export_viewer_plys_marks_unsafe_source_and_writes_safe_supersplat(tmp_p
 
     assert report["raw_gaussian_health"]["status"] == "unsafe"
     assert report["source_gaussian_health_ok"] is False
-    assert report["viewer_safety_status"] == "viewer_safe_postprocessed"
-    assert report["viewer_safe_postprocessed"] is True
+    assert report["viewer_safety_status"] == "source_unsafe_raw_exported_with_viewer_safe_companion"
+    assert report["viewer_safe_postprocessed"] is False
     assert report["geometry_preserved"] is True
     assert report["visual_qa_required"] is True
-    assert report["exported_gaussian_health"]["status"] == "safe"
-    assert report["exported_gaussian_health_ok"] is True
+    assert report["exported_gaussian_health"]["status"] == "unsafe"
+    assert report["exported_gaussian_health_ok"] is False
     assert report["supersplat_ply_info"]["source_gaussian_health_ok"] is False
     assert report["supersplat_ply_info"]["geometry_preserved"] is True
     assert report["shape_preview"]["ok"] is True
     assert Path(report["shape_preview"]["path"]).exists()
     exported = read_gsplat_ply(Path(report["supersplat_ply"]))
     assert np.allclose(exported["means"], np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32))
+    assert report["viewer_safe_supersplat_ply"]
+    assert Path(report["viewer_safe_supersplat_ply"]).exists()
     safety_report = json.loads(Path(report["viewer_safety_report"]).read_text(encoding="utf-8"))
     assert safety_report["viewer_safe_repair"]["before"]["status"] == "unsafe"
     assert safety_report["geometry_preserved"] is True
@@ -922,6 +1010,8 @@ def test_clean_3dgs_floaters_removes_outliers_and_elongated_low_opacity(tmp_path
         min_opacity=0.01,
         low_opacity=0.08,
         remove_low_opacity=False,
+        geometric_outliers=True,
+        elongation_filter=True,
     )
     header = parse_ply_vertex_header(output)
 
@@ -960,6 +1050,8 @@ def test_clean_3dgs_floaters_can_preserve_background_planes(tmp_path: Path):
         min_opacity=0.01,
         low_opacity=0.08,
         remove_low_opacity=False,
+        geometric_outliers=True,
+        elongation_filter=True,
         preserve_background_planes=True,
         background_up_axis="y",
         background_max_planes=1,

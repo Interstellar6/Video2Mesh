@@ -37,10 +37,10 @@ input video
 | 输入与位姿 | scan video | frames、cameras、sparse/dense points | COLMAP 主线，MASt3R/DUSt3R/VGGT 作为 fallback 调研 |
 | 视觉层 | posed images | 3DGS / splat | GraphDECO 3DGS，Spark/SuperSplat 做浏览器查看 |
 | Mesh 重建 | dense workspace / 3DGS renders / point cloud | GLB/PLY mesh | P0 用 COLMAP Delaunay collider，P1 做 per-object visual mesh |
-| 语义 | 2D masks、3D points、mesh | object ids、face sidecar | 保持 sidecar，不和 mesh topology 绑定死 |
+| 语义 | GroundingDINO/SAM2 2D masks、clean 3DGS、mesh | binary semantic core、轻量 SuperSplat overlay、face sidecar | 2D probability 直接投影到同一份 clean 3DGS；full core 不直接作为 viewer 输入 |
 | 补全 | crops、masks、bbox、clean plate | 完整 object mesh / background asset | image-blaster、Hunyuan3D、Meshy、TRELLIS 等作为后端 |
 | 物理代理 | mesh、bbox、semantic label | collider、mass、friction、body type | static mesh + primitive/convex proxy 先跑通 |
 
 ## 当前 P0 主链路
 
-P0 的目标是展示和交互闭环，不是最佳画质：COLMAP dense + Delaunay mesh 做场景 collider，GraphDECO 3DGS 做 visual layer，语义与物理属性通过 sidecar 管理。
+P0 的目标是展示和交互闭环，不是最佳画质：COLMAP dense + Delaunay mesh 做场景 collider，GraphDECO 3DGS 做 visual layer，语义与物理属性通过 sidecar 管理。默认语义路线使用 2D mask probability backprojection 写 binary semantic core，并从中生成 semantic mesh；SuperSplat 检查时打开 scene 3DGS 加轻量 semantic overlay，不直接加载 full semantic core。所有 mesh 同时输出单面 collider/source 和双面 display companion，避免 viewer 的 backface culling 改变质量判断。
