@@ -14,9 +14,9 @@ tags:
 
 # PhysX-Anything
 
-检查日期：2026-07-11；最新续跑：2026-07-14 00:18 CST
+检查日期：2026-07-11；最新续跑：2026-07-14 02:14 CST
 
-当前执行状态：论文 PDF、项目页、GitHub README、Hugging Face 权重页和 mil8 部署已复查；本轮没有下载完整 PhysX-Mobility 数据集，只下载并核验官方模型权重。官方 demo `demo/14.png` 在 mil8 的干净 checkout 中完成 VLM -> decoder -> split -> simready 链路：`test_demo/14/sample.glb`、part OBJ、`basic.urdf`、`basic.xml` 均已生成，MuJoCo 和 PyBullet 都能加载生成文件。`bedroom_4` 也用我们自己的 SAM3 单物体 crop `sam3_lamp_01` 完成了 VLM -> textured `sample.glb` -> split -> URDF/MJCF，并通过 MuJoCo/PyBullet 加载验证。证据边界必须写清楚：这不是“官方原版脚本无修改通过”，而是 **官方权重 + 官方/本项目输入 + 环境兼容 shim / 低显存兼容 decoder path**；`bedroom_4` 结论只覆盖单物体 lamp crop，不覆盖整房间 scene alignment 或最终资产质量验收。
+当前执行状态：论文 PDF、项目页、GitHub README、Hugging Face 权重页和 mil8 部署已复查；本轮没有下载完整 PhysX-Mobility 数据集，只下载并核验官方模型权重。官方 demo `demo/14.png` 在 mil8 的干净 checkout 中完成 VLM -> decoder -> split -> simready 链路：`test_demo/14/sample.glb`、part OBJ、`basic.urdf`、`basic.xml` 均已生成，MuJoCo 和 PyBullet 都能加载生成文件。`bedroom_4` 先用我们自己的 SAM3 单物体 crop `sam3_lamp_01` 完成了 VLM -> textured `sample.glb` -> split -> URDF/MJCF；随后扩展到 8 个 `bedroom_4` 物体候选（bed、lamp、nightstand、plant），每个候选都生成了 `sample.glb`、split OBJ、`basic.urdf` 和 `basic.xml`，并通过 MuJoCo/PyBullet 加载验证。证据边界必须写清楚：这不是“官方原版脚本无修改通过”，而是 **官方权重 + 官方/本项目输入 + 环境兼容 shim / 低显存兼容 decoder path**；其中 bed01、nightstand02、plant03 是 direct sparse coords mesh-only fallback，不是标准 textured GLB；lamp02、nightstand01、nightstand02、plant03 存在 VLM 语义误识别或低质量风险；`bedroom_4` 仍没有完成整房间 scene alignment 或最终资产质量验收。
 
 ![PhysX-Anything teaser](../assets/physx-anything/physx-anything-teaser.jpg "PhysX-Anything 官方 teaser：单张真实图像输入，输出带物体几何、关节和物理属性的仿真资产")
 
@@ -229,7 +229,10 @@ bedroom_4 full room frame
 | `bedroom_4` `sam3_lamp_01` VLM result | 使用本项目 SAM3 instance crop，VLM 输出 `Decorative Lamp`、4 个 part 和 `allind.npy` `(2385, 3)` |
 | `bedroom_4` `sam3_lamp_01` decoder compat result | 同样走 mesh+gaussian 兼容路径，导出 textured `sample.glb`，`6,654,052` bytes，`134,669` vertices / `213,392` faces |
 | `bedroom_4` `sam3_lamp_01` split + simready | 隔离 runner 中只处理 lamp01，生成 4 个 part OBJ、`basic_info.json`、`basic.urdf`、`basic.xml` |
-| `bedroom_4` `sam3_lamp_01` engine load validation | MuJoCo 加载 `basic.xml` 并 step 20 次通过；PyBullet DIRECT 加载 `basic.urdf` 通过，`4` joints |
+| `bedroom_4` multi-object continuation | 2026-07-14 继续处理 `bedroom4_bed01`、`bedroom4_lamp01`、`bedroom4_lamp02`、`bedroom4_nightstand01`、`bedroom4_nightstand02`、`bedroom4_plant01`、`bedroom4_plant02`、`bedroom4_plant03`；8/8 都有 `sample.glb`、split OBJ、URDF/XML |
+| Standard textured results | `lamp01`、`lamp02`、`nightstand01`、`plant01`、`plant02` 生成 `TextureVisuals` GLB；其中 `lamp02` 和 `plant02` texture baking 日志出现 `loss=nan`，纹理可信度要人工复核 |
+| Mesh-only fallback results | `bed01`、`nightstand02`、`plant03` 在标准 textured decoder OOM/失败后改走 direct sparse coords mesh-only fallback；GLB 为 `ColorVisuals`，可加载但没有 baked texture |
+| `bedroom_4` multi-object engine load validation | 8/8 的 `basic.xml` 可被 MuJoCo 加载，8/8 的 `basic.urdf` 可被 PyBullet DIRECT 加载；验证日志为 `tmp_remote_results/physx_bedroom4_try_20260713/logs/bedroom4_all_5_load_validation_20260714.log` |
 
 实测失败日志的关键点：
 
@@ -242,9 +245,9 @@ compat decoder: mesh+gaussian output succeeded; RF output not tested in this low
 bedroom_4 old proxy: geometry-only proxy GLB was used only for historical debugging, not official evidence
 ```
 
-结论边界：当前已经完成的是官方权重下载/核验、官方 demo/14 在兼容路径下的 VLM、textured `sample.glb`、官方 split、官方 simready 文件生成，以及 MuJoCo/PyBullet 加载验证；`bedroom_4` 的 `sam3_lamp_01` 单物体 crop 也已经在同一兼容路径下生成 textured `sample.glb`、4 个 part OBJ、`basic.urdf` 和 `basic.xml`，并通过 MuJoCo/PyBullet 加载验证。尚未完成的是未改源码的 official `1_vlm_demo.py` / `2_decoder.py` 端到端原版通过、默认 RF decode、以及把 bedroom_4 物体资产对齐回完整房间坐标后的质量验收；因此不能写成“官方原版四步无修改通过”，也不能写成“bedroom_4 整房间跑通”。
+结论边界：当前已经完成的是官方权重下载/核验、官方 demo/14 在兼容路径下的 VLM、textured `sample.glb`、官方 split、官方 simready 文件生成，以及 MuJoCo/PyBullet 加载验证；`bedroom_4` 的 8 个 SAM3 单物体候选也已经生成 `sample.glb`、split OBJ、`basic.urdf` 和 `basic.xml`，并通过 MuJoCo/PyBullet 加载验证。这里的“完整”只指每个候选的核心文件和 split 部件产物齐全，不等于几何/纹理/语义都达到最终交付质量。尚未完成的是未改源码的 official `1_vlm_demo.py` / `2_decoder.py` 端到端原版通过、默认 RF decode、以及把 bedroom_4 物体资产对齐回完整房间坐标后的质量验收；因此不能写成“官方原版四步无修改通过”，也不能写成“bedroom_4 整房间跑通”。
 
-本地已回传的官方 demo/14 产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_official_repro_20260713`，包含 `sample.glb`、part OBJ、URDF/XML、运行日志和验证用依赖缓存。`bedroom_4` 单物体实测产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_bedroom4_try_20260713/test_demo_bedroom4_lamp01`，日志在同级 `logs/`。旧 bedroom_4 proxy 调试产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_anything_bedroom4_proxy_20260712`，仅用于复查历史排障，不进入正式复现实验结论。
+本地已回传的官方 demo/14 产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_official_repro_20260713`，包含 `sample.glb`、part OBJ、URDF/XML、运行日志和验证用依赖缓存。`bedroom_4` 多物体实测产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_bedroom4_try_20260713/test_demo_bedroom4_*`，日志在同级 `logs/`，其中 `bedroom4_all_5_load_validation_20260714.log` 是 8 个对象的 MuJoCo/PyBullet 加载核验。旧 bedroom_4 proxy 调试产物放在 `/Users/zhangyuxiang/Desktop/worksplace/Video2Mesh/tmp_remote_results/physx_anything_bedroom4_proxy_20260712`，仅用于复查历史排障，不进入正式复现实验结论。
 
 ## 官方 demo/14 实测
 
@@ -318,6 +321,23 @@ VLM 对该 crop 的结构化理解是 `Decorative Lamp` / `Lighting Fixture`，d
 | PyBullet load | `p.loadURDF(..., DIRECT)` | ok；body id `0`，`4` joints |
 
 这次可以写成：**`bedroom_4` 的 `sam3_lamp_01` 单物体 crop 在官方权重和兼容路径下生成了 textured `sample.glb`、part OBJ、URDF/MJCF，并通过 MuJoCo/PyBullet 加载验证。** 仍不能写成：**bedroom_4 整房间跑通**、**官方脚本无修改通过**、或 **最终可交付仿真资产已经验收**。下一步如果要进入 Video2Mesh 主链路，还要做物体坐标/尺度回贴、support/penetration 检查、质量预览和 asset sidecar 写入。
+
+## bedroom_4 多物体续跑
+
+2026-07-14 又按同一官方权重和兼容环境继续跑了更多 `bedroom_4` SAM3 单物体候选。这里没有下载官方数据集，输入仍然来自本项目自己的 crop。结果已经从 `mil8:/root/autodl-tmp/physx-anything-official-repro-20260713/test_demo/<obj>/` 同步到本地 `tmp_remote_results/physx_bedroom4_try_20260713/test_demo_<obj>/`。验证脚本在远端 venv 中用 `trimesh` 读取 GLB，用 MuJoCo 读取 `basic.xml`，用 PyBullet DIRECT 读取 `basic.urdf`；同步后的验证日志在本地 `tmp_remote_results/physx_bedroom4_try_20260713/logs/bedroom4_all_5_load_validation_20260714.log`。
+
+| Object | VLM name | Decoder route | `sample.glb` | Split | Load validation | Caveat |
+|---|---|---|---|---:|---|---|
+| `bedroom4_bed01` | `Bed` | direct sparse coords mesh-only fallback | `1,807,816` bytes；`45,110` V / `90,420` F；`ColorVisuals` | 7 | MuJoCo `nbody=2,njnt=1,ngeom=8`；PyBullet `7` joints | 标准 textured decoder 和 mesh-only `run_control` 都 OOM；fallback 完整但无 baked texture |
+| `bedroom4_lamp01` | `Decorative Lamp` | compat mesh+gaussian textured | `6,654,052` bytes；`134,669` V / `213,392` F；`TextureVisuals` | 4 | MuJoCo `nbody=2,njnt=1,ngeom=5`；PyBullet `4` joints | 当前最干净的 `bedroom_4` 单物体 baseline |
+| `bedroom4_lamp02` | `Table` | compat mesh+gaussian textured | `4,243,116` bytes；`100,064` V / `186,448` F；`TextureVisuals` | 5 | MuJoCo `nbody=2,njnt=1,ngeom=6`；PyBullet `5` joints | 输入名是 lamp，但 VLM 识别成 table；texture baking 日志有 `loss=nan` |
+| `bedroom4_nightstand01` | `Potted Plant` | compat mesh+gaussian textured | `4,604,216` bytes；`91,372` V / `159,408` F；`TextureVisuals` | 2 | MuJoCo `nbody=3,njnt=2,ngeom=3`；PyBullet `3` joints | 对象名和 VLM 语义不一致，需人工复核；PyBullet 有 unsupported joint -> fixed warning |
+| `bedroom4_nightstand02` | `Safe` | direct sparse coords mesh-only fallback | `1,329,740` bytes；`33,231` V / `66,419` F；`ColorVisuals` | 5 | MuJoCo `nbody=5,njnt=4,ngeom=6`；PyBullet `8` joints | VLM 误识别为 safe；4 个小部件很小，主体占绝大多数；无 baked texture |
+| `bedroom4_plant01` | `Decorative Flower Pot` | compat mesh+gaussian textured | `7,498,328` bytes；`170,607` V / `263,372` F；`TextureVisuals` | 5 | MuJoCo `nbody=2,njnt=1,ngeom=6`；PyBullet `5` joints | 技术链路完整，质量仍需 viewer/scene alignment 复核 |
+| `bedroom4_plant02` | `Potted Plant` | compat mesh+gaussian textured retry on GPU5 | `4,461,672` bytes；`110,417` V / `187,406` F；`TextureVisuals` | 2 | MuJoCo `nbody=3,njnt=2,ngeom=3`；PyBullet `3` joints | 首次 decoder OOM，GPU5 retry 成功；texture baking 日志有 `loss=nan`；PyBullet 有 unsupported joint -> fixed warning |
+| `bedroom4_plant03` | `Safe` | direct sparse coords mesh-only fallback, no-preprocess | `1,544,588` bytes；`38,643` V / `77,107` F；`ColorVisuals` | 3 | MuJoCo `nbody=4,njnt=3,ngeom=4`；PyBullet `5` joints | crop 只有约 `43 x 43`，VLM 误识别为 safe；技术加载通过但几何和语义质量低 |
+
+这张表里的 “Load validation” 不是动力学仿真验收，只证明 GLB/OBJ/URDF/MJCF 文件是完整且能被目标引擎读取的。更严格的交付还需要把单物体资产对齐回 `bedroom_4` 场景坐标，再做 scale、support、penetration、关节方向、质量和纹理检查。尤其是 bed01 虽然已经重建并通过加载，但它不是标准 textured decoder 结果；nightstand02 和 plant03 虽然也完整生成了文件，但语义失败明显，不应该直接作为高质量资产宣传。
 
 ## 早期 bedroom_4 smoke/debug input
 
@@ -410,16 +430,16 @@ decoder / split / simready 脚本路径的 proxy 产物如下，只用于排障�
 | 层级 | 判断 | 原因 |
 |---|---|---|
 | P0 room reconstruction | 不进入 | 不是多视角房间重建器 |
-| P1 object asset enrichment | 官方 demo 和 `bedroom_4` 单物体 crop 已验证兼容路径 | 官方 `demo/14.png` 与 `sam3_lamp_01` 都已生成 textured GLB、part mesh、URDF/XML；旧 proxy 记录仍不能作为有效证据 |
-| P1 simulator QA | 文件加载通过，场景接入未验收 | demo/14 与 `sam3_lamp_01` 的 MJCF/URDF 可被 MuJoCo/PyBullet 加载；还没做 Video2Mesh scene coordinate 的 scale、pose、support、penetration 和 joint QA |
+| P1 object asset enrichment | 官方 demo 和 `bedroom_4` 多个单物体 crop 已验证兼容路径 | 官方 `demo/14.png` 与 `bedroom_4` 8 个候选都已生成 GLB、part mesh、URDF/XML；其中 5 个是 textured，3 个是 mesh-only fallback；旧 proxy 记录仍不能作为有效证据 |
+| P1 simulator QA | 文件加载通过，场景接入未验收 | demo/14 与 `bedroom_4` 8 个候选的 MJCF/URDF 可被 MuJoCo/PyBullet 加载；还没做 Video2Mesh scene coordinate 的 scale、pose、support、penetration、关节方向和质量 QA |
 | P2 articulated object library | 值得跟踪 | 对柜门、抽屉、笔记本、箱子、龙头等 articulated objects 很有价值 |
 | P2 deformable object | 暂不做 | 官方 README 也建议 deformable flag 设为 0 以获得更可靠的 simulation |
 
 下一步更稳的执行路线：
 
 1. 若目标是官方原版复现，继续修未改源码路径：PyTorch/Transformers/Qwen processor 兼容、官方 decoder/TRELLIS 相对路径，以及默认 RF decode 在 24GB GPU 上的 OOM。
-2. 若目标是 Video2Mesh 接入，下一步应扩大到更多 mask-clean 单物体 crop，优先选柜门、抽屉、开关、椅子这类真实 articulated object，并避免混合桌面、花瓶、床边背景的 heuristic crop。
-3. 把官方 demo/14 作为“环境和权重可用”的基线，把 `sam3_lamp_01` 作为本项目单物体 crop baseline，把 bedroom_4 proxy 仅作为历史排障 trace；正式 baseline 需要保留 `source`、`official_step_status`、`compatibility_shims`、`qa_status`。
+2. 若目标是 Video2Mesh 接入，下一步应从这 8 个候选里筛掉语义失败和低质量 crop，优先保留 `lamp01`、`plant01`、`bed01` 这类可读结果，再继续选 mask-clean、物体完整的柜门、抽屉、开关、椅子等 articulated object。
+3. 把官方 demo/14 作为“环境和权重可用”的基线，把 `bedroom_4` 8 物体续跑作为本项目单物体 crop baseline，把 bedroom_4 proxy 仅作为历史排障 trace；正式 baseline 需要保留 `source`、`official_step_status`、`compatibility_shims`、`fallback_route`、`semantic_caveat`、`qa_status`。
 4. 对接 Video2Mesh 时必须新增 alignment/preflight：把单物体坐标、尺度和姿态对齐回 COLMAP/scene coordinate，再检查 support、penetration、mass、joint limit 和 simulator loading。
 5. 不下载完整 PhysX-Mobility 数据集；除非要做论文 benchmark，当前只需要官方权重、官方 demo 和本项目自己的干净 crop。
 
@@ -429,7 +449,8 @@ decoder / split / simready 脚本路径的 proxy 产物如下，只用于排障�
 - **依赖风险**：官方 README 以 PyTorch 2.4.0 + CUDA 11.8 为默认，而 mil8 共享环境是 PyTorch 2.2.2 + CUDA 12.1；`flash_attn` 已安装，但官方原版 VLM 仍受 pytree/Qwen processor 兼容影响。
 - **GLB export 风险**：官方 demo/14 的 textured `sample.glb` 已在 mesh+gaussian 兼容路径下导出；默认 RF decode 在 24GB GPU 上 OOM，不能写成完整 decoder 默认输出通过。
 - **debug 标记风险**：pytree shim、Qwen processor redirect、absolute-path decoder config、diff-gaussian raster kwargs filter、mesh+gaussian-only decoder path 都是 compatibility workaround，不能写成官方原版复现。
-- **输入风险**：PhysX-Anything 训练/推理假设单物体图像；`sam3_lamp_01` 已规避 full-room 输入，但遮挡、低分辨率和 mask 边界仍会影响类别、尺度、部件和关节推理。
+- **输入风险**：PhysX-Anything 训练/推理假设单物体图像；`bedroom_4` 8 物体续跑已规避 full-room 输入，但遮挡、低分辨率和 mask 边界仍会影响类别、尺度、部件和关节推理，实际已经出现 lamp/table、nightstand/plant、nightstand/safe、plant/safe 等语义错配。
+- **fallback 风险**：bed01、nightstand02、plant03 的 direct sparse coords mesh-only fallback 可以产出可加载文件，但没有 baked texture；这类结果只能算 geometry/simready fallback，不能和标准 textured decoder 结果混写。
 - **坐标风险**：即使生成 URDF/XML，也还需要把单物体坐标、尺度和姿态对齐回 Video2Mesh 的 COLMAP/scene coordinate。
 - **质量风险**：论文指标来自 PhysX-Mobility 和互联网单物体图像；不能直接外推到遮挡严重、背景复杂的室内扫描帧。
 - **仿真风险**：自动物理属性必须经过 mass/friction/joint limit/penetration/support 的 simulator preflight，不可直接写进最终资产合同。
