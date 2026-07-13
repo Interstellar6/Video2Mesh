@@ -14511,12 +14511,14 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
     if not source_ply.exists():
         raise FileNotFoundError(f"Missing splat/point PLY: {source_ply}")
     source_ply = source_ply.resolve()
+    active_scene_ply = active_scene_ply.resolve() if active_scene_ply and active_scene_ply.exists() else None
+    source_path_matches_active_scene = bool(active_scene_ply and source_ply == active_scene_ply)
     source_contract = {
         "source_role": "explicit_splat_ply" if explicit_splat_ply else "active_scene_3dgs_ply",
-        "active_scene_3dgs_ply": str(active_scene_ply.resolve()) if active_scene_ply and active_scene_ply.exists() else None,
-        "source_matches_active_scene_3dgs": bool(
-            active_scene_ply and active_scene_ply.exists() and source_ply == active_scene_ply.resolve()
-        ),
+        "active_scene_3dgs_ply": str(active_scene_ply) if active_scene_ply else None,
+        "source_path_matches_active_scene_3dgs": source_path_matches_active_scene,
+        "source_geometry_matches_active_scene_3dgs": source_path_matches_active_scene,
+        "source_matches_active_scene_3dgs": source_path_matches_active_scene,
         "semantic_core_role": "full_resolution_mesh_transfer_and_audit_only",
         "recommended_viewer_role": "bounded_semantic_overlay_with_original_scene_3dgs",
     }
@@ -14634,6 +14636,26 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         }
 
     source_geometry = gaussian_geometry_fingerprint(geometry_source)
+    source_file_geometry = source_geometry if selected_gaussian_indices is None else gaussian_geometry_fingerprint(gaussian_data)
+    active_scene_geometry = None
+    if active_scene_ply is not None:
+        if source_path_matches_active_scene:
+            active_scene_geometry = source_file_geometry
+        elif active_scene_ply.stat().st_size == source_ply.stat().st_size:
+            # A pipeline may register a copied clean PLY under scene/3dgs while
+            # an explicit route points at the GraphDECO training directory.
+            # Compare geometry, not only paths, before calling that a mismatch.
+            active_scene_geometry = gaussian_geometry_fingerprint(read_gsplat_ply(active_scene_ply))
+        geometry_matches_active_scene = bool(
+            active_scene_geometry and active_scene_geometry["sha256"] == source_file_geometry["sha256"]
+        )
+        source_contract.update(
+            {
+                "source_geometry_matches_active_scene_3dgs": geometry_matches_active_scene,
+                "source_matches_active_scene_3dgs": geometry_matches_active_scene,
+                "active_scene_geometry": active_scene_geometry,
+            }
+        )
     output_geometry = gaussian_geometry_fingerprint(read_gsplat_ply(output_ply))
     geometry_identity_verified = source_geometry["sha256"] == output_geometry["sha256"]
     if not geometry_identity_verified:
@@ -19226,8 +19248,10 @@ def cmd_render_semantic_preview(args: argparse.Namespace) -> int:
     if points.shape[0] == 0:
         raise RuntimeError(f"No points found in semantic PLY: {semantic_splats_ply}")
     colors_u8 = semantic_colors_for_labels(labels)
-    colored_ply_path = output_dir / "semantic_splats_colored.ply"
-    write_colored_semantic_ply(colored_ply_path, points, labels, colors_u8)
+    write_colored_ply = bool(getattr(args, "write_colored_ply", True))
+    colored_ply_path = output_dir / "semantic_splats_colored.ply" if write_colored_ply else None
+    if colored_ply_path is not None:
+        write_colored_semantic_ply(colored_ply_path, points, labels, colors_u8)
     legend = semantic_legend_from_manifest(semantic_manifest, labels)
 
     frame_reports = []
@@ -19311,7 +19335,7 @@ def cmd_render_semantic_preview(args: argparse.Namespace) -> int:
         "project_root": str(project_root),
         "semantic_splats_ply": str(semantic_splats_ply),
         "semantic_splats_manifest": str(semantic_manifest_path) if semantic_manifest_path else None,
-        "colored_semantic_ply": str(colored_ply_path),
+        "colored_semantic_ply": str(colored_ply_path) if colored_ply_path is not None else None,
         "frames_dir": str(frames_dir),
         "camera_info": str(camera_info_path),
         "output_dir": str(output_dir),
@@ -19323,12 +19347,17 @@ def cmd_render_semantic_preview(args: argparse.Namespace) -> int:
         "notes": "Semantic object_id colors projected back to source frames for checking 3D object-mask alignment.",
     }
     write_json(preview_manifest_path, preview_manifest)
-    manifest["artifacts"]["semantic_preview"] = str(preview_manifest_path)
-    manifest["artifacts"]["semantic_splats_colored_ply"] = str(colored_ply_path)
-    save_manifest(project_root, manifest)
+    if bool(getattr(args, "register_artifacts", True)):
+        manifest["artifacts"]["semantic_preview"] = str(preview_manifest_path)
+        if colored_ply_path is not None:
+            manifest["artifacts"]["semantic_splats_colored_ply"] = str(colored_ply_path)
+        else:
+            manifest["artifacts"].pop("semantic_splats_colored_ply", None)
+        save_manifest(project_root, manifest)
     print(f"Rendered {len(valid_reports)} semantic preview frame(s) to {output_dir}")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"Colored semantic PLY: {colored_ply_path}")
+    if colored_ply_path is not None:
+        print(f"Colored semantic PLY: {colored_ply_path}")
     print(f"Preview manifest: {preview_manifest_path}")
     return 0
 
@@ -42524,6 +42553,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
     p.add_argument("--include-background", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--write-colored-ply", action=argparse.BooleanOptionalAction, default=True, help="Write a full ASCII semantic-color PLY beside the frame overlays.")
+    p.add_argument("--register-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Update the project manifest. Disable for independent AnySplat/SuGaR QA previews.")
     p.set_defaults(func=cmd_render_semantic_preview)
 
     p = sub.add_parser("export-object-mask-clouds", help="Export each object's 3D mask as its own PLY point cloud.")

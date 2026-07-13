@@ -5,8 +5,10 @@ import pytest
 
 from video2mesh.cli import (
     audit_gaussian_health,
+    cmd_render_semantic_preview,
     export_viewer_plys,
     read_gsplat_ply,
+    write_json,
     write_semantic_ply_with_labels,
     write_supersplat_ply,
 )
@@ -83,3 +85,77 @@ def test_semantic_overlay_uses_viewer_safe_gaussian_arrays(tmp_path: Path):
     assert report["supersplat_ply"] is None
     assert report["semantic_overlay_supersplat_ply_info"]["viewer_safe_geometry"] is True
     assert audit_gaussian_health(overlay_data["scales"], overlay_data["quats"], overlay_data["opacities"])["status"] == "safe"
+
+
+def test_semantic_preview_can_skip_large_colored_ply_and_manifest_registration(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    project_root = tmp_path / "project"
+    source = project_root / "scene.ply"
+    write_supersplat_ply(
+        source,
+        np.asarray([[0.0, 0.0, 2.0]], dtype=np.float32),
+        np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32),
+        np.asarray([0.8], dtype=np.float32),
+        np.asarray([[0.02, 0.02, 0.02]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    semantic = project_root / "semantic.ply"
+    write_semantic_ply_with_labels(source, semantic, [4], [0.9])
+    write_json(
+        project_root / "manifest.json",
+        {
+            "schema_version": 1,
+            "scene": {"frames_dir": "scene/frames", "camera_info": "scene/cameras/camera_info.json"},
+            "simulator_assets_dir": "simulator_assets",
+            "artifacts": {"untouched": "preserve-me"},
+        },
+    )
+    frames_dir = project_root / "scene/frames"
+    frames_dir.mkdir(parents=True)
+    Image.new("RGB", (3, 3), color=(0, 0, 0)).save(frames_dir / "000000.png")
+    camera_info = project_root / "scene/cameras/camera_info.json"
+    write_json(
+        camera_info,
+        {
+            "intrinsic": {"fx": 1.0, "fy": 1.0, "cx": 1.0, "cy": 1.0, "w": 3, "h": 3},
+            "extrinsic_type": "world_to_camera",
+            "extrinsic": {"000000": np.eye(4).tolist()},
+        },
+    )
+    output_dir = project_root / "preview"
+
+    rc = cmd_render_semantic_preview(
+        type(
+            "Args",
+            (),
+            {
+                "project_root": project_root,
+                "semantic_splats_ply": semantic,
+                "semantic_manifest": None,
+                "frames_dir": frames_dir,
+                "camera_info": camera_info,
+                "output_dir": output_dir,
+                "max_frames": 1,
+                "max_points_per_frame": 0,
+                "point_radius": 1,
+                "alpha": 0.9,
+                "seed": 7,
+                "extrinsic_type": "world_to_camera",
+                "occlusion_filter": True,
+                "depth_tolerance": 0.03,
+                "relative_depth_tolerance": 0.01,
+                "include_background": False,
+                "write_colored_ply": False,
+                "register_artifacts": False,
+            },
+        )()
+    )
+
+    assert rc == 0
+    assert (output_dir / "semantic_preview.json").exists()
+    assert not (output_dir / "semantic_splats_colored.ply").exists()
+    import json
+
+    manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifacts"] == {"untouched": "preserve-me"}

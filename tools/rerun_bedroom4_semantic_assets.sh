@@ -29,7 +29,7 @@ ANYSPLAT_RUN="$(cd "$2" && pwd)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 V2M_PYTHON="${V2M_PYTHON:-$(command -v python3)}"
 
-GRAPHDECO_PLY="${GRAPHDECO_PLY:-$PROJECT_ROOT/scene/reconstruction/3dgs_graphdeco/point_cloud/iteration_30000/point_cloud_clean_strict.ply}"
+GRAPHDECO_PLY="${GRAPHDECO_PLY:-$PROJECT_ROOT/scene/reconstruction/3dgs/point_cloud/iteration_30000/point_cloud_clean_strict.ply}"
 SCENE_MESH="${SCENE_MESH:-$PROJECT_ROOT/simulator_assets/scene_meshes/colmap_delaunay_dense/mesh.ply}"
 ANYSPLAT_MESH="${ANYSPLAT_MESH:-$ANYSPLAT_RUN/mesh_poisson_from_gaussian_centers/anysplat_poisson_voxel01_depth8_mesh.ply}"
 ANYSPLAT_IMAGE_SIZE="${ANYSPLAT_IMAGE_SIZE:-448}"
@@ -63,6 +63,16 @@ cd "$ROOT"
   --project-root "$PROJECT_ROOT" \
   --kind all \
   --output-dir "$PROJECT_ROOT/simulator_assets/viewer_plys_v4"
+
+"$V2M_PYTHON" -B -m video2mesh.cli render-semantic-preview \
+  --project-root "$PROJECT_ROOT" \
+  --semantic-splats-ply "$PROJECT_ROOT/simulator_assets/semantic_splats.ply" \
+  --semantic-manifest "$PROJECT_ROOT/simulator_assets/semantic_splats_manifest.json" \
+  --output-dir "$PROJECT_ROOT/simulator_assets/semantic_preview_v4" \
+  --max-frames 6 \
+  --max-points-per-frame 30000 \
+  --occlusion-filter \
+  --no-write-colored-ply
 
 "$V2M_PYTHON" -B -m video2mesh.cli transfer-mesh-semantics-local \
   --project-root "$PROJECT_ROOT" \
@@ -98,6 +108,19 @@ cd "$ROOT"
   --output "$ANYSPLAT_RUN/semantic_anysplat_gaussians_2d_probability_v3.ply" \
   --output-dir "$ANYSPLAT_RUN/gaussian_probabilities_v3" \
   --manifest-output "$ANYSPLAT_RUN/semantic_anysplat_gaussians_2d_probability_v3_manifest.json" \
+  --no-register-artifacts
+
+"$V2M_PYTHON" -B -m video2mesh.cli render-semantic-preview \
+  --project-root "$PROJECT_ROOT" \
+  --semantic-splats-ply "$ANYSPLAT_RUN/semantic_anysplat_gaussians_2d_probability_v3.ply" \
+  --semantic-manifest "$ANYSPLAT_RUN/semantic_anysplat_gaussians_2d_probability_v3_manifest.json" \
+  --frames-dir "$ANYSPLAT_RUN/images" \
+  --camera-info "$ANYSPLAT_RUN/semantic_projection_inputs_v3/camera_info_anysplat.json" \
+  --output-dir "$ANYSPLAT_RUN/semantic_preview_v3" \
+  --max-frames 6 \
+  --max-points-per-frame 30000 \
+  --occlusion-filter \
+  --no-write-colored-ply \
   --no-register-artifacts
 
 "$V2M_PYTHON" -B -m video2mesh.cli transfer-mesh-semantics-local \

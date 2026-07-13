@@ -309,6 +309,8 @@ def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_p
     report = json.loads(output_manifest.read_text(encoding="utf-8"))
     assert report["method"] == "svlgaussian_style_ray_to_gaussian_probability_backprojection"
     assert report["source_contract"]["source_role"] == "explicit_splat_ply"
+    assert report["source_contract"]["source_path_matches_active_scene_3dgs"] is True
+    assert report["source_contract"]["source_geometry_matches_active_scene_3dgs"] is True
     assert report["source_contract"]["source_matches_active_scene_3dgs"] is True
     assert report["geometry_identity"]["verified"] is True
     assert report["objects"][1]["object_id"] == "bed"
