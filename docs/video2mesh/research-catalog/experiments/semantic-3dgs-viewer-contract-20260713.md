@@ -118,6 +118,8 @@ PLY 本身没有 `doubleSided` material 开关。为避免查看器默认 backfa
 - semantic debug PLY 和 object semantic PLY 默认写正反两套 face；
 - GLB/exporter 应使用 `doubleSided: true`，不以单面 viewer 判断 mesh 是否存在。
 
+AnySplat、SuGaR 这类独立路线重做 semantic mesh 时使用 `transfer-mesh-semantics-local --no-register-artifacts`。它仍输出双面 semantic debug PLY，但不会把主 GraphDECO run 的 `mesh_semantics_local` manifest 指针错误改成外部路线的结果。
+
 ![旧 AnySplat semantic mesh](../assets/semantic-viewer-20260713/10-anysplat-semantic-mesh-before.png "旧 AnySplat semantic mesh 也受单面查看影响；新的 display companion 会保留双面可见性")
 
 这不会把 double faces 当作新的 collider 真值，也不会解决 AnySplat mesh 自身的孔洞、条带或尺度不一致；它只解决查看器的面剔除误判。

@@ -15,6 +15,7 @@ from video2mesh.cli import (
     clean_3dgs_floaters,
     cmd_clean_point_cloud_outliers,
     cmd_backproject_gaussian_probabilities,
+    cmd_transfer_mesh_semantics_local,
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
     cmd_reconstruct_object_meshes,
@@ -625,6 +626,75 @@ def test_lightweight_semantic_overlay_cap_preserves_each_label():
     assert report["selected_vertex_count"] == 60
     assert set(labels[selected].tolist()) == {1, 2, 3}
     assert all(count >= 10 for count in report["selected_by_label"].values())
+
+
+def test_local_mesh_semantics_can_skip_primary_manifest_registration(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    project_root = tmp_path / "project"
+    write_json(
+        project_root / "manifest.json",
+        {"schema_version": 1, "simulator_assets_dir": "simulator_assets", "artifacts": {}},
+    )
+    source = project_root / "scene.ply"
+    write_supersplat_ply(
+        source,
+        np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        np.full((3, 3), 0.5, dtype=np.float32),
+        np.full(3, 0.8, dtype=np.float32),
+        np.full((3, 3), 0.02, dtype=np.float32),
+        np.tile(np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (3, 1)),
+    )
+    semantic = project_root / "semantic.ply"
+    write_semantic_ply_with_labels(source, semantic, [1, 1, 1], [0.9, 0.9, 0.9])
+    mesh = project_root / "mesh.ply"
+    write_ascii_triangle_mesh_ply(
+        mesh,
+        np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64),
+        None,
+        [[0, 1, 2]],
+    )
+    output_dir = project_root / "external_route"
+
+    rc = cmd_transfer_mesh_semantics_local(
+        Namespace(
+            project_root=project_root,
+            mesh=mesh,
+            semantic_splats_ply=semantic,
+            semantic_manifest=None,
+            output_dir=output_dir,
+            output=None,
+            debug_ply=None,
+            k=1,
+            face_sample_mode="center",
+            max_distance=2.0,
+            max_distance_ratio=0.0,
+            min_sample_support=1.0,
+            min_neighbor_votes=1,
+            min_face_probability=0.0,
+            min_vote_confidence=0.0,
+            distance_power=2.0,
+            distance_epsilon=1e-5,
+            label_bbox_quantile=0.0,
+            label_bbox_padding_ratio=0.1,
+            bbox_min_probability=0.0,
+            smooth_iterations=0,
+            smooth_keep_probability=0.75,
+            smooth_min_neighbors=2,
+            min_region_faces=0,
+            semantic_max_points=0,
+            semantic_min_points_per_label=1,
+            register_artifacts=False,
+            seed=7,
+        )
+    )
+
+    assert rc == 0
+    saved_manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    assert "mesh_semantics_local" not in saved_manifest["artifacts"]
+    debug = output_dir / "mesh_semantics_debug.ply"
+    header = parse_ply_header(debug)
+    face_element = next(item for item in header["elements"] if item["name"] == "face")
+    assert face_element["count"] == 2
 
 
 def test_gaussian_health_flags_supersplat_streak_risk():

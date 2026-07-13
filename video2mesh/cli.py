@@ -18213,19 +18213,20 @@ def cmd_transfer_mesh_semantics_local(args: argparse.Namespace) -> int:
         },
     )
     write_json(output_json, payload)
-    manifest.setdefault("artifacts", {})["mesh_semantics_local"] = str(output_json)
-    manifest["artifacts"]["mesh_semantics_local_debug_ply"] = str(debug_ply)
-    manifest.setdefault("external_stages", {})["mesh_semantic_local_backfill"] = {
-        "status": "completed",
-        "method": "semantic_ply_local_multisample_face_transfer",
-        "mesh": str(mesh_path),
-        "semantic_splats_ply": str(semantic_ply),
-        "output": str(output_json),
-        "debug_ply": str(debug_ply),
-        "assigned_face_count": payload["summary"]["assigned_face_count"],
-        "mesh_face_count": payload["summary"]["mesh_face_count"],
-    }
-    save_manifest(project_root, manifest)
+    if bool(getattr(args, "register_artifacts", True)):
+        manifest.setdefault("artifacts", {})["mesh_semantics_local"] = str(output_json)
+        manifest["artifacts"]["mesh_semantics_local_debug_ply"] = str(debug_ply)
+        manifest.setdefault("external_stages", {})["mesh_semantic_local_backfill"] = {
+            "status": "completed",
+            "method": "semantic_ply_local_multisample_face_transfer",
+            "mesh": str(mesh_path),
+            "semantic_splats_ply": str(semantic_ply),
+            "output": str(output_json),
+            "debug_ply": str(debug_ply),
+            "assigned_face_count": payload["summary"]["assigned_face_count"],
+            "mesh_face_count": payload["summary"]["mesh_face_count"],
+        }
+        save_manifest(project_root, manifest)
     print(f"Wrote local semantic-ply mesh semantics: {output_json}")
     print(f"Wrote semantic debug mesh: {debug_ply}")
     print(json.dumps(payload["summary"], indent=2, ensure_ascii=False))
@@ -42355,6 +42356,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-region-faces", type=int, default=50, help="Set tiny same-label connected regions to unknown.")
     p.add_argument("--semantic-max-points", type=int, default=200000, help="Optional stratified cap on semantic source points for faster transfer; 0 keeps all.")
     p.add_argument("--semantic-min-points-per-label", type=int, default=3000, help="When downsampling, preserve at least this many high-probability points per semantic id when available.")
+    p.add_argument("--register-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Update the project manifest. Use --no-register-artifacts for independent AnySplat/SuGaR routes.")
     p.add_argument("--seed", type=int, default=7)
     p.set_defaults(func=cmd_transfer_mesh_semantics_local)
 
