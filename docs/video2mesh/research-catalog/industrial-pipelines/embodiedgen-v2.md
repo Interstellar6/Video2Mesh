@@ -316,6 +316,49 @@ tmp_remote_results/embodiedgen_v2_bedroom4_trellis_smoke_20260713/
 - bed 输出仍是单图生成先验，不应覆盖真实扫描几何，也不能直接作为 collider、navigation mesh 或 simulator rigid body。它最多可作为 object visual candidate / geometry repair seed，之后仍需 mesh、尺度、碰撞和物理验证闭环。
 - 当前 `mil8` 的 `/data` 只有约 `20GB` 可用且默认 Docker pull 超时；完整官方 stack 还需要解决 Docker/HF 网络、Python/CUDA 版本、Kaolin/GLIBC、GPT provider 和 SAPIEN/MuJoCo 环境，不能写成“EmbodiedGen V2 已完整部署”。
 
+### 全目标实例批量（2026-07-13）
+
+在首轮 `bed` 成功后，继续把 `bedroom_4` 已有的 **12 个非结构 SAM3 3D 实例**全部送入同一条 TRELLIS Gaussian-only 路径：`bed`、两扇 `door`、两盏 `lamp`、两个 `nightstand`、三盆 `plant`、两扇 `window`。`wall`、`floor`、`ceiling` 三个结构类没有送进 object generator，因为它们已有真实扫描的场景层，生成式单物体先验会破坏房间尺度和连续性。
+
+准备过程不是把同类 mask 直接混在一起：对每个 3D instance cloud，用 COLMAP `world_to_camera` 位姿投影到全部真实帧，再与对应真实 SAM3 类 mask 求交，按投影支撑、实例 bbox 和 alpha 面积选出独立 RGBA 输入。这样两盏灯和两个床头柜不会共享同一张 category crop。下图是最终选中的 12 个输入；`plant_03` 的输入只有 `43 x 43` 像素，已经在推理前标记为低细节风险。
+
+![bedroom_4 全目标 TRELLIS 输入审计](../assets/embodiedgen-v2-bedroom4-all-targets-inputs.png "每个 SAM3 3D instance 投影回最佳真实帧后生成的独立 RGBA 输入；墙、地板、天花板被排除")
+
+批处理使用空闲 GPU 4-7，每个 worker 只加载一次本地缓存的 Gaussian-only TRELLIS pipeline；模型加载阶段受远端高 CPU 负载影响较慢，但 25 + 25 sampling steps 的单件实际推理约 `8.60-11.35 s`，峰值显存约 `3.75-3.89 GB`。12/12 任务都生成了 PLY，随后字段、有限值和四元数检查也全部通过。
+
+| 实例 | 最佳输入（frame / bbox） | Gaussian 数 / 用时 | 视觉判定 | 资产处理 |
+|---|---|---:|---|---|
+| `sam3_bed_01` | `000052` / `1210 x 650` | `274,784` / `11.35 s` | 批量输入只保留床的一部分，弱于首轮全床结果 | **沿用首轮 `bed` PLY** 作为首选 visual candidate；批量版本保留审计 |
+| `sam3_door_01` | `000008` / `398 x 382` | `242,400` / `9.35 s` | 门板/边框轮廓可辨，但偏平且可能与另一实例重复 | Needs dedup + new view |
+| `sam3_door_02` | `000008` / `388 x 353` | `157,024` / `9.01 s` | 门板候选可读，仍缺少厚度与关节信息 | Needs dedup + new view |
+| `sam3_lamp_01` | `000060` / `143 x 194` | `82,720` / `10.70 s` | 灯罩、灯杆、底座均可辨 | **Visual candidate** |
+| `sam3_lamp_02` | `000077` / `125 x 157` | `65,632` / `10.24 s` | 轮廓可辨，细节较 `lamp_01` 少 | Conditional visual candidate |
+| `sam3_nightstand_01` | `000045` / `323 x 339` | `290,176` / `9.83 s` | mask/crop 混入背景，输出不像稳定的床头柜 | Re-select view / mask |
+| `sam3_nightstand_02` | `000073` / `335 x 206` | `67,072` / `8.60 s` | 同样受部分可见和背景影响 | Re-select view / mask |
+| `sam3_plant_01` | `000059` / `115 x 79` | `27,520` / `10.33 s` | 小而模糊，未形成可靠植株结构 | Reject for asset use |
+| `sam3_plant_02` | `000076` / `95 x 62` | `133,120` / `8.83 s` | 低细节输入导致片状/不稳定结构 | Reject for asset use |
+| `sam3_plant_03` | `000000` / `43 x 43` | `255,776` / `9.44 s` | 明显超出输入证据的先验 hallucination | Reject for asset use |
+| `sam3_window_01` | `000057` / `483 x 612` | `208,576` / `10.87 s` | 窗框、百叶/玻璃平面可读 | Static visual candidate |
+| `sam3_window_02` | `000013` / `344 x 426` | `355,776` / `10.98 s` | 平面窗框候选可读 | Static visual candidate |
+
+![清晰 lamp 输入的 TRELLIS Gaussian 三视图](../assets/embodiedgen-v2-bedroom4-lamp1-trellis-preview.png "从更大、更清晰的 bedroom_4 lamp instance crop 生成的 Gaussian；相较首轮 38 x 63 像素 lamp mask，灯罩和底座已可辨")
+
+![bedroom_4 全目标 TRELLIS Gaussian QA 总览](../assets/embodiedgen-v2-bedroom4-all-targets-trellis-preview.png "12 个实例的 x/y、x/z、y/z 点投影 QA；该图用于比较结构而非替代真实 Gaussian renderer")
+
+全量本地审计包（约 `158 MB`，原始 PLY 不进 Git）为：
+
+```text
+tmp_remote_results/embodiedgen_v2_bedroom4_all_targets_trellis_20260713/
+  input/    # 12 个 instance-level RGBA、源帧/mask/bbox/低细节标记
+  output/   # 12 个 binary Gaussian PLY + 5 个 GPU worker manifest
+  qa/       # 12 个字段/finite/quaternion JSON + 单件三视图 + 总览
+  logs/     # batch worker stdout/stderr
+```
+
+远端对应目录为：`mil8:/root/autodl-tmp/embodiedgen_v2_bedroom4_all_targets_trellis_20260713/`。本地与远端的 **12/12 PLY SHA-256 全部一致**；每份均含 `x/y/z`、`f_dc_*`、`opacity`、`scale_*`、`rot_*`，全部属性 finite，四元数范数中位数约为 `1.0`。这验证的是全目标的单图 Gaussian 生成和文件合同，不验证真实尺度回对、mesh/collider、URDF、物理属性、碰撞或仿真可用性。
+
+这批结果给 Video2Mesh 的直接工程结论是：对大且清晰的 instance crop，TRELLIS 可以提供 object visual completion candidate；对小物体、遮挡物体或 instance mask 不干净的类别，必须在送入生成器前执行最小像素尺寸、alpha 面积、单实例纯度和多视角一致性门槛。生成器输出不能自动替换扫描层，更不能自动标为 sim-ready asset。
+
 ## 风险
 
 | 风险 | 说明 | Video2Mesh 处理方式 |
