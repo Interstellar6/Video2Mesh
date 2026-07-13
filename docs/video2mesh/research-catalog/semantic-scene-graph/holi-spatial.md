@@ -3,6 +3,7 @@ title: Holi-Spatial 调研与 bedroom_4 实验报告
 id: video2mesh-semantic-scene-graph-holi-spatial
 category: 调研目录
 visibility: public
+updated: 2026-07-13
 summary: 调研 Holi-Spatial 的自动 3D 空间数据生成 pipeline、公开模型与数据集，并记录 Video2Mesh bedroom_4 的历史 smoke run 与 2026-07-13 真实 DA3、SAM3、PGSR 重跑。
 tags:
   - 语义与 Scene Graph
