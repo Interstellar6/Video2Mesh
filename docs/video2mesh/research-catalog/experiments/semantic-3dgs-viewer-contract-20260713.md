@@ -2,7 +2,7 @@
 title: bedroom_4 语义 3DGS、SuperSplat 与双面 Mesh 修复
 id: video2mesh-experiments-semantic-3dgs-viewer-contract-20260713
 category: 调研目录
-summary: 记录 bedroom_4 语义 3DGS 的文件膨胀、GraphDECO 同源几何合同、AnySplat 相机方向 bug、轻量 SuperSplat overlay 与 mesh 双面查看修复；历史结果与 2026-07-13 已真实重跑的 V4/V3 结果严格分开。
+summary: 记录 bedroom_4 语义 3DGS 的文件膨胀、GraphDECO 同源几何合同、AnySplat 相机方向 bug、轻量 SuperSplat overlay 与 mesh 双面查看修复；历史 V2/V3/V4 结果与 2026-07-14 V5 重跑严格分开。
 tags:
   - Video2Mesh
   - Experiment
@@ -11,6 +11,7 @@ tags:
   - AnySplat
   - SuperSplat
 visibility: public
+updated: 2026-07-14
 ---
 
 # bedroom_4 语义 3DGS、SuperSplat 与双面 Mesh 修复
@@ -37,6 +38,19 @@ double-sided display PLY
 ![GraphDECO clean visual 3DGS](../assets/semantic-viewer-20260713/01-graphdeco-visual.png "GraphDECO clean 3DGS：墙面和地板在保背景清理后仍保留完整")
 
 GraphDECO clean 3DGS 的视觉底图仍是当前 P0 visual layer：墙面和地板没有被 aggressive clean 删除。语义不应重新生成另一份几何，也不应把 dense semantic point cloud 或 3D mask 最近邻贴回它；正确做法是用 2D mask probability 投影到这个已经训练完成并 clean 的 Gaussian 序列上。
+
+## 2026-07-14 V5 更新
+
+用户审阅发现，本地 key-assets 曾混入历史 full semantic SuperSplat PLY，因此图中会看到“语义点云不像图一视觉 3DGS”以及 AnySplat 标签落在整面墙上的现象。V4/V3 的旧结果仍保留为排错证据，但不再是默认交付。
+
+V5 已在 `mil8` 对同一 `bedroom_4` run 真实重跑：
+
+- GraphDECO primary semantic core 强制直接读取 active `artifacts.scene_3dgs_ply`；source/output 的 Gaussian geometry SHA 均为 `02084ef6...3334bfa`。
+- full semantic core 仍只供 mesh transfer/audit，SuperSplat 默认输入改为 `visual_base_ply + bounded semantic_overlay_ply`，不再默认输出 full semantic scene duplicate。
+- AnySplat V5 继续只使用 own 19-frame camera/mask contract；它不覆盖主 manifest，semantic mesh 的 unknown face 比例仍高，保留为对照。
+- GraphDECO 与 AnySplat raw mesh 均重新导出了 `*_double_sided.ply` inspection companion；raw collider/source topology 保持不变。
+
+完整的 16 张历史/用户 QA 图、V5 投影 QA、文件体量和接入结论见 [GraphDECO、AnySplat 与 SuGaR 视觉、语义和 Mesh 对照实验](visual-3dgs-mesh-comparison-bedroom4-20260714.md)。
 
 ## 2026-07-13 审计状态
 

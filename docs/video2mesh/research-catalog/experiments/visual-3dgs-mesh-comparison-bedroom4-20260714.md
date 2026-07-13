@@ -1,132 +1,178 @@
 ---
-title: bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉和 Mesh 对照实验
+title: bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉、语义和 Mesh 对照实验
 id: video2mesh-experiments-visual-3dgs-mesh-comparison-bedroom4-20260714
 category: 调研目录
-summary: 基于 bedroom_4 的真实 PLY、Mesh 与新视角截图，对比 GraphDECO、AnySplat、SuGaR 三条视觉 3DGS / Mesh 路线，并明确各自能承担的资产角色。
+summary: 基于 bedroom_4 的真实 PLY、Mesh、语义投影和新视角截图，对比 GraphDECO、AnySplat、SuGaR 三条路线；明确当前可用资产、历史失效输出和 V5 修复合同。
 tags:
   - 本项目实验
   - Video2Mesh
   - GraphDECO
   - AnySplat
   - SuGaR
-  - 3DGS
+  - Semantic 3DGS
   - Mesh
 visibility: public
+updated: 2026-07-14
 ---
 
-# bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉和 Mesh 对照实验
+# bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉、语义和 Mesh 对照实验
 
 ## 结论
 
-这不是同一输入、同一训练预算下的严格 benchmark，而是对 `bedroom_4` 已真实跑出的资产做统一的视觉和几何审阅。三条路线的分工现在很清楚：
+这不是同一输入、同一训练预算下的 benchmark，而是对 `bedroom_4` 已实际生成的资产做一次带版本审计的视觉复盘。三条路线的分工现在应当是：
 
-| 路线 | 已观测视角 | 新视角 / 几何问题 | 当前角色 |
+| 路线 | 可以保留的资产 | 不能误用的资产 | 当前判断 |
 |---|---|---|---|
-| GraphDECO 30k | 床、墙、灯、窗和材质的照片感最好 | 远处 floaters、拉丝、高亮扩散和异常外扩 Gaussian 仍明显 | **P0 visual layer** |
-| AnySplat | 19 张输入即可快速给出完整房间外观，背景比原始 GraphDECO 更收敛 | 墙、窗边和床上方会出现条带、白色漂浮片和拉伸；不是可碰撞表面 | 快速 visual baseline / pose-depth-Gaussian prior |
-| SuGaR | 已观测视角下背景更贴墙、窗、地板，refined Gaussian 与可编辑 mesh 都有价值 | 新视角暴露未观测区空洞、薄片和碎裂；raw mesh 仍混入外部 / 背景组件 | P1/P2 visual mesh benchmark |
+| GraphDECO 30k | clean visual 3DGS、COLMAP Delaunay scene mesh、local multi-sample semantic mesh | 历史 full semantic SuperSplat PLY | **P0 visual layer + P0 scene collider/semantic mesh** |
+| AnySplat | 19-frame visual Gaussian、双面 depth8 inspection mesh、V3/V5 2D probability overlay | V2 full semantic viewer、单面 raw mesh 作为质量结论 | 快速 visual/pose-depth prior，不进入 collider 真值 |
+| SuGaR | refined Gaussian、refined OBJ visual benchmark、双面 inspection PLY | raw coarse mesh 当作已做背景剔除的 collider、1.6GB semantic ASCII PLY | P1/P2 surface-aware visual mesh 对照 |
 
-因此默认资产合同不变：**GraphDECO 负责视觉，COLMAP dense Delaunay 负责场景 collider，SuGaR 和 AnySplat 作为对照与后续升级候选。** 不能因为某一张前视截图更干净，就让 AnySplat 或 SuGaR mesh 直接替代碰撞代理。
+默认资产合同保持分层：**GraphDECO 负责视觉，COLMAP dense Delaunay 负责碰撞，semantic mesh 负责语义查询，AnySplat 和 SuGaR 负责对照与后续升级。** 不能把语义颜色 PLY 当成视觉质量 PLY，也不能把 viewer 的 backface culling 现象当成 mesh 几何已经消失。
 
-## 实验范围与证据
+## 证据与文件版本
 
-本页只记录真实本地 / `mil8` 产物和实际 viewer QA 图。不同路线的相机、输入帧数和优化预算不同，不能把它们的 Gaussian 数量或训练视角 PSNR 当作可横向比较的 NVS 指标。
+本页已收录本轮用户上传的图一至图十。每张图都被固定到仓库资产目录 `semantic-viewer-20260713/`，而不是只保留会话临时附件。图十一至图十六是同一批 `bedroom_4` 运行的 SuGaR 与回投 QA 补充证据。
 
-| 路线 | 真实输出 | 关键量化证据 | 本页如何解读 |
-|---|---|---|---|
-| GraphDECO | `bedroom_4` COLMAP -> 30k per-scene optimized Gaussian | 历史 fresh run 的 clean visual PLY 为约 95 万 Gaussian | 视觉主线；以截图检查 floaters 和背景保留 |
-| AnySplat | 2 fps 抽帧，19 张 `448 x 448` 输入 | 2,079,470 Gaussian，141,404,377 bytes；inference 4.158s，peak CUDA 约 9.18GiB | 前馈 baseline；重点看新视角条带和相机 / 深度一致性 |
-| SuGaR | GraphDECO 30k source -> surface-aligned refinement -> mesh | refined Gaussian 2,399,856；mesh 216,237 vertices / 399,976 faces | surface-aware visual mesh；重点区分 one-sided 显示与真实几何空洞 |
+| 资产 | 已核验的实测状态 | 打开/使用规则 |
+|---|---:|---|
+| GraphDECO clean visual PLY | 954,394 Gaussian，约 226MB | 可作为视觉底图打开 |
+| GraphDECO V4 semantic core | 954,394 Gaussian，约 233MB binary | 给 mesh transfer 和程序读 `object_id/object_probability`，不要单独拖入 SuperSplat |
+| GraphDECO semantic overlay | 180,000 Gaussian，约 12MB | 与 visual PLY 一起打开，作为颜色叠层 |
+| AnySplat visual PLY | 2,079,470 Gaussian，约 135MB | 仅在 AnySplat 自己的坐标系中使用 |
+| AnySplat V3 semantic core | 2,079,470 Gaussian，约 151MB binary | 不作为默认 SuperSplat 文件；V5 会以独立版本目录重新导出 |
+| SuGaR refined visual PLY | 2,399,856 Gaussian，约 568MB | 太大，只用于离线 visual benchmark |
+| SuGaR 历史 semantic core | 约 1.6GB ASCII | 已知不适合 viewer，不能当作默认交付 |
 
-和本页直接相关的语义链路采用的是 **2D mask -> Gaussian probability -> mesh local multi-sample transfer**。早期 `nearest_xyz_transfer_from_base_semantic_3dgs` 结果是历史 baseline，不纳入本页语义质量结论。
+全量 semantic core 比 visual PLY 更容易卡死，不是因为它多了几条标签字段，而是 SuperSplat 会把近百万至两百万个 Gaussian 解包成多个 CPU/GPU 缓冲。正确的查看方式是：原始 visual 3DGS 作为底图，再加载受预算限制的语义 overlay。core 仍然保留，因为 scene mesh semantic transfer、object split 和质量审计需要它。
 
-## GraphDECO：照片感最好，但不是干净表面
+## GraphDECO：视觉可用，语义必须绑定到同一份 Gaussian 几何
 
-![GraphDECO clean visual 3DGS](../assets/semantic-viewer-20260713/01-graphdeco-visual.png "GraphDECO 30k visual PLY：床、墙、窗和灯的照片感最好，但窗边、右侧和场景外壳存在明显的拉丝与高亮外扩")
+![图一，GraphDECO clean visual 3DGS](../assets/semantic-viewer-20260713/01-graphdeco-visual.png "GraphDECO 30k clean visual PLY：床、墙、地板、窗和灯都保留；窗边和房间外壳仍有拉丝与高亮外扩")
 
-GraphDECO 的优势仍是 per-scene optimization：在接近采集相机的视角，床、两侧床头柜、墙面、窗户和地板能形成最完整的视觉层。当前保背景的 clean 策略应该保留墙和地板，不应为了清掉远处小簇而把房间壳体一起删掉。
+图一是当前应当作为视觉底图的 GraphDECO clean 3DGS。它仍有右侧、窗边和未充分观测区域的 floaters，但墙面和地板没有被 aggressive clean 误删，照片感也是三条路线中最稳定的一条。
 
-它的限制也不能被 clean 操作掩盖。图中窗边、右侧、天花和相机轨迹外区域仍有大范围拉丝、半透明高亮片和外扩 Gaussian。这些 Gaussian 可以贡献训练视角的颜色，却没有变成可解释的单层 surface；因此直接从它们的 center 抽 Poisson 或把它们当 collider，都会放大伪影。
+![图二，历史 GraphDECO full semantic viewer](../assets/semantic-viewer-20260713/02-graphdeco-semantic-before.png "历史 full semantic SuperSplat：整场景被语义颜色替换，床、墙、门窗和小物体均存在串色；此文件不能作为当前视觉或语义展示资产")
 
-**判断：** 保留为默认 visual base，并让 2D semantic probability 直接写回同一份 clean Gaussian geometry；它不是 mesh truth，也不是语义 mesh 的替代品。
+图二对应历史文件 `semantic_3dgs_graphdeco_2d_probability_supersplat.ply`。它的问题有两层：第一，整场景改用 semantic palette 后，照片颜色消失，看起来必然不像图一；第二，早期 2D mask/实例质量存在串色、重复类别和低置信度扩张，颜色本身也不应被当作“分类已经正确”。
 
-## AnySplat：快速且相对收敛，但新视角有前馈条带
+这里需要区分一个容易混淆的事实：V4 的 manifest 对 `means/opacities/scales/quats` 做了 SHA-256 校验，source 和 semantic core 的 SHA 均为 `02084ef6...3334bfa`，因此 V4 标签确实写回了图一同一份 clean GraphDECO geometry，而不是 dense 点云或另一份训练结果。图二的失败是历史 full viewer 资产和语义质量问题，不是这份 SHA 能证明类别准确。V5 增加主资产 geometry guard：如果回投 source 与 `artifacts.scene_3dgs_ply` 不一致，主语义资产注册会直接失败。
 
-![AnySplat observed view](../assets/semantic-viewer-20260713/05-anysplat-visual.png "AnySplat bedroom_4：正面能较完整地看到床、墙、窗和地板，房间外壳比原始 GraphDECO 更集中")
+![图十五，GraphDECO V4 2D 回投 QA](../assets/semantic-viewer-20260713/15-graphdeco-v4-projection.png "V4 颜色标签投回输入帧的 QA：床、地板、窗和门的点落在对应图像区域；该图验证坐标合同，不等同于语义 IoU")
 
-AnySplat 在单张 RTX 3090 上已真实跑通：模型读取 19 张 2fps 输入并预测 Gaussian、相机和深度，前向推理约 4.16 秒。它的正面结果表明模型并不是只拟合主体床，背景墙、地面和窗也被覆盖；相较 GraphDECO，远离主体的随机 floaters 更少，墙面外壳更收敛。
+图十五验证的是 2D mask 到 Gaussian 位置的投影合同。它不能替代人工类别审阅，因此当前的 semantic 结果仍应描述为“可用的 sidecar baseline”，而不是高精度实例分割。
 
-![AnySplat novel-view stripes](../assets/semantic-viewer-20260713/06-anysplat-stripes.png "AnySplat 斜侧视角：墙面、床上方和窗边出现带状漂浮片、白色薄层和局部拉伸")
+### GraphDECO Mesh
 
-但新视角暴露出另一类问题：条带和薄层不是普通孤立离群点，靠简单 KNN / DBSCAN 清理无法可靠去掉。它更像前馈 depth、pose 与局部多视角几何没有完全一致的结果。把它直接做 Poisson mesh 会把这些薄层固化；把它做 visual layer 也需要 opacity / scale-aware trimming 和多视角 reprojection consistency 检查。
+![图三，COLMAP dense Delaunay scene mesh](../assets/semantic-viewer-20260713/03-colmap-mesh.png "COLMAP dense Delaunay mesh：房间和床的大结构仍在，但边缘有外部薄片；它承担低面数场景 collider")
 
-语义方面，旧 AnySplat 结果曾把 `camera-to-world` 外参误当成 `world-to-camera`，并混用了原始 80 帧 COLMAP mask。当前有效版本使用自己的 19 帧预测相机和对应 `448 x 448` crop mask，先 inverse 成 world-to-camera，再做 2D probability backprojection；该修复只证明投影坐标合同成立，不证明当前实例类别已达到可用精度。
+![图四，COLMAP local semantic mesh](../assets/semantic-viewer-20260713/04-colmap-semantic-mesh.png "local multi-sample semantic mesh：床、地板、门窗和主要背景结构的语义相对可读，是当前最好的 semantic mesh")
 
-**判断：** 很适合无可靠 COLMAP 时的快速 visual / pose-depth prior，也可做 GraphDECO 初始化候选；不能直接进入 collider、物理或最终 simulator bundle。
+图三和图四的质量目前优于其它 scene mesh 路线，保留在默认 pipeline。source collider 仍保留单面原始三角拓扑，额外导出 `mesh_double_sided.ply` 仅供查看，不能把 doubled faces 当作物理 mesh 的真实面数。
 
-## SuGaR：背景更贴表面，但 mesh 和新视角仍要分开审阅
+## AnySplat：正面干净，异视角条带和历史语义资产都要隔离
 
-![SuGaR refined Gaussian observed view](../assets/semantic-viewer-20260713/11-sugar-visual.png "SuGaR refined Gaussian：已观测视角下墙、窗、地板和床附近的背景比原始 GraphDECO 更贴近表面")
+![图五，AnySplat observed view](../assets/semantic-viewer-20260713/05-anysplat-visual.png "AnySplat 正面视角：床、墙、窗和地板覆盖相对完整，整体比 raw GraphDECO 更集中")
 
-SuGaR 从 GraphDECO 30k 继续做 surface-aligned Gaussian 优化，refined PLY 有 2,399,856 个 Gaussian，约 595MB binary。它在照片覆盖较好的视角里，背景更贴近墙、窗和地板，房间结构也更像一个连续外壳。这是它优于单纯 Gaussian-center-to-mesh 的实际价值。
+![图六，AnySplat novel-view stripes](../assets/semantic-viewer-20260713/06-anysplat-stripes.png "AnySplat 异视角：床上方、墙和窗外出现明显丝状条带、白色薄层和拉伸")
 
-![SuGaR refined Gaussian novel view](../assets/semantic-viewer-20260713/12-sugar-new-view.png "SuGaR 换到新视角后，床头上方、窗边、外墙和地面边界出现空洞、拉丝和碎裂")
+AnySplat 用 19 张 `448 x 448` 输入在约 4.16 秒前向得到 2,079,470 Gaussian。图五说明它可以很快得到完整、干净的房间视觉先验；图六同时说明它的 depth/pose/geometry 在新视角并没有收敛到可靠的表面。条带不是简单单点离群，不能直接做 Poisson collider，也不能用 KNN 清理后就当作稳健 mesh。
 
-用户观察到的“墙面 Gaussian 没有规范到平面上去”在新视角里确实成立为现象：墙不再保持连续平面，而是暴露为稀疏碎片和薄层。更准确地说，这说明当前 surface alignment 和观测覆盖不足以约束未见区域；不能从单张图推断 SuGaR 完全没有平面约束。下一步应优先做 visibility / density trimming、墙地平面保护和未观测区 hole handling，而不是只增加 Gaussian 数量。
+AnySplat 的绝对坐标尺度和 GraphDECO 不一致，二者不能在一个 scene transform 下混放。它的 semantic 2D 回投必须使用自己的 19 帧、中心裁切后的 mask 和自己的 predicted camera；不能拿 COLMAP 80 帧 camera/mask 混用。
 
-### SuGaR mesh：先排除单面显示，再判断真正缺失
+### AnySplat depth8 Mesh 与 backface culling
 
-| 文件 | 真实状态 | 审阅结论 |
-|---|---|---|
-| `scene_mesh_sugar_coarse.ply` | 16.2MB，216,237 vertices / 399,976 faces | raw coarse mesh 仍保留外部 / 背景组件，不能当作已完成 background removal 的 collider |
-| `scene_mesh_sugar_refined.obj` | 48.9MB，216,237 vertices / 399,976 faces | 该 refined export 的主体视觉上更整齐，但它是独立的 refinement / export 路线，不能反推 raw coarse PLY 也做过相同的背景裁剪 |
-| `*_double_sided.ply` | 反向复制 triangle winding 的 display companion | 只解决 backface culling 导致的“面消失”；不填洞、不删除外部碎片、不改变原 collider topology |
+![图七，AnySplat depth8 mesh 一侧](../assets/semantic-viewer-20260713/07-anysplat-mesh-back.png "AnySplat Poisson depth8 raw mesh：从一个方向看房间壳体相对完整")
 
-![SuGaR one-sided mesh symptom](../assets/semantic-viewer-20260713/13-sugar-mesh-before.png "SuGaR mesh 在单面查看时会显得大片缺失；这是 winding/normal 与 backface culling 的显示问题之一")
+![图八，AnySplat depth8 mesh 另一侧](../assets/semantic-viewer-20260713/08-anysplat-mesh-front.png "同一 raw mesh 翻到反面后大片面消失，主要是 triangle winding/backface culling 造成的 inspection 误判，几何本身仍有孔洞和碎片")
 
-原始 / coarse mesh 的“背景没有剔除”是实质问题，和单面可见性不是一回事。关闭 backface culling 或使用 double-sided display 后，床、窗和墙的已存在面片会更完整，但外部背景片、顶边碎片、窗边薄片和真实的新视角空洞仍然存在。`scene_mesh_sugar_refined.obj` 看起来更干净，说明 refined export 具有不同的 surface / visibility 筛选效果；后续应把其筛选步骤显式复用到 raw mesh，而不是只靠 viewer 里换一个显示模式。
+图七和图八是同一份 raw mesh，不能把“反面消失”误判为算法仅重建了一面。PLY 不带 material 的 `doubleSided` 标志，因此当前做法是：保留原始 depth8 mesh 作为 geometry source，再导出 `anysplat_poisson_voxel01_depth8_mesh_double_sided.ply` 作为默认 inspection companion。remote 已有该 companion，早前同步到本地的 key-assets 漏传了它。V5 输出会把它和 semantic debug mesh 一起列入交付清单。
 
-**判断：** SuGaR mesh 可以做 visual mesh benchmark 和编辑资产研究，不进入当前 P0 collider。进入 Unity / simulator 前至少需要 normal/winding 修复、双面检查、连通域清理、背景/外壳 ROI 裁剪、洞处理和独立的 collider 简化。
+double-sided 只能解决查看器剔除问题，不填补 AnySplat 本身的洞，也不消除图六条带。collider 仍不能改用这份 mesh。
 
-## SuGaR 语义：采用 2D probability，不把旧 nearest baseline 重新包装
+### AnySplat semantic：图九和图十是历史无效输出
 
-![SuGaR semantic mesh inspection](../assets/semantic-viewer-20260713/14-sugar-semantic-mesh-before.png "SuGaR semantic mesh 的早期查看症状图：语义颜色审阅仍受单面 mesh 可见性影响，不能仅凭颜色完整度判断分类正确")
+![图九，历史 AnySplat semantic viewer](../assets/semantic-viewer-20260713/09-anysplat-semantic-before.png "历史 AnySplat full semantic viewer：大量标签落在墙壳和错误位置，不能作为语义质量结论")
 
-当前有效的 SuGaR semantic Gaussian 使用 `svlgaussian_style_ray_to_gaussian_probability_backprojection`：80 帧 2D object probability masks 投影到 refined Gaussian，Top-8 近邻、3px ray radius、4px stride，并启用 occlusion filter。它不是 dense semantic point cloud、3D mask，也不是从旧 GraphDECO semantic PLY 最近邻复制标签。
+![图十，历史 AnySplat semantic mesh](../assets/semantic-viewer-20260713/10-anysplat-semantic-mesh-before.png "历史 AnySplat semantic mesh：既有语义串色也受单面 viewer 影响；不能作为最终 semantic mesh")
 
-| 产物 | 实测体量 / 合同 | 使用边界 |
-|---|---|---|
-| `semantic_sugar_refined_gaussians_2d_probability.ply` | 2,399,856 Gaussian，1.70GB ASCII；foreground 792,631 / background 1,607,225 | 语义回灌 / audit core，**不应直接丢给 SuperSplat** |
-| `semantic_scene_mesh_sugar_refined_2d_probability_fixed.ply` | 87.9MB，399,975 faces，1,199,925 个为 face-color debug 重复写出的 vertices | semantic mesh inspection，不替代原始 mesh collider |
-| `semantic_scene_mesh_sugar_refined_2d_probability_fixed.json` | local multi-sample face transfer，`inner4`，每 face 4 sample，SciPy cKDTree | 可追溯 face label / probability；还需单独评估 instance merge 和类别准确率 |
+图九和图十来自 V2 时代的 full viewer/debug mesh。该版本把 AnySplat 的 `camera-to-world` 外参、19-frame crop 和 Video2Mesh 原始 COLMAP camera/mask 合同混在一起，墙上大面积标签不是可用证据。V3 已改为 `inverse(camera_to_world) -> world_to_camera`，并且只用 19 张匹配图与 448 crop mask；下图是 V3 的投回原图 QA，能看到标签主要落在床、床头和地板的可见部分。
 
-语义全量 PLY 太大导致无法直接打开，不是“语义更多所以视觉更好”。它需要像 GraphDECO / AnySplat 一样拆成 binary semantic core 和受预算限制的轻量 overlay；语义颜色用于审阅，原始 visual PLY 仍是展示底图。当前 29 个 label 中仍存在多 lamp / plant 等重复实例，这反映 2D discovery / tracking 的实例合并问题，不能用 3D mesh 上的颜色去掩盖。
+![图十六，AnySplat V3 2D 回投 QA](../assets/semantic-viewer-20260713/16-anysplat-v3-projection.png "V3 语义回投 QA：床和地板落在正确图像区域，但覆盖仍偏稀疏且实例类别仍需改进")
 
-## 推荐的分层接入
+V3 证明相机方向修复生效，不证明 AnySplat 语义已经达标。2026-07-14 的 V5 已以全新版本目录重新导出 core、overlay、semantic mesh 和双面 mesh；旧的 `semantic_3dgs_anysplat_2d_probability_supersplat.ply` 不再同步为可打开资产。
+
+## SuGaR：观测视角贴表面，新视角与 raw mesh 仍不够稳
+
+![图十一，SuGaR refined Gaussian observed view](../assets/semantic-viewer-20260713/11-sugar-visual.png "SuGaR refined Gaussian：已观测视角下背景比 GraphDECO 更贴墙、窗和地板")
+
+![图十二，SuGaR refined Gaussian novel view](../assets/semantic-viewer-20260713/12-sugar-new-view.png "SuGaR 新视角：墙面、顶边、窗边和地板边界暴露空洞、碎裂和白色薄片")
+
+SuGaR 的 surface alignment 在已观测视角确实带来更贴背景的效果，图十一的墙、窗和地板比 raw GraphDECO 更接近平面。图十二说明当前可见的平整并不代表全部 surface 已规范到平面：未充分观测区域仍会出现稀疏碎片、孔洞与外壳浮片。
+
+### SuGaR Mesh 和背景处理
+
+![图十三，SuGaR coarse mesh 语义检查](../assets/semantic-viewer-20260713/13-sugar-mesh-before.png "SuGaR coarse mesh：背景/外壳碎片仍保留，面颜色可见但不能视为已完成 background removal")
+
+![图十四，SuGaR semantic refined mesh](../assets/semantic-viewer-20260713/14-sugar-semantic-mesh-before.png "SuGaR refined semantic mesh：床的大体位置可见，但背景碎片、串色和未知区域仍多")
+
+实测文件中 `scene_mesh_sugar_coarse.ply` 约 15MB，仍保留外部背景/外壳组件；`scene_mesh_sugar_refined.obj` 约 47MB，视觉上比 coarse 更干净，但这只能说明 refined export 走了不同的 visibility/surface 筛选，不能说明 raw mesh 已做 background removal。后续应把 refined 的可见性筛选拆成可复现的后处理，再叠加连通域与场景 ROI 清理；在此之前不把 SuGaR mesh 放进 P0 collider。
+
+SuGaR 的 semantic core 历史上被 ASCII 重写到约 1.6GB，无法作为 viewer 资产。新版 binary core + bounded overlay 合同可以避免不必要的文本膨胀，但 240 万 Gaussian 本身仍很重，默认只保留离线 mesh transfer/audit，不能承诺 SuperSplat 可直接打开。
+
+## V5 修复合同
+
+本页对应的代码修复已经写入项目开发分支，并在 `mil8` 对同一个 `bedroom_4` run 完成 V5 重跑：
 
 ```text
-COLMAP dense Delaunay mesh
-  -> 低面数、保守的 scene collider / raycast / ground probe
-GraphDECO clean 3DGS
-  -> 默认 visual layer
-2D mask probability -> semantic Gaussian / semantic mesh sidecar
-  -> object query、inspection、后续 instance merge，不替代视觉或碰撞
-AnySplat
-  -> 快速 prior / baseline / COLMAP 失败 fallback
-SuGaR refined Gaussian + repaired visual mesh
-  -> P1/P2 high-quality visual mesh and editable-asset benchmark
+active GraphDECO visual 3DGS
+  -> 2D mask probability backprojection
+  -> binary semantic core (保留原始 RGB 和 Gaussian 几何)
+  -> bounded semantic overlay (语义色，仅 inspection)
+  -> COLMAP mesh local multi-sample semantic transfer
+  -> raw collider + double-sided inspection companion
+
+AnySplat own Gaussian + own 19-frame camera/mask contract
+  -> isolated semantic core + overlay + semantic mesh
+  -> raw depth8 mesh + double-sided inspection companion
 ```
 
-后续修复优先级应为：
+实现上的约束如下：
 
-1. 保持 GraphDECO 的背景保护 clean，单独清除远离 COLMAP dense bbox 的孤岛簇。
-2. 对 AnySplat 做 depth / pose consistency、opacity-scale trimming 和固定相机 QA，而不是盲目增大输入帧数后直接建 mesh。
-3. 将 SuGaR refined OBJ 的有效 visibility / surface 筛选拆成显式、可复现步骤，再对 raw mesh 做 connected-component / background ROI 清理。
-4. 对语义实例做跨帧 identity 和 3D spatial merge，随后重新做 2D probability 投影融合；不从 3D mask 或历史 semantic PLY 回灌。
+1. 主 GraphDECO semantic output 注册前必须与 `artifacts.scene_3dgs_ply` 的 Gaussian geometry SHA 相同，否则命令失败。
+2. semantic core 不再被默认当作 SuperSplat 场景文件。推荐输入写入 manifest：`visual_base_ply + semantic_overlay_ply`。
+3. AnySplat/SuGaR 是独立坐标系，使用 `--no-register-artifacts`，不会覆盖 GraphDECO 主 manifest。
+4. 所有 scene mesh 路线保留 raw source，同时默认导出 `*_double_sided.ply` inspection companion；语义 debug PLY 也写双面 faces。
+5. SuGaR raw mesh background removal 仍未完成。V5 不会把它伪装为已修复，而是保留为后续 P1/P2 工作项。
+
+### V5 真实输出与 QA
+
+| 路线 | V5 输出 | 量化审计 | 结论 |
+|---|---|---|---|
+| GraphDECO | `semantic_splats.ply` binary core，244,326,452 bytes；overlay 12,240,416 bytes | source 直接取 active `scene_3dgs_ply`，source/output geometry SHA 均为 `02084ef6...3334bfa`；954,394 Gaussian；6/6 QA 帧有效 | 几何与 visual 3DGS 同源已验证；标签质量仍是 2D mask/instance 问题，不以 full semantic viewer 评价视觉质量 |
+| GraphDECO semantic mesh | `mesh_semantics_local_2d_probability_v5_20260714` | 94,021 vertices / 189,760 faces，151,008 faces 已分配语义；raw -> double-sided display 为 189,760 -> 379,520 faces | 继续保留在默认 pipeline |
+| AnySplat | binary core 158,040,194 bytes；overlay 12,240,416 bytes | 2,079,470 Gaussian，19 predicted cameras，380 张 matched/cropped masks，6/6 QA 帧有效 | 坐标合同正确，但 foreground coverage 和类别完整度不足 |
+| AnySplat semantic mesh | `mesh_semantics_local_2d_probability_v5_20260714` | 148,660 vertices / 297,172 faces，47,572 faces 已分配，249,600 faces unknown；raw -> double-sided display 为 297,172 -> 594,344 faces | 只作为对照，不能替代 GraphDECO/COLMAP semantic mesh |
+
+![GraphDECO V5 2D probability projection](../assets/semantic-viewer-20260714/17-graphdeco-v5-semantic-projection.png "V5 GraphDECO QA：标签在图一对应的 active visual Gaussian geometry 上；视觉底图与颜色 overlay 应分开加载")
+
+![AnySplat V5 2D probability projection](../assets/semantic-viewer-20260714/18-anysplat-v5-semantic-projection.png "V5 AnySplat QA：标签不再覆盖整面右墙，但床右侧和远处结构的覆盖仍不足")
+
+GraphDECO V5 的 `mean_projected_foreground_ratio=0.9984`、`mean_visible_foreground_ratio=0.5565`；AnySplat V5 分别为 `0.8689` 和 `0.4143`。这些比率只表示投影/可见点的覆盖，不是类别 IoU。视觉检查仍应以图十七、图十八和全局 semantic mesh 一起进行。
+
+## 当前接入判断
+
+| 层 | 默认输入 | 默认输出 | 是否进入主 pipeline |
+|---|---|---|---|
+| visual | GraphDECO clean 30k PLY | 原始照片色 visual 3DGS | 是 |
+| semantic 3DGS | GroundingDINO/SAM2 2D masks + GraphDECO active PLY | binary core + bounded overlay + manifest | 是，作为 sidecar |
+| scene collider | COLMAP dense workspace | Delaunay raw mesh + double-sided inspection PLY | 是 |
+| semantic mesh | semantic core + COLMAP mesh | local multi-sample semantic mesh | 是 |
+| fast prior | AnySplat | visual Gaussian、V5 isolated semantic QA | 否，只保留对照 |
+| surface-aware visual mesh | SuGaR | refined Gaussian/OBJ、双面 inspection PLY | 否，只保留对照 |
 
 ## 相关记录
 
-- [语义 3DGS、SuperSplat 与双面 Mesh 修复](#/doc/video2mesh-experiments-semantic-3dgs-viewer-contract-20260713)
+- [语义 3DGS、SuperSplat 与双面 Mesh 合同](#/doc/video2mesh-experiments-semantic-3dgs-viewer-contract-20260713)
 - [AnySplat 研究与 bedroom_4 实测](#/doc/video2mesh-visual-3dgs-anysplat)
 - [SuGaR 研究与 bedroom_4 mesh 观察](#/doc/video2mesh-mesh-reconstruction-sugar)
 - [COLMAP Delaunay 场景 collider 实验](#/doc/video2mesh-experiments-colmap-delaunay-experiment)

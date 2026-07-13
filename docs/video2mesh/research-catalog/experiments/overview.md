@@ -59,6 +59,6 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 
 [bedroom_4 语义 3DGS、SuperSplat 与双面 Mesh 修复](semantic-3dgs-viewer-contract-20260713.md) 记录了一个必须固定下来的资产合同：语义 full PLY 是 binary pipeline core，SuperSplat 使用轻量 semantic overlay，不直接加载 full semantic PLY；GraphDECO 语义投影强制验证 Gaussian geometry SHA；AnySplat 必须使用自己的 predicted cameras 和 448x448 crop mask，不能与 COLMAP 80 帧 camera_info 混用。该实验也将 PLY mesh 的双面查看副本纳入默认输出，避免 backface culling 造成正反面质量误判。
 
-## 实验七：GraphDECO、AnySplat 与 SuGaR 视觉 / Mesh 对照
+## 实验七：GraphDECO、AnySplat 与 SuGaR 视觉 / 语义 / Mesh 对照
 
-[bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉和 Mesh 对照实验](visual-3dgs-mesh-comparison-bedroom4-20260714.md) 将三条实际输出路线放在同一份 QA 记录里。结论是：GraphDECO 保持 P0 visual layer；AnySplat 是快速 visual / pose-depth prior，存在新视角条带；SuGaR 的背景在观测视角更贴表面、mesh 有 visual benchmark 价值，但 raw mesh 的外部背景、单面显示和未观测区空洞必须分别处理。报告同时明确 SuGaR 语义使用 2D mask probability 回投，不把早期 nearest transfer baseline 当作有效语义结果。
+[bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉、语义和 Mesh 对照实验](visual-3dgs-mesh-comparison-bedroom4-20260714.md) 现已收录用户审阅的图一至图十和 SuGaR、2D 回投补充 QA。结论是：GraphDECO 保持 P0 visual layer，COLMAP semantic mesh 保留在默认 pipeline；AnySplat 是快速 visual / pose-depth prior，历史 V2 semantic viewer 不能再使用；SuGaR 的背景在观测视角更贴表面，但 raw mesh 的外部背景、未观测区空洞和超大 semantic PLY 仍未解决。报告同时固定 V5 交付合同：语义 core 不直接打开，SuperSplat 使用 visual base 加 bounded overlay，所有 mesh 都提供双面 inspection companion。
