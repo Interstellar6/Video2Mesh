@@ -2,7 +2,7 @@
 title: bedroom_4 语义 3DGS、SuperSplat 与双面 Mesh 修复
 id: video2mesh-experiments-semantic-3dgs-viewer-contract-20260713
 category: 调研目录
-summary: 记录 bedroom_4 语义 3DGS 的文件膨胀、GraphDECO 几何合同、AnySplat 相机坐标错配、轻量 SuperSplat overlay 与 mesh 双面查看修复。
+summary: 记录 bedroom_4 语义 3DGS 的文件膨胀、GraphDECO 同源几何合同、AnySplat 相机方向 bug、轻量 SuperSplat overlay 与 mesh 双面查看修复；历史结果和待复跑 V4/V3 结果严格分开。
 tags:
   - Video2Mesh
   - Experiment
@@ -38,6 +38,21 @@ double-sided display PLY
 
 GraphDECO clean 3DGS 的视觉底图仍是当前 P0 visual layer：墙面和地板没有被 aggressive clean 删除。语义不应重新生成另一份几何，也不应把 dense semantic point cloud 或 3D mask 最近邻贴回它；正确做法是用 2D mask probability 投影到这个已经训练完成并 clean 的 Gaussian 序列上。
 
+## 2026-07-13 审计状态
+
+这次针对用户实际查看到的 PLY 和 mesh 做了回溯，而不是把“文件能生成”当作“语义正确”。下表区分已经有的历史产物与本次代码修复后的待复跑产物。
+
+| 项目 | 历史证据 | 本次结论 / V4-V3 合同 |
+|---|---|---|
+| GraphDECO visual PLY | `point_cloud_clean_strict.ply`，954,394 Gaussian；墙面、地板在 visual view 中完整 | 继续保留为默认 visual base；2D probability 必须直接写到这同一份 clean Gaussian geometry |
+| 旧 GraphDECO semantic viewer | `semantic_3dgs_graphdeco_2d_probability_supersplat.ply`，954,394 Gaussian，226MB | 它是完整场景的旧副本，不能作为默认 SuperSplat 输入；不把它改名为新结果或重新传回本地 |
+| 旧 GraphDECO semantic manifest | `source_ply` 已指向 `point_cloud_clean_strict.ply`，但旧 manifest 没有 geometry SHA | V4 强制写 `source_contract` 和 `means/opacities/scales/quats` SHA；源路径和输出几何不一致时命令失败 |
+| AnySplat V2 semantic | 使用了 19-frame crop 输入，但 adapter 把 `predicted_cameras.extrinsic` 原样标为 world-to-camera | **无效结果**：AnySplat 原始外参是 camera-to-world，未反转会把 2D mask 射线投到错误位置，墙面标签不能用来评价方法 |
+| AnySplat V3 semantic | 尚未在当前可达远端完成真实输出 | adapter 显式 inverse camera-to-world，保留 19-frame/448 crop 合同；必须以 V3 preview 和投影 QA 再验收 |
+| mesh 可见性 | COLMAP semantic mesh 质量相对最好；AnySplat Poisson 正反面显示差异明显 | 默认保留 collider/source 原始 topology，同时输出 `*_double_sided.ply` display companion；这只修 viewer culling，不把 mesh 自身孔洞伪装成已修好 |
+
+因此，GraphDECO “投影到哪份点云”的问题不是 sparse/dense 点云混用了：旧 manifest 已经引用 clean 3DGS。真正缺少的是可验证的几何同源指纹，以及不会复制完整场景的 viewer asset 合同。本次 V4 同时补上两项，重新生成后以 SHA 作为交付验收条件。
+
 ## 发现的问题
 
 ![旧 GraphDECO semantic SuperSplat 预览](../assets/semantic-viewer-20260713/02-graphdeco-semantic-before.png "旧语义预览：分类色可见，但视觉表面与原始 3DGS 观感不一致，且文件过大")
@@ -68,16 +83,16 @@ GraphDECO clean 3DGS 的视觉底图仍是当前 P0 visual layer：墙面和地�
 
 `semantic_splats.ply` 仍是完整 binary pipeline core，保留给 mesh semantic transfer 和 object split；它不是 SuperSplat 的输入。需要完整 viewer 副本时必须显式加 `--full-semantic-supersplat`，以免误把高内存调试资产当作默认结果。
 
-## GraphDECO V2/V3 实验
+## GraphDECO 历史结果与 V4 重跑
 
 远端 run：`/data/zyx/workspace/Video2MeshWorkspace/video2mesh_runs/bedroom_4_fresh_full_cpu_seq30_8gpu_dense_20260711_0600`。
 
 | 产物 | 实测状态 | 用途 |
 |---|---:|---|
 | `point_cloud_clean_strict.ply` | 954,394 Gaussians | GraphDECO visual base |
-| `semantic_splats_v2.ply` | 234MB binary，geometry SHA verified | full semantic core，给 mesh transfer |
-| `semantic_gaussian_probability_supersplat.ply` | 62MB DC-only semantic preview | 兼容性检查，不作为首选视觉层 |
-| `semantic_gaussian_probability_semantic_overlay_supersplat.ply` | 27MB | 推荐与 scene base 一起在 SuperSplat 打开 |
+| 旧 full semantic SuperSplat | 226MB / 954,394 Gaussian | 历史错误 viewer asset；不能再让 SuperSplat 默认加载 |
+| V4 `semantic_splats.ply` | 待真实重跑 | full-resolution binary core，仅用于 mesh semantic transfer / audit；写出 source contract 和 geometry SHA |
+| V4 `*_semantic_overlay_supersplat.ply` | 待真实重跑，硬上限 180,000 Gaussian | 唯一推荐的语义 viewer asset；危险 scale/rotation/opacity 改用 viewer-safe display arrays |
 
 ![COLMAP dense Delaunay mesh](../assets/semantic-viewer-20260713/03-colmap-mesh.png "COLMAP Delaunay dense mesh：当前稳定的场景 collider/geometry proxy")
 
@@ -93,15 +108,17 @@ AnySplat 的 visual 结果整体完整干净，但新视角仍有空中丝状带
 
 ![AnySplat new-view stripes](../assets/semantic-viewer-20260713/06-anysplat-stripes.png "AnySplat 新视角的丝状条带：尚未作为 collider 或真实 surface 使用")
 
-旧 AnySplat semantic run 的真正错误不是“墙体遮挡算法不够强”，而是把 AnySplat **19 张输入图、预测 camera、预测坐标尺度**，拿去配 Video2Mesh COLMAP 的 **80 帧 camera_info 和原始画幅 mask**。这会把 mask 投到错误的射线上，造成标签落到墙面。
+旧 AnySplat semantic run 的问题不只是“墙体遮挡算法不够强”。第一版把 AnySplat **19 张输入图、预测 camera、预测坐标尺度**，拿去配 Video2Mesh COLMAP 的 **80 帧 camera_info 和原始画幅 mask**。后续 V2 已改成 19-frame/448 crop 输入，但代码审计又发现一个更基础的错误：`predicted_cameras.extrinsic` 是 **camera-to-world**，adapter 曾直接把它写成 **world-to-camera**。这会把 mask 投到错误射线，表现为语义落在墙面。
 
-新工具 `tools/prepare_anysplat_semantic_projection.py` 完成：
+V3 工具 `tools/prepare_anysplat_semantic_projection.py` 的正确合同是：
 
 - 19/19 AnySplat input image 与 project frame 匹配；最大 thumbnail MSE 为 `0.00421`。
 - 380 张 mask 按 AnySplat `process_image` 的 448x448 center crop 规则重采样。
-- `predicted_cameras.npz` 转为 AnySplat world-to-camera `camera_info_anysplat.json`。
-- AnySplat V2 semantic core 以该相机合同重投，2,079,470 Gaussian 的 geometry SHA 与原始 `gaussians.ply` 完全一致。
-- V2 full semantic core 为 151MB binary；推荐 viewer overlay 为 11MB。
+- `predicted_cameras.npz` 先作为 AnySplat camera-to-world 读取，再逐帧 inverse 成 `camera_info_anysplat.json` 的 world-to-camera。
+- V3 backprojection 只用该 19-frame camera/mask contract，并用 `--no-register-artifacts` 保持 GraphDECO 主 manifest 不被外部路线覆盖。
+- V3 同样只交付 bounded semantic overlay 给 viewer；full semantic core 留给 AnySplat mesh semantic transfer，不向 SuperSplat 作为默认资产暴露。
+
+V2 的 2,079,470 Gaussian、151MB binary core 和 11MB overlay 是历史中间数据，不再作为有效语义结果宣传。V3 需要在 mil8 上实际跑完，并通过 source geometry SHA、2D reprojection preview、mask/frame coverage 和 semantic mesh 双面显示四项验证后，才可以替换本节的“待复跑”状态。
 
 ![旧 AnySplat semantic 结果](../assets/semantic-viewer-20260713/09-anysplat-semantic-before.png "旧 AnySplat semantic cloud：因相机/裁切错配，标签被错误投到墙面")
 
@@ -148,6 +165,16 @@ clean GraphDECO 3DGS
 ```
 
 默认仍关闭 adapter 和 OBJ object reconstruction。3DGS 负责视觉，COLMAP Delaunay / mesh 负责 collider，语义点云与 semantic mesh 是 sidecar/inspection 资产，不替代物理几何。
+
+已完成 GraphDECO 30k 与 AnySplat inference 的 bedroom_4 run，用下面的脚本只重跑这次修复相关的语义和双面 mesh 输出：
+
+```bash
+bash tools/rerun_bedroom4_semantic_assets.sh \
+  /data/zyx/workspace/Video2MeshWorkspace/video2mesh_runs/bedroom_4_fresh_full_cpu_seq30_8gpu_dense_20260711_0600 \
+  /data/zyx/workspace/Video2MeshWorkspace/video2mesh_runs/bedroom_4_fresh_full_cpu_seq30_8gpu_dense_20260711_0600/extra_routes/anysplat_fresh_2fps_20260711_0600
+```
+
+脚本生成 GraphDECO V4 primary semantic core / overlay / semantic mesh，及 AnySplat V3 isolated semantic core / overlay / semantic mesh；两条 raw mesh 都会补 `*_double_sided.ply` display companion。
 
 ## 未解决项
 

@@ -77,6 +77,13 @@ def find_mask(mask_dir: Path, frame_id: str) -> Path | None:
 
 
 def camera_info_from_anysplat(cameras_path: Path, frame_ids: list[str], image_size: int) -> dict[str, Any]:
+    """Convert AnySplat camera-to-world predictions into Video2Mesh poses.
+
+    AnySplat exposes ``pred_context_pose[\"extrinsic\"]`` as camera-to-world.
+    Video2Mesh projection consumes world-to-camera matrices. Treating the former
+    as the latter sends masks through the room and can label a foreground object
+    onto an intervening wall, so inversion is required by this adapter contract.
+    """
     with np.load(cameras_path, allow_pickle=False) as camera_arrays:
         extrinsics = np.asarray(camera_arrays["extrinsic"], dtype=np.float64).reshape(-1, 4, 4)
         intrinsics = np.asarray(camera_arrays["intrinsic"], dtype=np.float64).reshape(-1, 3, 3)
@@ -100,16 +107,25 @@ def camera_info_from_anysplat(cameras_path: Path, frame_ids: list[str], image_si
             "cy": float(matrix[1, 2] * image_size),
         }
         frame_camera_ids[frame_id] = camera_id
-        extrinsic_records[frame_id] = extrinsics[index].tolist()
+        camera_to_world = extrinsics[index]
+        if not np.isfinite(camera_to_world).all():
+            raise ValueError(f"AnySplat camera {index} has non-finite extrinsic values")
+        try:
+            world_to_camera = np.linalg.inv(camera_to_world)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(f"AnySplat camera {index} has a non-invertible camera-to-world extrinsic") from exc
+        extrinsic_records[frame_id] = world_to_camera.tolist()
     return {
         "schema_version": 1,
         "source": "anysplat_predicted_cameras",
         "extrinsic_type": "world_to_camera",
+        "source_extrinsic_type": "camera_to_world",
+        "extrinsic_conversion": "inverse(predicted_cameras.extrinsic)",
         "intrinsic": intrinsic_records["0"],
         "intrinsics": intrinsic_records,
         "frame_camera_ids": frame_camera_ids,
         "extrinsic": extrinsic_records,
-        "notes": "AnySplat predicted cameras. Masks were resized and center-cropped to the same square input used by AnySplat inference.",
+        "notes": "AnySplat predicted camera-to-world poses were inverted to Video2Mesh world-to-camera poses. Masks were resized and center-cropped to the same square input used by AnySplat inference.",
     }
 
 

@@ -5510,6 +5510,10 @@ def export_viewer_plys(
     safe_scales = raw_scales
     safe_quats = raw_quats
     safe_opacities = raw_opacities
+    overlay_scales = raw_scales
+    overlay_quats = raw_quats
+    overlay_opacities = raw_opacities
+    overlay_uses_viewer_safe_geometry = False
     viewer_safe_supersplat_path = None
     viewer_safe_label_sidecar = None
     viewer_safe_exported_health = None
@@ -5517,6 +5521,7 @@ def export_viewer_plys(
     semantic_overlay_label_sidecar = None
     semantic_overlay_count = 0
     semantic_overlay_selection: dict[str, Any] | None = None
+    semantic_overlay_health = None
     write_full_supersplat = not include_labels or bool(export_full_semantic_supersplat)
     if health_report.get("status") != "safe":
         safe_scales, safe_quats, safe_opacities, repair_report = make_viewer_safe_gaussian_arrays(
@@ -5540,6 +5545,12 @@ def export_viewer_plys(
                 "raw export is inspected."
             ),
         }
+        # A semantic overlay is display-only. Keep the base visual 3DGS raw,
+        # but never let unstable scale/rotation values obscure its color labels.
+        overlay_scales = safe_scales
+        overlay_quats = safe_quats
+        overlay_opacities = safe_opacities
+        overlay_uses_viewer_safe_geometry = True
     plain_path = output_dir / f"{prefix}_point_cloud.ply" if export_point_cloud else None
     supersplat_path = output_dir / f"{prefix}_supersplat.ply"
     viewer_safe_supersplat_path = output_dir / f"{prefix}_supersplat_viewer_safe.ply"
@@ -5581,9 +5592,9 @@ def export_viewer_plys(
                 semantic_overlay_path,
                 data["means"][overlay_indices],
                 display_colors[overlay_indices],
-                raw_opacities[overlay_indices],
-                raw_scales[overlay_indices],
-                raw_quats[overlay_indices],
+                overlay_opacities[overlay_indices],
+                overlay_scales[overlay_indices],
+                overlay_quats[overlay_indices],
                 normals=data.get("normals")[overlay_indices] if data.get("normals") is not None else None,
                 # The overlay carries category color only; the base scene PLY
                 # keeps the full SH appearance below it.
@@ -5593,6 +5604,11 @@ def export_viewer_plys(
                 semantic_overlay_path,
                 labels_np[overlay_indices],
                 probabilities_np[overlay_indices],
+            )
+            semantic_overlay_health = audit_gaussian_health(
+                overlay_scales[overlay_indices],
+                overlay_quats[overlay_indices],
+                overlay_opacities[overlay_indices],
             )
     if write_full_supersplat and health_report.get("status") != "safe":
         write_supersplat_ply(
@@ -5621,6 +5637,8 @@ def export_viewer_plys(
     safety_report["semantic_overlay_label_sidecar"] = str(semantic_overlay_label_sidecar) if semantic_overlay_label_sidecar else None
     safety_report["semantic_overlay_vertex_count"] = semantic_overlay_count
     safety_report["semantic_overlay_selection"] = semantic_overlay_selection
+    safety_report["semantic_overlay_uses_viewer_safe_geometry"] = overlay_uses_viewer_safe_geometry
+    safety_report["semantic_overlay_gaussian_health"] = semantic_overlay_health
     exported_health = audit_gaussian_health(raw_scales, raw_quats, raw_opacities)
     try:
         shape_preview = write_gaussian_shape_preview(
@@ -5696,6 +5714,8 @@ def export_viewer_plys(
             "display_mode": "load with the original scene 3DGS PLY as a semantic color overlay",
             "geometry_source": str(source_ply),
             "selection": semantic_overlay_selection,
+            "viewer_safe_geometry": overlay_uses_viewer_safe_geometry,
+            "exported_gaussian_health": semantic_overlay_health,
         } if semantic_overlay_path else None,
         "source_gaussian_health_ok": health_report.get("status") == "safe",
         "exported_gaussian_health_ok": exported_health.get("status") == "safe",
@@ -14482,12 +14502,24 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     manifest = load_manifest(project_root)
     artifacts = manifest.get("artifacts", {})
-    source_ply = args.splat_ply or resolve_existing_path(artifacts.get("scene_3dgs_ply"), project_root)
+    active_scene_ply = resolve_existing_path(artifacts.get("scene_3dgs_ply"), project_root)
+    explicit_splat_ply = getattr(args, "splat_ply", None)
+    source_ply = explicit_splat_ply or active_scene_ply
     if source_ply is None:
         source_ply = resolve_project_path(manifest["scene"]["point_cloud"], project_root)
     source_ply = resolve_project_cli_path(source_ply, project_root)
     if not source_ply.exists():
         raise FileNotFoundError(f"Missing splat/point PLY: {source_ply}")
+    source_ply = source_ply.resolve()
+    source_contract = {
+        "source_role": "explicit_splat_ply" if explicit_splat_ply else "active_scene_3dgs_ply",
+        "active_scene_3dgs_ply": str(active_scene_ply.resolve()) if active_scene_ply and active_scene_ply.exists() else None,
+        "source_matches_active_scene_3dgs": bool(
+            active_scene_ply and active_scene_ply.exists() and source_ply == active_scene_ply.resolve()
+        ),
+        "semantic_core_role": "full_resolution_mesh_transfer_and_audit_only",
+        "recommended_viewer_role": "bounded_semantic_overlay_with_original_scene_3dgs",
+    }
     mask_root = args.mask_root or resolve_active_mask_root(project_root, manifest)
     mask_root = resolve_project_cli_path(mask_root, project_root)
     camera_info_path = resolve_project_cli_path(args.camera_info, project_root) if args.camera_info else (project_root / manifest["scene"]["camera_info"])
@@ -14630,6 +14662,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         "project_root": str(project_root),
         "scene_id": manifest.get("scene_id"),
         "source_ply": str(source_ply),
+        "source_contract": source_contract,
         "output_ply": str(output_ply),
         "output_source_ply": str(output_source_ply),
         "vertex_count": int(vertex_count),
@@ -40714,10 +40747,17 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     "skipped",
                     "semantic_splats generated directly from 2D mask probability backprojection",
                 )
+                manifest = load_manifest(project_root)
+                active_semantic_source = resolve_existing_path(
+                    (manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}).get("scene_3dgs_ply"),
+                    project_root,
+                )
+                if active_semantic_source is None or not active_semantic_source.exists():
+                    raise FileNotFoundError("No active scene_3dgs_ply available for semantic probability backprojection")
                 cmd_backproject_gaussian_probabilities(
                     argparse.Namespace(
                         project_root=project_root,
-                        splat_ply=None,
+                        splat_ply=active_semantic_source,
                         camera_info=None,
                         mask_root=None,
                         output=None,
@@ -40787,6 +40827,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                     output_dir=None,
                     prefix=None,
                     include_labels=False,
+                    full_semantic_supersplat=False,
                 )
             )
             append_pipeline_step(steps, "export_viewer_plys", "completed")

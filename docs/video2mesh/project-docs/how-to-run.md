@@ -52,7 +52,11 @@ RUN_SIMULATOR_ADAPTERS=1 bash run.sh dataset/<video>.mp4
 
 Gaussian probability backprojection 现在是 quick run 默认路线。它会直接把 2D mask probability 投到 clean GraphDECO 3DGS，同一份 Gaussian 的 `means/opacities/scales/quats` 在 semantic core 写出前后会进行几何指纹校验。`semantic_splats.ply` 是 binary pipeline core，供 mesh transfer 使用；SuperSplat 应打开 scene visual PLY 和轻量 `semantic_*_overlay_supersplat.ply`，不要直接导入 full semantic core。
 
+在 `bedroom_4` 的已完成 GraphDECO/AnySplat run 上修复语义资产时，使用 `tools/rerun_bedroom4_semantic_assets.sh`。该脚本将 GraphDECO semantic 直接绑定到当前 active `scene_3dgs_ply`，并把 AnySplat 的预测 camera-to-world 外参反转为投影所需 world-to-camera；AnySplat 结果用 `--no-register-artifacts` 隔离，不能覆盖主 pipeline 的 semantic manifest。
+
 默认不会再复制一份完整 semantic SuperSplat PLY。overlay 只保留 `object_probability >= 0.55` 的 Gaussian，最多 180,000 个；小类别先保留最少 2,048 个候选，再按置信度选取，避免墙/地板吞掉床、灯、植物。需要排查完整 semantic viewer 副本时才显式使用 `export-viewer-plys --full-semantic-supersplat` 或 `backproject-gaussian-probabilities --export-full-semantic-supersplat`。
+
+当原始 Gaussian 有极端 scale、elongation 或非单位 quaternion 时，semantic overlay 会使用 viewer-safe display-only scale/rotation/opacity；视觉底图仍保持原始 scene 3DGS。这样不会改变 semantic core 的 mesh-transfer geometry，也不会把旧的 full semantic PLY 当成可用 viewer 输出。
 
 ```bash
 # 仅做旧 baseline 对照时可关闭（默认已开启）
