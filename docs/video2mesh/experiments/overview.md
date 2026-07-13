@@ -77,3 +77,7 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 ![Holi-Spatial bedroom_4 semantic viewer](assets/holi-spatial-bedroom4-pgsr-semantic-viewer-20260713.png "PGSR viewer-safe semantic PLY：语义区域可见，但标签元数据仍保存在 sidecar")
 
 本轮还修复了 DA3 semantic PLY 的展示问题：原 `semantic_da3_points.ply` 的 `object_id/object_probability` 数据正确，但常规 viewer 只显示保留的原始 RGB；新增 binary `semantic_da3_points_palette.ply` 后可直接显示 16 类语义颜色，同时逐点保留坐标、标签和概率字段。
+
+## 实验九：GraphDECO、AnySplat 与 SuGaR 视觉 / Mesh 对照
+
+[bedroom_4：GraphDECO、AnySplat 与 SuGaR 视觉和 Mesh 对照实验](visual-3dgs-mesh-comparison-bedroom4-20260714.md) 将三条实际输出路线放在同一份 QA 记录里。结论是：GraphDECO 保持 P0 visual layer；AnySplat 是快速 visual / pose-depth prior，存在新视角条带；SuGaR 的背景在观测视角更贴表面、mesh 有 visual benchmark 价值，但 raw mesh 的外部背景、单面显示和未观测区空洞必须分别处理。报告同时明确 SuGaR 语义使用 2D mask probability 回投，不把早期 nearest transfer baseline 当作有效语义结果。
