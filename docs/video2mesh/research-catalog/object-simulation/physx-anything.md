@@ -328,8 +328,8 @@ VLM 对该 crop 的结构化理解是 `Decorative Lamp` / `Lighting Fixture`，d
 
 | Object | VLM name | Decoder route | `sample.glb` | Split | Load validation | Caveat |
 |---|---|---|---|---:|---|---|
-| `bedroom4_bed01` | `Bed` | direct sparse coords mesh-only fallback | `1,807,816` bytes；`45,110` V / `90,420` F；`ColorVisuals` | 7 | MuJoCo `nbody=2,njnt=1,ngeom=8`；PyBullet `7` joints | 标准 textured decoder 和 mesh-only `run_control` 都 OOM；fallback 完整但无 baked texture |
-| `bedroom4_lamp01` | `Decorative Lamp` | compat mesh+gaussian textured | `6,654,052` bytes；`134,669` V / `213,392` F；`TextureVisuals` | 4 | MuJoCo `nbody=2,njnt=1,ngeom=5`；PyBullet `4` joints | 当前最干净的 `bedroom_4` 单物体 baseline |
+| `bedroom4_bed01` | `Bed` | direct sparse coords mesh-only fallback | `1,807,816` bytes；`45,110` V / `90,420` F；`ColorVisuals` | 7 | MuJoCo `nbody=2,njnt=1,ngeom=8`；PyBullet `7` joints | 标准 textured decoder 和 mesh-only `run_control` 都 OOM；fallback 整体床形很好，但 split part/局部面片很破碎，无 baked texture |
+| `bedroom4_lamp01` | `Decorative Lamp` | compat mesh+gaussian textured | `6,654,052` bytes；`134,669` V / `213,392` F；`TextureVisuals` | 4 | MuJoCo `nbody=2,njnt=1,ngeom=5`；PyBullet `4` joints | 当前最干净的 `bedroom_4` 单物体 baseline；视觉上能看出台灯伞面和支柱，但仍有生成式形变 |
 | `bedroom4_lamp02` | `Table` | compat mesh+gaussian textured | `4,243,116` bytes；`100,064` V / `186,448` F；`TextureVisuals` | 5 | MuJoCo `nbody=2,njnt=1,ngeom=6`；PyBullet `5` joints | 输入名是 lamp，但 VLM 识别成 table；texture baking 日志有 `loss=nan` |
 | `bedroom4_nightstand01` | `Potted Plant` | compat mesh+gaussian textured | `4,604,216` bytes；`91,372` V / `159,408` F；`TextureVisuals` | 2 | MuJoCo `nbody=3,njnt=2,ngeom=3`；PyBullet `3` joints | 对象名和 VLM 语义不一致，需人工复核；PyBullet 有 unsupported joint -> fixed warning |
 | `bedroom4_nightstand02` | `Safe` | direct sparse coords mesh-only fallback | `1,329,740` bytes；`33,231` V / `66,419` F；`ColorVisuals` | 5 | MuJoCo `nbody=5,njnt=4,ngeom=6`；PyBullet `8` joints | VLM 误识别为 safe；4 个小部件很小，主体占绝大多数；无 baked texture |
@@ -337,7 +337,38 @@ VLM 对该 crop 的结构化理解是 `Decorative Lamp` / `Lighting Fixture`，d
 | `bedroom4_plant02` | `Potted Plant` | compat mesh+gaussian textured retry on GPU5 | `4,461,672` bytes；`110,417` V / `187,406` F；`TextureVisuals` | 2 | MuJoCo `nbody=3,njnt=2,ngeom=3`；PyBullet `3` joints | 首次 decoder OOM，GPU5 retry 成功；texture baking 日志有 `loss=nan`；PyBullet 有 unsupported joint -> fixed warning |
 | `bedroom4_plant03` | `Safe` | direct sparse coords mesh-only fallback, no-preprocess | `1,544,588` bytes；`38,643` V / `77,107` F；`ColorVisuals` | 3 | MuJoCo `nbody=4,njnt=3,ngeom=4`；PyBullet `5` joints | crop 只有约 `43 x 43`，VLM 误识别为 safe；技术加载通过但几何和语义质量低 |
 
+![bedroom4 bed01 overall preview](../assets/physx-anything/physx-anything-bedroom4-bed01-preview-overall.png "bedroom4_bed01 整体预览：床体、床头板、枕头和床垫轮廓比较完整，是这批结果里形状最可读的资产之一")
+
+![bedroom4 bed01 fragmented part A](../assets/physx-anything/physx-anything-bedroom4-bed01-fragmented-part-a.png "bedroom4_bed01 局部/split 预览：床体整体可读，但局部 part 出现薄片、锯齿和破碎边界")
+
+![bedroom4 bed01 fragmented part B](../assets/physx-anything/physx-anything-bedroom4-bed01-fragmented-part-b.png "bedroom4_bed01 局部/split 预览：独立 part 上的三角片更明显，说明 split/simready 还不能直接作为高质量部件资产")
+
+![bedroom4 lamp01 preview](../assets/physx-anything/physx-anything-bedroom4-lamp01-preview.png "bedroom4_lamp01 预览：能看出台灯结构，但伞面、底座和纹理仍有明显生成式偏差")
+
+人工 viewer 复查后，bed01 的结论需要比加载验证更乐观也更谨慎：**整体床很好**，比之前只看日志时预期更可用，床头、床垫、枕头和底座轮廓都能看出来；但它的 split part 非常破碎，局部有薄片、尖刺、破洞和边界撕裂。台灯 lamp01 是当前最值得保留的 textured baseline，但图像上仍能看到伞面和底座被生成式重构成“像台灯但不完全真实”的形态。其它对象整体更偏 VLM/decoder 的生成式猜测，尤其语义误识别的 nightstand/plant/safe/table 结果，不应直接进入资产库。
+
 这张表里的 “Load validation” 不是动力学仿真验收，只证明 GLB/OBJ/URDF/MJCF 文件是完整且能被目标引擎读取的。更严格的交付还需要把单物体资产对齐回 `bedroom_4` 场景坐标，再做 scale、support、penetration、关节方向、质量和纹理检查。尤其是 bed01 虽然已经重建并通过加载，但它不是标准 textured decoder 结果；nightstand02 和 plant03 虽然也完整生成了文件，但语义失败明显，不应该直接作为高质量资产宣传。
+
+### Prompt override 判断
+
+可以尝试用更详细的 VLM prompt 生成，但它主要会改善 **类别、部件划分、材料/关节描述和 32³ coarse voxel 先验**，不能保证 decoder 纹理和三角面质量一定变好。官方 `dataset/overall_prompt.txt` 目前是通用模板，只要求“分析图像并按 Name / Category / Dimension / Parts / Group_info 输出结构化描述”；后续每个 part 的问题也只是“基于 `l_i` 描述生成 32³ voxel index”。这对官方单物体图够用，但对 `bedroom_4` 这种遮挡、裁剪和低分辨率 crop，容易把 nightstand 看成 plant/safe，把 lamp 看成 table，或者把一个静态大物体拆成太多破碎 part。
+
+下一轮更稳的 prompt 方式应该走 **known-object prompt override**，不要只让 VLM自由猜：
+
+```text
+You are given a masked crop from a bedroom scene. The target object is known:
+object_id=<bedroom4_bed01>, class=<bed>, expected_state=<single complete bed>.
+Describe only the target object, ignore background and occluders.
+Do not invent unrelated categories such as safe, table, vase, or plant.
+Prefer a small number of physically meaningful parts:
+mattress, pillows, headboard, bed frame/base, optional drawers/legs.
+For static furniture, use fixed groups unless a real drawer/hinge is visible.
+Keep parts spatially contiguous in the 32^3 voxel grid; avoid thin isolated shards.
+If a part is uncertain, merge it into the nearest large fixed structural part.
+Output the same PhysX-Anything schema exactly.
+```
+
+对 lamp/nightstand/plant 也应把 `class`、`expected parts`、`negative categories` 和 `part merge policy` 写进 prompt。更进一步，可以两阶段跑：先让普通 VLM 做识别，再用我们自己的 SAM3 label、人工类别或 GroundingDINO label 覆盖 `Name/Category/expected parts`，最后再问每个 part 的 voxel。这样比单纯“更长 prompt”更可靠，因为它把最容易错的类别和部件边界从开放生成变成受控输入。
 
 ## 早期 bedroom_4 smoke/debug input
 
