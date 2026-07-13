@@ -370,6 +370,35 @@ Output the same PhysX-Anything schema exactly.
 
 对 lamp/nightstand/plant 也应把 `class`、`expected parts`、`negative categories` 和 `part merge policy` 写进 prompt。更进一步，可以两阶段跑：先让普通 VLM 做识别，再用我们自己的 SAM3 label、人工类别或 GroundingDINO label 覆盖 `Name/Category/expected parts`，最后再问每个 part 的 voxel。这样比单纯“更长 prompt”更可靠，因为它把最容易错的类别和部件边界从开放生成变成受控输入。
 
+### Prompt-guided VLM 实测
+
+2026-07-14 继续在 mil8 做了 prompt-guided generation 小实验，脚本和配置已回写到本项目：
+
+| 文件 | 作用 |
+|---|---|
+| `tools/physx_anything_prompt_guided_vlm.py` | 在不改官方 `1_vlm_demo.py` 的前提下，注入 known-object prompt / seeded `basic_info`，生成 `coord_i.txt`、`ind_i.npy/ply`、`allind.npy` 和 `prompt_guided_report.json` |
+| `tools/physx_anything_decode_one_compat.py` | 单对象 decoder 兼容脚本，只跑 mesh+gaussian path，过滤当前 rasterizer 不支持的参数，导出 `sample.glb` 和 `decode_report.json` |
+| `configs/physx_anything_bedroom4_prompt_overrides.json` | bedroom_4 的 bed/lamp/nightstand known-object override：target class、expected parts、negative categories、part merge policy、seeded part schema |
+
+第一版尝试是把较长的 known-object override 直接追加到官方 `overall_prompt.txt`。这个方案 **失败**：`bedroom4_bed01` 和 `bedroom4_lamp02` 的第一轮 VLM 没有输出 `Name/Category/Parts/Group_info`，而是直接进入 voxel index 输出模式，因此 part_count 变成 0。结论是：这个 PhysX-Anything VLM fine-tune 对 prompt 分布比较敏感，不能简单把很长的自然语言合同塞进第一轮描述问题里。
+
+第二版改成 **seeded `basic_info`**：由 Video2Mesh/SAM3/人工标签生成 schema-valid `basic_info.txt`，把 `Name`、`Category`、`Dimension`、expected parts、material 和 fixed group 先固定住；VLM 只负责每个 `l_i` 的 32³ voxel。这个方案跑通了：
+
+| Object | Baseline VLM | Seeded prompt result | Coarse voxel effect | Decoder |
+|---|---|---|---|---|
+| `bedroom4_bed01` | `Bed` / `Furniture`，7 parts：mattress、2 pillows、headboard、base、horizontal surface、drawers | `Bed` / `Furniture / bed`，4 parts：mattress、pillow cluster、headboard、bed frame/base | `allind` 5836 voxels，1 connected component；旧结果中 `horizontal surface` 是 3 个组件、`drawers` 是 2 个组件，seeded 后碎片部件被合并 | 未跑标准 decoder；bed 旧路线已 OOM，本轮只验证 VLM/coarse voxel |
+| `bedroom4_lamp02` | 误识别为 `Table` / `Furniture`，5 table parts | `Table Lamp` / `Lighting fixture / table lamp`，4 parts：lampshade、stem/stand、base、bulb/diffuser | 每个 part 自身都是 1 connected component；`allind` 有 3 个组件，说明部件之间还有 coarse voxel 间隙 | mesh+gaussian compat decoder 生成 `sample.glb`，`4,948,472` bytes，`95,078` V / `157,228` F，`TextureVisuals` |
+
+本地同步目录为：
+
+```text
+tmp_remote_results/physx_prompt_guided_vlm_20260714/
+  prompt_guided_vlm_failed_long_prompt/
+  prompt_seeded_vlm_success/
+```
+
+这次可以写成：**seeded `basic_info` 是比“更长 overall prompt”更稳的控制方式，可以把类别和 part schema 固定住，并能指导 VLM 生成新的 coarse voxels；lamp02 的 seeded voxels 已经成功驱动 decoder 产出 textured GLB。** 不能写成：**prompt 已经证明能提升最终视觉质量**，因为 bed 没跑 decoder，lamp02 还没做 viewer 质量检查，也没跑 split/simready/MuJoCo/PyBullet。
+
 ## 早期 bedroom_4 smoke/debug input
 
 以下是早期为了验证 Video2Mesh 数据能否接到 PhysX-Anything 而做的 smoke/debug 输入。它们已经被上面的 `sam3_lamp_01` 单物体实测取代，只保留为排障历史。

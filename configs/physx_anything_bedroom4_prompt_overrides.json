@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "notes": "Known-object prompt overrides for PhysX-Anything bedroom_4 VLM experiments. These are inference-time constraints, not training data.",
+  "objects": {
+    "bedroom4_bed01": {
+      "target_name": "Bed",
+      "target_class": "Furniture / bed",
+      "expected_parts": [
+        "mattress",
+        "pillow cluster",
+        "headboard",
+        "bed frame/base"
+      ],
+      "dimension": "200*160*110",
+      "parts": [
+        {
+          "name": "Mattress",
+          "affordance_rank": 1,
+          "material": "Foam and fabric",
+          "density": "0.10 g/cm^3",
+          "youngs_modulus": "0.05",
+          "poisson_ratio": "0.35",
+          "description": "One contiguous rectangular soft mattress on top of the bed frame."
+        },
+        {
+          "name": "Pillow cluster",
+          "affordance_rank": 2,
+          "material": "Foam and fabric",
+          "density": "0.05 g/cm^3",
+          "youngs_modulus": "0.05",
+          "poisson_ratio": "0.35",
+          "description": "All visible pillows merged into one contiguous soft pillow cluster at the head of the bed."
+        },
+        {
+          "name": "Headboard",
+          "affordance_rank": 3,
+          "material": "Wood",
+          "density": "0.70 g/cm^3",
+          "youngs_modulus": "10.0",
+          "poisson_ratio": "0.30",
+          "description": "One vertical wooden headboard behind the mattress."
+        },
+        {
+          "name": "Bed frame/base",
+          "affordance_rank": 4,
+          "material": "Wood",
+          "density": "0.70 g/cm^3",
+          "youngs_modulus": "10.0",
+          "poisson_ratio": "0.30",
+          "description": "The complete rigid support frame and base, including slats, rails, drawers, and uncertain thin structures merged into one part."
+        }
+      ],
+      "exact_expected_parts": true,
+      "max_parts": 4,
+      "negative_categories": [
+        "safe",
+        "table",
+        "plant",
+        "vase",
+        "cabinet",
+        "nightstand"
+      ],
+      "part_merge_policy": "Use one complete bed asset. Merge slats, drawers, thin surfaces, rails, and uncertain fragments into bed frame/base. Merge all pillows into one pillow cluster unless they are very clearly separable. Avoid isolated shards.",
+      "static_joint_policy": "A bed is static furniture here. Put all parts in a single fixed group with Type: E; do not invent drawers, hinges, or movable joints.",
+      "notes": "The desired output is a complete bed, not a set of separate broken bed pieces."
+    },
+    "bedroom4_lamp02": {
+      "target_name": "Table Lamp",
+      "target_class": "Lighting fixture / table lamp",
+      "expected_parts": [
+        "lampshade",
+        "stem/stand",
+        "base",
+        "bulb or light diffuser"
+      ],
+      "dimension": "35*35*70",
+      "parts": [
+        {
+          "name": "Lampshade",
+          "affordance_rank": 1,
+          "material": "Fabric or translucent plastic",
+          "density": "0.20 g/cm^3",
+          "youngs_modulus": "0.50",
+          "poisson_ratio": "0.35",
+          "description": "One contiguous shade surrounding the lamp head."
+        },
+        {
+          "name": "Stem/stand",
+          "affordance_rank": 2,
+          "material": "Metal",
+          "density": "7.80 g/cm^3",
+          "youngs_modulus": "200.0",
+          "poisson_ratio": "0.30",
+          "description": "The narrow rigid vertical support connecting shade and base."
+        },
+        {
+          "name": "Base",
+          "affordance_rank": 3,
+          "material": "Metal",
+          "density": "7.80 g/cm^3",
+          "youngs_modulus": "200.0",
+          "poisson_ratio": "0.30",
+          "description": "The stable rigid bottom base of the table lamp."
+        },
+        {
+          "name": "Bulb or light diffuser",
+          "affordance_rank": 4,
+          "material": "Glass or plastic",
+          "density": "2.50 g/cm^3",
+          "youngs_modulus": "50.0",
+          "poisson_ratio": "0.25",
+          "description": "Small internal light diffuser or bulb region, merged if uncertain."
+        }
+      ],
+      "exact_expected_parts": true,
+      "max_parts": 4,
+      "negative_categories": [
+        "standalone table",
+        "desk",
+        "safe",
+        "plant",
+        "vase",
+        "nightstand"
+      ],
+      "part_merge_policy": "Describe only the lamp. If the supporting furniture is visible, treat it as background and exclude it. Merge tiny uncertain lamp details into stem/stand or lampshade rather than creating floating fragments.",
+      "static_joint_policy": "A table lamp is a rigid static object here. Put all parts in a single fixed group with Type: E.",
+      "notes": "The crop was previously misread as a table; force the target to remain a lamp."
+    },
+    "bedroom4_nightstand02": {
+      "target_name": "Nightstand",
+      "target_class": "Furniture / bedside table",
+      "expected_parts": [
+        "top surface",
+        "cabinet body",
+        "drawer or front panel",
+        "legs or base"
+      ],
+      "dimension": "55*45*60",
+      "parts": [
+        {
+          "name": "Top surface",
+          "affordance_rank": 1,
+          "material": "Wood",
+          "density": "0.70 g/cm^3",
+          "youngs_modulus": "10.0",
+          "poisson_ratio": "0.30",
+          "description": "The flat top board of the nightstand."
+        },
+        {
+          "name": "Cabinet body",
+          "affordance_rank": 2,
+          "material": "Wood",
+          "density": "0.70 g/cm^3",
+          "youngs_modulus": "10.0",
+          "poisson_ratio": "0.30",
+          "description": "The main rigid box-shaped body of the nightstand."
+        },
+        {
+          "name": "Drawer or front panel",
+          "affordance_rank": 3,
+          "material": "Wood",
+          "density": "0.70 g/cm^3",
+          "youngs_modulus": "10.0",
+          "poisson_ratio": "0.30",
+          "description": "Visible drawer face or front panel; tiny handles are merged into this part."
+        },
+        {
+          "name": "Legs or base",
+          "affordance_rank": 4,
+          "material": "Wood",
+          "density": "0.70 g/cm^3",
+          "youngs_modulus": "10.0",
+          "poisson_ratio": "0.30",
+          "description": "The support legs or plinth base merged as one structural support part."
+        }
+      ],
+      "exact_expected_parts": false,
+      "max_parts": 4,
+      "negative_categories": [
+        "safe",
+        "plant",
+        "vase",
+        "lamp",
+        "bed"
+      ],
+      "part_merge_policy": "Keep the nightstand as one complete bedside table asset. Merge tiny handles and ambiguous thin details into drawer/front panel. Do not create separate shards.",
+      "static_joint_policy": "Use a single fixed group with Type: E unless a drawer front is clearly visible and should be represented as a sliding group.",
+      "notes": "The crop was previously misread as a safe; keep it as a bedside table/nightstand."
+    }
+  }
+}
