@@ -171,6 +171,7 @@ def main() -> None:
 
     pointcloud_da3 = run_root / "scannetppv2" / "data" / "bedroom_4" / "pointcloud_da3.ply"
     semantic_da3 = project / "simulator_assets" / "semantic_da3_points.ply"
+    semantic_da3_palette = project / "simulator_assets" / "semantic_da3_points_palette.ply"
     pgsr_ply = run_root / "pgsr_scannetppv2_all" / "bedroom_4" / "point_cloud" / "iteration_30000" / "point_cloud.ply"
     pgsr_semantic = project / "simulator_assets" / "semantic_pgsr_30k.ply"
     pgsr_mesh = run_root / "pgsr_scannetppv2_all" / "bedroom_4" / "mesh" / "tsdf_fusion_post.ply"
@@ -251,7 +252,8 @@ def main() -> None:
 
     artifacts = {
         "DA3 point cloud": artifact(pointcloud_da3),
-        "semantic DA3 PLY": artifact(semantic_da3),
+        "semantic DA3 PLY (raw RGB + fields)": artifact(semantic_da3),
+        "semantic DA3 PLY (palette display)": artifact(semantic_da3_palette),
         "3D bbox JSON": artifact(run_root / "output_scannetppv2_new" / "bedroom_4.json"),
         "object PLY manifest": artifact(project / "simulator_assets" / "object_masks_3d" / "object_mask_clouds.json"),
         "SAM3 2D overview": artifact(run_root / "visualizations" / "sam3_2d_overlay_contact_sheet.jpg"),
@@ -267,7 +269,7 @@ def main() -> None:
         "SAM3 image inference has no stable cross-frame instance ID here; foreground instances are split after lifting with voxel DBSCAN.",
         "Door and ceiling masks are visibly less reliable than bed/floor/lamp/nightstand/plant/window and should be treated as low-confidence labels.",
         "BBox dimensions are in the COLMAP/Video2Mesh scene coordinate scale, not meters; metric claims require an explicit scale calibration.",
-        "The semantic PLY stores fields as data; viewers must color/filter by object_id to expose semantics.",
+        "semantic_da3_points.ply preserves the DA3 RGB reconstruction plus semantic fields; use semantic_da3_points_palette.ply for a viewer-visible object_id palette without changing the raw artifact.",
     ]
     report = {
         "schema_version": 1,

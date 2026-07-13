@@ -5088,6 +5088,49 @@ def write_vertex_data_ascii_ply(
     return vertex_count
 
 
+def write_vertex_data_binary_ply(
+    path: Path,
+    properties: list[tuple[str, str]],
+    data: dict[str, Any],
+) -> int:
+    """Write scalar vertex properties as a compact little-endian PLY."""
+    np = import_numpy()
+    if not properties:
+        raise ValueError("No PLY properties to write")
+    names = [name for name, _prop_type in properties]
+    if len(set(names)) != len(names):
+        raise ValueError("PLY properties must have unique names")
+    first_name = names[0]
+    if first_name not in data:
+        raise ValueError(f"Missing PLY property data: {first_name}")
+    first_values = np.asarray(data[first_name]).reshape(-1)
+    vertex_count = int(first_values.shape[0])
+    dtype_fields = []
+    values_by_name: dict[str, Any] = {first_name: first_values}
+    for name, prop_type in properties:
+        dtype_code = PLY_NUMPY_DTYPES.get(prop_type)
+        if dtype_code is None:
+            raise RuntimeError(f"Unsupported PLY property type {prop_type!r}: {path}")
+        if name not in data:
+            raise ValueError(f"Missing PLY property data: {name}")
+        values = np.asarray(data[name]).reshape(-1)
+        if int(values.shape[0]) != vertex_count:
+            raise ValueError(f"PLY property {name} has {values.shape[0]} rows; expected {vertex_count}")
+        values_by_name[name] = values
+        dtype_fields.append((name, np.dtype("<" + dtype_code)))
+    rows = np.empty(vertex_count, dtype=np.dtype(dtype_fields))
+    for name, prop_type in properties:
+        rows[name] = values_by_name[name].astype(np.dtype("<" + PLY_NUMPY_DTYPES[prop_type]), copy=False)
+    ensure_dir(path.parent)
+    with path.open("wb") as f:
+        header_lines = ["ply", "format binary_little_endian 1.0", f"element vertex {vertex_count}"]
+        header_lines.extend(f"property {prop_type} {name}" for name, prop_type in properties)
+        header_lines.append("end_header")
+        f.write(("\n".join(header_lines) + "\n").encode("ascii"))
+        rows.tofile(f)
+    return vertex_count
+
+
 def read_gsplat_ply(path: Path) -> dict[str, Any]:
     np = import_numpy()
     vertex_data = read_ply_vertex_data(path)
@@ -5146,6 +5189,12 @@ def read_gsplat_ply(path: Path) -> dict[str, Any]:
     f_rest_names = [f"f_rest_{idx}" for idx in range(45)]
     if set(f_rest_names).issubset(names):
         f_rest = np.stack([np.asarray(data[name], dtype=np.float32) for name in f_rest_names], axis=1)
+    labels = np.asarray(data["object_id"], dtype=np.int64) if "object_id" in names else None
+    probabilities = (
+        np.clip(np.asarray(data["object_probability"], dtype=np.float32), 0.0, 1.0)
+        if "object_probability" in names
+        else None
+    )
     return {
         "means": points,
         "colors": colors,
@@ -5155,6 +5204,8 @@ def read_gsplat_ply(path: Path) -> dict[str, Any]:
         "normals": normals,
         "f_rest": f_rest,
         "properties": properties,
+        "labels": labels,
+        "probabilities": probabilities,
     }
 
 
@@ -5224,8 +5275,8 @@ def export_viewer_plys(
 ) -> dict[str, Any]:
     np = import_numpy()
     data = read_gsplat_ply(source_ply)
-    labels = read_ascii_ply_property(source_ply, "object_id") if include_labels else None
-    probabilities = read_ascii_ply_float_property(source_ply, "object_probability") if include_labels else None
+    labels = data.get("labels") if include_labels else None
+    probabilities = data.get("probabilities") if include_labels else None
     source_label_sidecar = None
     if include_labels and labels is None and probabilities is None:
         labels, probabilities, source_label_sidecar = read_supersplat_label_sidecar(source_ply)
@@ -14942,6 +14993,61 @@ def read_semantic_ply_with_probabilities(path: Path):
     return points, labels, probabilities, colors
 
 
+def write_semantic_palette_ply(source_ply: Path, output_ply: Path) -> dict[str, Any]:
+    """Write a viewer-oriented semantic PLY without changing the source artifact."""
+    np = import_numpy()
+    vertex_data = read_ply_vertex_data(source_ply)
+    source_properties: list[tuple[str, str]] = vertex_data["properties"]
+    data = vertex_data["data"]
+    source_names = [name for name, _prop_type in source_properties]
+    required = {"x", "y", "z", "object_id"}
+    missing = sorted(required - set(source_names))
+    if missing:
+        raise RuntimeError(f"Semantic PLY is missing required properties {missing}: {source_ply}")
+
+    labels = np.asarray(data["object_id"], dtype=np.int64).reshape(-1)
+    colors = semantic_colors_for_labels(labels)
+    color_names = {"red", "green", "blue"}
+    output_properties: list[tuple[str, str]] = []
+    inserted_colors = False
+    for name, prop_type in source_properties:
+        if name in color_names:
+            continue
+        output_properties.append((name, prop_type))
+        if name == "z":
+            output_properties.extend([("red", "uchar"), ("green", "uchar"), ("blue", "uchar")])
+            inserted_colors = True
+    if not inserted_colors:
+        raise RuntimeError(f"Semantic PLY has no z coordinate property: {source_ply}")
+
+    output_data = dict(data)
+    output_data["red"] = colors[:, 0]
+    output_data["green"] = colors[:, 1]
+    output_data["blue"] = colors[:, 2]
+    vertex_count = write_vertex_data_binary_ply(output_ply, output_properties, output_data)
+    unique, counts = np.unique(labels, return_counts=True)
+    return {
+        "schema_version": DEFAULT_SCHEMA_VERSION,
+        "source_ply": str(source_ply),
+        "output_ply": str(output_ply),
+        "vertex_count": int(vertex_count),
+        "encoding": "binary_little_endian",
+        "source_properties": source_names,
+        "output_properties": [name for name, _prop_type in output_properties],
+        "semantic_label_property": "object_id",
+        "probability_property": "object_probability" if "object_probability" in source_names else None,
+        "color_mode": "semantic_preview_palette_from_object_id",
+        "source_had_rgb": color_names.issubset(source_names),
+        "source_preserved": True,
+        "label_distribution": {str(int(label)): int(count) for label, count in zip(unique, counts)},
+        "palette": {str(int(label)): list(semantic_preview_color(int(label))) for label in unique},
+        "notes": (
+            "The source PLY is unchanged. This companion replaces its RGB display channels with the stable "
+            "object_id palette while preserving x/y/z, object_id, object_probability, and other scalar vertex fields."
+        ),
+    }
+
+
 def nearest_source_neighbors(source_points, target_points, k: int, max_distance: float | None = None):
     np = import_numpy()
     source_points_np = np.asarray(source_points, dtype=np.float32)
@@ -19508,6 +19614,50 @@ def cmd_export_splat_masks(args: argparse.Namespace) -> int:
         print(f"Wrote semantic SuperSplat PLY: {viewer_exports['supersplat_ply']}")
         print(f"Wrote semantic point-cloud PLY: {viewer_exports['point_cloud_ply']}")
     print(f"Wrote semantic manifest: {manifest_path}")
+    return 0
+
+
+def cmd_export_semantic_palette_ply(args: argparse.Namespace) -> int:
+    project_root = args.project_root.resolve()
+    manifest = load_manifest(project_root)
+    artifacts = manifest.get("artifacts", {})
+    if args.semantic_ply:
+        source_ply = resolve_project_cli_path(args.semantic_ply, project_root)
+    else:
+        source_ply = resolve_existing_path(artifacts.get("semantic_splats_ply"), project_root)
+    if source_ply is None or not source_ply.exists():
+        raise FileNotFoundError("Missing semantic PLY. Pass --semantic-ply or run export-splat-masks first.")
+    output_ply = (
+        resolve_project_cli_path(args.output, project_root)
+        if args.output
+        else source_ply.with_name(f"{source_ply.stem}_palette.ply")
+    )
+    if output_ply.resolve() == source_ply.resolve():
+        raise ValueError("--output must differ from --semantic-ply so the raw semantic PLY remains unchanged.")
+    output_manifest = (
+        resolve_project_cli_path(args.output_manifest, project_root)
+        if args.output_manifest
+        else output_ply.with_name(f"{output_ply.stem}_manifest.json")
+    )
+    source_manifest = (
+        resolve_project_cli_path(args.semantic_manifest, project_root)
+        if args.semantic_manifest
+        else resolve_existing_path(artifacts.get("semantic_splats_manifest"), project_root)
+    )
+
+    report = write_semantic_palette_ply(source_ply, output_ply)
+    report["project_root"] = str(project_root)
+    report["semantic_source_manifest"] = str(source_manifest) if source_manifest and source_manifest.exists() else None
+    write_json(output_manifest, report)
+    if args.register_artifacts:
+        manifest.setdefault("artifacts", {})["semantic_palette_ply"] = str(output_ply)
+        manifest["artifacts"]["semantic_palette_manifest"] = str(output_manifest)
+        save_manifest(project_root, manifest)
+
+    print(f"Wrote semantic palette PLY: {output_ply}")
+    print(f"Wrote semantic palette manifest: {output_manifest}")
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -52605,6 +52755,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, help="Output semantic PLY path.")
     p.add_argument("--manifest-output", type=Path, help="Output semantic manifest path. Defaults to simulator_assets/semantic_splats_manifest.json.")
     p.set_defaults(func=cmd_export_splat_masks)
+
+    p = sub.add_parser("export-semantic-palette-ply", help="Export a compact semantic-color PLY for generic point-cloud viewers without overwriting the raw semantic PLY.")
+    add_common_project_arg(p)
+    p.add_argument("--semantic-ply", type=Path, help="Semantic PLY containing x/y/z/object_id and optional object_probability. Defaults to artifacts.semantic_splats_ply.")
+    p.add_argument("--semantic-manifest", type=Path, help="Optional source semantic manifest recorded in the palette sidecar.")
+    p.add_argument("--output", type=Path, help="Defaults beside the source as <stem>_palette.ply.")
+    p.add_argument("--output-manifest", type=Path, help="Defaults beside --output as <stem>_manifest.json.")
+    p.add_argument("--register-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Register the palette PLY and sidecar in the project manifest.")
+    p.add_argument("--json", action="store_true", help="Print the palette export report JSON.")
+    p.set_defaults(func=cmd_export_semantic_palette_ply)
 
     p = sub.add_parser("transfer-semantic-ply-to-splats", help="Recover semantic 3DGS labels from an existing semantic PLY by nearest XYZ transfer.")
     add_common_project_arg(p)

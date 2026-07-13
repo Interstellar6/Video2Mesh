@@ -16,6 +16,7 @@ from video2mesh.cli import (
     clean_3dgs_floaters,
     cmd_clean_point_cloud_outliers,
     cmd_backproject_gaussian_probabilities,
+    cmd_export_semantic_palette_ply,
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
     cmd_reconstruct_object_meshes,
@@ -45,13 +46,16 @@ from video2mesh.cli import (
     quantile_bounds_from_points,
     read_colmap_text_images,
     read_point_cloud,
+    read_ply_vertex_data,
     read_semantic_ply,
     read_semantic_ply_with_probabilities,
     read_gsplat_ply,
     resolve_export_record_path,
     scaled_intrinsic_for_size,
     select_colmap_sparse_model,
+    semantic_colors_for_labels,
     source_labels_from_object_masks,
+    write_vertex_data_binary_ply,
     write_json,
     write_point_cloud_ascii_ply,
     write_supersplat_ply,
@@ -639,6 +643,130 @@ def test_read_semantic_ply_supports_binary_vertices(tmp_path: Path):
     assert np.array_equal(labels_with_prob, labels)
     assert np.allclose(probabilities, [0.75, 0.5])
     assert np.allclose(colors_with_prob, colors)
+
+
+def test_export_semantic_palette_ply_keeps_metadata_and_recolors_binary_source(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    source = project_root / "semantic_raw_rgb.ply"
+    source_data = {
+        "x": np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
+        "y": np.asarray([3.0, 4.0, 5.0], dtype=np.float32),
+        "z": np.asarray([6.0, 7.0, 8.0], dtype=np.float32),
+        "red": np.asarray([17, 31, 47], dtype=np.uint8),
+        "green": np.asarray([23, 37, 53], dtype=np.uint8),
+        "blue": np.asarray([29, 41, 59], dtype=np.uint8),
+        "object_id": np.asarray([0, 3, 9], dtype=np.int32),
+        "object_probability": np.asarray([0.0, 0.85, 0.95], dtype=np.float32),
+    }
+    source_properties = [
+        ("x", "float"),
+        ("y", "float"),
+        ("z", "float"),
+        ("red", "uchar"),
+        ("green", "uchar"),
+        ("blue", "uchar"),
+        ("object_id", "int"),
+        ("object_probability", "float"),
+    ]
+    write_vertex_data_binary_ply(source, source_properties, source_data)
+    write_json(
+        project_root / "manifest.json",
+        {"schema_version": 1, "artifacts": {"semantic_splats_ply": str(source)}},
+    )
+
+    rc = cmd_export_semantic_palette_ply(
+        Namespace(
+            project_root=project_root,
+            semantic_ply=source,
+            semantic_manifest=None,
+            output=None,
+            output_manifest=None,
+            register_artifacts=True,
+            json=False,
+        )
+    )
+
+    assert rc == 0
+    output = project_root / "semantic_raw_rgb_palette.ply"
+    output_manifest = project_root / "semantic_raw_rgb_palette_manifest.json"
+    source_vertex_data = read_ply_vertex_data(source)
+    output_vertex_data = read_ply_vertex_data(output)
+    assert output_vertex_data["format"] == "binary_little_endian"
+    assert [name for name, _prop_type in output_vertex_data["properties"]] == [
+        "x",
+        "y",
+        "z",
+        "red",
+        "green",
+        "blue",
+        "object_id",
+        "object_probability",
+    ]
+    assert np.array_equal(output_vertex_data["data"]["x"], source_vertex_data["data"]["x"])
+    assert np.array_equal(output_vertex_data["data"]["object_id"], source_data["object_id"])
+    assert np.allclose(output_vertex_data["data"]["object_probability"], source_data["object_probability"])
+    expected_colors = semantic_colors_for_labels(source_data["object_id"])
+    actual_colors = np.stack(
+        [
+            output_vertex_data["data"]["red"],
+            output_vertex_data["data"]["green"],
+            output_vertex_data["data"]["blue"],
+        ],
+        axis=1,
+    )
+    assert np.array_equal(actual_colors, expected_colors)
+    assert np.array_equal(source_vertex_data["data"]["red"], source_data["red"])
+    report = json.loads(output_manifest.read_text(encoding="utf-8"))
+    assert report["source_preserved"] is True
+    assert report["label_distribution"] == {"0": 1, "3": 1, "9": 1}
+    updated_manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    assert updated_manifest["artifacts"]["semantic_palette_ply"] == str(output)
+
+
+def test_export_viewer_plys_uses_binary_semantic_vertex_labels(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("PIL.Image")
+    source = tmp_path / "semantic_binary.ply"
+    labels = np.asarray([2, 7], dtype=np.int32)
+    write_vertex_data_binary_ply(
+        source,
+        [
+            ("x", "float"),
+            ("y", "float"),
+            ("z", "float"),
+            ("red", "uchar"),
+            ("green", "uchar"),
+            ("blue", "uchar"),
+            ("object_id", "int"),
+            ("object_probability", "float"),
+        ],
+        {
+            "x": np.asarray([0.0, 1.0], dtype=np.float32),
+            "y": np.asarray([0.0, 0.0], dtype=np.float32),
+            "z": np.asarray([0.0, 0.0], dtype=np.float32),
+            "red": np.asarray([255, 255], dtype=np.uint8),
+            "green": np.asarray([255, 255], dtype=np.uint8),
+            "blue": np.asarray([255, 255], dtype=np.uint8),
+            "object_id": labels,
+            "object_probability": np.asarray([0.7, 0.8], dtype=np.float32),
+        },
+    )
+
+    report = export_viewer_plys(source, tmp_path, "semantic_binary_viewer", include_labels=True)
+
+    assert report["includes_object_id"] is True
+    assert report["source_label_sidecar"] is None
+    point_cloud = read_ply_vertex_data(Path(report["point_cloud_ply"]))
+    colors = np.stack(
+        [point_cloud["data"]["red"], point_cloud["data"]["green"], point_cloud["data"]["blue"]],
+        axis=1,
+    )
+    assert np.array_equal(colors, semantic_colors_for_labels(labels))
+    sidecar = json.loads(Path(report["label_sidecar"]).read_text(encoding="utf-8"))
+    assert sidecar["object_id"] == [2, 7]
+    assert sidecar["object_probability"] == pytest.approx([0.7, 0.8])
 
 
 def test_scaled_intrinsic_for_size_scales_focal_length_and_principal_point():

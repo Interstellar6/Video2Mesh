@@ -477,7 +477,7 @@ GroundingDINO 在这次运行中没有向 SAM3 传入任何 detection box。它�
 | 产物 | 规模 | 说明 |
 |---|---:|---|
 | DA3 depth | 80 个 `.npy` | 真实 DA3 深度；DA3 直接回投产出 4M 点初始几何 |
-| DA3 semantic PLY | 4,000,000 vertices，binary，约 92MB | 含 `object_id` 与 `object_probability`；这是 Video2Mesh 三维投影融合的直接结果 |
+| DA3 semantic PLY | 4,000,000 vertices，binary，约 92MB | `semantic_da3_points.ply` 保留 DA3 RGB + `object_id/object_probability`；另有 `semantic_da3_points_palette.ply` 供普通 viewer 直接显示语义颜色 |
 | SAM3 masks | 977 instances / 630 merged class-frame masks | `table`、`wall art` 没有有效 mask；其余 9 类产生实际结果 |
 | 3D instances | 15 | bed 1、ceiling 1、door 2、floor 1、lamp 2、nightstand 2、plant 3、wall 1、window 2 |
 | PGSR 30k | 877,848 Gaussians，约 208MB raw PLY | 最终训练 L1 `0.0117173`、PSNR `33.3479 dB`、缺失 depth warning 为 0 |
@@ -499,6 +499,12 @@ GroundingDINO 在这次运行中没有向 SAM3 传入任何 detection box。它�
 | `viewer_plys_pgsr_30k/semantic_pgsr_30k_supersplat_labels.json` | 约 24MB | 与 viewer PLY 按顶点顺序对应的 `object_id/object_probability` sidecar |
 
 viewer PLY 为解决 ASCII 文件过大和 viewer 崩溃而生成。它保留 Gaussian center 与语义标签，但为了安全显示裁剪了 scale、归一化 rotation、限制 opacity；因此它是 **显示用派生产物**，不是原始 PGSR Gaussian 的无损替代。原始 PGSR 的数值审计中，scale p99 为 `0.6649`，elongation p99 为 `6.23e11`，存在明显长条 splat 风险；viewer-safe 版本将最大 scale 限制为 `0.04`、elongation 限制为 `12`。这能改善加载/显示，不应被解释为训练几何质量已经修复。
+
+### 语义 PLY 显示修复与归档
+
+2026-07-13 的真实 run 中，`semantic_da3_points.ply` 的 `object_id/object_probability` 本身已经有效，但它保留了 DA3 原始 RGB；普通 PLY viewer 优先显示 RGB 而不会自动把自定义 `object_id` 映射为颜色，因此画面会与原始 DA3 点云近似。新增 `semantic_da3_points_palette.ply` 后，仅将 RGB 替换为稳定的 object-id palette，逐点保留 `x/y/z/object_id/object_probability`。对 4,000,000 点的检查确认 16 个 semantic ID/颜色、`3,999,995` 行 RGB 改写，非颜色字段完全一致；原始 PLY 未被覆盖。
+
+对应实现为 `video2mesh export-semantic-palette-ply`，`export-viewer-plys --include-labels` 也已改为识别 binary PLY 中的语义字段。四类 3D 查看器 QA、原始/显示产物边界和本地回传状态见：[Holi-Spatial bedroom_4 全链路实验归档](../../experiments/holi-spatial-bedroom4-full-run-20260713.md)。
 
 ### 投影与视觉 QA
 

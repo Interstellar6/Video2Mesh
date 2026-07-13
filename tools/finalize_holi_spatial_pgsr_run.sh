@@ -55,6 +55,15 @@ cp "$PROJECT/simulator_assets/semantic_splats_manifest.json" \
   "$PROJECT/simulator_assets/semantic_da3_points_manifest.json"
 
 env PYTHONUNBUFFERED=1 PYTHONPATH="$SNAPSHOT" \
+  "$PGSR_PYTHON" -B -m video2mesh.cli export-semantic-palette-ply \
+    --project-root "$PROJECT" \
+    --semantic-ply "$PROJECT/simulator_assets/semantic_da3_points.ply" \
+    --semantic-manifest "$PROJECT/simulator_assets/semantic_da3_points_manifest.json" \
+    --output "$PROJECT/simulator_assets/semantic_da3_points_palette.ply" \
+    --output-manifest "$PROJECT/simulator_assets/semantic_da3_points_palette_manifest.json" \
+  2>&1 | tee "$RUN_ROOT/logs/semantic_da3_palette_export.log"
+
+env PYTHONUNBUFFERED=1 PYTHONPATH="$SNAPSHOT" \
   "$PGSR_PYTHON" -B -m video2mesh.cli export-splat-masks \
     --project-root "$PROJECT" \
     --splat-ply "$PGSR_PLY" \
