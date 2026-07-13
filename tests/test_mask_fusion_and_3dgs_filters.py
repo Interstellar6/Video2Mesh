@@ -14,6 +14,7 @@ from video2mesh.cli import (
     bbox_proxy_mesh_from_points,
     clean_3dgs_floaters,
     cmd_clean_point_cloud_outliers,
+    cmd_backproject_gaussian_probabilities,
     clean_binary_object_mask,
     clip_mask_by_depth_quantiles,
     cmd_reconstruct_object_meshes,
@@ -210,6 +211,100 @@ def test_source_labels_keep_first_priority_assignment(tmp_path: Path):
     assert labels[3] == object_id_to_semantic["gdino_object_bed"]
     assert labels[0] == object_id_to_semantic["gdino_object_door"]
     assert labels[4] == object_id_to_semantic["gdino_object_floor"]
+
+
+def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    project_root = tmp_path / "project"
+    manifest = {
+        "schema_version": 1,
+        "scene_id": "tiny",
+        "project_root": str(project_root),
+        "scene": {
+            "frames_dir": "scene/frames",
+            "camera_info": "scene/cameras/camera_info.json",
+            "point_cloud": "scene/reconstruction/point_cloud.ply",
+            "scene_3dgs": "scene/reconstruction/3dgs",
+        },
+        "masks": {"mask_2d_dir": "masks/2d", "mask_3d_dir": "masks/3d"},
+        "objects_dir": "objects",
+        "simulator_assets_dir": "simulator_assets",
+        "artifacts": {"scene_3dgs_ply": str(project_root / "scene/reconstruction/3dgs/point_cloud.ply")},
+    }
+    write_json(project_root / "manifest.json", manifest)
+    write_supersplat_ply(
+        project_root / "scene/reconstruction/3dgs/point_cloud.ply",
+        np.asarray([[0.0, 0.0, 2.0]], dtype=np.float32),
+        np.asarray([[0.8, 0.2, 0.1]], dtype=np.float32),
+        np.asarray([0.8], dtype=np.float32),
+        np.asarray([[0.02, 0.02, 0.02]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    write_json(
+        project_root / "scene/cameras/camera_info.json",
+        {
+            "intrinsic": {"fx": 1.0, "fy": 1.0, "cx": 1.0, "cy": 1.0, "w": 3, "h": 3},
+            "extrinsic_type": "world_to_camera",
+            "extrinsic": {"000000": np.eye(4).tolist()},
+        },
+    )
+    object_dir = project_root / "objects" / "bed"
+    mask_dir = project_root / "masks" / "2d" / "bed"
+    object_dir.mkdir(parents=True)
+    mask_dir.mkdir(parents=True)
+    write_json(object_dir / "object.json", {"object_id": "bed", "name": "bed", "category": "bed"})
+    mask = np.zeros((3, 3), dtype=np.uint8)
+    mask[1, 1] = 255
+    Image.fromarray(mask, mode="L").save(mask_dir / "000000.png")
+
+    output = project_root / "extra_routes" / "semantic_anysplat.ply"
+    output_manifest = project_root / "extra_routes" / "semantic_anysplat_manifest.json"
+    rc = cmd_backproject_gaussian_probabilities(
+        Namespace(
+            project_root=project_root,
+            splat_ply=project_root / "scene/reconstruction/3dgs/point_cloud.ply",
+            camera_info=None,
+            mask_root=None,
+            output=output,
+            output_dir=project_root / "extra_routes" / "probabilities",
+            manifest_output=output_manifest,
+            extrinsic_type="world_to_camera",
+            top_n=1,
+            ray_radius_pixels=1.0,
+            weight_sigma_pixels=1.0,
+            pixel_stride=1,
+            max_pixels_per_mask=0,
+            max_gaussians=0,
+            max_gaussians_per_frame=0,
+            min_probability=0.5,
+            output_min_probability=0.5,
+            probability_scale=255.0,
+            include_background_structures=False,
+            merge_background_structure_masks=False,
+            background_mask_source_ply=None,
+            background_max_transfer_distance=0.08,
+            background_overwrite_existing=False,
+            occlusion_filter=False,
+            depth_tolerance=0.03,
+            relative_depth_tolerance=0.01,
+            seed=7,
+            register_artifacts=False,
+        )
+    )
+
+    assert rc == 0
+    header = parse_ply_vertex_header(output)
+    assert "object_id" in [name for name, _prop_type in header["properties"]]
+    assert "object_probability" in [name for name, _prop_type in header["properties"]]
+    report = json.loads(output_manifest.read_text(encoding="utf-8"))
+    assert report["method"] == "svlgaussian_style_ray_to_gaussian_probability_backprojection"
+    assert report["objects"][1]["object_id"] == "bed"
+    assert report["objects"][1]["point_count"] == 1
+    assert report["background_structure_mask_merge"]["enabled"] is False
+    saved_manifest = json.loads((project_root / "manifest.json").read_text(encoding="utf-8"))
+    assert saved_manifest["artifacts"]["scene_3dgs_ply"].endswith("point_cloud.ply")
+    assert "semantic_splats_ply" not in saved_manifest["artifacts"]
 
 
 def test_prepare_3dgs_source_reuses_real_colmap_sparse_then_filters(tmp_path: Path):
@@ -1319,6 +1414,8 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert pipeline.g3dgs_prefer_dense_colmap_init is True
     assert pipeline.g3dgs_clean_3dgs_floaters is True
     assert pipeline.g3dgs_clean_max_elongation == pytest.approx(25.0)
+    assert pipeline.backproject_gaussian_probabilities is False
+    assert pipeline.gaussian_backproject_merge_background_structure_masks is False
     assert pipeline.reconstruct_scene_meshes is False
     assert pipeline.transfer_scene_mesh_semantics is False
     assert pipeline.split_scene_mesh_by_semantics is False
@@ -1343,6 +1440,22 @@ def test_3dgs_mesh_cli_commands_are_registered():
     assert full_scene_mesh.transfer_scene_mesh_semantics is True
     assert full_scene_mesh.split_scene_mesh_by_semantics is True
     assert full_scene_mesh.scene_mesh_semantic_route == "projected-splats"
+    backproject = parser.parse_args(["backproject-gaussian-probabilities", "--project-root", "proj"])
+    assert backproject.merge_background_structure_masks is False
+    assert backproject.register_artifacts is True
+    external_route = parser.parse_args(
+        [
+            "backproject-gaussian-probabilities",
+            "--project-root",
+            "proj",
+            "--splat-ply",
+            "extra/anysplat/gaussians.ply",
+            "--output",
+            "extra/anysplat/semantic_anysplat.ply",
+            "--no-register-artifacts",
+        ]
+    )
+    assert external_route.register_artifacts is False
     assert clean.func.__name__ == "cmd_clean_3dgs_floaters"
     assert clean.knn == 24
     assert clean_cloud.func.__name__ == "cmd_clean_point_cloud_outliers"

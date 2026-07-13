@@ -13848,6 +13848,93 @@ def semantic_ids_from_gaussian_probabilities(best_object, best_probability) -> t
     return [int(value) for value in labels.tolist()], [float(value) for value in probabilities.tolist()]
 
 
+def accumulate_mask_pixels_to_projected_gaussians(
+    sums,
+    weights,
+    observations,
+    candidate_indices,
+    cand_u,
+    cand_v,
+    xs,
+    ys,
+    values,
+    *,
+    radius: float,
+    sigma_sq: float,
+    top_n: int,
+) -> tuple[int, str]:
+    np = import_numpy()
+    if values.size == 0 or candidate_indices.size == 0:
+        return 0, "empty"
+
+    query_points = np.column_stack([xs, ys]).astype(np.float32, copy=False)
+    candidate_points = np.column_stack([cand_u, cand_v]).astype(np.float32, copy=False)
+    top_n = max(1, int(top_n))
+    radius = float(radius)
+    radius_sq = radius * radius
+    sigma_sq = max(float(sigma_sq), 1e-8)
+
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+
+        tree = cKDTree(candidate_points)
+        distances, local = tree.query(
+            query_points,
+            k=top_n,
+            distance_upper_bound=radius,
+            workers=-1,
+        )
+        distances = np.asarray(distances, dtype=np.float32)
+        local = np.asarray(local, dtype=np.int64)
+        if distances.ndim == 1:
+            distances = distances[:, None]
+            local = local[:, None]
+        valid = (local >= 0) & (local < candidate_indices.size) & np.isfinite(distances)
+        if not bool(valid.any()):
+            return 0, "scipy_ckdtree"
+        gaussian_local = local[valid]
+        pixel_rows, _cols = np.nonzero(valid)
+        dist_sq = distances[valid] * distances[valid]
+        local_weights = np.exp(-dist_sq / (2.0 * sigma_sq)).astype(np.float32)
+        row_weight_sums = np.zeros(query_points.shape[0], dtype=np.float32)
+        np.add.at(row_weight_sums, pixel_rows, local_weights)
+        local_weights /= np.maximum(row_weight_sums[pixel_rows], 1e-8)
+        target = candidate_indices[gaussian_local]
+        pixel_probability = values[pixel_rows].astype(np.float32, copy=False)
+        np.add.at(sums, target, local_weights * pixel_probability)
+        np.add.at(weights, target, local_weights)
+        np.add.at(observations, target, 1)
+        return int(np.unique(target).shape[0]), "scipy_ckdtree"
+    except Exception:
+        pass
+
+    updated: set[int] = set()
+    for px, py, probability in zip(xs, ys, values):
+        dx = cand_u - float(px)
+        dy = cand_v - float(py)
+        dist_sq = dx * dx + dy * dy
+        within = np.flatnonzero(dist_sq <= radius_sq)
+        if within.size == 0:
+            continue
+        if within.size > top_n:
+            local = within[np.argpartition(dist_sq[within], top_n - 1)[:top_n]]
+        else:
+            local = within
+        local_dist_sq = dist_sq[local]
+        local_weights = np.exp(-local_dist_sq / (2.0 * sigma_sq)).astype(np.float32)
+        weight_sum = float(local_weights.sum())
+        if weight_sum <= 1e-12:
+            continue
+        local_weights /= weight_sum
+        target = candidate_indices[local]
+        weighted_probability = local_weights * float(probability)
+        sums[target] += weighted_probability
+        weights[target] += local_weights
+        observations[target] += 1
+        updated.update(int(index) for index in target.tolist())
+    return int(len(updated)), "numpy_radius_scan"
+
+
 def update_object_table_probability_counts(object_table: list[dict[str, Any]], labels: list[int], probabilities: list[float]) -> None:
     np = import_numpy()
     label_array = np.asarray(labels, dtype=np.int64)
@@ -13870,6 +13957,7 @@ def backproject_object_masks_to_gaussians(
     gaussian_points,
     camera_info: dict[str, Any],
     args: argparse.Namespace,
+    projection_cache: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     np = import_numpy()
     sums = np.zeros(gaussian_points.shape[0], dtype=np.float32)
@@ -13886,40 +13974,57 @@ def backproject_object_masks_to_gaussians(
     top_n = max(1, int(args.top_n))
 
     for record in records:
-        extrinsic = resolve_extrinsic(camera_info["extrinsic"], record.frame_id)
-        if extrinsic is None:
-            skipped.append({"frame_id": record.frame_id, "mask": str(record.path), "reason": "missing_extrinsic"})
-            continue
-        intrinsic = intrinsic_for_frame(camera_info, record.frame_id)
-        w2c = world_to_camera_matrix(extrinsic, camera_info.get("extrinsic_type") or args.extrinsic_type)
-        inside, u_float, v_float, z = project_points_float(gaussian_points, intrinsic, w2c)
-        if bool(args.occlusion_filter):
-            u_int = np.full(gaussian_points.shape[0], -1, dtype=np.int64)
-            v_int = np.full(gaussian_points.shape[0], -1, dtype=np.int64)
-            inside_idx_all = np.flatnonzero(inside)
-            u_int[inside] = np.floor(u_float[inside]).astype(np.int64)
-            v_int[inside] = np.floor(v_float[inside]).astype(np.int64)
-            visible, _zbuf = visibility_mask_from_projection(
-                inside,
-                u_int,
-                v_int,
-                z,
-                int(intrinsic["w"]),
-                int(intrinsic["h"]),
-                args.depth_tolerance,
-                args.relative_depth_tolerance,
-            )
-            candidate_indices = np.flatnonzero(visible)
+        projection = projection_cache.get(record.frame_id) if projection_cache is not None else None
+        if projection is None:
+            extrinsic = resolve_extrinsic(camera_info["extrinsic"], record.frame_id)
+            if extrinsic is None:
+                skipped.append({"frame_id": record.frame_id, "mask": str(record.path), "reason": "missing_extrinsic"})
+                continue
+            intrinsic = intrinsic_for_frame(camera_info, record.frame_id)
+            w2c = world_to_camera_matrix(extrinsic, camera_info.get("extrinsic_type") or args.extrinsic_type)
+            inside, u_float, v_float, z = project_points_float(gaussian_points, intrinsic, w2c)
+            if bool(args.occlusion_filter):
+                u_int = np.full(gaussian_points.shape[0], -1, dtype=np.int64)
+                v_int = np.full(gaussian_points.shape[0], -1, dtype=np.int64)
+                inside_idx_all = np.flatnonzero(inside)
+                u_int[inside] = np.floor(u_float[inside]).astype(np.int64)
+                v_int[inside] = np.floor(v_float[inside]).astype(np.int64)
+                visible, _zbuf = visibility_mask_from_projection(
+                    inside,
+                    u_int,
+                    v_int,
+                    z,
+                    int(intrinsic["w"]),
+                    int(intrinsic["h"]),
+                    args.depth_tolerance,
+                    args.relative_depth_tolerance,
+                )
+                candidate_indices = np.flatnonzero(visible)
+            else:
+                inside_idx_all = np.flatnonzero(inside)
+                candidate_indices = inside_idx_all
+            if max_gaussians_per_frame > 0 and candidate_indices.size > max_gaussians_per_frame:
+                order = np.argsort(z[candidate_indices])[:max_gaussians_per_frame]
+                candidate_indices = np.sort(candidate_indices[order])
+            projection = {
+                "intrinsic": intrinsic,
+                "u_float": u_float,
+                "v_float": v_float,
+                "candidate_indices": candidate_indices,
+                "projected_gaussians": int(inside_idx_all.size),
+            }
+            if projection_cache is not None:
+                projection_cache[record.frame_id] = projection
         else:
-            inside_idx_all = np.flatnonzero(inside)
-            candidate_indices = inside_idx_all
+            intrinsic = projection["intrinsic"]
+            u_float = projection["u_float"]
+            v_float = projection["v_float"]
+            candidate_indices = projection["candidate_indices"]
+            inside_idx_all = None
 
         if candidate_indices.size == 0:
             skipped.append({"frame_id": record.frame_id, "mask": str(record.path), "reason": "no_visible_gaussians"})
             continue
-        if max_gaussians_per_frame > 0 and candidate_indices.size > max_gaussians_per_frame:
-            order = np.argsort(z[candidate_indices])[:max_gaussians_per_frame]
-            candidate_indices = np.sort(candidate_indices[order])
 
         xs, ys, values, active_pixel_count = sampled_mask_probability_pixels(
             record.path,
@@ -13948,30 +14053,20 @@ def backproject_object_masks_to_gaussians(
 
         cand_u = u_float[candidate_indices].astype(np.float32)
         cand_v = v_float[candidate_indices].astype(np.float32)
-        updated: set[int] = set()
-        for px, py, probability in zip(xs, ys, values):
-            dx = cand_u - float(px)
-            dy = cand_v - float(py)
-            dist_sq = dx * dx + dy * dy
-            within = np.flatnonzero(dist_sq <= radius_sq)
-            if within.size == 0:
-                continue
-            if within.size > top_n:
-                local = within[np.argpartition(dist_sq[within], top_n - 1)[:top_n]]
-            else:
-                local = within
-            local_dist_sq = dist_sq[local]
-            local_weights = np.exp(-local_dist_sq / (2.0 * sigma_sq)).astype(np.float32)
-            weight_sum = float(local_weights.sum())
-            if weight_sum <= 1e-12:
-                continue
-            local_weights /= weight_sum
-            target = candidate_indices[local]
-            weighted_probability = local_weights * float(probability)
-            sums[target] += weighted_probability
-            weights[target] += local_weights
-            observations[target] += 1
-            updated.update(int(index) for index in target.tolist())
+        updated_count, query_engine = accumulate_mask_pixels_to_projected_gaussians(
+            sums,
+            weights,
+            observations,
+            candidate_indices,
+            cand_u,
+            cand_v,
+            xs,
+            ys,
+            values,
+            radius=radius,
+            sigma_sq=sigma_sq,
+            top_n=top_n,
+        )
 
         frame_reports.append(
             {
@@ -13980,8 +14075,9 @@ def backproject_object_masks_to_gaussians(
                 "active_pixels": int(active_pixel_count),
                 "sampled_pixels": int(values.shape[0]),
                 "candidate_gaussians": int(candidate_indices.size),
-                "updated_gaussians": int(len(updated)),
-                "projected_gaussians": int(inside_idx_all.size),
+                "updated_gaussians": int(updated_count),
+                "projected_gaussians": int(projection["projected_gaussians"]),
+                "query_engine": query_engine,
             }
         )
 
@@ -14026,9 +14122,9 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
     mask_root = args.mask_root or resolve_active_mask_root(project_root, manifest)
     mask_root = resolve_project_cli_path(mask_root, project_root)
     camera_info_path = resolve_project_cli_path(args.camera_info, project_root) if args.camera_info else (project_root / manifest["scene"]["camera_info"])
-    output_ply = resolve_project_relative_path(args.output, project_root) if args.output else (project_root / manifest["simulator_assets_dir"] / "semantic_gaussian_probabilities.ply")
+    output_ply = resolve_project_relative_path(args.output, project_root) if args.output else (project_root / manifest["simulator_assets_dir"] / "semantic_splats.ply")
     output_dir = ensure_dir(resolve_project_relative_path(args.output_dir, project_root) if args.output_dir else (project_root / manifest["simulator_assets_dir"] / "gaussian_probabilities"))
-    manifest_path = resolve_project_relative_path(args.manifest_output, project_root) if args.manifest_output else (output_dir / "gaussian_probabilities_manifest.json")
+    manifest_path = resolve_project_relative_path(args.manifest_output, project_root) if args.manifest_output else (project_root / manifest["simulator_assets_dir"] / "semantic_splats_manifest.json")
 
     gaussian_data = read_gsplat_ply(source_ply)
     gaussian_points = np.asarray(gaussian_data["means"], dtype=np.float64)
@@ -14050,6 +14146,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
     best_object = np.zeros(gaussian_points_work.shape[0], dtype=np.int64)
     object_reports: list[dict[str, Any]] = []
     skipped_objects: dict[str, str] = {}
+    projection_cache: dict[str, dict[str, Any]] = {}
 
     for item in object_table:
         semantic_id = int(item.get("semantic_id", 0))
@@ -14071,6 +14168,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             gaussian_points_work,
             camera_info,
             args,
+            projection_cache,
         )
         probability = result["probability"]
         better = probability > best_probability
@@ -14100,7 +14198,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
 
     labels, probabilities = semantic_ids_from_gaussian_probabilities(best_object, best_probability)
     background_merge_report = {"enabled": False}
-    if bool(getattr(args, "merge_background_structure_masks", True)):
+    if bool(getattr(args, "merge_background_structure_masks", False)):
         background_merge_report = merge_background_structure_masks_to_gaussians(
             project_root,
             manifest,
@@ -14169,9 +14267,10 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
             "min_probability": float(args.min_probability),
             "output_min_probability": float(args.output_min_probability),
             "occlusion_filter": bool(args.occlusion_filter),
-            "merge_background_structure_masks": bool(getattr(args, "merge_background_structure_masks", True)),
+            "merge_background_structure_masks": bool(getattr(args, "merge_background_structure_masks", False)),
             "background_max_transfer_distance": getattr(args, "background_max_transfer_distance", None),
             "background_overwrite_existing": bool(getattr(args, "background_overwrite_existing", False)),
+            "projection_cache_frames": len(projection_cache),
         },
         "object_id_to_semantic": object_id_to_semantic,
         "objects": object_table,
@@ -14189,21 +14288,23 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         ),
     }
     write_json(manifest_path, report)
-    manifest.setdefault("artifacts", {})["semantic_splats_ply"] = str(output_ply)
-    manifest["artifacts"]["semantic_splats_manifest"] = str(manifest_path)
-    manifest["artifacts"]["gaussian_probabilities_manifest"] = str(manifest_path)
-    if isinstance(viewer_exports, dict) and viewer_exports.get("point_cloud_ply"):
-        manifest["artifacts"]["semantic_point_cloud_ply"] = str(viewer_exports["point_cloud_ply"])
-    if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
-        manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["supersplat_ply"])
-    manifest.setdefault("external_stages", {})["semantic_probability_backprojection"] = {
-        "status": "svlgaussian_style_backprojection_completed",
-        "source_ply": str(source_ply),
-        "output_ply": str(output_ply),
-        "manifest": str(manifest_path),
-        "object_count": len(object_reports),
-    }
-    save_manifest(project_root, manifest)
+    if bool(getattr(args, "register_artifacts", True)):
+        manifest.setdefault("artifacts", {})["semantic_splats_ply"] = str(output_ply)
+        manifest["artifacts"]["semantic_splats_manifest"] = str(manifest_path)
+        manifest["artifacts"]["gaussian_probabilities_manifest"] = str(manifest_path)
+        if isinstance(viewer_exports, dict) and viewer_exports.get("point_cloud_ply"):
+            manifest["artifacts"]["semantic_point_cloud_ply"] = str(viewer_exports["point_cloud_ply"])
+        if isinstance(viewer_exports, dict) and viewer_exports.get("supersplat_ply"):
+            manifest["artifacts"]["semantic_supersplat_ply"] = str(viewer_exports["supersplat_ply"])
+        manifest.setdefault("external_stages", {})["semantic_probability_backprojection"] = {
+            "status": "svlgaussian_style_backprojection_completed",
+            "source_ply": str(source_ply),
+            "output_ply": str(output_ply),
+            "manifest": str(manifest_path),
+            "object_count": len(object_reports),
+            "semantic_source": "2d_mask_probability_projection",
+        }
+        save_manifest(project_root, manifest)
     print(f"Wrote Gaussian semantic probabilities: {output_ply}")
     print(f"Manifest: {manifest_path}")
     print(f"Objects processed: {len(object_reports)}; skipped: {len(skipped_objects)}")
@@ -14465,7 +14566,8 @@ def build_gaussian_probability_quality_report(
         "warnings": warnings,
         "notes": (
             "Foreground objects are measured from SVLGaussian-style 2D mask probability ray back-projection. "
-            "Background structures are measured separately because they are merged from 3D point-index masks by nearest-center transfer."
+            "Background structures are only measured as a separate legacy 3D point-index nearest-center transfer when "
+            "merge_background_structure_masks is explicitly enabled."
         ),
     }
 
@@ -50468,6 +50570,13 @@ def scene_point_cloud_path(project_root: Path, manifest: dict[str, Any]) -> Path
     return resolve_project_path(manifest["scene"]["point_cloud"], project_root).resolve()
 
 
+def default_mask_source_point_cloud_path(project_root: Path, manifest: dict[str, Any]) -> Path:
+    dense_fused = existing_colmap_dense_fused_ply(project_root, manifest)
+    if dense_fused is not None:
+        return dense_fused.resolve()
+    return scene_point_cloud_path(project_root, manifest)
+
+
 def cmd_run_pipeline(args: argparse.Namespace) -> int:
     project_root = args.project_root.resolve()
     steps: list[dict[str, Any]] = []
@@ -50606,7 +50715,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
         if has_video_to_3dgs_stage:
             selected_3dgs_point_cloud = gsplat_point_cloud if args.train_gsplat else g3dgs_point_cloud
             append_pipeline_step(steps, "video_to_3dgs_init_point_cloud", "selected", str(selected_3dgs_point_cloud))
-        mask_source_point_cloud = default_3dgs_point_cloud
+        mask_source_point_cloud = default_mask_source_point_cloud_path(project_root, manifest)
         append_pipeline_step(steps, "mask_source_point_cloud", "selected", str(mask_source_point_cloud))
 
         if has_full_point_cloud_sensitive_stage or args.reconstruction_readiness_fail_on_not_ready:
@@ -51006,19 +51115,13 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
             append_pipeline_step(steps, "infer_background_plane_masks", "skipped", "--infer-background-plane-masks not set")
 
         if not args.skip_export_splat_masks:
-            cmd_export_splat_masks(
-                argparse.Namespace(
-                    project_root=project_root,
-                    splat_ply=None,
-                    mask_source_ply=mask_source_point_cloud,
-                    transfer_mode=args.transfer_mode,
-                    max_transfer_distance=args.max_transfer_distance,
-                    output=None,
-                    include_probabilities=True,
-                )
-            )
-            append_pipeline_step(steps, "export_splat_masks", "completed")
             if args.backproject_gaussian_probabilities:
+                append_pipeline_step(
+                    steps,
+                    "export_splat_masks",
+                    "skipped",
+                    "semantic_splats generated directly from 2D mask probability backprojection",
+                )
                 cmd_backproject_gaussian_probabilities(
                     argparse.Namespace(
                         project_root=project_root,
@@ -51040,7 +51143,7 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                         output_min_probability=args.gaussian_backproject_output_min_probability,
                         probability_scale=args.probability_scale,
                         include_background_structures=args.gaussian_backproject_include_background_structures,
-                        merge_background_structure_masks=True,
+                        merge_background_structure_masks=args.gaussian_backproject_merge_background_structure_masks,
                         background_mask_source_ply=None,
                         background_max_transfer_distance=0.08,
                         background_overwrite_existing=False,
@@ -51048,9 +51151,10 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                         depth_tolerance=args.depth_tolerance,
                         relative_depth_tolerance=args.relative_depth_tolerance,
                         seed=args.gaussian_backproject_seed,
+                        register_artifacts=True,
                     )
                 )
-                append_pipeline_step(steps, "backproject_gaussian_probabilities", "completed")
+                append_pipeline_step(steps, "backproject_gaussian_probabilities", "completed", "2d_mask_probability_projection")
                 cmd_gaussian_probability_quality_report(
                     argparse.Namespace(
                         project_root=project_root,
@@ -51063,6 +51167,18 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
                 )
                 append_pipeline_step(steps, "gaussian_probability_quality_report", "completed")
             else:
+                cmd_export_splat_masks(
+                    argparse.Namespace(
+                        project_root=project_root,
+                        splat_ply=None,
+                        mask_source_ply=mask_source_point_cloud,
+                        transfer_mode=args.transfer_mode,
+                        max_transfer_distance=args.max_transfer_distance,
+                        output=None,
+                        include_probabilities=True,
+                    )
+                )
+                append_pipeline_step(steps, "export_splat_masks", "completed", "legacy_3d_mask_to_splat_transfer")
                 append_pipeline_step(steps, "backproject_gaussian_probabilities", "skipped", "--backproject-gaussian-probabilities not set")
                 append_pipeline_step(steps, "gaussian_probability_quality_report", "skipped", "--backproject-gaussian-probabilities not set")
         else:
@@ -52531,9 +52647,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--splat-ply", type=Path, help="Registered 3DGS/PLY to receive object_id and object_probability. Defaults to artifacts.scene_3dgs_ply.")
     p.add_argument("--camera-info", type=Path, help="Defaults to scene/cameras/camera_info.json.")
     p.add_argument("--mask-root", type=Path, help="Defaults to masks/2d.")
-    p.add_argument("--output", type=Path, help="Output semantic PLY. Defaults to simulator_assets/semantic_gaussian_probabilities.ply.")
+    p.add_argument("--output", type=Path, help="Output semantic PLY. Defaults to simulator_assets/semantic_splats.ply.")
     p.add_argument("--output-dir", type=Path, help="Directory for per-object probability NPZ files.")
-    p.add_argument("--manifest-output", type=Path, help="JSON report path. Defaults to output-dir/gaussian_probabilities_manifest.json.")
+    p.add_argument("--manifest-output", type=Path, help="JSON report path. Defaults to simulator_assets/semantic_splats_manifest.json.")
     p.add_argument("--extrinsic-type", choices=["world_to_camera", "camera_to_world"], default="world_to_camera")
     p.add_argument("--top-n", type=int, default=8, help="Closest projected Gaussian centers receiving each pixel probability.")
     p.add_argument("--ray-radius-pixels", type=float, default=3.0, help="Pixel-space radius around each mask pixel for candidate Gaussian centers.")
@@ -52546,13 +52662,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-min-probability", type=float, default=0.5, help="Minimum accumulated Gaussian probability assigned to an object_id.")
     p.add_argument("--probability-scale", type=float, default=255.0, help="Mask value divisor used to convert grayscale masks to [0, 1].")
     p.add_argument("--include-background-structures", action="store_true", help="Also process background_structure records when matching 2D masks exist.")
-    p.add_argument("--merge-background-structure-masks", action=argparse.BooleanOptionalAction, default=True, help="Merge background_structure 3D point-index masks into the output Gaussian semantic PLY after 2D probability back-projection.")
+    p.add_argument("--merge-background-structure-masks", action=argparse.BooleanOptionalAction, default=False, help="Optional legacy fallback: merge background_structure 3D point-index masks into the output after 2D probability back-projection.")
     p.add_argument("--background-mask-source-ply", type=Path, help="Point cloud whose vertex order background point-index masks reference. Defaults to the fused mask source point cloud.")
     p.add_argument("--background-max-transfer-distance", type=float, default=0.08, help="Nearest XYZ distance cutoff when transferring background structure masks to Gaussian centers.")
     p.add_argument("--background-overwrite-existing", action=argparse.BooleanOptionalAction, default=False, help="Allow background structures to overwrite already assigned foreground Gaussian labels.")
     p.add_argument("--occlusion-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-tolerance", type=float, default=0.03)
     p.add_argument("--relative-depth-tolerance", type=float, default=0.01)
+    p.add_argument("--register-artifacts", action=argparse.BooleanOptionalAction, default=True, help="Update manifest semantic_splats artifacts. Use --no-register-artifacts for independent AnySplat/SuGaR route outputs.")
     p.add_argument("--seed", type=int, default=7)
     p.set_defaults(func=cmd_backproject_gaussian_probabilities)
 
@@ -54572,7 +54689,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--background-plane-replace-existing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--background-plane-seed", type=int, default=7)
     p.add_argument("--skip-export-splat-masks", action="store_true")
-    p.add_argument("--backproject-gaussian-probabilities", action="store_true", help="After export-splat-masks, run SVLGaussian-style ray-to-Gaussian semantic probability back-projection.")
+    p.add_argument("--backproject-gaussian-probabilities", action="store_true", help="Generate semantic_splats.ply directly by SVLGaussian-style 2D-mask-to-Gaussian probability back-projection.")
     p.add_argument("--gaussian-backproject-top-n", type=int, default=8)
     p.add_argument("--gaussian-backproject-ray-radius-pixels", type=float, default=3.0)
     p.add_argument("--gaussian-backproject-weight-sigma-pixels", type=float, default=1.5)
@@ -54582,6 +54699,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gaussian-backproject-max-gaussians-per-frame", type=int, default=0)
     p.add_argument("--gaussian-backproject-output-min-probability", type=float, default=0.5)
     p.add_argument("--gaussian-backproject-include-background-structures", action="store_true")
+    p.add_argument("--gaussian-backproject-merge-background-structure-masks", action=argparse.BooleanOptionalAction, default=False, help="Optional legacy fallback for background structures that have no 2D masks; disabled by default.")
     p.add_argument("--gaussian-backproject-seed", type=int, default=7)
     p.add_argument("--skip-export-viewer-plys", action="store_true")
     p.add_argument("--render-semantic-preview", action="store_true", help="Project colored semantic splat/object masks back to frames for QA.")
