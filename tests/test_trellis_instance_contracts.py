@@ -25,6 +25,9 @@ prepare = load_tool("prepare_trellis_bedroom4_instances")
 review = load_tool("review_trellis_instances_with_qwen")
 materialize = load_tool("materialize_trellis_vlm_splits")
 prompted = load_tool("prepare_trellis_prompted_instances")
+references = load_tool("materialize_trellis_prompted_references")
+geometry = load_tool("trellis_geometry_contracts")
+runner = load_tool("run_trellis_gaussian_batch")
 
 
 def test_projected_instance_seed_discards_unrelated_disconnected_component(tmp_path: Path) -> None:
@@ -170,3 +173,69 @@ def test_prompted_masks_resolve_shared_mullion_without_duplicate_alpha() -> None
     assert overlap_pixels == 360
     assert not np.any(resolved[0] & resolved[1])
     assert int((resolved[0] | resolved[1]).sum()) == int((left | right).sum())
+
+
+def test_prompted_reference_is_recorded_and_selected(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    reference = tmp_path / "reference.png"
+    Image.new("RGBA", (40, 60), (120, 130, 140, 255)).save(source)
+    edited = Image.new("RGBA", (80, 100), (255, 0, 255, 0))
+    edited.paste(Image.new("RGBA", (30, 70), (220, 225, 230, 255)), (25, 15))
+    edited.save(reference)
+    item = {"object_id": "window_01", "category": "window", "rgba_path": str(source)}
+    config = {
+        "provider": "test-editor",
+        "geometry_contract": {"kind": "planar", "max_thickness_to_short_side_ratio": 0.1},
+        "objects": {"window_01": {"prompt": "Create one thin planar window."}},
+    }
+    materialized = references.materialize_reference(
+        item,
+        config,
+        reference,
+        tmp_path / "output",
+        None,
+        min_alpha_pixels=100,
+        max_alpha_ratio=0.9,
+    )
+    selected, provenance, error = runner.generation_input(materialized, True, True)
+    assert error is None
+    assert selected and selected.is_file()
+    assert provenance and provenance["provider"] == "test-editor"
+    assert materialized["geometry_contract"]["kind"] == "planar"
+
+
+def test_prompted_reference_contract_blocks_missing_reference() -> None:
+    selected, provenance, error = runner.generation_input(
+        {"object_id": "window_01", "rgba_path": "original.png"},
+        use_prompted_reference=True,
+        require_prompted_reference=True,
+    )
+    assert selected is None
+    assert provenance is None
+    assert error == "missing_prompted_reference"
+
+
+def test_planar_geometry_gate_accepts_thin_plane_and_rejects_box() -> None:
+    yy, xx = np.meshgrid(np.linspace(-1.0, 1.0, 50), np.linspace(-0.6, 0.6, 40), indexing="ij")
+    thin_points = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(xx.size)])
+    thick_points = np.concatenate(
+        [
+            thin_points + np.asarray([0.0, 0.0, -0.35]),
+            thin_points + np.asarray([0.0, 0.0, 0.35]),
+        ],
+        axis=0,
+    )
+    opacity = np.ones(len(thin_points), dtype=np.float32)
+    contract = {
+        "kind": "planar",
+        "max_thickness_to_short_side_ratio": 0.1,
+        "opacity_threshold": 0.5,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+    }
+    thin = geometry.evaluate_geometry_contract(thin_points, opacity, contract)
+    thick = geometry.evaluate_geometry_contract(thick_points, np.ones(len(thick_points), dtype=np.float32), contract)
+    assert thin["status"] == "passed"
+    assert thin["thickness_to_short_side_ratio"] < 0.01
+    assert thick["status"] == "failed"
+    assert thick["thickness_to_short_side_ratio"] > 0.1

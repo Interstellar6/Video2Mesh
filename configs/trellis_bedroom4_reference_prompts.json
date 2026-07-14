@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "kind": "video2mesh.trellis_prompted_reference_config",
+  "provider": "gpt-image-2",
+  "geometry_contract": {
+    "kind": "planar",
+    "max_thickness_to_short_side_ratio": 0.1,
+    "opacity_threshold": 0.5,
+    "quantile_low": 0.01,
+    "quantile_high": 0.99
+  },
+  "objects": {
+    "sam3_window_01_left_pane": {
+      "prompt": "Use case: precise-object-edit. Image 1 is the edit target. Transform the selected window into a clean catalog reference of exactly one detached left window sash. Preserve the tall aspect ratio, white PVC frame, outer sash, and crossbar layout. Make it a thin planar construction with a shallow frame depth of about 4 cm and one opaque pale blue-gray glass panel. Front orthographic view, centered with generous padding. Remove the blinds, wall, furniture, room, reflections, outdoor scenery, adjacent pane, and any box-like back enclosure. Place it on a perfectly flat solid #ff00ff background with no shadow, gradient, texture, text, or watermark. Change only the presentation and ambiguous glazing content; keep the selected sash identity and proportions.",
+      "expected_subject": "one thin left window sash"
+    },
+    "sam3_window_01_right_pane": {
+      "prompt": "Use case: precise-object-edit. Image 1 is the edit target. Transform the selected window into a clean catalog reference of exactly one detached right window sash. Preserve the tall aspect ratio, white PVC frame, outer sash, and crossbar layout. Make it a thin planar construction with a shallow frame depth of about 4 cm and one opaque pale blue-gray glass panel. Front orthographic view, centered with generous padding. Remove the blinds, wall, furniture, room, reflections, outdoor scenery, adjacent pane, and any box-like back enclosure. Place it on a perfectly flat solid #ff00ff background with no shadow, gradient, texture, text, or watermark. Change only the presentation and ambiguous glazing content; keep the selected sash identity and proportions.",
+      "expected_subject": "one thin right window sash"
+    }
+  }
+}
