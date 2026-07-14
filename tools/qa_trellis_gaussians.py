@@ -201,12 +201,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-preview-points", type=int, default=140000)
     parser.add_argument("--input-manifest", type=Path, help="Optional TRELLIS input manifest containing per-object geometry_contract values.")
     parser.add_argument("--require-geometry-contract", action="store_true")
+    parser.add_argument("--objects", nargs="*", help="Optional object ids to validate.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     paths = sorted(args.input_dir.glob("*_trellis_gaussian.ply"))
+    wanted = set(args.objects or [])
+    if wanted:
+        paths = [path for path in paths if path.stem.removesuffix("_trellis_gaussian") in wanted]
+        found = {path.stem.removesuffix("_trellis_gaussian") for path in paths}
+        missing = sorted(wanted - found)
+        if missing:
+            raise FileNotFoundError(f"Requested TRELLIS Gaussian PLY files are missing: {missing}")
     if not paths:
         raise FileNotFoundError(f"No TRELLIS Gaussian PLY files in {args.input_dir}")
     contracts: dict[str, dict[str, Any]] = {}

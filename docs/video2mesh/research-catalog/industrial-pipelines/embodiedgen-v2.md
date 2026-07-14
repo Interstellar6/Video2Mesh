@@ -27,6 +27,8 @@ EmbodiedGen V2 是 Horizon Robotics / WuwenAI 在 2026-07 发布的 sim-ready 3D
 - Code: https://github.com/HorizonRobotics/EmbodiedGen
 - Paper: https://arxiv.org/abs/2607.07459
 - arXiv HTML: https://arxiv.org/html/2607.07459v1
+- TRELLIS official code: https://github.com/microsoft/TRELLIS
+- Hunyuan3D-2 official code: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
 - RoboVerse real asset example: https://roboverse.wiki/metasim/get_started/quick_start/14_real_asset
 - RoboVerse embodied layout example: https://roboverse.wiki/metasim/get_started/quick_start/16_embodiedgen_layout
 
@@ -440,6 +442,104 @@ tmp_remote_results/embodiedgen_v2_bedroom4_prompted_reference_rerun_20260714/
 ```
 
 这次改动解决的是“窗扇被补成厚盒子”的形状先验问题，不等于恢复了真实扫描几何。图像编辑器会把遮挡、玻璃纹理和五金细节补成一个合理但可能不真实的同类窗；因此新结果适合作为薄窗 visual candidate，不能直接覆盖扫描层，也不能在没有尺度回对、mesh/collider 和仿真测试时标成 sim-ready asset。
+
+### 全目标自动补全与独立资产装配（2026-07-14）
+
+窗扇实验说明详细 prompt 可以改善输入先验，但它还不是一个可批量运行的资产策略。本轮继续把同一方法扩展到 `bedroom_4` 的全部 12 个非结构实例，并把目标改成：**每个源实例必须自动得到一个可复用的独立资产，双联窗必须展开为两个子资产，低证据结果必须显式降级，任何 QA 失败都不能进入最终目录。**
+
+自动化不是让同一个 prompt 处理所有类别，而是先审计可见证据，再按类别选择动作和几何合同：
+
+```text
+instance RGBA + mask statistics
+  -> evidence tier: high / medium / low
+  -> policy: reuse / prompt-complete / prompt-split / external-split / reject
+  -> category-specific detailed completion prompt
+  -> prompt materialized as a clean single-object RGBA
+  -> TRELLIS image-conditioned Gaussian generation
+  -> finite-field sanitation in a new PLY copy
+  -> category geometry contract
+  -> optional deterministic planar center + covariance correction
+  -> fail-closed final asset assembly
+```
+
+这里的 prompt 不会直接传给当前 `run_old`。本地 TRELLIS 调用只消费 RGBA，因此文字中的“完整物体、只保留一个实例、补哪一部分、禁止出现什么、视角和厚度”先由图像编辑模型物化为参考图，TRELLIS 再从参考图生成 3D。官方 TRELLIS 代码还提供 text-to-image 后接 image-to-3D，以及 tuning-free multi-image conditioning；本轮没有把单帧扫描伪装成多视角，仍使用已经在 `mil8` 验证过的本地 image-conditioned 权重。Hunyuan3D-2 也公开了 multiview shape generation 和分离的 shape / texture pipeline，可作为后续真正多视角后端；本轮没有下载其另一套权重，因此不把它混写成本次结果。
+
+| 可复跑阶段 | 仓库入口 | 失败语义 |
+|---|---|---|
+| evidence / strategy / prompt planning | `tools/plan_trellis_auto_completion.py` + `configs/trellis_bedroom4_auto_completion.json` | 类别无策略、拆分无子任务或缺几何合同时停止 |
+| reference edit + alpha QA | `tools/run_trellis_reference_edit_jobs.py` | 前景过小、无透明背景、目标占满画布或 provider 失败时停止 |
+| prompted RGBA materialization | `tools/materialize_trellis_prompted_references.py` | 缺 provider provenance、prompt、hash 或 alpha 时停止 |
+| Gaussian generation | `tools/run_trellis_gaussian_batch.py` | 每个 object 独立记录 completed / blocked / failed |
+| non-finite sanitation | `tools/sanitize_trellis_gaussians.py` | 删除比例超过 `1%` 时拒绝，不修改 raw PLY |
+| file + category geometry QA | `tools/qa_trellis_gaussians.py` | 缺字段、非有限数、四元数异常或类别几何失败时拒绝 |
+| planar deterministic correction | `tools/enforce_trellis_planar_contracts.py` | 仅允许修正厚度比 `(0, 0.5]` 的平面类；更离谱的结果直接拒绝 |
+| final assembly | `tools/assemble_trellis_auto_completion_bundle.py` | 缺 QA、QA failed 或缺 PLY 时 non-zero exit |
+
+#### 证据分级与资产策略
+
+高/中/低证据由源 crop 的短边、alpha 像素数、3D 投影支撑率和原有 `low_detail_input` 标记共同决定。它不是“质量分高就一定生成”，而是控制允许宣称的 fidelity：低分辨率植物可以生成完整类别代理，但不能声称恢复了原植物的真实叶片和花盆。
+
+| 源实例 | 数量 | 自动策略 | 最终资产 | fidelity 解释 |
+|---|---:|---|---:|---|
+| bed | 1 | `reuse_baseline` | 1 | 复用已通过 QA 的扫描条件候选 |
+| lamp | 2 | `reuse_baseline` | 2 | 清晰输入已经得到可辨灯罩、灯杆和底座 |
+| door | 2 | `prompt_complete` | 2 | 从部分门板证据补成完整独立门扇；之后强制平面合同 |
+| nightstand | 2 | `prompt_complete` | 2 | 补齐被裁切的桌面、柜体或桌腿，要求三维体积不能坍成薄片 |
+| plant | 3 | `prompt_complete` | 3 | 补齐花盆、根部和植株；三件均标为低证据 category proxy |
+| window 01 | 1 | `external_split` | 2 | 复用上一轮已通过薄平面 QA 的左右独立窗扇 |
+| window 02 | 1 | `prompt_split` | 2 | 从一个双联窗观察分别生成左、右独立窗扇 |
+| **合计** | **12** | 3 reuse + 7 completion + 2 split policies | **14** | 每份 PLY 对应一个可单独寻址的资产 |
+
+详细 prompt 使用统一合同骨架，但类别段落不同。例如门要求 `exactly one complete shallow interior door leaf`，保留可见颜色、比例和 molding，禁止墙、门洞、相邻门和深柜体；床头柜要求完整桌面、四侧和落地支撑，禁止床、灯、墙和被截断边缘；植物要求一个完整花盆、连贯茎叶和从顶到底全物体，同时明确低证据时只能使用最不特定的素色圆柱花盆；双联窗则为左右子任务分别写 `exclude the right/left sash`，并限制约 `4 cm` 浅框深度。
+
+![自动补全后实际送入 TRELLIS 的 9 个单物体参考图](../assets/embodiedgen-v2-bedroom4-auto-completion-references.png "两扇门、两个床头柜、三盆植物和 window 02 的左右独立窗扇；图中每格只有一个完整目标，植物是低证据类别代理")
+
+#### mil8 生成、清洗与类别合同
+
+9 个新参考图在 `mil8` 的 RTX 3090 GPU 7 上串行生成，TRELLIS 采样总耗时 `133.83 s`，单件 `9.34-21.72 s`，峰值显存 `4.526 GB`。原始 9/9 PLY 都成功写出；其中四份在 raw opacity logit 中出现少量非有限点，因此没有直接放宽 QA，而是生成独立 sanitized copy：门 1 删除 `1,553 / 684,672`（`0.2268%`），门 2 删除 `6,368 / 958,304`（`0.6645%`），床头柜 2 删除 `15`，植物 1 删除 `21`。所有删除比例都低于 fail-closed 上限 `1%`，原始 PLY 保持不动。
+
+| 新资产 | TRELLIS 原始 Gaussian / 用时 | 最终 Gaussian | 类别几何合同与结果 |
+|---|---:|---:|---|
+| `sam3_door_01` | `684,672` / `15.15 s` | `683,119` | planar，厚度比 `0.36577 -> 0.11201`，Passed |
+| `sam3_door_02` | `958,304` / `16.67 s` | `951,936` | planar，厚度比 `0.36005 -> 0.11200`，Passed |
+| `sam3_nightstand_01` | `733,856` / `15.55 s` | `733,856` | bounded volume，厚/次短轴 `0.9561`，长/最短轴 `1.1294`，Passed |
+| `sam3_nightstand_02` | `726,304` / `16.82 s` | `726,289` | bounded volume，厚/次短轴 `0.9748`，长/最短轴 `1.2162`，Passed |
+| `sam3_plant_01` | `1,281,664` / `21.72 s` | `1,281,643` | upright volume，高/最大水平轴 `1.5171`，水平深度比 `0.9746`，lower support Passed |
+| `sam3_plant_02` | `710,528` / `15.47 s` | `710,528` | upright volume，高/最大水平轴 `1.4751`，水平深度比 `0.8156`，lower support Passed |
+| `sam3_plant_03` | `542,432` / `13.73 s` | `542,432` | upright volume，高/最大水平轴 `1.4276`，水平深度比 `0.9790`，lower support Passed |
+| `sam3_window_02_left_pane` | `102,400` / `9.34 s` | `102,400` | planar，厚度比 `0.07690 <= 0.10`，Passed |
+| `sam3_window_02_right_pane` | `121,856` / `9.37 s` | `121,856` | planar，厚度比 `0.05693 <= 0.10`，Passed |
+
+门的详细 prompt 已要求浅门板，但两份未经修正的 3D 仍被 TRELLIS 补成厚度比约 `0.36` 的箱体，说明**语义约束不能替代输出几何约束**。平面修正器以高 opacity 点做 robust PCA，只在源厚度比不超过 `0.5` 时允许修正；它把 Gaussian 中心沿最薄轴压到合同上限 `0.14` 的 `80%`，并对每个 Gaussian 的完整协方差执行 `A * covariance * A^T`，再分解回 log-scale 和归一化四元数。门 1/2 的轴缩放分别为 `0.30620` 和 `0.31107`，最终厚度比为 `0.11201` 和 `0.11200`；窗口已合格，不做二次变形。
+
+不同类别不能共用“越薄越好”的门禁：
+
+- door / window 使用 `planar`，拒绝异常厚盒子；
+- nightstand 使用 `bounded_volume`，同时拒绝薄片和极端长条；
+- plant 使用 `upright_volume`，检查高度、两个水平轴深度，以及**下端**是否有足够点和跨度支撑，避免把蓬松树冠误当成落地支撑；
+- bed / lamp 本轮只复用已有通过视觉审计的结果，不因自动化而无意义地重生成。
+
+![14 个最终独立资产的 TRELLIS Gaussian 三视图 QA](../assets/embodiedgen-v2-bedroom4-auto-completion-trellis-preview.png "最终 bundle 包含床、两扇门、两盏灯、两个床头柜、三盆植物和两组各自拆开的左右窗扇；点投影只用于结构审计")
+
+最终装配器读取 completion plan 和三组 QA（baseline、新生成、上一轮 window 01 split），只有 `status=passed` 且 PLY 存在的资产才复制到 `final_assets/`。本次实际装配为 **14/14 accepted、0 blocked、417 MB**，其中三盆植物使用 `accepted_with_fidelity_caveat`；manifest 逐件记录 source kind、fidelity、vertex count、bytes、geometry report 和 SHA-256。9 份 mil8 最终 PLY 回传后也逐文件完成远端/本地 SHA-256 对照，无差异。任何一件缺 QA、几何失败或文件缺失都会让命令非零退出，而不是把它写成 accepted。
+
+完整本地产物只保存在实验目录，不上传网站、不进入 Git：
+
+```text
+tmp_remote_results/embodiedgen_v2_bedroom4_auto_completion_20260714/
+  plan/                 # evidence tier、策略、详细 prompt、拆分子任务
+  reference_raw/        # prompt 编辑原图
+  reference_rgba/       # chroma key 后实际送入 TRELLIS 的透明 RGBA
+  run/output/           # raw 运行清单和 QA；raw PLY 只保留在 mil8
+  run/sanitized_output/ # 清洗清单；中间 PLY 只保留在 mil8
+  run/final_output/     # 平面合同修正后的 9 份最终新资产
+  run/final_qa/         # 9/9 文件、finite、quaternion、类别几何 QA
+  bundle/final_assets/  # baseline + 两组拆窗 + 新补全组成的 14 件独立资产
+  bundle/qa/            # 最终 14 件本地复读 QA 和三视图总览
+  bundle/auto_completion_asset_manifest.json
+```
+
+这批结果证明“其他物品也能按同一框架自动优化”，但不是证明它们已经是精确扫描模型或 sim-ready mesh。当前产物仍是 canonical-space Gaussian visual candidates，没有回填各自在房间中的真实尺度和位姿，也没有 mesh、背面真实性、collider、质量/摩擦、铰链或物理仿真验证。尤其植物 3 的源观察只有 `43 x 43` 像素，完整外形主要来自生成先验；清单中的 fidelity caveat 是资产合同的一部分，不能在下游被丢掉。
 
 ## 风险
 
