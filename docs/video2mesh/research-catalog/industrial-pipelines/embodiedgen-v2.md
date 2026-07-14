@@ -377,7 +377,7 @@ SAM3 semantic text "window" + positive geometric box
   -> PLY field / finite / quaternion QA
 ```
 
-每个物体合同都要求描述可见材质、框体、玻璃、百叶、朝向、遮挡和边界，同时明确禁止合并 `adjacent window pane`、共享框之外的结构、墙、床、床头柜和植物。这个详细 prompt 用于支持文本条件的通用 VLM 或物理资产描述器；本次 TRELLIS `run_old` 接口本身只接收 RGBA，不能把文字直接作为生成条件，所以真正改善精度的是先把文字语义落成 SAM3 的实例级几何约束。
+每个物体合同都要求描述可见材质、框体、玻璃、百叶、朝向、遮挡和边界，同时明确禁止合并 `adjacent window pane`、共享框之外的结构、墙、床、床头柜和植物。TRELLIS `run_old` 接口本身只接收 RGBA，不能把文字直接作为生成条件；首轮修复因此先把文字语义落成 SAM3 的实例级几何约束。后续若要让更详细的描述真正影响 TRELLIS，必须先用支持文本条件的图像编辑器把描述物化为新的 RGBA，再把该图送进 TRELLIS，而不是假装 `run_old` 已经吃到了 prompt。
 
 本机缓存的 PhysX-Anything Qwen2.5-VL 权重也做了真实探测：它是专用 voxel decoder fine-tune，面对通用 JSON 审核提示会输出体素编号序列，而不是实例描述。代码因此将此输出识别为 `unsupported_voxel_sequence` 并 fail-closed，绝不把它误报为 VLM 已完成窗扇识别。后续接入通用 instruction-following VLM 时，可直接复用相同的 JSON instance contract；当前可复现实验则依赖 SAM3 文本加正向框。
 
@@ -399,6 +399,47 @@ tmp_remote_results/embodiedgen_v2_bedroom4_instance_refinement_20260714/
 ```
 
 这证明“每扇窗独立生成”已经完成，但仍只是一对 visual completion candidates：没有回填真实世界坐标、mesh、collider、玻璃物理、铰链、URDF 或仿真验证。
+
+### Prompt 编辑参考图重跑（2026-07-14）
+
+拆开左右窗扇后，首轮 PLY 虽然通过字段、finite 和四元数检查，侧视图却仍像一段房间壳体。原因是文件合同只能证明“Gaussian 文件可读”，不能证明“窗户应当是薄平面”。本轮把详细描述放到 TRELLIS 前面的图像编辑阶段，并新增形状硬门禁：
+
+```text
+bedroom_4 single-pane RGBA
+  -> prompt-guided image edit (exactly one sash, front orthographic, about 4 cm frame depth)
+  -> chroma-key removal to clean RGBA
+  -> require_prompted_references=true
+  -> TRELLIS image-only Gaussian generation
+  -> file QA + robust PCA planar-thickness gate
+```
+
+图像编辑使用本地已配置的 OpenAI-compatible 接口和 `gpt-image-2`。左右 prompt 分别要求：只保留一扇 detached left/right sash；保持高宽比、白色 PVC 外框和横竖框布局；限制为约 `4 cm` 浅框深度、正交正视图和浅蓝灰色不透明玻璃；删除百叶、墙、家具、室内、倒影、室外景物、相邻窗扇、阴影以及箱体式后壳。输出先落在纯色背景，再做 chroma key 得到透明 RGBA。TRELLIS 仍然只看图，文本条件通过参考图间接生效。
+
+![详细 prompt 编辑后、实际送入 TRELLIS 的左右窗扇参考图](../assets/embodiedgen-v2-bedroom4-window-prompted-references.png "左、右窗扇分别成为单物体正视参考图；透明区域在预览中以深色显示")
+
+几何门禁只统计 opacity `>= 0.5` 的 Gaussian，用 PCA 求主轴后，在每个轴上取 `1%-99%` 分位跨度。对 `planar` 合同，最短轴厚度除以次短轴边长必须 `<= 0.10`。旧结果即使文件 QA Passed，也会被该门禁拒绝；本轮两份新结果均通过。
+
+| 窗扇 | 旧 Gaussian / 厚度比 | Prompt 参考图新 Gaussian / 用时 | 新 PCA 跨度 / 厚度比 | 结果 / PLY SHA-256 |
+|---|---:|---:|---:|---|
+| left | `538,656` / `0.52983` | `85,632` / `10.97 s` | `[0.99312, 0.42646, 0.02681]` / `0.06287` | **Passed** / `ecbd3bbf87c8d28940583c9ac4e0d4c1021d5e3f70929b5578849cc7695ccdb0` |
+| right | `213,856` / `0.36216` | `88,896` / `9.19 s` | `[0.99356, 0.42782, 0.02657]` / `0.06210` | **Passed** / `bae4bde006702a6c6e77716ed347173debfca86a7671645f6056e4e79df817ad` |
+
+![Prompt 参考图重跑后的两扇窗 TRELLIS Gaussian 三视图](../assets/embodiedgen-v2-bedroom4-window-prompted-trellis-preview.png "正视图保持窗框结构，两个侧视图已收敛为薄层；左右厚度比分别为 0.06287 和 0.06210")
+
+本轮在 `mil8` 的 RTX 3090 GPU 7 上运行，峰值显存约 `3.827 GB`；两份 PLY 的必需字段均存在、全部数值 finite、四元数范数中位数为 `1.0`。远端与回传本地的 SHA-256 完全一致，原始产物仅保存在：
+
+```text
+tmp_remote_results/embodiedgen_v2_bedroom4_prompted_reference_rerun_20260714/
+  reference_raw/          # 图像编辑原图
+  reference_rgba/         # chroma key 后的透明输入
+  baseline_geometry_qa/   # 旧 PLY 通过文件 QA、未通过平面门禁的证据
+  run/input/              # 强制 prompt-reference 的选择清单和实际输入
+  run/output/             # 两份新 Gaussian PLY，不进 Git、不上传网站
+  run/qa/                 # 字段 QA、几何合同 JSON 和三视图
+  logs/                   # 远端运行日志
+```
+
+这次改动解决的是“窗扇被补成厚盒子”的形状先验问题，不等于恢复了真实扫描几何。图像编辑器会把遮挡、玻璃纹理和五金细节补成一个合理但可能不真实的同类窗；因此新结果适合作为薄窗 visual candidate，不能直接覆盖扫描层，也不能在没有尺度回对、mesh/collider 和仿真测试时标成 sim-ready asset。
 
 ## 风险
 
