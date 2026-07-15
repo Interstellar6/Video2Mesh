@@ -76,4 +76,4 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 
 ![Holi-Spatial bedroom_4 TSDF mesh](assets/holi-spatial-bedroom4-rerun-20260714-tsdf-mesh.png "本轮官方 PGSR TSDF mesh：床、墙、窗和地面连续，整体重建质量良好")
 
-人工 QA 显示 TSDF mesh、DA3 RGB 点云、床/台灯/床头柜/窗对象云、DA3 palette semantic PLY 和 semantic 3DGS 均值得归档。PGSR 30k 原始 Gaussian 的主体空洞已基本修复，但场景边缘仍有少量拉丝与漂浮伪影；两个 600 MiB 级语义 PLY 只完成结构和投影 QA，避免在 MacBook 查看器中触发显存耗尽。
+人工 QA 显示 TSDF mesh、DA3 RGB 点云、床/台灯/床头柜/窗对象云、DA3 palette semantic PLY 和 semantic 3DGS 均值得归档。PGSR 30k 原始 Gaussian 的主体空洞已基本修复，但场景边缘仍有少量拉丝与漂浮伪影；约 946 MiB 的 `semantic_supersplat.ply` 和两份约 213 MiB 的语义 PGSR PLY 只完成结构和投影 QA，避免在 MacBook 查看器中触发显存耗尽。
