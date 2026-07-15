@@ -616,7 +616,7 @@ tmp_remote_results/embodiedgen_v2_bedroom4_auto_completion_20260714/
 ## 接入判断
 
 - P0：不改 Video2Mesh 主重建链路。继续保持 COLMAP、GraphDECO 3DGS、scene mesh、object split、semantic transfer 的分层资产路线。
-- P1：把 EmbodiedGen V2 的 asset contract 落到 `simulator_asset_bundle` manifest：visual/collision/physics/semantic/adapters/validation 分目录。
+- P1：把 EmbodiedGen V2 的 asset contract 落到 `simulator_asset_bundle` manifest：按 visual、collision、physics、semantic、adapters、validation 分目录。
 - P1：新增 collision preflight：mesh stats、non-manifold 检查、bbox/scale 检查、ground probe、简单 rigid-body drop/settle。
 - P1/P2：给 object sidecar 扩展 material、mass、friction、affordance、grasp pose 和 source/confidence 字段。
 - P2：实现 URDF/MJCF/USD adapter。优先 MuJoCo/Genesis，再看 Isaac Sim/Unity。
