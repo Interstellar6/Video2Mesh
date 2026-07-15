@@ -22,15 +22,15 @@ EmbodiedGen V2 是 Horizon Robotics / WuwenAI 在 2026-07 发布的 sim-ready 3D
 
 ## 链接
 
-- 微信入口: https://mp.weixin.qq.com/s/ss2zoYr2hVpJfGlwufiMwQ?scene=1
-- Project page: https://horizonrobotics.github.io/EmbodiedGen/
-- Code: https://github.com/HorizonRobotics/EmbodiedGen
-- Paper: https://arxiv.org/abs/2607.07459
-- arXiv HTML: https://arxiv.org/html/2607.07459v1
-- TRELLIS official code: https://github.com/microsoft/TRELLIS
-- Hunyuan3D-2 official code: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
-- RoboVerse real asset example: https://roboverse.wiki/metasim/get_started/quick_start/14_real_asset
-- RoboVerse embodied layout example: https://roboverse.wiki/metasim/get_started/quick_start/16_embodiedgen_layout
+- 微信入口: [微信文章](https://mp.weixin.qq.com/s/ss2zoYr2hVpJfGlwufiMwQ?scene=1)
+- Project page: [EmbodiedGen V2](https://horizonrobotics.github.io/EmbodiedGen/)
+- Code: [HorizonRobotics/EmbodiedGen](https://github.com/HorizonRobotics/EmbodiedGen)
+- Paper: [arXiv 2607.07459](https://arxiv.org/abs/2607.07459)
+- arXiv HTML: [2607.07459v1](https://arxiv.org/html/2607.07459v1)
+- TRELLIS official code: [microsoft/TRELLIS](https://github.com/microsoft/TRELLIS)
+- Hunyuan3D-2 official code: [Tencent-Hunyuan/Hunyuan3D-2](https://github.com/Tencent-Hunyuan/Hunyuan3D-2)
+- RoboVerse real asset example: [Real-asset quick start](https://roboverse.wiki/metasim/get_started/quick_start/14_real_asset)
+- RoboVerse embodied layout example: [EmbodiedGen layout quick start](https://roboverse.wiki/metasim/get_started/quick_start/16_embodiedgen_layout)
 
 ## 基本信息
 
