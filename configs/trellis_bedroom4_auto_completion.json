@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "kind": "video2mesh.trellis_auto_completion_policy",
+  "provider": {
+    "name": "gpt-image-2",
+    "quality": "medium",
+    "background": "#ff00ff"
+  },
+  "evidence_thresholds": {
+    "high_min_short_side": 144,
+    "high_min_alpha_pixels": 8000,
+    "high_min_support_ratio": 0.75,
+    "medium_min_short_side": 80,
+    "medium_min_alpha_pixels": 2000,
+    "medium_min_support_ratio": 0.45
+  },
+  "categories": {
+    "bed": {
+      "strategy": "reuse_baseline",
+      "subject": "bed assembly",
+      "expected_subject": "one complete bed assembly"
+    },
+    "lamp": {
+      "strategy": "reuse_baseline",
+      "subject": "table lamp",
+      "expected_subject": "one complete table lamp"
+    },
+    "door": {
+      "strategy": "prompt_complete",
+      "subject": "interior door leaf",
+      "expected_subject": "one complete shallow interior door leaf",
+      "size": "1024x1536",
+      "view": "Near-front orthographic product view with only a subtle depth cue so the shallow edge thickness remains visible.",
+      "completion": "Continue the visible plain white door profile into one complete rectangular door leaf. Keep the slab shallow and architectural, with realistic but minimal edge and hinge-side detail. Preserve visible color and molding profile; do not invent ornate panels or a surrounding wall opening.",
+      "avoid": "door frame outside the leaf, wall, floor, trim, adjacent door, furniture, deep cabinet-like body, thick box enclosure",
+      "geometry_contract": {
+        "kind": "planar",
+        "max_thickness_to_short_side_ratio": 0.14,
+        "opacity_threshold": 0.5,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99
+      }
+    },
+    "nightstand": {
+      "strategy": "prompt_complete",
+      "subject": "bedside nightstand",
+      "expected_subject": "one complete freestanding bedside nightstand",
+      "size": "1024x1024",
+      "view": "Centered front three-quarter catalog view showing the front, top, side depth, and contact with the ground.",
+      "completion": "Complete the visible dark wood furniture into one coherent freestanding bedside nightstand. Preserve the visible top profile, wood color, drawer-front cues, hardware, and leg style. Continue occluded parts conservatively using symmetry and simple furniture construction.",
+      "avoid": "bed, lamp, wall, floor patch, floating tabletop, console table extension, extra drawers, extra furniture, disconnected duplicate legs",
+      "geometry_contract": {
+        "kind": "bounded_volume",
+        "min_thickness_to_short_side_ratio": 0.22,
+        "max_long_side_to_short_side_ratio": 4.5,
+        "opacity_threshold": 0.5,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99
+      }
+    },
+    "plant": {
+      "strategy": "prompt_complete",
+      "subject": "potted indoor plant",
+      "expected_subject": "one complete potted indoor plant",
+      "size": "1024x1536",
+      "view": "Centered eye-level front three-quarter catalog view showing the full pot, stems, and foliage from top to bottom.",
+      "completion": "Preserve the visible foliage color, density, and broad silhouette. Complete exactly one plant with coherent stems rooted in one simple neutral pot. When the pot is not visible, use the least-specific plain cylindrical indoor pot and mark the result as a generated category proxy rather than observed geometry.",
+      "avoid": "second plant, planter stand, wall, furniture, floor patch, floating foliage ball, bouquet, outdoor landscape, decorative scene",
+      "geometry_contract": {
+        "kind": "upright_volume",
+        "vertical_axis": "y",
+        "min_height_to_max_horizontal_ratio": 0.55,
+        "max_height_to_max_horizontal_ratio": 4.5,
+        "min_horizontal_depth_ratio": 0.16,
+        "end_band_fraction": 0.18,
+        "supported_end": "lower",
+        "min_supported_end_point_fraction": 0.025,
+        "min_supported_end_span_ratio": 0.12,
+        "opacity_threshold": 0.5,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99
+      }
+    },
+    "window": {
+      "strategy": "prompt_complete",
+      "subject": "architectural window unit",
+      "expected_subject": "one complete shallow window unit",
+      "size": "1024x1536",
+      "view": "Front orthographic product view with a tiny shallow edge cue, centered with generous padding.",
+      "completion": "Complete exactly one independently framed window unit. Preserve visible white frame proportions, mullion layout, and glazing color. Keep the construction shallow and planar with approximately 4 cm frame depth.",
+      "avoid": "adjacent window unit, wall, blinds, curtain, outdoor view, furniture, room shell, thick box enclosure",
+      "geometry_contract": {
+        "kind": "planar",
+        "max_thickness_to_short_side_ratio": 0.1,
+        "opacity_threshold": 0.5,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99
+      }
+    }
+  },
+  "objects": {
+    "sam3_window_01": {
+      "strategy": "external_split",
+      "replacement_ids": [
+        "sam3_window_01_left_pane",
+        "sam3_window_01_right_pane"
+      ]
+    },
+    "sam3_window_02": {
+      "strategy": "prompt_split",
+      "units": [
+        {
+          "unit_id": "left_pane",
+          "subject": "detached left window sash",
+          "expected_subject": "one complete shallow left window sash",
+          "completion": "Extract and complete only the left sash visible in the window observation. Preserve its white frame, tall proportions, glazing color, and crossbar layout. Exclude the right sash and any shared structure outside the left unit. Keep approximately 4 cm shallow frame depth."
+        },
+        {
+          "unit_id": "right_pane",
+          "subject": "detached right window sash",
+          "expected_subject": "one complete shallow right window sash",
+          "completion": "Extract and complete only the right sash visible in the window observation. Preserve its white frame, tall proportions, glazing color, and crossbar layout. Exclude the left sash and any shared structure outside the right unit. Keep approximately 4 cm shallow frame depth."
+        }
+      ]
+    }
+  }
+}

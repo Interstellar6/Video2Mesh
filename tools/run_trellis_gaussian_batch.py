@@ -68,6 +68,24 @@ def reviewed_specs(path: Path) -> dict[str, dict[str, Any]]:
     return specs
 
 
+def generation_input(
+    item: dict[str, Any],
+    use_prompted_reference: bool,
+    require_prompted_reference: bool,
+) -> tuple[Path | None, dict[str, Any] | None, str | None]:
+    reference = item.get("prompted_reference")
+    if (use_prompted_reference or require_prompted_reference) and isinstance(reference, dict):
+        path = reference.get("rgba_path")
+        if isinstance(path, str) and path:
+            return Path(path), reference, None
+    if require_prompted_reference:
+        return None, None, "missing_prompted_reference"
+    path = item.get("rgba_path")
+    if not isinstance(path, str) or not path:
+        return None, None, "missing_rgba_input"
+    return Path(path), None, None
+
+
 def gaussian_only_weight_root(weights: Path, output_root: Path) -> Path:
     config = read_json(weights / "pipeline.json")
     args = config.get("args")
@@ -142,6 +160,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--objects", nargs="*")
     parser.add_argument(
+        "--use-prompted-references",
+        action="store_true",
+        help="Use prompted_reference.rgba_path when present in the input manifest.",
+    )
+    parser.add_argument(
+        "--require-prompted-references",
+        action="store_true",
+        help="Block jobs that do not have a prompted reference instead of falling back to the original RGBA.",
+    )
+    parser.add_argument(
         "--vlm-spec-manifest",
         type=Path,
         help="Validated instance-contract review. Entries without generation_allowed=true are blocked.",
@@ -169,12 +197,31 @@ def main() -> int:
     allowed_jobs: list[dict[str, Any]] = []
     for item in jobs:
         object_id = str(item["object_id"])
+        input_path, prompted_reference, input_error = generation_input(
+            item,
+            args.use_prompted_references,
+            args.require_prompted_references,
+        )
+        if input_error:
+            results.append(
+                {
+                    "object_id": object_id,
+                    "input": "",
+                    "status": "blocked_by_prompted_reference_contract",
+                    "reason": input_error,
+                }
+            )
+            print(f"blocked {object_id}: {input_error}", flush=True)
+            continue
+        prepared_item = dict(item)
+        prepared_item["_generation_input_path"] = str(input_path)
+        prepared_item["_prompted_reference"] = prompted_reference
         if not args.vlm_spec_manifest:
-            allowed_jobs.append(item)
+            allowed_jobs.append(prepared_item)
             continue
         spec = specs.get(object_id)
         if spec and spec.get("generation_allowed") is True:
-            allowed_jobs.append(item)
+            allowed_jobs.append(prepared_item)
             continue
         results.append(
             {
@@ -195,7 +242,8 @@ def main() -> int:
 
     for index, item in enumerate(allowed_jobs):
         object_id = str(item["object_id"])
-        input_path = Path(str(item["rgba_path"]))
+        input_path = Path(str(item["_generation_input_path"]))
+        prompted_reference = item.get("_prompted_reference")
         ply_path = output_dir / f"{object_id}_trellis_gaussian.ply"
         entry: dict[str, Any] = {
             "object_id": object_id,
@@ -204,7 +252,15 @@ def main() -> int:
             "seed": int(args.seed + index),
             "formats": ["gaussian"],
             "preprocess_image": True,
+            "input_source": "prompted_reference" if isinstance(prompted_reference, dict) else "original_rgba",
         }
+        if isinstance(prompted_reference, dict):
+            entry["prompted_reference"] = {
+                "provider": prompted_reference.get("provider"),
+                "prompt": prompted_reference.get("prompt"),
+                "sha256": prompted_reference.get("sha256"),
+                "source_rgba_path": prompted_reference.get("source_rgba_path"),
+            }
         if args.vlm_spec_manifest:
             entry["vlm_spec_manifest"] = str(args.vlm_spec_manifest.resolve())
             entry["vlm_decision"] = specs[object_id].get("decision")
@@ -263,6 +319,8 @@ def main() -> int:
         "dino_source": str(args.dino_source.resolve()),
         "job_count": len(jobs),
         "allowed_job_count": len(allowed_jobs),
+        "use_prompted_references": args.use_prompted_references,
+        "require_prompted_references": args.require_prompted_references,
         "vlm_spec_manifest": str(args.vlm_spec_manifest.resolve()) if args.vlm_spec_manifest else None,
         "results": results,
     }
@@ -270,7 +328,7 @@ def main() -> int:
     write_json(worker_manifest_path, worker_manifest)
     completed = sum(item.get("status") == "completed" for item in results)
     failed = sum(item.get("status") == "failed" for item in results)
-    blocked = sum(item.get("status") == "blocked_by_vlm_instance_contract" for item in results)
+    blocked = sum(str(item.get("status", "")).startswith("blocked_by_") for item in results)
     print(f"worker gpu={args.gpu}: completed={completed} blocked={blocked} failed={failed} manifest={worker_manifest_path}", flush=True)
     return 1 if failed else 0
 
