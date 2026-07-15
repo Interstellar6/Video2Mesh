@@ -543,6 +543,8 @@ instance RGBA + mask statistics
 | `sam3_nightstand_01` | `323 x 339`，台面与支腿残缺 | `733,856` | 补出完整矩形台面、围边、抽屉/把手和四腿支撑 |
 | `sam3_nightstand_02` | `335 x 206`，只见部分台面与单侧结构 | `726,289` | 保留弧形后挡板和木色，补成完整抽屉式床头柜 |
 
+以下五张均为本次从 Gaussian viewer 截取的最终资产视图，与上面的原始扫描证据一一对应。
+
 ![自动补全后的 plant 01 Gaussian viewer](../assets/embodiedgen-v2-bedroom4-auto-completion-plant-01-viewer.png "plant 01：从 115 x 79 像素叶团补成带圆柱花盆、枝干和圆冠的完整独立植物")
 
 ![自动补全后的 plant 02 Gaussian viewer](../assets/embodiedgen-v2-bedroom4-auto-completion-plant-02-viewer.png "plant 02：补出花盆、土面、枝干与具有三维层次的混合叶簇")
