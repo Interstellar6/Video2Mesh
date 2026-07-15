@@ -156,7 +156,7 @@ scene images
   -> bbox / caption / spatial QA
 ```
 
-本项目此前 `bedroom_4` Holi-Spatial-compatible smoke run 没有跑 DA3：源包里没有 `depth_da3/*.npy`，且当时服务器磁盘不适合再下载完整 DA3/SAM3/PGSR/VLM 依赖。因此那次只应写成 schema / QA adapter，不是 DA3 复现。
+当前保留的 `bedroom_4` Holi-Spatial fresh run 已实际执行官方 `DA3NESTED-GIANT-LARGE`，生成 80 张 `depth_da3/*.npy` 和 4,000,000 点 `pointcloud_da3.ply`。历史 smoke run 已清理，不再作为 DA3 实验结论。
 
 ## 和 Video2Mesh 现有方法的关系
 
@@ -218,11 +218,11 @@ DA3 的点云和 GLB preview 不能直接当 simulator collider。它们缺少 w
 | 长视频 | 官方提供 DA3-Streaming，宣称滑窗方式可低于 12GB GPU memory 处理超长序列；需要单独测试 |
 | 生产集成 | 先用 Base/Small/Large 做格式和 pipeline 验证，再切 Nested/Giant 做质量对照 |
 
-如果在 `mil8` 做第一版实验，建议先不要跑完整 Holi-Spatial，而是只跑 DA3：
+如果后续要新建 run 验证 DA3，使用新的空目录而不要改写已完成的 fresh run：
 
 ```bash
-cd /data/zyx/workspace/Holi-Spatial
-SCENE_DIR=/data/zyx/workspace/holi_spatial_runs/bedroom_4_smoke_20260709/scannetppv2/data/bedroom_4 \
+cd /data/zyx/workspace/third_party/holi-spatial
+SCENE_DIR=/data/design/zyx/workspace/holi_spatial_runs/<new_run>/scannetppv2/data/bedroom_4 \
   CUDA_VISIBLE_DEVICES=0 bash run_da3.sh
 ```
 
@@ -246,7 +246,7 @@ SCENE_DIR=/data/zyx/workspace/holi_spatial_runs/bedroom_4_smoke_20260709/scannet
 
 - P0：不替代 COLMAP 主链路。
 - P1：作为 learned depth / pose / point-cloud prior 加入实验队列，优先做 `bedroom_4` 小样本对照。
-- P1：给 Holi-Spatial adapter 补官方 `depth_da3/*.npy`，验证 bbox lifting 是否比当前 proxy/schema smoke run 更稳。
+- P1：以当前真实 `depth_da3/*.npy` 为基线，继续验证 bbox lifting、遮挡过滤和 PGSR 直接语义投影的稳定性。
 - P1：把 DA3 depth 作为 PGSR / GraphDECO short refinement 的初始化或正则候选。
 - P2：跟踪 DA3-Streaming 和 DA3 3DGS head，评估长视频和快速 visual preview 价值。
 - 禁止：把 DA3 PLY / GLB / Gaussian preview 直接标成 final mesh、collider、semantic scene graph 或 simulator asset。

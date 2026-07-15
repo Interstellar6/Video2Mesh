@@ -1,6 +1,6 @@
 ---
 title: Holi-Spatial bedroom_4 DA3 + SAM3 + PGSR 全链路重跑
-id: video2mesh-experiments-holi-spatial-bedroom4-full-run-20260713
+id: video2mesh-experiments-holi-spatial-bedroom4-fresh-run-20260714
 category: 实验目录
 visibility: public
 updated: 2026-07-15
@@ -17,7 +17,7 @@ tags:
 
 # Holi-Spatial bedroom_4 全链路重跑
 
-本页已用 `2026-07-14` 的真实重跑结果覆盖此前的 Holi-Spatial 实验归档。它不是历史 schema smoke run，也没有复用旧 DA3、SAM2 或 3DGS 输出冒充新结果：DA3、SAM3、PGSR 30k、TSDF mesh、Video2Mesh 的 2D-to-3D lifting 和 bbox 后处理都重新执行。
+本页只记录 `2026-07-14 18:42` 的 fresh 全链路 run。历史 Holi-Spatial schema smoke、代理分割和早期 PGSR 输出均已从归档中清理；本页中的 DA3、SAM3、PGSR 30k、TSDF mesh、Video2Mesh 2D-to-3D lifting 和 bbox 后处理都在本次 run 中重新执行。
 
 相关方法、论文组件分工、硬件边界和论文级未复现部分见：[Holi-Spatial 调研与 bedroom_4 实验报告](../research-catalog/semantic-scene-graph/holi-spatial.md)。
 
@@ -26,15 +26,15 @@ tags:
 | 项目 | 本次实际内容 |
 |---|---|
 | 场景输入 | `bedroom_4` 的 80 帧与校正后的相机参数 |
-| 重跑目录 | `mil8:/data/zyx/workspace/holi_spatial_runs/bedroom_4_rerun_da3_sam3_pgsr_20260714_011621` |
-| 本地归档 | `tmp_remote_results/holi_spatial_bedroom4_rerun_da3_sam3_pgsr_20260714_011621/` |
+| 重跑目录 | `mil8:/data/design/zyx/workspace/holi_spatial_runs/bedroom_4_fresh_da3_sam3_pgsr_20260714_184217` |
+| 本地归档 | `tmp_remote_results/holi_spatial_bedroom4_fresh_da3_sam3_pgsr_20260714_184217/` |
 | DA3 | 官方 `DA3NESTED-GIANT-LARGE`，80 张深度，4,000,000 点初始场景点云 |
 | SAM3 | 真实 checkpoint 的文本提示推理，957 个源实例 mask 合并为 616 个 class-frame 概率 mask |
-| PGSR | 官方单场景优化至 iteration 30,000，867,077 个 Gaussians |
-| 几何表面 | 官方 PGSR render/TSDF 后处理，704,084 vertices / 1,364,354 faces |
+| PGSR | 官方单场景优化至 iteration 30,000，871,317 个 Gaussians |
+| 几何表面 | 官方 PGSR render/TSDF 后处理，694,773 vertices / 1,351,454 faces |
 | 语义 3DGS | SAM3 2D 概率 mask 直接回投到 PGSR Gaussian centers，带 z-buffer 可见性过滤和逐 Gaussian 概率聚合 |
 
-相机 `world-to-camera` round-trip 最大误差为 `1.33e-15`；PGSR 日志中没有 `depth not found` warning。PGSR iteration 30,000 的 train evaluation 是 L1 `0.0117853`、PSNR `33.3745 dB`。这些是单场景训练日志指标，不是论文的 ScanNet/ScanNet++ benchmark。
+相机 `world-to-camera` round-trip 最大误差为 `1.33e-15`；PGSR 日志中没有 `depth not found` warning。PGSR iteration 30,000 的 train evaluation 是 L1 `0.0118202`、PSNR `33.1155 dB`。这些是单场景训练日志指标，不是论文的 ScanNet/ScanNet++ benchmark。
 
 ## 组件与数据流
 
@@ -85,12 +85,12 @@ GroundingDINO 从 68 个候选中得到 20 个 prompts 和 9 个类别候选；S
 
 物体 PLY 均从同一份 DA3 4M 点云按 SAM3 融合标签抽取，保留 RGB 和原始坐标。它们不是补全后的 watertight object mesh。
 
-| 对象 | 对应实例 | 点数 | 人工检查 |
-|---|---|---:|---|
-| 床 | `sam3_bed_01.ply` | 1,076,890 | 结构完整，床头、被褥与床沿可辨认，结果良好 |
-| 台灯 | `sam3_lamp_01.ply` | 37,927 | 灯罩、灯杆和底座形状可辨认，结果良好 |
-| 床头柜 | `sam3_nightstand_01.ply` | 75,032 | 台面、立柱和主体轮廓清楚，结果良好 |
-| 窗 | `sam3_window_01.ply` | 406,696 | 玻璃/窗框区域连续，新增截图后确认结果良好 |
+| 对象 | 对应实例 | 人工检查 |
+|---|---|---|
+| 床 | `sam3_bed_01.ply` | 结构完整，床头、被褥与床沿可辨认，结果良好 |
+| 台灯 | `sam3_lamp_01.ply` | 灯罩、灯杆和底座形状可辨认，结果良好 |
+| 床头柜 | `sam3_nightstand_01.ply` | 台面、立柱和主体轮廓清楚，结果良好 |
+| 窗 | `sam3_window_01.ply` | 玻璃/窗框区域连续，新增截图后确认结果良好 |
 
 ![Bed object point cloud](assets/holi-spatial-bedroom4-rerun-20260714-object-bed.png "sam3_bed_01.ply：床头、床体和床单整体被正确聚合")
 
@@ -112,9 +112,9 @@ GroundingDINO 从 68 个候选中得到 20 个 prompts 和 9 个类别候选；S
 
 ![Semantic 3DGS viewer](assets/holi-spatial-bedroom4-rerun-20260714-semantic-3dgs.png "semantic Gaussian viewer：语义类别可见，床、窗、地面和墙的空间关系与场景重建对齐")
 
-语义 3DGS 的视觉检查结果良好。主产物 `semantic_pgsr_30k_projected.ply` 保留原始 Gaussian 字段，并追加 `object_id/object_probability`；这次标签来自 SAM3 2D mask 到 PGSR Gaussian 的直接投影，而非把 DA3 最近邻结果当作唯一方法。10 帧投影 QA 均有效，8 个有效类别都选中了 Gaussian，共 528,582 个选中 Gaussian；平均可见前景比例为 `0.79565`。
+语义 3DGS 的视觉检查结果良好。主产物 `semantic_pgsr_30k_projected.ply` 保留原始 Gaussian 字段，并追加 `object_id/object_probability`；这次标签来自 SAM3 2D mask 到 PGSR Gaussian 的直接投影，而非把 DA3 最近邻结果当作唯一方法。10 帧投影 QA 均有效，8 个有效类别都选中了 Gaussian，共 701,608 个选中 Gaussian。
 
-展示用 `semantic_gaussian_probability_supersplat.ply` 是 binary、SuperSplat 友好的派生物，用于语义视觉审阅；它不能替代原始 PGSR Gaussian。`semantic_pgsr_30k.ply` 和 `semantic_pgsr_30k_projected.ply` 各约 600 MiB，当前 MacBook 上直接加载可能触发显存耗尽，因此这两个大文件本轮只做了字段、大小、顶点数和投影 QA，不把“未打开”误报成视觉质量结论。
+展示用 `semantic_gaussian_probability_supersplat.ply` 是 binary、SuperSplat 友好的派生物，用于语义视觉审阅；它不能替代原始 PGSR Gaussian。`semantic_supersplat.ply` 约 946 MiB，两个语义 PGSR PLY 各约 213 MiB；当前 MacBook 上直接加载大型 Gaussian PLY 可能触发显存耗尽，因此未打开的大文件只做了字段、大小、顶点数和投影 QA，不把“未打开”误报成视觉质量结论。
 
 ## 自动 QA 与产物清单
 
@@ -124,21 +124,22 @@ GroundingDINO 从 68 个候选中得到 20 个 prompts 和 9 个类别候选；S
 | DA3 | Passed | 80 depth maps；4,000,000 点 |
 | SAM3 | Passed | 957 源实例 mask；8 个有效类别；616 个 class-frame 概率 mask |
 | 2D-to-3D / bbox | Passed | 概率融合、遮挡过滤、至少 2 次投票；13 个 3D records |
-| PGSR 30k | Passed | iteration 30,000；867,077 Gaussians；缺失 depth warning 为 0 |
-| TSDF mesh | Passed | 704,084 vertices / 1,364,354 faces |
+| PGSR 30k | Passed | iteration 30,000；871,317 Gaussians；缺失 depth warning 为 0 |
+| TSDF mesh | Passed | 694,773 vertices / 1,351,454 faces |
 | PGSR 语义投影 | Passed | 10/10 preview frames 有效；8/8 类有选中 Gaussian |
 
 | 文件 | 规模 | 用途与状态 |
 |---|---:|---|
 | `pointcloud_da3.ply` | 57.2 MiB，4,000,000 points | DA3 RGB 初始点云，已人工检查 |
-| `semantic_da3_points.ply` | 225.6 MiB，4,000,000 points | 原始 RGB + `object_id/object_probability` 审计文件 |
+| `semantic_da3_points.ply` | 87.7 MiB，4,000,000 points | binary 原始 RGB + `object_id/object_probability` 审计文件 |
 | `semantic_da3_points_palette.ply` | 87.7 MiB，4,000,000 points | 语义调色板显示文件，已人工检查 |
 | `object_masks_3d/sam3_*.ply` | 对象级 | bed、lamp、nightstand、window 等拆分点云，已抽查 |
-| `point_cloud/iteration_30000/point_cloud.ply` | 205.1 MiB，867,077 Gaussians | 官方 PGSR 30k 原始 Gaussian，已人工检查 |
-| `mesh/tsdf_fusion_post.ply` | 35.0 MiB | 官方 PGSR TSDF 表面，已人工检查 |
-| `semantic_gaussian_probability_supersplat.ply` | 205.1 MiB，867,077 Gaussians | SuperSplat 友好语义展示派生物，已人工检查 |
-| `semantic_pgsr_30k.ply` | 600.0 MiB，867,077 Gaussians | 大型语义 3DGS 兼容/对照输出，仅做结构和 QA 核验 |
-| `semantic_pgsr_30k_projected.ply` | 600.0 MiB，867,077 Gaussians | 主语义 3DGS，SAM3 直接投影结果，仅做结构和 QA 核验 |
+| `point_cloud/iteration_30000/point_cloud.ply` | 206.1 MiB，871,317 Gaussians | 官方 PGSR 30k 原始 Gaussian，已人工检查 |
+| `mesh/tsdf_fusion_post.ply` | 34.6 MiB | 官方 PGSR TSDF 表面，已人工检查 |
+| `semantic_gaussian_probability_supersplat.ply` | 206.1 MiB，871,317 Gaussians | SuperSplat 友好语义展示派生物，已人工检查 |
+| `semantic_pgsr_30k_nearest_da3.ply` | 212.7 MiB，871,317 Gaussians | DA3 最近邻语义对照输出，仅做结构和 QA 核验 |
+| `semantic_pgsr_30k_projected.ply` | 212.7 MiB，871,317 Gaussians | 主语义 3DGS，SAM3 直接投影结果，仅做结构和 QA 核验 |
+| `semantic_supersplat.ply` | 946.0 MiB | 大型展示导出，因本地显存风险未直接打开 |
 
 ## 本次代码固化
 
@@ -155,4 +156,4 @@ GroundingDINO 从 68 个候选中得到 20 个 prompts 和 9 个类别候选；S
 - 本次确实跑通 DA3、SAM3、PGSR、lifting、bbox 和直接 semantic 3DGS 投影，但仍不是论文完整数据工厂复现：论文中的 VLM/vLLM 类别发现、instance caption、VLM-agent verification、官方 spatial QA、LLaMA-Factory 转换与 benchmark 没有在本 run 中执行。
 - bbox 使用 Video2Mesh/COLMAP scene units，尚无公制标定；mesh 也尚未完成 collider、watertightness 或物理可用性验证。
 
-下一步优先处理原始 PGSR 的边缘长条和漂浮 Gaussian，并为 600 MiB 级语义 PLY 提供下采样/分块预览，避免本地查看器占满显存。
+下一步优先处理原始 PGSR 的边缘长条和漂浮 Gaussian，并为大体积语义 Gaussian PLY 提供下采样/分块预览，避免本地查看器占满显存。

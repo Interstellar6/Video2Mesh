@@ -72,7 +72,7 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 
 ## 实验八：Holi-Spatial bedroom_4 DA3 + SAM3 + PGSR 全链路重跑
 
-[Holi-Spatial bedroom_4 全链路重跑归档](holi-spatial-bedroom4-full-run-20260713.md) 已覆盖此前实验页，固定记录 `2026-07-14` 的 80 帧真实重跑：官方 DA3、真实 SAM3、官方 PGSR 30k、TSDF mesh、Video2Mesh 2D-to-3D lifting、bbox 后处理和 SAM3 直接投影 semantic 3DGS 均实际执行。
+[Holi-Spatial bedroom_4 全链路重跑归档](holi-spatial-bedroom4-fresh-run-20260714.md) 只记录 `2026-07-14 18:42` 的 80 帧正式重跑：官方 DA3、真实 SAM3、官方 PGSR 30k、TSDF mesh、Video2Mesh 2D-to-3D lifting、bbox 后处理和 SAM3 直接投影 semantic 3DGS 均实际执行。
 
 ![Holi-Spatial bedroom_4 TSDF mesh](assets/holi-spatial-bedroom4-rerun-20260714-tsdf-mesh.png "本轮官方 PGSR TSDF mesh：床、墙、窗和地面连续，整体重建质量良好")
 

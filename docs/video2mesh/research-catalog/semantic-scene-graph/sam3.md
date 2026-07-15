@@ -200,4 +200,4 @@ Video2Mesh owned outputs:
 
 ## 当前状态
 
-本页是调研文档，不是本地部署报告。已核验官方 GitHub、arXiv、Hugging Face model metadata 和 SAM3.1 release notes；尚未下载 gated checkpoint，也没有在本机或 `mil8` 跑 SAM3/SAM3.1 推理。后续如果做实验，应该单独补一节“`bedroom_4` SAM3 实测结果”，写清楚输入帧、prompt 列表、GPU、运行时间、mask 数量、2D/3D coverage、截图和失败样例。
+本页以方法调研为主。`bedroom_4` 的当前 fresh Holi-Spatial run 已在 `mil8` 用真实 SAM3 checkpoint 完成文本提示推理：957 个源实例 mask 合并为 616 个 class-frame 概率 mask，并进入 DA3 lifting 与 PGSR semantic projection。详细输入、类别边界、截图和 QA 见 [Holi-Spatial fresh 实验报告](../../experiments/holi-spatial-bedroom4-fresh-run-20260714.md)。SAM3.1 video mode、VLM 自动类别发现和跨帧稳定实例 ID 仍未在当前 run 中执行。

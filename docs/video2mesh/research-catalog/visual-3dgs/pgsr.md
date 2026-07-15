@@ -1,251 +1,82 @@
 ---
-title: PGSR
+title: PGSR：面向表面的 Gaussian Splatting 与 bedroom_4 实测
 id: video2mesh-visual-3dgs-pgsr
 category: 调研目录
 visibility: public
-summary: PGSR 是面向表面重建的 Planar-based Gaussian Splatting；本页记录论文方法、官方代码、Holi-Spatial 用法、Video2Mesh 接入边界，以及 bedroom_4 120 iter smoke 的真实 PLY/mesh 输出质量。
-updated: 2026-07-11
+updated: 2026-07-15
+summary: PGSR 的 surface-aware Gaussian reconstruction 方法、Holi-Spatial 中的几何角色，以及 Video2Mesh bedroom_4 唯一保留的 30k fresh 运行结果。
 tags:
-  - 视觉重建与 3DGS
-  - Surface-aware GS
+  - 视觉 3DGS
+  - PGSR
+  - TSDF
   - Mesh Reconstruction
   - Holi-Spatial
-  - PGSR
-  - Research Catalog
 ---
 
-# PGSR
+# PGSR：面向表面的 Gaussian Splatting 与 bedroom_4 实测
 
-PGSR 全称是 **Planar-based Gaussian Splatting for Efficient and High-Fidelity Surface Reconstruction**。它不是一个语义模型，也不是一个直接可下载的通用预训练重建模型；它更像 GraphDECO 3DGS 的 surface-aware 训练分支：仍然用多视角 RGB 和相机优化一套 3D Gaussians，但把 Gaussian 压到更接近平面表面，并显式渲染 depth/normal，再用 TSDF 融合导出 mesh。
-
-![PGSR surface-aware 3DGS pipeline](../assets/pgsr-pipeline.svg "PGSR 把 3DGS 从纯视觉代理推向 surface-aware reconstruction：训练输出 Gaussian PLY、rendered depth/normal 和 TSDF mesh")
+本页只保留 `2026-07-14` 的 `bedroom_4_fresh_da3_sam3_pgsr_20260714_184217` 30k 结果。此前 120-iteration smoke 和其他旧 PGSR 实验输出均已清理，不再作为质量或部署结论。
 
 ## 链接
 
-- Project page: https://zju3dv.github.io/pgsr/
-- Code: https://github.com/zju3dv/PGSR
-- Paper: https://arxiv.org/abs/2406.06521
-- Holi-Spatial code: https://github.com/Visionary-Laboratory/Holi-Spatial
-- Local Holi-Spatial clone inspected: `/tmp/Holi-Spatial-official`
-- Local PGSR wrapper inspected: `/tmp/Holi-Spatial-official/PGSR`
-
-## 基本信息
-
-| 项 | 内容 |
-|---|---|
-| 论文标题 | PGSR: Planar-based Gaussian Splatting for Efficient and High-Fidelity Surface Reconstruction |
-| 作者 | Danpeng Chen, Hai Li, Weicai Ye, Yifan Wang, Weijian Xie, Shangjin Zhai, Nan Wang, Haomin Liu, Hujun Bao, Guofeng Zhang |
-| 日期 | arXiv 2024-06-10 |
-| 方法类型 | Surface reconstruction oriented 3D Gaussian Splatting |
-| 输入 | posed multi-view RGB images，通常来自 COLMAP 或数据集相机 |
-| 输出 | optimized Gaussian PLY、rendered RGB/depth/normal、TSDF mesh |
-| 官方定位 | 不依赖预训练 depth/normal prior，从多视角 RGB 里做高保真表面重建 |
-| 对 Video2Mesh 的定位 | P1/P2 surface-aware visual mesh / depth evidence 候选，不直接替代 P0 collider |
+- Paper / project: https://github.com/zju3dv/PGSR
+- Holi-Spatial pipeline: https://github.com/Visionary-Laboratory/Holi-Spatial
+- 当前实验报告：[Holi-Spatial bedroom_4 全链路重跑](../../experiments/holi-spatial-bedroom4-fresh-run-20260714.md)
 
 ## 摘要要点
 
-传统 GraphDECO 3DGS 很适合 novel-view rendering，但 Gaussian point cloud 本身是非结构化、各向异性的视觉表示。只靠 RGB reconstruction loss，Gaussian 可能为了渲染好看而拉长、漂浮或穿透真实表面；这就是为什么直接用 Gaussian center 做 Poisson/mesh/collider 往往会出现壳状伪影和飞片。
-
-PGSR 的核心改动是把 Gaussian 当成局部平面来约束。它从 Gaussian 的最小轴估计 normal，把 splat 渲染为 plane distance / normal / depth，并加入 single-view normal consistency、multi-view geometric consistency 和 photometric NCC regularization。训练完成后，它不只是保存 3DGS PLY，还能渲染每个训练视角的 refined depth/normal，并用 Open3D TSDF fusion 把这些深度融合成 mesh。
-
-所以 PGSR 对 Video2Mesh 的价值不是“有个现成模型直接出资产”，而是给当前 GraphDECO 视觉层增加一条更几何友好的训练路线：如果我们希望从 3DGS 得到更可靠的 surface mesh、mask lifting depth 或 object bbox evidence，PGSR 比 vanilla GraphDECO 更接近目标。
+PGSR 是面向表面重建的 per-scene Gaussian Splatting 方法。它并非通用预训练视频到 3D 模型：每个 scene 都需要利用图像、相机和初始化几何进行优化，输出该场景的 Gaussians、rendered depth/normal 和 TSDF mesh。它的价值在于为视觉 3DGS 与显式 mesh 之间提供一条 surface-aware 路线。
 
 ## 方法 Pipeline
 
-| 阶段 | PGSR 做什么 | 关键输出 |
-|---|---|---|
-| 数据预处理 | 准备 multi-view images、camera intrinsics/extrinsics、初始 sparse/dense point cloud | COLMAP/NeRF-style scene directory |
-| Gaussian 初始化 | 从点云初始化 Gaussian center、颜色、opacity、scale、rotation | 初始 3D Gaussians |
-| Planar Gaussian 表示 | 用 Gaussian 最小轴作为局部 normal，把 Gaussian 压向局部平面 | normal-aware Gaussian field |
-| Plane depth render | 渲染 plane distance、rendered normal、depth normal 和 unbiased depth | `plane_depth`, `rendered_normal`, `depth_normal` |
-| RGB reconstruction | 和 3DGS 类似，用训练视角 RGB loss 保持外观质量 | photorealistic splats |
-| Single-view geometry | 约束 rendered normal 与 depth-derived normal 一致 | 局部表面更平滑 |
-| Multi-view geometry | 将当前视角 depth 回投到邻近视角，检查 depth consistency | 多视角几何更一致 |
-| Multi-view photometric | 对邻近视角 patch 做 NCC/photometric consistency | 减少弱纹理/遮挡带来的错误 surface |
-| Densify / prune / trim | 继续使用 3DGS 风格的增密、裁剪和 opacity culling | 更紧凑的 Gaussian PLY |
-| TSDF mesh extraction | 对训练/测试视角渲染 depth，用 Open3D TSDF 融合三角网格 | `mesh/tsdf_fusion_post.ply` |
+```text
+images + calibrated cameras + initialization points/depth
+  -> Gaussian optimization with geometric regularization
+  -> rendered RGB / depth / normal
+  -> TSDF fusion and postprocess
+  -> scene mesh for geometric inspection
+```
 
-在官方代码里，训练端的关键逻辑集中在 `PGSR/train.py`：7000 iter 后开始 single-view normal loss 和 multi-view geo/photo loss；如果 camera 带 `depth_map`，代码也支持 depth L1 supervision。渲染端的关键逻辑在 `PGSR/render.py`：它保存 depth/normal 可视化，按 camera pose 把 rendered depth 融合进 `ScalableTSDFVolume`，最后写出 raw mesh 和 post-processed mesh。
-
-## 几何生成路径
-
-PGSR 生成几何的路径可以拆成三层：
-
-| 层 | 产物 | 能做什么 | 不能直接做什么 |
+| 阶段 | 输入 | 输出 | 作用 |
 |---|---|---|---|
-| Gaussian PLY | `point_cloud/iteration_30000/point_cloud.ply` | visual proxy、novel-view rendering、semantic splat 辅助 | 不等于 watertight surface，不应直接当 collider |
-| Rendered depth/normal | `renders_depth`, `renders_normal`, `plane_depth` | 2D mask 回投、bbox evidence、TSDF fusion 输入 | 不是人工真值，遮挡/反射/薄结构仍要过滤 |
-| TSDF mesh | `mesh/tsdf_fusion.ply`, `mesh/tsdf_fusion_post.ply` | visual mesh、surface QA、object lifting 辅助 | 未经 QA 不适合作为物理碰撞体或仿真 body |
+| 初始化 | images、cameras、DA3/point prior | initial Gaussians | 把场景放入统一多视图坐标 |
+| PGSR optimization | Gaussians、图像监督、几何项 | optimized Gaussian PLY | 提高场景视觉与几何一致性 |
+| render | optimized model | RGB、depth、normal | 给 TSDF 和 mask lifting 提供视图一致的几何证据 |
+| TSDF fusion | rendered depth | mesh | 从 Gaussian 视觉层导出显式场景表面 |
 
-这和 Video2Mesh 当前的分层资产合同一致：3DGS/PGSR 是视觉和几何证据层，collider 仍然要单独走 COLMAP Delaunay、primitive proxy、convex decomposition 或手工 QA 后的 mesh route。PGSR mesh 如果要进入 simulator，需要额外检查尺度、坐标、连通分量、薄片、孔洞、法线、碰撞稳定性和物体分割。
+## 在 Holi-Spatial 中的角色
 
-## 官方结果摘录
+Holi-Spatial 使用 PGSR/3DGS 作为 DA3 之后的 per-scene geometry optimization。SAM3 只给出 2D masks；更一致的 depth、mesh 和 Gaussian centers 才能支持后续 2D-to-3D lifting、bbox 和 semantic Gaussian projection。PGSR 仍不是语义模型、实例分割模型或 collider 生成器。
 
-官方 README 的 Code_V1.0 结果给了两个工程上有用的量级参考：
+## bedroom_4 fresh 30k 实测
 
-| Benchmark | 指标 | PGSR Code_V1.0 | 时间 |
-|---|---|---:|---:|
-| DTU | Chamfer Distance mean，越低越好 | 0.47 | 0.5h |
-| Tanks and Temples | F1 mean，越高越好 | 0.51 | 45m |
-
-这些数字只说明 PGSR 在官方数据和 protocol 下的 surface reconstruction 能力，不等于 Video2Mesh `bedroom_4` 的本地指标。下面的 smoke 结果只验证了部署、训练、render 和 TSDF export 链路，不代表完整 PGSR 30k 训练质量。
-
-## 安装与硬件需求
-
-官方 PGSR README 给出的基础环境是：
-
-```bash
-conda create -n pgsr python=3.8
-conda activate pgsr
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install -r requirements.txt
-pip install submodules/diff-plane-rasterization
-pip install submodules/simple-knn
-```
-
-工程上要注意三点：
-
-| 项 | 说明 |
+| 项 | 结果 |
 |---|---|
-| CUDA 扩展 | `diff-plane-rasterization` 和 `simple-knn` 都要本机编译，Mac CPU 环境不适合跑完整训练 |
-| GPU/VRAM | 官方没有写死最低 VRAM；参考 3DGS/PGSR 单场景训练，建议 16GB 以上，24GB RTX 3090 更稳 |
-| 批量训练 | Holi-Spatial `3dgs_train.sh` 默认 `MAX_JOBS_PER_GPU=3`，对 24GB GPU 和高分辨率室内场景可能偏激进，正式跑前建议降到 1 |
+| 远端 run | `mil8:/data/design/zyx/workspace/holi_spatial_runs/bedroom_4_fresh_da3_sam3_pgsr_20260714_184217` |
+| 输入 | 80 帧 `bedroom_4`、校正相机、DA3 point/depth prior |
+| 训练 | 官方 PGSR 至 iteration 30,000 |
+| 最终日志 | L1 `0.0118202`、PSNR `33.1155 dB`、missing-depth warning `0` |
+| 原始 Gaussian | 871,317 vertices，206.1 MiB binary PLY |
+| TSDF post mesh | 694,773 vertices / 1,351,454 faces，34.6 MiB |
+| 语义后续 | SAM3 2D masks 直接投影到 PGSR Gaussians，701,608 selected Gaussians |
 
-对我们的机器判断：
+![PGSR bedroom_4 fresh TSDF mesh](../../experiments/assets/holi-spatial-bedroom4-rerun-20260714-tsdf-mesh.png "fresh PGSR TSDF mesh：床、墙、窗和地面连续，适合表面几何检查")
 
-| 机器 | 适合做什么 | 不适合做什么 |
-|---|---|---|
-| 本地 Mac | 读代码、写文档、准备数据、轻量检查 PLY/JSON | 编译 CUDA rasterizer、完整 PGSR 训练 |
-| `mil8` 8 x RTX 3090 24GB | 单场景 PGSR、Holi-Spatial wrapper、mesh render、并行小批量实验 | 当前磁盘很紧时直接铺大数据集/全量 Holi-Spatial 批处理 |
+![PGSR bedroom_4 fresh raw Gaussian](../../experiments/assets/holi-spatial-bedroom4-rerun-20260714-pgsr-30k-gaussians.png "fresh PGSR 30k 原始 Gaussian：主体空洞改善，边缘仍有拉丝和漂浮伪影")
 
-## 有没有训好的模型
+### 质量判断
 
-PGSR 本身不是“下载一个 checkpoint 后直接通用推理”的 feed-forward 模型。它的常规使用方式是 **每个场景单独训练/优化**：给定这一场景的 images 和 cameras，训练出该场景自己的 Gaussian PLY，再 render depth/normal/mesh。
+- TSDF mesh 的床、墙、窗和地面连续，是本次最强的表面化输出，适合几何检查与后续 visual mesh 对照。
+- 原始 30k Gaussian 的主体空洞基本修复，但窗边、场景外缘和未充分观测区仍可见长条 splat、floaters 和放射状伪影。
+- 训练日志中的 PSNR/L1 是同场景 train-view evaluation，不是 ScanNet benchmark，也不能证明 collider 或物理可用性。
 
-因此官方 PGSR repo 主要发布的是代码、训练脚本和 benchmark protocol，不是像 DepthSplat/AnySplat 那种跨场景预训练权重。Holi-Spatial 里的 PGSR 也承担 per-scene geometry optimization；它输出的是每个 scene 的 trained 3DGS/PGSR assets，而不是一个可复用到任意视频的模型 checkpoint。
+## 硬件与环境
 
-## 在 Holi-Spatial 中怎么用
-
-Holi-Spatial 把 PGSR 放在几何优化链路里。它前面可以有 DA3 depth/pointcloud prior，后面接 mesh-guided mask、2D-to-3D lifting、3D bbox 和 spatial QA。
-
-官方 clone 中与 PGSR 直接相关的入口是：
-
-| 文件 | 作用 | 关键输出 |
-|---|---|---|
-| `3dgs_train.sh` | 批量训练 ScanNet v2 / ScanNet++ / DL3DV 风格场景的 PGSR/3DGS | `<OUTPUT_ROOT>/<scene>/point_cloud/iteration_30000/point_cloud.ply` |
-| `mesh.sh` | 调用 `PGSR/render.py` 渲染 depth/normal 并做 TSDF mesh，随后用 mesh 生成 mask 过滤证据 | `<OUTPUT_ROOT>/<scene>/mesh/tsdf_fusion_post.ply` 和 scene `mask/` |
-| `PGSR/train.py` | 单场景训练逻辑，RGB loss + single/multi-view geometry regularization | trained Gaussian model |
-| `PGSR/render.py` | 输出 rendered depth/normal，并 Open3D TSDF fusion 成 mesh | `renders_depth`, `renders_normal`, `mesh/*.ply` |
-| `PGSR/mesh2mask.py` | 用 mesh/depth 约束 mask 或过滤不可靠区域 | mesh-guided masks |
-
-Holi-Spatial 的真实数据流可以理解成：
-
-```text
-scene images + cameras
-  -> DA3 depth / point cloud prior
-  -> PGSR per-scene optimization
-  -> rendered refined depth + TSDF mesh
-  -> SAM3 2D masks and VLM labels
-  -> mask pixels back-projected by refined depth
-  -> multi-view object bbox merge
-  -> captions / 3D grounding / spatial QA
-```
-
-这里 PGSR 的作用是让 “2D mask -> 3D points -> bbox” 这一步的深度和表面更可靠。它不是 SAM3，也不负责识别物体类别；类别来自 VLM/SAM3 那条 perception 线。
-
-## 在 Video2Mesh 中的位置
-
-Video2Mesh 当前稳定主链路是：
-
-```text
-video frames
-  -> COLMAP cameras / sparse / dense geometry
-  -> GraphDECO 3DGS visual layer
-  -> mesh / collider route
-  -> semantic sidecars
-  -> simulator asset bundle
-```
-
-PGSR 可以插入的位置更像 P1/P2 升级：
-
-```text
-frames + cameras
-  -> PGSR surface-aware 3DGS
-  -> rendered refined depth / normal
-  -> TSDF visual mesh
-  -> semantic mask lifting / bbox QA / visual mesh benchmark
-```
-
-| 能借用 | 价值 |
-|---|---|
-| PGSR 训练端 regularization | 减少 vanilla 3DGS 的拉丝、漂浮点和弱纹理表面错误 |
-| Rendered depth/normal | 比直接用 Gaussian center 更适合 mask lifting、bbox 估计和 mesh fusion |
-| TSDF mesh extraction | 给 SuGaR/2DGS/GOF 之外增加一条 visual mesh benchmark |
-| Holi-Spatial wrapper | 已经把 ScanNet/ScanNet++/DL3DV 批处理和 mesh-to-mask 串起来，可参考目录合同 |
-
-| 暂不直接接入 | 原因 |
-|---|---|
-| P0 collider 主链路 | PGSR mesh 仍需碰撞 QA，不能天然保证 watertight、低面数、稳定接触 |
-| 全量 Holi-Spatial 批处理 | 依赖 DA3/SAM3/VLM/PGSR 多组件和大磁盘，不适合一口气塞进主 pipeline |
-| 直接替换 GraphDECO | 当前 Video2Mesh 已有 GraphDECO 资产和 viewer 合同；PGSR 要先做同场景 A/B QA |
-
-## bedroom_4 smoke 实测（2026-07-11）
-
-这次实际部署跑的是 **smoke test**，不是完整 PGSR 30k 训练，也不是 Holi-Spatial 官方全量复现。目标是确认 PGSR 能在 `mil8` 上安装、编译 CUDA extension、读取 `bedroom_4` 数据、训练出 Gaussian PLY，并从 rendered depth 导出 TSDF mesh。
-
-![PGSR bedroom_4 120 iter Gaussian PLY](../assets/pgsr-bedroom4-smoke-point-cloud-poor.png "Gaussian PLY：可见床和窗，但雾状 splats、漂浮团和外侧噪声明显")
-
-| 项目 | 真实配置 / 指标 |
-|---|---|
-| 远端环境 | `mil8`，PGSR repo `/data/zyx/workspace/third_party/PGSR`，venv `/data/zyx/workspace/pgsr_env`，复用 `/opt/envs/max` 的 Torch 2.2.2 + CUDA 12.1 |
-| 输入 | 80 张 `bedroom_4` 图像，采样 80,000 个真实 COLMAP 点 |
-| 训练 | 120 iterations；保存 `iteration_60` 和 `iteration_120`；几何项日志中已出现 `Single / Geo / Pho` |
-| smoke metric | iter 60: L1 0.1470 / train PSNR 16.37；iter 120: L1 0.1347 / train PSNR 17.70 |
-| 渲染产物 | 80 张 RGB render、80 张 depth、80 张 normal |
-
-`17.70 dB` 只是 120 iter train-view smoke 指标，不能当作 benchmark PSNR，也不能和完整 GraphDECO/PGSR 训练直接比较。
-
-### 主要产物
-
-| 产物 | 规模 | 本地路径 | 远端路径 | 视觉判断 |
-|---|---:|---|---|---|
-| Gaussian PLY | 97,381 vertices / 24,152,018 bytes | `tmp_remote_results/bedroom_4_pgsr_smoke_20260711_025236/full_assets/bedroom_4_pgsr_smoke_iter120_point_cloud.ply` | `output/point_cloud/iteration_120/point_cloud.ply` | 不太行：床、窗和部分家具轮廓可辨，但上半场景有大片黄褐色雾状 splats，右侧窗边和外侧有白色漂浮团，不能作为当前 visual layer 主资产。 |
-| TSDF fusion post mesh | 903,694 vertices / 1,703,876 faces / 46,550,396 bytes | `tmp_remote_results/bedroom_4_pgsr_smoke_20260711_025236/full_assets/bedroom_4_pgsr_smoke_tsdf_fusion_post.ply` | `output/mesh/tsdf_fusion_post.ply` | 一般般：床和窗的大结构保住了，后处理去掉了一部分碎片，但墙面、窗边、床边仍有薄片、粘连、破洞和漂浮面。 |
-| TSDF fusion raw mesh | 1,091,652 vertices / 1,975,303 faces / 55,153,814 bytes | `tmp_remote_results/bedroom_4_pgsr_smoke_20260711_025236/full_assets/bedroom_4_pgsr_smoke_tsdf_fusion_raw.ply` | `output/mesh/tsdf_fusion.ply` | 一般般：比 post 版本保留更多碎片和外侧漂浮面，细节更多但噪声也更多；保真度提高不等于可用度提高。 |
-
-### 截图证据
-
-![PGSR bedroom_4 TSDF fusion post mesh](../assets/pgsr-bedroom4-smoke-tsdf-post-fair.png "TSDF post mesh：主体可辨，但墙窗边和床边薄片、粘连、破洞仍明显")
-
-![PGSR bedroom_4 TSDF fusion raw mesh](../assets/pgsr-bedroom4-smoke-tsdf-raw-fair.png "TSDF raw mesh：保留更多细节，也保留更多漂浮面和外侧碎片")
-
-### 效果分析
-
-这次结果的正面意义是：PGSR 环境、训练、render、depth/normal 输出和 TSDF mesh export 都跑通了；几何项也确实进入训练日志，说明不是只跑了普通 3DGS fallback。
-
-问题同样明显：
-
-- 120 iter 远低于 PGSR/3DGS 常规收敛迭代数，Gaussian 还处在粗糙覆盖阶段。
-- 初始点云只采样了 80,000 个 COLMAP 点，足够 smoke，但不足以支撑稳定 room-scale 表面。
-- TSDF fusion 消费的是早期 rendered depth；depth 里一旦有雾状 Gaussian 或漂浮块，mesh 就会变成薄片、粘连和外侧碎片。
-- 后处理版 `tsdf_fusion_post.ply` 能减少一部分小碎片，但没有解决窗边、墙面和床边的系统性噪声。
-
-所以这次 smoke 只应该记为 **部署通过、质量未达可用线**。PGSR 可以继续留作 P1/P2 geometry-aware 3DGS 候选，但这三份 `bedroom_4` 120 iter 产物不应替换当前 GraphDECO visual layer，也不应进入 collider、navigation mesh 或 simulator physics body。
-
-## 推荐实验路线
-
-如果后续要正式评估 PGSR，建议按这个顺序做，避免又陷入“看起来能出 mesh，但不知道能不能用”的状态：
-
-1. 用同一个 `bedroom_4` COLMAP source，训练 GraphDECO 30k 与 PGSR 30k。
-2. 对比 viewer 截图、Gaussian PLY header、Gaussian count、bbox 范围和 floater 分布。
-3. 用 PGSR render depth 做 TSDF mesh，记录 vertex/face count、连通分量、孔洞和薄片。
-4. 与当前 COLMAP Delaunay collider、SuGaR/GS2Mesh visual mesh 做同视角对比。
-5. 只在 mesh QA 通过后，才尝试把 PGSR mesh 降面/修补后作为 visual mesh 或 object mesh source；collider 仍保留单独验证。
-6. 如果用于 Holi-Spatial-style QA，重点看 mask lifting 后的 3D bbox 是否更稳定，而不是只看 mesh 是否好看。
+PGSR 需要 CUDA PyTorch 和 `diff-plane-rasterization`、`simple-knn` 等 CUDA 扩展。本次在 `mil8` 的 8 张 RTX 3090 24GB 环境完成单场景训练。全量 Holi-Spatial 批处理还会叠加 DA3、SAM3、VLM 和输出存储成本，单场景通过不能直接外推为批量吞吐。
 
 ## 接入判断
 
-- **短期 P0**：不进入主线；继续使用 GraphDECO 作为 visual layer，COLMAP/Delaunay 或已有 mesh route 做 collider。
-- **P1**：作为 `bedroom_4` 单场景 A/B 实验候选，验证它是否能减少 3DGS floaters 并提高 mesh/depth 质量。
-- **P2**：作为 Holi-Spatial-style 语义空间数据生成的几何后端，用于更可靠的 2D mask 回投、bbox、spatial QA。
-- **风险**：CUDA 编译、训练耗时、磁盘占用、参数调节、TSDF mesh 的物理可用性都需要实测；不能只凭论文指标宣布可替换现有 Video2Mesh 主链路。
+- 可作为 Video2Mesh P1/P2 的高质量 visual mesh / depth backend 候选。
+- 不应直接替换 COLMAP Delaunay collider：尚未做 watertightness、尺度、碰撞或接触 QA。
+- semantic 3DGS 需要单独写入 `object_id/object_probability`，而不是假定 PGSR 原生带语义。
+- 下一步优先做 Gaussian elongation / floater 过滤和 TSDF mesh 碰撞可用性验证。
