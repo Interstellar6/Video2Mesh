@@ -3,8 +3,8 @@ title: Holi-Spatial 调研与 bedroom_4 实验报告
 id: video2mesh-semantic-scene-graph-holi-spatial
 category: 调研目录
 visibility: public
-updated: 2026-07-13
-summary: 调研 Holi-Spatial 的自动 3D 空间数据生成 pipeline、公开模型与数据集，并记录 Video2Mesh bedroom_4 的历史 smoke run 与 2026-07-13 真实 DA3、SAM3、PGSR 重跑。
+updated: 2026-07-15
+summary: 调研 Holi-Spatial 的自动 3D 空间数据生成 pipeline、公开模型与数据集，并记录 Video2Mesh bedroom_4 的历史 smoke run 与 2026-07-14 真实 DA3、SAM3、PGSR 全链路重跑。
 tags:
   - 语义与 Scene Graph
   - Holi-Spatial
@@ -15,7 +15,7 @@ tags:
 
 # Holi-Spatial 调研与 bedroom_4 实验报告
 
-这份报告记录 Holi-Spatial 论文、官方仓库、公开模型/数据集状态，以及 Video2Mesh `bedroom_4` 片段接入 Holi-Spatial 后处理和 spatial QA 的实际实验结果。文中保留历史 **Holi-Spatial-compatible smoke run**，并在末尾新增 2026-07-13 的真实 DA3、SAM3、PGSR 运行；两者不能混为一条实验结论。
+这份报告记录 Holi-Spatial 论文、官方仓库、公开模型/数据集状态，以及 Video2Mesh `bedroom_4` 片段接入 Holi-Spatial 后处理和 spatial QA 的实际实验结果。文中保留历史 **Holi-Spatial-compatible smoke run**，并以 `2026-07-14` 的真实 DA3、SAM3、PGSR 全链路重跑作为当前可用实验结论；两者不能混为一条实验结论。
 
 ![Holi-Spatial 官方 teaser](../assets/holi-spatial-teaser.jpg "官方 Holi-Spatial teaser：从视频流构建几何、语义、3D grounding 和 spatial QA 数据")
 
@@ -526,3 +526,9 @@ viewer PLY 为解决 ASCII 文件过大和 viewer 崩溃而生成。它保留 Ga
 ### 与论文完整复现的差异
 
 这轮已经不再是 DA3/SAM2/旧 3DGS 的 proxy 路线：DA3、SAM3、PGSR、mesh 以及 Video2Mesh 的 2D-to-3D projection fusion 都真实执行了。不过它仍不应写成“完整官方 Holi-Spatial 复现”：类别发现使用的是 GroundingDINO query-bank filtering 而非官方 VLM/vLLM，lifting 与 bbox 使用用户指定的 Video2Mesh 实现而非论文脚本，instance caption、VLM-agent verification、官方 spatial QA、LLaMA-Factory 转换和论文 benchmark 也未运行。
+
+## 2026-07-14：当前正式实验归档
+
+`bedroom_4_rerun_da3_sam3_pgsr_20260714_011621` 覆盖了此前实验页中的可视化和产物结论。实际得到 80 张 DA3 depth、4,000,000 个 DA3 点、957 个真实 SAM3 mask、616 个概率 mask、13 个 3D records、867,077 个 PGSR Gaussians 与 704,084 vertices / 1,364,354 faces 的 TSDF mesh。与 7 月 13 日的最近邻语义迁移不同，当前主 semantic 3DGS 由 SAM3 mask 直接投影到 PGSR Gaussian centers，10 帧投影 QA 均有效，8 个有效类别共选择 528,582 个 Gaussian。
+
+人工 QA 表明 TSDF mesh、PGSR 30k 主体、DA3 RGB 点云、bed/lamp/nightstand/window 对象云、DA3 palette semantic PLY 和 semantic 3DGS 均可归档。PGSR 原始 Gaussian 的边缘仍有少量拉丝/漂浮伪影；两个 600 MiB 的语义 Gaussian PLY 因本地 MacBook 查看器显存风险未直接打开，只完成了字段、顶点数和投影 QA。完整截图、文件清单、组件边界和后续修复项见：[Holi-Spatial bedroom_4 全链路重跑归档](../../experiments/holi-spatial-bedroom4-full-run-20260713.md)。

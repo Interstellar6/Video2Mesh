@@ -154,8 +154,8 @@ def main() -> None:
     sam3_tracking = read_json(project / "masks" / "2d" / "tracking_manifest.json", {})
     class_fusion = read_json(project / "masks" / "3d" / "object_masks.json", {})
     instance_fusion = read_json(project / "masks" / "3d_instances" / "object_masks.json", {})
-    semantic_manifest = read_json(project / "simulator_assets" / "semantic_splats_manifest.json", {})
-    semantic_preview = read_json(project / "simulator_assets" / "semantic_preview" / "semantic_preview.json", {})
+    semantic_manifest = read_json(project / "simulator_assets" / "semantic_pgsr_30k_projected_manifest.json", {})
+    semantic_preview = read_json(project / "simulator_assets" / "semantic_pgsr_30k_projected_preview" / "semantic_preview.json", {})
     pgsr_log_path = run_root / "logs" / "pgsr_official_30k.log"
     pgsr_log = parse_pgsr_log(pgsr_log_path)
 
@@ -173,7 +173,8 @@ def main() -> None:
     semantic_da3 = project / "simulator_assets" / "semantic_da3_points.ply"
     semantic_da3_palette = project / "simulator_assets" / "semantic_da3_points_palette.ply"
     pgsr_ply = run_root / "pgsr_scannetppv2_all" / "bedroom_4" / "point_cloud" / "iteration_30000" / "point_cloud.ply"
-    pgsr_semantic = project / "simulator_assets" / "semantic_pgsr_30k.ply"
+    pgsr_semantic_nearest = project / "simulator_assets" / "semantic_pgsr_30k_nearest_da3.ply"
+    pgsr_semantic_projected = project / "simulator_assets" / "semantic_pgsr_30k_projected.ply"
     pgsr_mesh = run_root / "pgsr_scannetppv2_all" / "bedroom_4" / "mesh" / "tsdf_fusion_post.ply"
 
     counts = {
@@ -196,7 +197,7 @@ def main() -> None:
 
     pgsr_complete = bool(pgsr_log.get("training_complete") and pgsr_ply.exists())
     pgsr_mesh_complete = pgsr_mesh.exists()
-    pgsr_semantic_complete = pgsr_semantic.exists()
+    pgsr_semantic_complete = pgsr_semantic_projected.exists()
     stages = {
         "data_package": {
             "status": "Passed" if camera_validation.get("passed") else "Failed",
@@ -230,9 +231,9 @@ def main() -> None:
             "status": "Passed" if pgsr_mesh_complete else "Pending",
             "evidence": str(pgsr_mesh),
         },
-        "PGSR_semantic_transfer": {
+        "PGSR_semantic_projection": {
             "status": "Passed" if pgsr_semantic_complete else "Pending",
-            "evidence": str(pgsr_semantic),
+            "evidence": str(pgsr_semantic_projected),
         },
     }
     required_complete = all(
@@ -246,7 +247,7 @@ def main() -> None:
             "bbox_postprocess",
             "PGSR_30k",
             "PGSR_mesh",
-            "PGSR_semantic_transfer",
+            "PGSR_semantic_projection",
         ]
     )
 
@@ -260,7 +261,8 @@ def main() -> None:
         "3D bbox topdown": artifact(run_root / "visualizations" / "sam3_da3_3d_bbox_topdown.png"),
         "PGSR 30k PLY": artifact(pgsr_ply),
         "PGSR TSDF post mesh": artifact(pgsr_mesh),
-        "semantic PGSR PLY": artifact(pgsr_semantic),
+        "semantic PGSR PLY (SAM3 projected)": artifact(pgsr_semantic_projected),
+        "semantic PGSR PLY (DA3 nearest baseline)": artifact(pgsr_semantic_nearest),
         "PGSR log": artifact(pgsr_log_path),
     }
     limitations = [
@@ -270,6 +272,7 @@ def main() -> None:
         "Door and ceiling masks are visibly less reliable than bed/floor/lamp/nightstand/plant/window and should be treated as low-confidence labels.",
         "BBox dimensions are in the COLMAP/Video2Mesh scene coordinate scale, not meters; metric claims require an explicit scale calibration.",
         "semantic_da3_points.ply preserves the DA3 RGB reconstruction plus semantic fields; use semantic_da3_points_palette.ply for a viewer-visible object_id palette without changing the raw artifact.",
+        "semantic_pgsr_30k_projected.ply receives labels by SAM3 mask projection, z-buffer visibility filtering, and per-Gaussian probability aggregation; it is category semantic because the available SAM3 masks are class-merged rather than temporally tracked instances.",
     ]
     report = {
         "schema_version": 1,

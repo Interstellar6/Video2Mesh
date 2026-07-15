@@ -13522,13 +13522,13 @@ def write_semantic_ply_with_labels(
             raise ValueError(f"Label count {len(labels)} does not match PLY vertex count {len(next(iter(data.values())))}.")
         extra_names = {name for name, _prop_type, _values in extra_properties}
         filtered_properties = [(name, prop_type) for name, prop_type in properties if name not in extra_names]
-        vertex_count = write_vertex_data_ascii_ply(
-            output_ply,
-            filtered_properties,
-            data,
-            extra_properties,
-        )
-        return vertex_count, "ply_vertex_rewrite"
+        output_data = dict(data)
+        output_properties = list(filtered_properties)
+        for name, prop_type, values in extra_properties:
+            output_data[name] = values
+            output_properties.append((name, prop_type))
+        vertex_count = write_vertex_data_binary_ply(output_ply, output_properties, output_data)
+        return vertex_count, "binary_little_endian_vertex_rewrite"
     except Exception:
         pass
 
@@ -13718,11 +13718,15 @@ def source_labels_from_object_masks(
     return labels, probabilities, object_table, object_id_to_semantic
 
 
-def object_table_from_records(project_root: Path, manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, dict[str, Any]]]:
+def object_table_from_records(
+    project_root: Path,
+    manifest: dict[str, Any],
+    objects_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, dict[str, Any]]]:
     object_table: list[dict[str, Any]] = [{"object_id": "background", "semantic_id": 0, "point_count": 0}]
     object_id_to_semantic = {"background": 0}
     records_by_id: dict[str, dict[str, Any]] = {}
-    objects_dir = project_root / manifest["objects_dir"]
+    objects_dir = objects_dir or (project_root / manifest["objects_dir"])
     for semantic_id, object_json in enumerate(sorted(objects_dir.glob("*/object.json")), start=1):
         obj = read_json(object_json)
         object_id = slugify(obj.get("object_id") or object_json.parent.name)
@@ -14192,7 +14196,16 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
 
     camera_info = load_camera_info(camera_info_path)
     records_by_object = mask_records_by_object(mask_root)
-    object_table, object_id_to_semantic, records_by_id = object_table_from_records(project_root, manifest)
+    objects_dir = (
+        resolve_project_cli_path(args.objects_dir, project_root)
+        if getattr(args, "objects_dir", None)
+        else None
+    )
+    object_table, object_id_to_semantic, records_by_id = object_table_from_records(
+        project_root,
+        manifest,
+        objects_dir=objects_dir,
+    )
     best_probability = np.zeros(gaussian_points_work.shape[0], dtype=np.float32)
     best_object = np.zeros(gaussian_points_work.shape[0], dtype=np.int64)
     object_reports: list[dict[str, Any]] = []
@@ -14267,14 +14280,10 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         vertex_count, export_mode = write_semantic_ply_with_labels(source_ply, output_ply, labels, probabilities)
         output_source_ply = source_ply
     else:
-        write_gsplat_ply(
-            output_ply,
-            gaussian_data["means"][selected_gaussian_indices],
-            gaussian_data["colors"][selected_gaussian_indices],
-            gaussian_data["opacities"][selected_gaussian_indices],
-            gaussian_data["scales"][selected_gaussian_indices],
-            gaussian_data["quats"][selected_gaussian_indices],
-        )
+        keep_mask = np.zeros(gaussian_points.shape[0], dtype=bool)
+        keep_mask[selected_gaussian_indices] = True
+        # Preserve the exact source Gaussian layout for smoke/debug subsets.
+        write_filtered_vertex_ply(source_ply, output_ply, keep_mask)
         vertex_count, export_mode = write_semantic_ply_with_labels(output_ply, output_ply, labels, probabilities)
         output_source_ply = output_ply
 
@@ -14289,6 +14298,7 @@ def cmd_backproject_gaussian_probabilities(args: argparse.Namespace) -> int:
         "project_root": str(project_root),
         "scene_id": manifest.get("scene_id"),
         "source_ply": str(source_ply),
+        "objects_dir": str(objects_dir) if objects_dir is not None else str(project_root / manifest["objects_dir"]),
         "output_ply": str(output_ply),
         "output_source_ply": str(output_source_ply),
         "vertex_count": int(vertex_count),
@@ -52782,6 +52792,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("backproject-gaussian-probabilities", help="SVLGaussian-style ray-to-Gaussian semantic probability back-projection from 2D masks.")
     add_common_project_arg(p)
     p.add_argument("--splat-ply", type=Path, help="Registered 3DGS/PLY to receive object_id and object_probability. Defaults to artifacts.scene_3dgs_ply.")
+    p.add_argument("--objects-dir", type=Path, help="Object records corresponding to --mask-root. Defaults to manifest objects_dir; use this when 2D class masks and lifted 3D instances live in separate directories.")
     p.add_argument("--camera-info", type=Path, help="Defaults to scene/cameras/camera_info.json.")
     p.add_argument("--mask-root", type=Path, help="Defaults to masks/2d.")
     p.add_argument("--output", type=Path, help="Output semantic PLY. Defaults to simulator_assets/semantic_splats.ply.")

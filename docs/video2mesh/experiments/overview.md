@@ -70,10 +70,10 @@ COLMAP dense + Delaunay mesher 输出约 82,920 vertices / 167,082 triangles，G
 
 结论：这次更新没有改变 3DGS / mesh 的真实配准，只增强浏览器端探索能力；本地验证已确认 `1,313,391` visual splats、`142,219` collider faces、gizmo 拖动、滚轮缩放和 WASD 机器人控制均可用。
 
-## 实验八：Holi-Spatial bedroom_4 DA3 + SAM3 + PGSR 全链路
+## 实验八：Holi-Spatial bedroom_4 DA3 + SAM3 + PGSR 全链路重跑
 
-[Holi-Spatial bedroom_4 全链路结果归档](holi-spatial-bedroom4-full-run-20260713.md) 记录了真实 DA3、SAM3、PGSR 30k、TSDF mesh、Video2Mesh 2D-to-3D lifting 与 bbox 后处理。DA3 原始点云和 PGSR mesh 的几何效果均值得归档；原始 PGSR Gaussian 在边缘仍有长条 splat，viewer-safe semantic PLY 仅用于稳定显示。
+[Holi-Spatial bedroom_4 全链路重跑归档](holi-spatial-bedroom4-full-run-20260713.md) 已覆盖此前实验页，固定记录 `2026-07-14` 的 80 帧真实重跑：官方 DA3、真实 SAM3、官方 PGSR 30k、TSDF mesh、Video2Mesh 2D-to-3D lifting、bbox 后处理和 SAM3 直接投影 semantic 3DGS 均实际执行。
 
-![Holi-Spatial bedroom_4 semantic viewer](assets/holi-spatial-bedroom4-pgsr-semantic-viewer-20260713.png "PGSR viewer-safe semantic PLY：语义区域可见，但标签元数据仍保存在 sidecar")
+![Holi-Spatial bedroom_4 TSDF mesh](assets/holi-spatial-bedroom4-rerun-20260714-tsdf-mesh.png "本轮官方 PGSR TSDF mesh：床、墙、窗和地面连续，整体重建质量良好")
 
-本轮还修复了 DA3 semantic PLY 的展示问题：原 `semantic_da3_points.ply` 的 `object_id/object_probability` 数据正确，但常规 viewer 只显示保留的原始 RGB；新增 binary `semantic_da3_points_palette.ply` 后可直接显示 16 类语义颜色，同时逐点保留坐标、标签和概率字段。
+人工 QA 显示 TSDF mesh、DA3 RGB 点云、床/台灯/床头柜/窗对象云、DA3 palette semantic PLY 和 semantic 3DGS 均值得归档。PGSR 30k 原始 Gaussian 的主体空洞已基本修复，但场景边缘仍有少量拉丝与漂浮伪影；两个 600 MiB 级语义 PLY 只完成结构和投影 QA，避免在 MacBook 查看器中触发显存耗尽。

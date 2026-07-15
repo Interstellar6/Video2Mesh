@@ -71,16 +71,41 @@ env PYTHONUNBUFFERED=1 PYTHONPATH="$SNAPSHOT" \
     --transfer-mode nearest \
     --include-probabilities \
     --no-export-viewer-plys \
-    --output "$PROJECT/simulator_assets/semantic_pgsr_30k.ply" \
-    --manifest-output "$PROJECT/simulator_assets/semantic_pgsr_30k_manifest.json" \
-  2>&1 | tee "$RUN_ROOT/logs/semantic_transfer_pgsr_30k.log"
+    --output "$PROJECT/simulator_assets/semantic_pgsr_30k_nearest_da3.ply" \
+    --manifest-output "$PROJECT/simulator_assets/semantic_pgsr_30k_nearest_da3_manifest.json" \
+  2>&1 | tee "$RUN_ROOT/logs/semantic_pgsr_30k_nearest_da3.log"
+
+# Primary semantic 3DGS: project the SAM3 2D probability masks directly onto
+# the reconstructed PGSR Gaussian centers. The DA3 nearest transfer above is
+# retained only as a comparison baseline.
+env PYTHONUNBUFFERED=1 PYTHONPATH="$SNAPSHOT" \
+  "$PGSR_PYTHON" -B -m video2mesh.cli backproject-gaussian-probabilities \
+    --project-root "$PROJECT" \
+    --splat-ply "$PGSR_PLY" \
+    --objects-dir "$PROJECT/objects" \
+    --mask-root "$PROJECT/masks/2d" \
+    --camera-info "$PROJECT/scene/cameras/camera_info.json" \
+    --output "$PROJECT/simulator_assets/semantic_pgsr_30k_projected.ply" \
+    --output-dir "$PROJECT/simulator_assets/semantic_pgsr_30k_projected_probabilities" \
+    --manifest-output "$PROJECT/simulator_assets/semantic_pgsr_30k_projected_manifest.json" \
+    --top-n 8 \
+    --ray-radius-pixels 3.0 \
+    --weight-sigma-pixels 1.5 \
+    --pixel-stride 3 \
+    --max-pixels-per-mask 8000 \
+    --include-background-structures \
+    --no-merge-background-structure-masks \
+    --occlusion-filter \
+    --depth-tolerance 0.05 \
+    --relative-depth-tolerance 0.03 \
+  2>&1 | tee "$RUN_ROOT/logs/semantic_pgsr_30k_projected_backprojection.log"
 
 env PYTHONUNBUFFERED=1 PYTHONPATH="$SNAPSHOT" \
   "$PGSR_PYTHON" -B -m video2mesh.cli render-semantic-preview \
     --project-root "$PROJECT" \
-    --semantic-splats-ply "$PROJECT/simulator_assets/semantic_pgsr_30k.ply" \
-    --semantic-manifest "$PROJECT/simulator_assets/semantic_pgsr_30k_manifest.json" \
-    --output-dir "$PROJECT/simulator_assets/semantic_pgsr_preview" \
+    --semantic-splats-ply "$PROJECT/simulator_assets/semantic_pgsr_30k_projected.ply" \
+    --semantic-manifest "$PROJECT/simulator_assets/semantic_pgsr_30k_projected_manifest.json" \
+    --output-dir "$PROJECT/simulator_assets/semantic_pgsr_30k_projected_preview" \
     --max-frames 10 \
     --max-points-per-frame 30000 \
     --occlusion-filter \
@@ -94,4 +119,5 @@ env PYTHONUNBUFFERED=1 PYTHONPATH="$SNAPSHOT" \
 echo "PGSR finalization complete"
 echo "PGSR PLY: $PGSR_PLY"
 echo "PGSR mesh: $MODEL/mesh/tsdf_fusion_post.ply"
-echo "Semantic PGSR: $PROJECT/simulator_assets/semantic_pgsr_30k.ply"
+echo "Semantic PGSR (2D-to-3D projected): $PROJECT/simulator_assets/semantic_pgsr_30k_projected.ply"
+echo "Semantic PGSR baseline (DA3 nearest): $PROJECT/simulator_assets/semantic_pgsr_30k_nearest_da3.ply"

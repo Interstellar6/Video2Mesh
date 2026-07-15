@@ -235,7 +235,7 @@ def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_p
             "scene_3dgs": "scene/reconstruction/3dgs",
         },
         "masks": {"mask_2d_dir": "masks/2d", "mask_3d_dir": "masks/3d"},
-        "objects_dir": "objects",
+        "objects_dir": "objects_instances",
         "simulator_assets_dir": "simulator_assets",
         "artifacts": {"scene_3dgs_ply": str(project_root / "scene/reconstruction/3dgs/point_cloud.ply")},
     }
@@ -271,6 +271,7 @@ def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_p
         Namespace(
             project_root=project_root,
             splat_ply=project_root / "scene/reconstruction/3dgs/point_cloud.ply",
+            objects_dir=project_root / "objects",
             camera_info=None,
             mask_root=None,
             output=output,
@@ -282,7 +283,7 @@ def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_p
             weight_sigma_pixels=1.0,
             pixel_stride=1,
             max_pixels_per_mask=0,
-            max_gaussians=0,
+            max_gaussians=1,
             max_gaussians_per_frame=0,
             min_probability=0.5,
             output_min_probability=0.5,
@@ -302,10 +303,13 @@ def test_backproject_gaussian_probabilities_uses_2d_masks_without_3d_masks(tmp_p
 
     assert rc == 0
     header = parse_ply_vertex_header(output)
+    assert header["format"] == "binary_little_endian"
     assert "object_id" in [name for name, _prop_type in header["properties"]]
     assert "object_probability" in [name for name, _prop_type in header["properties"]]
+    assert "f_dc_0" in [name for name, _prop_type in header["properties"]]
     report = json.loads(output_manifest.read_text(encoding="utf-8"))
     assert report["method"] == "svlgaussian_style_ray_to_gaussian_probability_backprojection"
+    assert report["objects_dir"] == str(project_root / "objects")
     assert report["objects"][1]["object_id"] == "bed"
     assert report["objects"][1]["point_count"] == 1
     assert report["background_structure_mask_merge"]["enabled"] is False
