@@ -26,6 +26,8 @@ Spark 是浏览器端 3DGS renderer，面向 Three.js 集成，支持把 splats 
 
 它们给 Video2Mesh 的启发不是“浏览器能自动做物理”，而是明确了工业界分层：splat 负责视觉，mesh/collider/primitive 才负责交互和物理。Web viewer 可以同时加载 visual proxy 与隐藏 collider proxy。
 
+需要避免名称混淆：使用 OctoMap/FCL 为 3DGS 场景补体素碰撞的是 [SplatGym](../collider-physics-proxy/splatgym-voxel-collision.md)，不是 SuperSplat。SplatGym 也没有直接体素化 SuperSplat PLY，而是从同一视频额外训练 Nerfacto 并导出点云，随后建立独立碰撞层。
+
 ## Pipeline
 
 | 工具 | Pipeline | 输出 |

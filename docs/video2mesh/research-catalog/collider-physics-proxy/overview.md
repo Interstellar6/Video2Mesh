@@ -21,6 +21,7 @@ visibility: public
 
 | 方法 / 项目 | 简介 | 适合对象 | Video2Mesh 用法 |
 |---|---|---|---|
+| [SplatGym：3DGS + OctoMap 体素碰撞](splatgym-voxel-collision.md) | 3DGS 负责视觉，点云经局部 OctoMap/FCL 形成布尔碰撞层 | 静态场景导航、RL、mesh 不可靠时的 occupancy fallback | 用 COLMAP dense 点云构建可审计的 OctoMap sidecar，并与现有 static mesh collider 对照 |
 | Static triangle mesh collider | 简化后的 GLB/mesh 作为静态环境碰撞 | 地面、墙体、大型静态家具、房间壳体 | COLMAP Delaunay / Poisson mesh -> simplified GLB |
 | Primitive fitting | box、capsule、sphere、cylinder 等基本形体 | 桌、柜、床、椅腿、花盆等 | 物体交互 P1 的首选 collider |
 | Convex hull / convex decomposition | 用凸包或多个 convex parts 近似复杂物体 | 可移动刚体、可抓取物体 | 后续可接 CoACD / V-HACD |
