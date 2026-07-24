@@ -215,6 +215,26 @@ PYTHONUSERBASE=/data/zyx/workspace/nova3r/.pyuser_any_lisa \
 
 这次实测说明：NOVA3R 在 24GB 3090 上至少能跑官方单图 demo，显存余量很大；下一步真正有价值的是把输入换成 Video2Mesh 的 object crop / selected views，并补一个坐标拟合与 provenance sidecar，而不是继续只跑官方样例。
 
+### Video2Mesh bedroom_4 场景帧实测
+
+同日继续用 Video2Mesh 的真实 `bedroom_4` 片段跑了两张 full-scene frame。输入来自已有场景 run 的 `scene/frames`，没有裁物体、没有用 mask、没有做 COLMAP/world 坐标拟合；因此这组结果只验证 NOVA3R 对真实 bedroom 场景单图输入的 feed-forward 点云生成能力。
+
+![NOVA3R bedroom_4 scene smoke](../assets/nova3r-bedroom4-scene-n1-comparison.jpg "左列是 Video2Mesh bedroom_4 的真实输入帧 000030 / 000040，右列是 NOVA3R scene_n1 单图输出的点云预览")
+
+| Frame | 输入 | 远端输出 | 本地同步 | 推理与规模 | 观察 |
+|---|---|---|---|---|---|
+| `000030` | `/data/zyx/workspace/Video2MeshWorkspace/video2mesh_runs/bedroom_4_scene_only_v2mw_20260709_030359/scene/frames/000030.png`，1280x720 | `/data/zyx/workspace/nova3r/demo/outputs/bedroom4_scene_n1_frame000030_20260724_210934/000030/pointcloud.ply` | `tmp_remote_results/nova3r_bedroom4_scene_n1_frame000030_20260724/pointcloud.ply` | `3.47s`，peak `4538 MB`，100,000 points，PLY `2400149` bytes，MP4 `3723142` bytes | 能生成床、墙角、窗侧的整体盒状点云；床主体和房间边界可辨，但表面稀疏且没有颜色/语义 |
+| `000040` | `/data/zyx/workspace/Video2MeshWorkspace/video2mesh_runs/bedroom_4_scene_only_v2mw_20260709_030359/scene/frames/000040.png`，1280x720 | `/data/zyx/workspace/nova3r/demo/outputs/bedroom4_scene_n1_frame000040_20260724_211206/000040/pointcloud.ply` | `tmp_remote_results/nova3r_bedroom4_scene_n1_frame000030_20260724/pointcloud_000040.ply` | `2.69s`，peak `4538 MB`，100,000 points，PLY `2400149` bytes，MP4 `3343050` bytes | 相隔 10 帧后输出尺度和房间轮廓仍相近，说明单图 `scene_n1` 对这段 bedroom 视角有一定稳定性 |
+
+点云数值统计：
+
+| Frame | finite | min XYZ | max XYZ | extent XYZ | center XYZ |
+|---|---|---|---|---|---|
+| `000030` | true | `[-2.099, -2.709, 0.631]` | `[2.183, 1.276, 3.986]` | `[4.282, 3.984, 3.355]` | `[0.163, -0.397, 2.637]` |
+| `000040` | true | `[-2.129, -2.558, 0.623]` | `[1.945, 1.287, 3.779]` | `[4.074, 3.845, 3.156]` | `[0.279, -0.211, 2.599]` |
+
+实际效果判断：这组 full-scene 单图结果比“直接失败”好，能给出卧室主要体块和遮挡后方空间的 amodal 几何猜测；但它仍不如 VGGT-Omega / PGSR / COLMAP dense 那类对真实场景结构和相机坐标更贴近的路线。对 Video2Mesh 来说，NOVA3R 更值得先用于 `bed`、`nightstand`、`lamp` 等 object crop 的补全实验，而不是把整帧输出直接当作房间 mesh。当前 `scene_n2` 双图权重尚未部署，本轮未测试双视角一致性。
+
 ## 风险
 
 - 坐标和尺度风险：输出在第一视角坐标系中，必须和 COLMAP/object bbox 拟合，不能直接进入 world frame。
