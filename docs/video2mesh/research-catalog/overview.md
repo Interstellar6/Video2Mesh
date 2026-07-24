@@ -27,7 +27,7 @@ visibility: public
 | Mesh 重建 | [mesh-reconstruction](mesh-reconstruction/overview.md) | COLMAP Delaunay、Poisson/Open3D、GS2Mesh、SuGaR、2DGS/GOF |
 | 动态 / 4D 重建 | [dynamic-4d-reconstruction](dynamic-4d-reconstruction/overview.md) | D4RT、动态 depth/camera/tracks、动态点云、per-object trajectory sidecar |
 | 点云/背景补全 | [pointcloud-completion](pointcloud-completion/overview.md) | 点云清理、背景 clean plate、inpainting、场景结构补全 |
-| 物体 Mesh 补全 | [object-mesh-completion](object-mesh-completion/overview.md) | Hunyuan3D、Meshy、TRELLIS、InstantMesh、image-blaster object jobs |
+| 物体 Mesh 补全 | [object-mesh-completion](object-mesh-completion/overview.md) | Hunyuan3D、Meshy、TRELLIS、NOVA3R、InstantMesh、image-blaster object jobs |
 | 语义与 Scene Graph | [semantic-scene-graph](semantic-scene-graph/overview.md) | SAM/Grounded-SAM、SceneVerse++ / PQ3D / SpatialLM、2D-to-3D fusion、semantic splats、face sidecar |
 | Collider 与物理代理 | [collider-physics-proxy](collider-physics-proxy/overview.md) | static collider、primitive proxy、convex decomposition、Rapier/Unity collision |
 | 物体仿真 | [object-simulation](object-simulation/overview.md) | rigid body、soft body、PhysSplat/Sim Anything、动态 Gaussian |
