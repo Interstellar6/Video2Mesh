@@ -235,6 +235,36 @@ PYTHONUSERBASE=/data/zyx/workspace/nova3r/.pyuser_any_lisa \
 
 实际效果判断：这组 full-scene 单图结果比“直接失败”好，能给出卧室主要体块和遮挡后方空间的 amodal 几何猜测；但它仍不如 VGGT-Omega / PGSR / COLMAP dense 那类对真实场景结构和相机坐标更贴近的路线。对 Video2Mesh 来说，NOVA3R 更值得先用于 `bed`、`nightstand`、`lamp` 等 object crop 的补全实验，而不是把整帧输出直接当作房间 mesh。当前 `scene_n2` 双图权重尚未部署，本轮未测试双视角一致性。
 
+### 缺损物体点云 AE 重建
+
+同日继续补齐 `scene_ae` 权重并跑了 Pts2Pts autoencoder 路线。输入不是图片，而是真实 bedroom_4 的 `sam3_nightstand_01.ply` 物体点云；为了有可控缺损和可比较的 reference，从 75,728 点的 source 中按 PCA 主方向保留 55%，得到 41,650 点的 synthetic partial input。这个缺损是 debug/controlled deletion，不是原始扫描自带缺损。
+
+![NOVA3R nightstand AE partial reconstruction](../assets/nova3r-nightstand-ae-pca55-objectlocal-projection.png "灰色为原始 SAM3 nightstand 点云，蓝色为按 PCA 删除后的 55% partial input，红色为 NOVA3R scene_ae object-local 重建后反变换到 world 坐标的结果")
+
+| 项 | 结果 |
+|---|---|
+| AE 权重 | `/data/zyx/workspace/nova3r/checkpoints/scene_ae/checkpoint-last.pth`，`274260207` bytes；`.hydra/config.yaml` 已补齐 |
+| Source | `/data/zyx/workspace/nova3r/experiments/bedroom4_object_ae/source/sam3_nightstand_01.ply`，75,728 points |
+| Partial input | `/data/zyx/workspace/nova3r/experiments/bedroom4_object_ae/inputs/sam3_nightstand_01_pca55_partial.ply`，41,650 points，保留比例 55.0% |
+| Direct-world AE | `bedroom4_nightstand01_ae_pca55_20260724_212451`，3.02s，peak 697 MB，输出 50,000 points |
+| Object-local AE | `bedroom4_nightstand01_ae_pca55_objectlocal_20260724_212807`，2.96s，peak 697 MB，输出 50,000 points |
+| 本地同步 | `tmp_remote_results/nova3r_bedroom4_nightstand01_ae_pca55_20260724/` 和 `tmp_remote_results/nova3r_bedroom4_nightstand01_ae_pca55_objectlocal_20260724/` |
+
+需要特别注意坐标处理：官方 `demo_nova3r_ae.py` 会按 `norm_mode: median_3` 归一化输入，但保存输出时没有自动反归一化。本轮因此额外生成了两个可检查版本：
+
+- `recon_denorm_median3.ply`：direct-world 输入的 median scale 反归一化结果。
+- `recon_world_from_object_local.ply`：先用 partial bbox 转 object-local，AE 重建后再按 median scale + bbox transform 反变换回 bedroom_4 world 坐标。
+
+最近邻距离显示 object-local 版并没有真正恢复被删掉的大块远侧几何：
+
+| 指标 | Partial vs source | Object-local recon vs source |
+|---|---:|---:|
+| source-to-output mean NN distance | 0.538 | 0.541 |
+| source-to-output p90 NN distance | 1.827 | 1.757 |
+| output-to-source mean NN distance | 0.000026 | 0.0319 |
+
+定性结论：NOVA3R `scene_ae` 能把残缺 nightstand 点云重采样成 50k 点，并在已有 partial 附近生成更连续的点云壳；但在这个 45% 删除的 controlled defect 上，它没有明显补回灰色 source 左侧的大块缺失区域。当前它更像点云 autoencoder / regularizer，不足以单独承担 Video2Mesh 的物体 amodal completion。下一步如果继续验证，应换 `scene_n2` 图像双视角 object crop，或把 AE 只作为 denoise/resample 组件，而不是主补全器。
+
 ## 风险
 
 - 坐标和尺度风险：输出在第一视角坐标系中，必须和 COLMAP/object bbox 拟合，不能直接进入 world frame。
