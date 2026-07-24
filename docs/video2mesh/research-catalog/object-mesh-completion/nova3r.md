@@ -265,6 +265,46 @@ PYTHONUSERBASE=/data/zyx/workspace/nova3r/.pyuser_any_lisa \
 
 定性结论：NOVA3R `scene_ae` 能把残缺 nightstand 点云重采样成 50k 点，并在已有 partial 附近生成更连续的点云壳；但在这个 45% 删除的 controlled defect 上，它没有明显补回灰色 source 左侧的大块缺失区域。当前它更像点云 autoencoder / regularizer，不足以单独承担 Video2Mesh 的物体 amodal completion。下一步如果继续验证，应换 `scene_n2` 图像双视角 object crop，或把 AE 只作为 denoise/resample 组件，而不是主补全器。
 
+### SAM3 物体图片补全实测
+
+同日按 bedroom_4 已有 SAM3 segmentation 输出，直接把单物体 RGB crop 喂给 `scene_n1` 图像条件模型，覆盖床、台灯和植物。没有找到独立 `pillow` SAM3 crop，因此本轮没有伪造枕头输入；床图里包含床面和枕头区域，但仍按 `bed` 记录 provenance。这组实验验证的是“从 SAM3 分割物体图片到完整点云”的 feed-forward 能力，不包含真实尺度拟合、object bbox 对齐、mesh reconstruction 或 collider 生成。
+
+![NOVA3R SAM3 object inputs](../assets/nova3r-bedroom4-sam3-object-inputs.png "输入给 NOVA3R scene_n1 的 bedroom_4 SAM3 物体 RGB crops：床、两个台灯视角、三个植物视角")
+
+![NOVA3R SAM3 object point clouds](../assets/nova3r-bedroom4-sam3-object-pointcloud-xy-preview.png "NOVA3R 对 SAM3 物体图输出的 100k 点云 XY 投影预览。颜色仅表示相对 z 值，不是语义或纹理")
+
+远端路径：
+
+- 输入：`/data/zyx/workspace/nova3r/experiments/bedroom4_sam3_object_completion/inputs/`
+- 输出：`/data/zyx/workspace/nova3r/experiments/bedroom4_sam3_object_completion/outputs/bedroom4_sam3_scene_n1_20260724_213839/`
+- 本地同步：`tmp_remote_results/nova3r_bedroom4_sam3_object_completion_20260724/`
+
+运行命令骨架：
+
+```bash
+cd /data/zyx/workspace/nova3r
+CUDA_VISIBLE_DEVICES=6 \
+PYTHONUSERBASE=/data/zyx/workspace/nova3r/.pyuser_any_lisa \
+/data/zyx/bin/micromamba run -n any-lisa \
+  python demo_nova3r.py \
+    --images experiments/bedroom4_sam3_object_completion/inputs/sam3_bed_01_rgb.png \
+    --ckpt checkpoints/scene_n1/checkpoint-last.pth \
+    --resolution 518 392 \
+    --num_queries 50000 \
+    --output_dir experiments/bedroom4_sam3_object_completion/outputs/bedroom4_sam3_scene_n1_20260724_213839
+```
+
+| SAM3 crop | 输入尺寸 | 输出 | 推理 | 观察 |
+|---|---:|---|---|---|
+| `sam3_bed_01_rgb.png` | 1210x650 | `pointcloud.ply` 100,000 vertices，`2400149` bytes；`pointcloud.mp4` `3319210` bytes | 2.83s，peak 4538 MB | 形成较完整的大体块，床面/靠背/侧边可辨；但仍是 scene-level bbox 风格点云，没有真实纹理和 world scale |
+| `sam3_lamp_01_rgb.png` | 143x194 | `pointcloud.ply` 100,000 vertices，`2400149` bytes；`pointcloud.mp4` `4087688` bytes | 2.65s，peak 4538 MB | 小物体被明显放大后，输出更像带空洞的规则盒状体，台灯细杆/灯罩细节不足 |
+| `sam3_lamp_02_rgb.png` | 125x157 | `pointcloud.ply` 100,000 vertices，`2400149` bytes；`pointcloud.mp4` `5269029` bytes | 2.74s，peak 4538 MB | 同样偏盒状，说明低分辨率单图 crop 对 `scene_n1` 的类别/形状约束不够 |
+| `sam3_plant_01_rgb.png` | 115x79 | `pointcloud.ply` 100,000 vertices，`2400149` bytes | 2.82s，peak 4538 MB | 输出为中心密集、外围规则边界的体块，植物枝叶形态没有被稳定恢复 |
+| `sam3_plant_02_rgb.png` | 95x62 | `pointcloud.ply` 100,000 vertices，`2400149` bytes | 1.02s，peak 4565 MB | 输出纵深跨度更大，但仍缺少植物结构；视频渲染跳过以避免 Open3D 卡顿 |
+| `sam3_plant_03_rgb.png` | 43x43 | `pointcloud.ply` 100,000 vertices，`2400149` bytes | 1.01s，peak 4539 MB | 输入过小，结果主要是模型先验形状，参考价值最低 |
+
+这次结果把定位进一步收窄：`scene_n1` 可以从 SAM3 物体图稳定生成完整 PLY，但它不是“给任意小 crop 就能还原真实物体”的补全器。床这类大范围、结构清晰、像 indoor scene patch 的对象最接近可用；台灯和植物这样的低分辨率小物体，单图 `scene_n1` 更容易生成盒状场景先验。下一步应优先补齐 `scene_n2` 双图权重，给同一物体两个 selected views，并在输入前保留更多上下文或使用 object-local bbox/observed cloud 做后验拟合。
+
 ## 风险
 
 - 坐标和尺度风险：输出在第一视角坐标系中，必须和 COLMAP/object bbox 拟合，不能直接进入 world frame。
