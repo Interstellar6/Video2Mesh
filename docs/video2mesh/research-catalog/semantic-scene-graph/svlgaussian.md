@@ -40,7 +40,7 @@ SVLGaussian 的关键贡献不是“用一张图恢复测量级完整三维”�
 ## 链接
 
 - DOI: https://doi.org/10.1049/cit2.70148
-- Wiley / CAAI Transactions on Intelligence Technology: https://ietresearch.onlinelibrary.wiley.com/doi/10.1049/cit2.70148
+- [Wiley / CAAI Transactions on Intelligence Technology](https://ietresearch.onlinelibrary.wiley.com/doi/10.1049/cit2.70148)
 - 本地源 PDF：`钱塘观潮申报书/djj-paper/CAAI Trans on Intel Tech - 2026 - Wang - SVLGaussian  Single View Language Gaussian Splatting.pdf`
 - 历史选帧说明最后提交：`27f014c72cd6ed9adf46672e12dfaebdee035d6b`
 
