@@ -11,6 +11,7 @@ tags:
   - SAM3
   - SceneVerse++
 visibility: public
+updated: 2026-07-26
 ---
 
 # 语义与 Scene Graph 阶段
@@ -27,6 +28,9 @@ visibility: public
 | [SAM3 / SAM3.1](sam3.md) | Meta 的 promptable concept segmentation 模型，用文本、exemplar、点/框/mask 在图像和视频中检测、分割并跟踪开放词汇概念 | 可替代或增强 GroundingDINO+SAM2，给 Video2Mesh 提供带 identity 的 2D mask evidence | 权重 gated、CUDA 栈新；仍需相机/深度/多视角 fusion 才能进入 3D sidecar |
 | GroundingDINO / Grounded-SAM | 文本提示驱动检测 + mask | 开放词汇发现床、桌、椅、窗帘等对象 | 边界和类别稳定性需多帧融合 |
 | 2D-to-3D mask fusion | 将每帧 mask 投影/投票到 3D 点或 Gaussian | 生成 3D object masks、semantic/probability splats | 遮挡和深度误差会造成串色 |
+| [SVLGaussian](svlgaussian.md) | 单图 Flash3D 几何 + Qwen-VL/SAM 多轮像素概率 + ray-to-Gaussian 回投；本页同时继承历史 5/10/30/±3 选帧协议 | 对应现有 `backproject-gaussian-probabilities` 和 semantic splats 的论文来源，并明确本地是工程适配而非完整单图复现 | 单图几何、小目标 MLLM 幻觉、大视角偏移与论文数据统计不一致 |
+| [FLGS](flgs.md) | 用描述性 fuzzy query、代表视角、3D 尺度相似图和最大团过滤错误 mask，再优化单维 Gaussian mask encoding | 可作为 SAM2/SAM3 masks 进入 3D 回投前的多视角一致性 gate | fuzzy 不等于物理不确定性；尺度相近对象可能误连；当前未复现 |
+| [REALM](realm.md) | 在已有 3DGS instance field 上以 Qwen2.5-VL/SAM 做全局到局部隐式语言推理分割和对象编辑 | 可在 semantic sidecar 之上增加复杂文本到 `object_id` 的 reasoning/query 层 | 依赖稳定实例场；benchmark 与方法共享 MLLM/SAM；编辑仅定性展示 |
 | [Holi-Spatial](holi-spatial.md) | 从 raw video 自动生成 3DGS、2D masks、3D bbox、caption、grounding 和 spatial QA | 给 Video2Mesh 增加空间 QA benchmark 和语义空间 sidecar schema | 当前保留一份真实 DA3/SAM3/PGSR fresh run；VLM、caption 与官方 QA 仍未执行 |
 | [SceneVerse++ / PQ3D / SpatialLM](sceneversepp-pq3d-spatiallm.md) | SceneVerse++ 中的 PQ3D 做 3D instance segmentation，SpatialLM 做 layout / object detection / structured indoor modeling | 接到 semantic sidecar、object bbox、scene graph 和 spatial QA 层，补结构化 3D scene understanding | 它们消费已有 `mesh.ply` / `metadata.json`，不是从视频生成 mesh 或 3DGS 的重建模型 |
 | Semantic splats | 给 3DGS/point cloud 携带 object probability | 支持可视化、hover、语义筛选和 mesh 回灌 | 不等同于 mesh face 语义 |
