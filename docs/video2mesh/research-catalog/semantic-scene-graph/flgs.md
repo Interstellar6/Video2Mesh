@@ -32,8 +32,8 @@ FLGS 把“模糊查询”定义为不直接说出对象名称，而是描述对
 
 ## 链接
 
-- DOI: https://doi.org/10.1109/TFUZZ.2025.3644901
-- IEEE Xplore: https://ieeexplore.ieee.org/document/11316279/
+- [DOI: 10.1109/TFUZZ.2025.3644901](https://doi.org/10.1109/TFUZZ.2025.3644901)
+- [IEEE Xplore paper page](https://ieeexplore.ieee.org/document/11316279/)
 - 本地源 PDF：`钱塘观潮申报书/djj-paper/期刊-TFS25.pdf`
 
 提供的 PDF 是 IEEE Transactions on Fuzzy Systems 接收作者版，页眉明确提示尚未完成最终编辑；本页引用 DOI，不把作者版排版当作最终版本。PDF 中没有给出公开代码仓库或项目页。
