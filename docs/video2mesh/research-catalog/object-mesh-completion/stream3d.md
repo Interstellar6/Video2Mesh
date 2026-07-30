@@ -31,7 +31,8 @@ Stream3D 不是新的端到端 3D 基础模型，而是一个 **training-free �
 | 官方代码 | Source verified | 公开推理代码支持 SAM3D 与 TRELLIS.2，数据加载、流式记忆、view selection / weighting、GLB / PLY 导出均已实现 |
 | 本地源码静态检查 | Passed | 官方仓库快照可读；Python 源码已由主线完成 `compileall` 静态检查 |
 | AutoDL 推理 | **Passed（官方样例、fast、chunk 0）** | RTX 4090 上复用现有 SAM3D 权重完成真实推理，exit 0，产出可读 GLB / Gaussian PLY；这只证明首 chunk 执行和资产合同，不证明跨 chunk 记忆收益或论文 full 指标 |
-| `bedroom_4` 对象接入 | **Passed with limitations** | 已用连续 8 帧、SAM3 mask 与 DA3 相机/深度完成 6 个对象的 fast 首 chunk 生成和 GLB 视觉 QA；5 个可作视觉候选，窗户不晋级 |
+| `bedroom_4` 对象接入 | **Passed with limitations** | 已用连续 8 帧、SAM3 mask 与 DA3 相机/深度完成 6 个对象的 fast 首 chunk 生成和 GLB 视觉 QA；6 个均保留为 object-local 视觉候选，其中窗户是用户确认的最佳 window visual candidate，但仍只是薄窗面 |
+| 床 / 枕头 guided refinement | **Passed with limitations** | Qwen-VL 结构化框 + SAM3 组件 mask 已驱动 TRELLIS2 / Hunyuan3D 2.1 对照；床得到最佳外观与最佳 watertight shape 两个互补候选，身份一致的最终枕头资产尚未完成 |
 | Room alignment / simulator asset | Not tested | 尚未把 object-local 结果拟合回房间坐标，也未生成 collider、semantic 或 physics sidecar |
 
 ## 身份与官方资源
@@ -298,7 +299,7 @@ tmp_remote_results/stream3d_alarm_fast_chunk0_20260731/output/alarm/chunk_0000/
 
 六个 GLB 均可被 `trimesh` 读取，六个 PLY 均为 `binary_little_endian`、17 个 Gaussian vertex 属性，文件 payload 与 header 声明的 vertex count / stride 精确一致。12 个主文件在远端到本地同步后通过 SHA-256 对照。GLB 使用 vertex color，没有 UV/PBR texture。
 
-![bedroom_4 六对象 GLB 六轴检查](../assets/stream3d-bedroom4-glb-axis-contact-sheet.jpg "Blender 六轴渲染总览。床、枕头、床头柜、盆栽与花盆具有可辨识形态；右侧窗户退化为薄板，未通过视觉晋级")
+![bedroom_4 六对象 GLB 六轴检查](../assets/stream3d-bedroom4-glb-axis-contact-sheet.jpg "Blender 六轴渲染总览。床、枕头、床头柜、盆栽与花盆具有可辨识形态；右侧窗户虽为薄窗面，但按用户视觉判断保留为当前最佳 window visual candidate")
 
 | 对象 | GLB vertices / faces | 连通体 | Watertight | Stage-2 视角 | 视觉判断 |
 |---|---:|---:|---|---:|---|
@@ -307,9 +308,9 @@ tmp_remote_results/stream3d_alarm_fast_chunk0_20260731/output/alarm/chunk_0000/
 | 左侧床头柜 | 664,624 / 1,329,260 | 1 | 是 | 8 | 几何连贯，但更像开放式边桌，不是对源柜体的严格复刻 |
 | 左侧盆栽 | 806,244 / 1,612,952 | 117 | 否 | 6 | 花冠与盆体轮廓完整；叶片高度离散，不能直接作为碰撞几何 |
 | 左侧花盆 | 512,864 / 1,025,148 | 145 | 是 | 8 | 花盆可辨识，但比例和装饰相对原始小盆发生漂移 |
-| 右侧窗户 | 264,184 / 528,372 | 2 | 是 | 5 | **不晋级**：仅生成约 0.794 x 1.001 x 0.074 的薄封闭板，缺少窗框、窗扇与玻璃结构 |
+| 右侧窗户 | 264,184 / 528,372 | 2 | 是 | 5 | **用户确认的最佳 window visual candidate**：可读、watertight，但约 0.794 x 1.001 x 0.074 的薄窗面仍缺少可分离的窗框、窗扇与玻璃结构 |
 
-结构层全部 `Passed` 不等于视觉层全部通过。当前可保留床、枕头、床头柜、盆栽和花盆作为后续拟合候选；窗户应回到平面实例、墙体开洞或专用门窗建模路径，而不是继续把薄板当作成功资产。床和盆栽明确非 watertight；其余 mesh 即使 watertight，也没有经过减面、质量属性、碰撞稳定性或物理尺度验证。
+结构层全部 `Passed` 不等于下游全部通过。当前 6 个对象都保留为 object-local 视觉候选；其中窗户是用户确认的当前最佳 window visual candidate，但这个判断只针对视觉候选排序，不把薄窗面升级成墙体 opening、带 sash / glass 语义的门窗组件或 room-aligned 物理资产。床和盆栽明确非 watertight；其余 mesh 即使 watertight，也没有经过减面、质量属性、碰撞稳定性或物理尺度验证。
 
 本地审计包位于 `tmp_remote_results/stream3d_bedroom4_objects_20260731/`，包含输入 manifest、逐对象 metadata、SHA-256 清单、完整日志、GLB 六轴渲染和 Gaussian PLY。全包落盘约 463 MiB，其中 12 个 GLB / PLY 主文件共 428.4 MB（408.6 MiB）；因体积、授权与资产用途边界，不复制到公开文档站，站点仅发布经过压缩的输入/输出总览图和本节统计。
 
@@ -319,11 +320,71 @@ tmp_remote_results/stream3d_alarm_fast_chunk0_20260731/output/alarm/chunk_0000/
 |---|---|---|
 | `bedroom_4` 数据合同可接入 Stream3D | Passed | 仅连续 8 帧、首 chunk、SAM3D backend |
 | 六对象 GLB / Gaussian PLY 文件生成 | Passed | 文件结构与哈希通过，不等于视觉或物理可用 |
-| 五个物体具有可辨识视觉候选 | Passed with limitations | 仍为 object-local、生成式补全、vertex-color 高模 |
-| 窗户可作为窗结构资产 | Failed promotion | 仅为薄板；不是墙体 opening，也没有 sash / glass 语义 |
+| 六个物体具有可辨识视觉候选 | Passed with limitations | 仍为 object-local、生成式补全、vertex-color 高模；窗户的晋级来自用户视觉确认 |
+| 窗户可作为最佳 visual candidate | Passed with limitations | 仅为薄窗面；不是墙体 opening，也没有 sash / glass 语义、房间对齐或物理属性 |
 | Stream3D 跨 chunk evidential memory 收益 | Not tested | 只有 `chunk_0000`，没有长流或 baseline / full 对照 |
 | 房间坐标、米制尺度与支撑关系 | Not tested | metadata 中的生成 pose 不等于已验证的 room-world transform |
 | Collider / semantic / physics / simulator bundle | Not tested | 需要 Video2Mesh 后处理与独立 QA |
+
+## Qwen / SAM3 引导的床与枕头修复
+
+这是在上述 Stream3D 六对象结果之后追加的 **downstream guided refinement**，不是 Stream3D 原生推理能力。流程用 Qwen-VL 给出对象与子组件的结构化框，SAM3 分别提取床体、床头板和三个枕头，再把组件证据并入最终 union mask；同一输入随后分别交给 TRELLIS2 和 Hunyuan3D 2.1。它用于验证“更完整的组件 mask + 两类 3D backend”能否修复床与枕头，不应归因成 evidential memory 的收益。
+
+![Qwen / SAM3 guided bed workflow](../assets/stream3d-bedroom4-guided-bed-workflow.jpg "左上：Qwen-VL 结构化框；右上：SAM3 组件 mask 与 union；左下：TRELLIS2 observed bed 的 3D 轴向渲染；右下：reused EmbodiedGen prior 输入经 TRELLIS2 生成并移除退化面的 repaired bed 3D 渲染")
+
+### 组件证据与 mask 合并
+
+| 证据层 | 像素 / 增量 | 审计结果 |
+|---|---:|---|
+| 床体 core mask | 352,062 px | 主体基础证据；最终 union 前的核心区域 |
+| 床头板 | 36,919 px / 新增 35,586 px | 主要补足原床 mask 未覆盖的木质床头结构 |
+| 左侧枕头 | 24,721 px / 新增 130 px | 与 core 大部分重合，保留为独立组件证据 |
+| 中央枕头 | 12,208 px / 新增 0 px | 已完全落在现有 union 内 |
+| 右侧枕头 tight-box retry | 8,861 px / 新增 254 px | 使用窄框重试；wide box 会错误合并三个枕头和灯具碎片 |
+| 最终 union mask | **388,033 px** | bbox `[133, 141, 1129, 720]`；1 个连通体，最大连通体占比 1.0 |
+
+Qwen-VL 在这里提供的是结构化对象约束，不是像素 mask；SAM3 才负责组件分割。文本提示分支未跑完，不能宣称 text-prompt segmentation 成功。最终 union 保持单连通体，但组件像素增加和连通性只证明分割合同成立，不代表背面、底部或遮挡区域已被真实观测。
+
+### 图像先验与 provenance
+
+本轮 **没有完成 fresh image completion**：内置 image-edit 能力不可用，因此复用了较早的 EmbodiedGen V2 床 / 枕头参考图。对应 manifest 明确记录 `fresh_generation=false`；对复用 prior，`observed_region=0`、`generated_region=alpha`。Qwen 复核将床和枕头均判为 `shape_prior_only`：床的床品颜色与设计不一致，枕头则是不同的花卉纹理。它们只能帮助观察完整轮廓，不能作为 bedroom_4 对象身份或材质的证据。
+
+### 两个 backend 的运行合同
+
+| Backend | 固定配置 | 输出属性 |
+|---|---|---|
+| TRELLIS2 | 官方 commit `75fbf0183001ed9876c8dbb35de6b68552ee08bd`，model revision `af44b45f2e35a493886929c6d786e563ec68364d`；512 pipeline；12 / 12 / 12 steps；100k target；seed 1234 | PBR 外观 mesh；部分 raw mesh 含退化面，另存 repaired derivative，不覆盖原件 |
+| Hunyuan3D 2.1 | 30 steps；resolution 256；guidance 5；seed 1234 | 白色 shape GLB / PLY、无纹理；4 个任务约 14.86-15.29 s / job，峰值 CUDA allocated 7.6264 GiB |
+
+统一结构 QA 对 8 个交付 mesh 全部得到 readable、finite、winding consistent，即 **8/8 technical pass**。这里的 8/8 包含修复后 derivative，不代表 8 个视觉结果都可晋级，也不代表 mesh 都 watertight。
+
+### 床：外观与闭合形状是两个候选
+
+![bed backend comparison](../assets/stream3d-bedroom4-bed-backend-comparison.jpg "床的 2 x 2 对照：左上 TRELLIS2 observed，右上 TRELLIS2 reused prior；左下 Hunyuan observed，右下 Hunyuan reused prior")
+
+| 输入 / backend | Mesh QA | 视觉与用途判断 |
+|---|---|---|
+| TRELLIS2 observed | 59,116 V / 94,956 F；非 watertight；PBR；raw technical pass | **最佳外观候选**：床头板、三个枕头、床品与床裙可辨识；背部 / 底部仍不完整 |
+| TRELLIS2 reused prior | raw 因 3 个 degenerate faces 未通过；repaired 为 95,099 V / 97,302 F、非 watertight | 仅 `shape_prior_only`；完整轮廓但设计、颜色和纹理不匹配 |
+| Hunyuan observed | 261,486 V / 523,052 F；watertight；无纹理 | **最佳 watertight shape 候选**：适合闭合形状参考，但不是外观资产 |
+| Hunyuan reused prior | 324,180 V / 648,396 F；watertight；无纹理 | 结构完整但设计不同，只能作 shape prior |
+
+因此床已经得到两个互补结果：TRELLIS2 observed 是最佳外观候选，Hunyuan observed 是最佳 watertight shape 候选。二者当前 **没有融合，也没有相互配准或 room alignment**，不能把白模闭合性和 PBR 外观合并宣称为一个完成资产。
+
+### 枕头：尚无身份一致的最终资产
+
+![pillow backend comparison](../assets/stream3d-bedroom4-pillow-backend-comparison.jpg "枕头的 2 x 2 对照：左上 TRELLIS2 observed，右上 TRELLIS2 reused prior；左下 Hunyuan observed，右下 Hunyuan reused prior")
+
+| 输入 / backend | Mesh QA | 视觉与用途判断 |
+|---|---|---|
+| TRELLIS2 observed | raw 有 1 个 degenerate face；repaired 为 58,410 V / 96,003 F、非 watertight | 右侧存在明显 tear / curl，不晋级 |
+| TRELLIS2 reused prior | 60,756 V / 96,138 F；非 watertight；PBR；raw technical pass | 轮廓完整但花卉纹理来自另一只枕头，仅 `shape_prior_only` |
+| Hunyuan observed | 208,980 V / 418,020 F；watertight；无纹理 | 仍有严重遮挡撕裂，不晋级 |
+| Hunyuan reused prior | 188,204 V / 376,408 F；非 watertight；无纹理 | 形状较干净但底部有 seam，且对象身份不匹配 |
+
+结论是：**枕头身份一致的最终资产没有完成**。下一步需要真正的 image completion 覆盖遮挡区域，再做 texture transfer 或观测 / 先验 3D fusion，并分别验证身份、材质、闭合性和房间坐标；不能从当前任一 repaired 或 prior 文件直接晋级。
+
+guided 包的完整本地审计目录为 `tmp_remote_results/stream3d_bedroom4_guided_reconstruction_20260731/`，落盘约 116 MiB。公开站点只发布上述三张压缩报告图和统计结论，不发布 GLB / PLY。床头柜、盆栽、花盆和窗户沿用原 Stream3D 结果，本轮没有重新推理；所有候选仍缺 room alignment、collider、semantic sidecar 和 physics sidecar。
 
 ## Video2Mesh 接入位置
 
@@ -381,6 +442,6 @@ video frames + calibrated cameras
 
 ## 建议决策
 
-Stream3D 值得保留为 Video2Mesh 的 P1 object completion 候选，但应定位为 **“SAM3D 的长多视角证据聚合器”**，不是场景重建主干。本次已经完成官方 GSO 首 chunk 与 `bedroom_4` 六对象 fast 首 chunk 两道兼容门；下一优先级不是继续扩充 object-local 资产数量，而是对床头柜或枕头跑多个连续 chunk / full 25+25 steps 对照，并用 observed object cloud / bbox 完成 room alignment。窗户则应改走平面实例与墙体 opening 路线。
+Stream3D 值得保留为 Video2Mesh 的 P1 object completion 候选，但应定位为 **“SAM3D 的长多视角证据聚合器”**，不是场景重建主干。本次已经完成官方 GSO 首 chunk、`bedroom_4` 六对象 fast 首 chunk，以及床 / 枕头的 guided downstream refinement。下一优先级不是继续扩充 object-local 资产数量，而是完成身份一致的枕头图像补全与 3D 融合，并用 observed object cloud / bbox 对候选做 room alignment。用户确认的窗户 visual candidate 应继续保留；墙体 opening、sash / glass 语义和物理属性仍应由平面实例与专用门窗建模路径补齐。
 
 只有同时通过输入契约、真实推理、产物结构、视觉 QA 和 room-coordinate fit，才能把它升级为 Video2Mesh 的可用 backend。即使通过，collider、semantic 和 physics 仍是后续独立阶段。
