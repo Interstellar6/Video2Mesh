@@ -11,6 +11,7 @@ tags:
   - SAM3
   - SceneVerse++
 visibility: public
+updated: 2026-08-02
 ---
 
 # 语义与 Scene Graph 阶段

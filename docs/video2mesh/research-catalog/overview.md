@@ -10,6 +10,7 @@ tags:
   - Mesh
   - Simulation
 visibility: public
+updated: 2026-08-02
 ---
 
 # 场景扫描与可交互资产调研目录
